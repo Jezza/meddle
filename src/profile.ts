@@ -6,7 +6,7 @@ import { initColocated, isJjRepo, jj } from "./jj";
 
 export const PROFILE_ENTRIES = ["CLAUDE.md", "settings.json", "skills", "agents", "commands", "hooks"] as const;
 
-async function exists(path: string): Promise<boolean> {
+export async function exists(path: string): Promise<boolean> {
   try {
     await stat(path);
     return true;
