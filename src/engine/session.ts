@@ -16,7 +16,7 @@ import { buildOptions, type EngineInput } from "./options";
 export type MeddleEvent =
   | { type: "meddle"; subtype: "turn_started"; at: string; resume: boolean }
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
-  | { type: "meddle"; subtype: "turn_failed"; error: string }
+  | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput };
 
 /** How long the child may outlive its `result` (stdin closed) before it is closed for it. */
@@ -57,7 +57,14 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
     record({ type: "meddle", subtype: "permission_denied_hook", input: hookInput });
   };
 
-  const q = query({ prompt: queue, options: buildOptions({ ...input, prompt: queue, canUseTool, onPermissionDenied }) });
+  let q: Query;
+  try {
+    q = query({ prompt: queue, options: buildOptions({ ...input, prompt: queue, canUseTool, onPermissionDenied }) });
+  } catch (err) {
+    queue.end();
+    bestEffort(() => record(turnFailed(String(err))));
+    throw err;
+  }
   return { query: q, done: drive(q, queue, args.signal, record) };
 }
 
@@ -86,12 +93,10 @@ async function drive(
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
   let graceOver: Promise<"grace"> | undefined;
   let result: SDKResultMessage | undefined;
-
-  const abort = (): never => {
-    q.close();
-    record({ type: "meddle", subtype: "turn_aborted", at: new Date().toISOString() });
-    throw new DOMException("aborted", "AbortError");
-  };
+  let ended = false; // the iterator finished on its own: the child has gone
+  let closed = false;
+  let logged = false; // a turn_aborted or turn_failed is in the log
+  const close = () => { if (!closed) { closed = true; q.close(); } };
 
   try {
     for (;;) {
@@ -99,13 +104,19 @@ async function drive(
       try {
         step = await Promise.race([it.next(), aborted, ...(graceOver ? [graceOver] : [])]);
       } catch (err) {
-        if (signal?.aborted) return abort();
-        record({ type: "meddle", subtype: "turn_failed", error: String(err) });
-        throw err;
+        if (result !== undefined) return result; // shutdown noise after the result
+        if (!signal?.aborted) throw err;
+        step = "aborted";
       }
-      if (step === "aborted") return abort();
-      if (step === "grace") { q.close(); return result!; }
-      if (step.done) break;
+      if (step === "aborted") {
+        close();
+        if (result !== undefined) return result;
+        logged = true;
+        bestEffort(() => record({ type: "meddle", subtype: "turn_aborted", at: new Date().toISOString() }));
+        throw new DOMException("aborted", "AbortError");
+      }
+      if (step === "grace") return result!;
+      if (step.done) { ended = true; break; }
       const m = step.value;
       record(m);
       if (m.type === "result" && result === undefined) {
@@ -115,12 +126,27 @@ async function drive(
       }
     }
     if (result !== undefined) return result;
+    logged = true;
     const error = "turn ended without a result";
-    record({ type: "meddle", subtype: "turn_failed", error });
+    bestEffort(() => record(turnFailed(error)));
     throw new Error(error);
+  } catch (err) {
+    if (!ended) close();
+    if (!logged) bestEffort(() => record(turnFailed(String(err))));
+    throw err;
   } finally {
+    if (!ended) close();
     signal?.removeEventListener("abort", onAbort);
     clearTimeout(graceTimer);
     queue.end();
   }
+}
+
+function turnFailed(error: string): MeddleEvent {
+  return { type: "meddle", subtype: "turn_failed", at: new Date().toISOString(), error };
+}
+
+/** Runs `f`, ignoring a throw: used for the closing entry of a turn that is already failing. */
+function bestEffort(f: () => void): void {
+  try { f(); } catch { /* the turn's own error is the one reported */ }
 }

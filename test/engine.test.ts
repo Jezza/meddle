@@ -1,6 +1,7 @@
 // test/engine.test.ts
 import { test, expect } from "bun:test";
 import { mkdtemp, mkdir } from "node:fs/promises";
+import { readdirSync, readFileSync } from "node:fs";
 import { openDb } from "../src/store/db";
 import { listEvents } from "../src/store/events";
 import { SqliteSessionStore } from "../src/store/session-store";
@@ -44,6 +45,42 @@ test("abort closes the query", async () => {
   const { done } = runTurn({ input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: "x", db, approvals: new Approvals(), signal: ac.signal });
   setTimeout(() => ac.abort(), 300);
   await expect(done).rejects.toMatchObject({ name: "AbortError" });
+});
+/** Pids of live processes whose environment carries `mark`. */
+function processesWith(mark: string): number[] {
+  return readdirSync("/proc").filter(d => /^\d+$/.test(d)).filter(d => {
+    try { return readFileSync(`/proc/${d}/environ`, "latin1").includes(mark); } catch { return false; }
+  }).map(Number);
+}
+test("a turn that fails to record closes the child and logs turn_failed", async () => {
+  const { db, input, fixture } = await setup();
+  const mark = `MEDDLE_TEST_MARK=${crypto.randomUUID()}`;
+  let childSeen = false;
+  const boom = new Error("broadcast failed");
+  const { done } = runTurn({
+    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1", MEDDLE_TEST_MARK: mark.split("=")[1]! } },
+    prompt: "x", db, approvals: new Approvals(),
+    onMessage: (m) => { if (m.type !== "meddle") { childSeen = processesWith(mark).length > 0; throw boom; } },
+  });
+  await expect(done).rejects.toBe(boom);
+  expect(childSeen).toBe(true);
+  const failed = listEvents(db, "abc").map(e => e.message as any).filter(m => m.subtype === "turn_failed");
+  expect(failed).toMatchObject([{ type: "meddle", error: "Error: broadcast failed" }]);
+  expect(typeof failed[0].at).toBe("string");
+  for (let i = 0; i < 100 && processesWith(mark).length > 0; i++) await Bun.sleep(20);
+  expect(processesWith(mark)).toEqual([]);
+});
+test("an abort after the result resolves with the result", async () => {
+  const { db, input, fixture } = await setup();
+  const ac = new AbortController();
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: "x", db, approvals: new Approvals(), signal: ac.signal, onMessage: (m) => { if (m.type === "result") ac.abort(); } });
+  expect((await done).type).toBe("result");
+  expect(listEvents(db, "abc").map(e => (e.message as any).subtype)).not.toContain("turn_aborted");
+});
+test("a synchronous failure to start still closes the turn in the log", async () => {
+  const { db, input } = await setup();
+  expect(() => runTurn({ input: { ...input, cfg: undefined as any }, prompt: "x", db, approvals: new Approvals() })).toThrow();
+  expect(listEvents(db, "abc").map(e => (e.message as any).subtype)).toEqual(["turn_started", "turn_failed"]);
 });
 test("onMessage streams every recorded event, meddle's own included, in seq order", async () => {
   const { db, input, fixture } = await setup();
