@@ -20,6 +20,28 @@ const MIGRATIONS = [
     created_at TEXT,
     updated_at TEXT
   )`,
+  `CREATE TABLE IF NOT EXISTS events (
+    task_id TEXT,
+    seq INTEGER,
+    type TEXT,
+    subtype TEXT,
+    uuid TEXT,
+    at TEXT,
+    json TEXT,
+    PRIMARY KEY (task_id, seq)
+  )`,
+  `CREATE TABLE IF NOT EXISTS transcript (
+    project_key TEXT,
+    session_id TEXT,
+    subpath TEXT NOT NULL DEFAULT '',
+    seq INTEGER,
+    uuid TEXT,
+    ts INTEGER,
+    json TEXT,
+    PRIMARY KEY (project_key, session_id, subpath, seq)
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS transcript_uuid
+    ON transcript (project_key, session_id, subpath, uuid) WHERE uuid IS NOT NULL`,
 ];
 
 export function openDb(path: string): Database {
