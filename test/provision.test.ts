@@ -76,3 +76,26 @@ test("provision with an unknown project throws and leaves no task folder", async
   );
   expect(await readdir(cfg.taskRoot)).toEqual([]);
 });
+test("a provision failing after a workspace exists undoes workspaces, bookmarks and the task folder", async () => {
+  const { mkdir, readdir } = await import("node:fs/promises");
+  const { jj } = await import("../src/jj");
+  const home = await mkdtemp("/tmp/meddle-prov-");
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/data`, MEDDLE_TASK_ROOT: `${home}/tasks` });
+  await ensureDataDirs(cfg);
+  await mkdir(cfg.taskRoot, { recursive: true });
+  const db = openDb(`${home}/data/meddle.sqlite`);
+  const a = `${home}/a`; await initColocated(a);
+  const b = `${home}/b`; await initColocated(b);
+  const pa = await addProjectFromFolder(cfg, db, a, "a");
+  const pb = await addProjectFromFolder(cfg, db, b, "b");
+  await expect(
+    provisionTask(cfg, db, { title: "t", projectIds: [pa.id, pb.id], parents: { [pb.id]: "nonexistent_rev" } }),
+  ).rejects.toThrow(/nonexistent_rev/);
+  expect(await readdir(cfg.taskRoot)).toEqual([]);
+  for (const repo of [a, b]) {
+    expect((await jj(["workspace", "list", "-T", 'name ++ "\\n"'], repo)).trim()).toBe("default");
+    expect((await jj(["bookmark", "list", "-T", 'name ++ "\\n"'], repo)).trim()).not.toContain("meddle/task/");
+  }
+  const { listTasks } = await import("../src/store/records");
+  expect(listTasks(db)).toEqual([]);
+});

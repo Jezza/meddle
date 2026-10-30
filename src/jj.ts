@@ -60,6 +60,10 @@ export async function bookmarkSet(repo: string, name: string, revision: string):
   await jj(["bookmark", "set", name, "-r", revision, "--allow-backwards"], repo);
 }
 
+export async function bookmarkDelete(repo: string, name: string): Promise<void> {
+  await jj(["bookmark", "delete", `exact:${name}`], repo);
+}
+
 export async function changeId(workspace: string): Promise<string> {
   return (await jj(["log", "-r", "@", "--no-graph", "-T", "change_id"], workspace)).trim();
 }

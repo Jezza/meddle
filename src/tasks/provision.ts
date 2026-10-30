@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { checkTaskRoot, paths } from "../paths";
-import { bookmarkSet, changeId, trunkRevset, workspaceAdd, workspaceForget } from "../jj";
+import { bookmarkDelete, bookmarkSet, changeId, trunkRevset, workspaceAdd, workspaceForget } from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
 import { ensureMemoryReplica, linkMemory } from "../memory";
 import { getProject, type Project } from "../projects/project";
@@ -68,6 +68,7 @@ export async function provisionTask(
   const task = p.task(id);
   const workspaceName = `meddle-${id}`;
   const added: string[] = [];
+  const bookmarks: Array<{ replica: string; name: string }> = [];
   try {
     const configDir = p.taskConfig(id);
     await mkdir(configDir, { recursive: true });
@@ -75,9 +76,11 @@ export async function provisionTask(
     for (const project of projects) {
       const workspace = join(task, project.name);
       const parent = input.parents?.[project.id] ?? (await trunkRevset(project.replica));
-      await workspaceAdd(project.replica, workspaceName, workspace, parent);
       added.push(project.replica);
-      await bookmarkSet(project.replica, `meddle/task/${id}/${project.name}`, await changeId(workspace));
+      await workspaceAdd(project.replica, workspaceName, workspace, parent);
+      const bookmark = `meddle/task/${id}/${project.name}`;
+      await bookmarkSet(project.replica, bookmark, await changeId(workspace));
+      bookmarks.push({ replica: project.replica, name: bookmark });
       entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent });
     }
     await linkProfile(configDir, cfg);
@@ -105,6 +108,7 @@ export async function provisionTask(
     });
     return manifest;
   } catch (err) {
+    for (const { replica, name } of bookmarks) await bookmarkDelete(replica, name).catch(() => {});
     for (const replica of added) await workspaceForget(replica, workspaceName).catch(() => {});
     await rm(task, { recursive: true, force: true }).catch(() => {});
     throw err;

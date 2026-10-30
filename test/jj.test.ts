@@ -18,3 +18,13 @@ test("jj errors carry stderr", async () => {
   const { jj } = await import("../src/jj");
   await expect(jj(["log"], "/tmp")).rejects.toMatchObject({ code: expect.any(Number) });
 });
+test("bookmarkDelete removes exactly the named bookmark", async () => {
+  const { bookmarkDelete, jj } = await import("../src/jj");
+  const repo = await mkdtemp("/tmp/meddle-jj-");
+  await initColocated(repo);
+  await bookmarkSet(repo, "meddle/task/1/p", "@");
+  await bookmarkSet(repo, "meddle/task/1/px", "@");
+  await bookmarkDelete(repo, "meddle/task/1/p");
+  const names = (await jj(["bookmark", "list", "-T", 'name ++ "\\n"'], repo)).trim().split("\n");
+  expect(names).toEqual(["meddle/task/1/px"]);
+});
