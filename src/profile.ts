@@ -1,4 +1,4 @@
-import { cp, lstat, mkdir, readdir, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, rename, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { NodeConfig } from "./config";
 import { paths } from "./paths";
@@ -24,17 +24,21 @@ async function createDefault(entry: (typeof PROFILE_ENTRIES)[number], dst: strin
 export async function seedProfile(cfg: NodeConfig): Promise<void> {
   const profile = paths(cfg).profile;
   if (await isJjRepo(profile)) return;
-  await initColocated(profile);
+  const staging = `${profile}.seeding`;
+  await rm(staging, { recursive: true, force: true });
+  await initColocated(staging);
   for (const entry of PROFILE_ENTRIES) {
     const src = join(cfg.claudeHome, entry);
-    const dst = join(profile, entry);
+    const dst = join(staging, entry);
     if (await exists(src)) await cp(src, dst, { recursive: true, dereference: true });
     else await createDefault(entry, dst);
   }
   await jj(
     ["commit", "-m", `seed profile from ${cfg.claudeHome}`, "--config", 'snapshot.max-new-file-size="50MiB"'],
-    profile,
+    staging,
   );
+  if (await exists(profile)) await rmdir(profile);
+  await rename(staging, profile);
 }
 
 export async function ensurePlugins(cfg: NodeConfig): Promise<void> {
