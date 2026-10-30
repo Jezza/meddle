@@ -84,7 +84,7 @@ export function buildOptions(i: EngineInput): Options {
   if (i.resume) options.resume = i.manifest.sessionId;
   else options.sessionId = i.manifest.sessionId;
   if (Object.keys(mcpServers).length > 0) options.mcpServers = mcpServers as Record<string, McpServerConfig>;
-  if (skills !== undefined) options.skills = skills;
+  if (skills != null) options.skills = skills;
   if (i.model !== undefined) options.model = i.model;
   if (i.tools !== undefined) options.tools = i.tools;
   if (i.effort !== undefined) options.effort = i.effort as Options["effort"];

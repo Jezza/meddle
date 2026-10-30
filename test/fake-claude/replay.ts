@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 
 type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t: number } | { dir: "exit"; t: number; code: number | null };
 type Frame = { type: string; subtype?: string; request_id?: string; request?: { subtype?: string }; response?: { request_id?: string } };
-type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string } | { kind: "eof" };
+type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
 type Step = { need: Need } | { emit: string; frame: Frame };
 
 const fixture = process.env.MEDDLE_FIXTURE;
@@ -26,7 +26,9 @@ const recordedResponse = new Map<string, Frame>(); // subtype -> recorded contro
 const steps: Step[] = [];
 let sawClose = false, exitedOnItsOwn = false;
 for (const e of entries) {
-  if (e.dir === "close") { sawClose = true; steps.push({ need: { kind: "eof" } }); continue; }
+  // A recorded `close` is the SDK ending stdin; where it falls among the child's output is
+  // incidental, so it never gates an `out` line. It only decides the lifetime at the end.
+  if (e.dir === "close") { sawClose = true; continue; }
   if (e.dir === "exit") { exitedOnItsOwn = !sawClose; continue; }
   const f: Frame = JSON.parse(e.line);
   if (e.dir === "in") {
@@ -87,7 +89,6 @@ function matches(need: Need, f: Frame): boolean {
     case "response": return f.type === "control_response" && f.response?.request_id === lastEmittedRequestId;
     case "host": return f.type === "control_request" && f.request?.subtype === need.subtype;
     case "type": return f.type === need.type;
-    case "eof": return false;
   }
 }
 
@@ -101,7 +102,6 @@ function waitForEof(): Promise<void> {
 
 /** Resolves once an unconsumed arrived frame satisfies `need`; exits if stdin ends first. */
 async function waitFor(need: Need) {
-  if (need.kind === "eof") return waitForEof();
   for (;;) {
     const hit = arrived.find(a => !a.used && matches(need, a.frame));
     if (hit) { hit.used = true; return; }
