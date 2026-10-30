@@ -1,4 +1,9 @@
+import { randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
+
+export function newId(): string {
+  return randomBytes(6).toString("hex");
+}
 
 export type ProjectRow = {
   id: string;

@@ -1,11 +1,10 @@
-import { randomBytes } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import { paths, type NodeConfig } from "../config";
 import { cloneColocated, initColocated, isJjRepo } from "../jj";
 import { ensureMemoryReplica, importMemory } from "../memory";
-import { getProjectRow, insertProject, listProjectRows, type ProjectRow } from "../store/records";
+import { getProjectRow, insertProject, listProjectRows, newId, type ProjectRow } from "../store/records";
 
 export type Project = {
   id: string;
@@ -13,10 +12,6 @@ export type Project = {
   source: { kind: "folder"; path: string } | { kind: "upstream"; url: string };
   replica: string;
 };
-
-function newId(): string {
-  return randomBytes(6).toString("hex");
-}
 
 function toProject(row: ProjectRow): Project {
   const source: Project["source"] = row.source_kind === "folder"
