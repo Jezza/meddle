@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "./config";
-import { startDashboard } from "./dashboard/server";
+import { startDashboard, type Dashboard } from "./dashboard/server";
 import { findTaskPids, MetricsSampler } from "./metrics";
 import { ensurePlugins, seedProfile } from "./profile";
 import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
@@ -30,8 +30,25 @@ class NoNode extends Error {
   }
 }
 
+/** What `serve` has opened so far, closed by `shutdown`. */
+type OpenNode = { db?: Database; harness?: { close(): Promise<void> }; metrics?: MetricsSampler; host?: Host; dashboard?: Dashboard };
+
+/** Closes whatever of the node is open: the dashboard, metrics, the harness, the host, then the database. */
+async function shutdown(node: OpenNode): Promise<void> {
+  await node.dashboard?.stop();
+  node.metrics?.stop();
+  await node.harness?.close();
+  await node.host?.close();
+  node.db?.close();
+}
+
 /** Runs the node: its data, its durable turns, its chord objects and the dashboard, until SIGINT or SIGTERM. */
 async function serve(): Promise<number> {
+  // Installed first, so a signal during startup shuts down once startup is done; a repeated signal changes nothing.
+  const signalled = Promise.withResolvers<void>();
+  process.on("SIGINT", () => signalled.resolve());
+  process.on("SIGTERM", () => signalled.resolve());
+
   const cfg = loadConfig();
   await ensureDataDirs(cfg);
   await seedProfile(cfg);
@@ -39,25 +56,27 @@ async function serve(): Promise<number> {
   const root = await checkTaskRoot(cfg);
   if (!root.ok) console.error(`meddle: ${root.reason}; this node will not host tasks`);
 
-  const db = openDb(paths(cfg).db);
-  const harness = await openHarness(cfg, createRegistry());
-  const runner = new TaskRunner(cfg, db, harness.harness, runnerDeps());
-  const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 5000, dataDir: cfg.dataDir });
-  metrics.start();
-  const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion() });
-  const dashboard = await startDashboard(cfg, host);
-  console.log(`dashboard at ${dashboard.url}`);
+  const node: OpenNode = {};
+  try {
+    const db = (node.db = openDb(paths(cfg).db));
+    const harness = (node.harness = await openHarness(cfg, createRegistry()));
+    const runner = new TaskRunner(cfg, db, harness.harness, runnerDeps());
+    const metrics = (node.metrics = new MetricsSampler({
+      taskPids: () => findTaskPids(cfg.taskRoot),
+      intervalMs: 5000,
+      dataDir: cfg.dataDir,
+    }));
+    metrics.start();
+    const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion() }));
+    node.dashboard = await startDashboard(cfg, host);
+  } catch (err) {
+    await shutdown(node);
+    throw err;
+  }
+  console.log(`dashboard at ${node.dashboard.url}`);
 
-  const signalled = Promise.withResolvers<void>();
-  process.once("SIGINT", () => signalled.resolve());
-  process.once("SIGTERM", () => signalled.resolve());
   await signalled.promise;
-
-  await dashboard.stop();
-  metrics.stop();
-  await harness.close();
-  await host.close();
-  db.close();
+  await shutdown(node);
   return 0;
 }
 
@@ -85,7 +104,7 @@ async function status(): Promise<number> {
   console.log(`meddle ${VERSION}`);
   console.log(`claude code ${claudeCodeVersion()}`);
   console.log(`data dir ${cfg.dataDir}`);
-  console.log(`task root ${cfg.taskRoot} ${root.ok ? "ok" : root.reason}`);
+  console.log(root.ok ? `task root ${cfg.taskRoot} ok` : root.reason);
   console.log(`token ${token.present ? `present expires ${token.expiresAt}` : "absent"}`);
   console.log(`tasks ${taskCount(cfg)}`);
   return 0;
@@ -178,7 +197,12 @@ function taskNew(title: string, projectIds: string[]): Promise<number> {
   });
 }
 
-/** Submits a turn and prints each new event's `type[/subtype]` to stderr until a `result` arrives. */
+type WindowEvent = { seq: number; message: unknown };
+
+/**
+ * Submits a turn and prints each new event's `type[/subtype]` to stderr until a `result` arrives. A `turn_failed`
+ * event, or the task going idle again with no `result` (a turn that failed before it logged anything), fails it.
+ */
 function taskPrompt(id: string, text: string): Promise<number> {
   return withNode(async (client, socket) => {
     const task = await client.get(TaskObject, { id });
@@ -187,20 +211,34 @@ function taskPrompt(id: string, text: string): Promise<number> {
     const finished = Promise.withResolvers<void>();
     finished.promise.catch(() => {}); // a failed prompt leaves it unawaited when the socket then closes
     socket.addEventListener("close", () => finished.reject(new Error("the node closed the connection")));
-    const unsubscribe = session.window.subscribe((window) => {
-      for (const { seq, message } of window) {
+    const follow = (events: readonly WindowEvent[]) => {
+      for (const { seq, message } of events) {
         if (seq <= printed) continue;
         printed = seq;
         const { type, subtype } = message as { type?: string; subtype?: string };
         console.error(subtype === undefined ? `${type}` : `${type}/${subtype}`);
         if (type === "result") return finished.resolve();
+        if (type === "meddle" && subtype === "turn_failed") return finished.reject(new Error("the turn failed"));
       }
-    });
+    };
+    /** Idle again: the database has every event the turn logged, so a `result` missing from it means failure. */
+    const settle = async () => {
+      follow(await session.loadEarlier({ beforeSeq: Number.MAX_SAFE_INTEGER, limit: 200 }));
+      finished.reject(new Error("the turn failed"));
+    };
+    let busy = false;
+    const unsubscribe = [
+      session.window.subscribe(follow),
+      task.state.subscribe((state) => {
+        if (state !== "idle") busy = true;
+        else if (busy) settle().catch((err: Error) => finished.reject(err));
+      }),
+    ];
     try {
       await task.prompt({ text });
       await finished.promise;
     } finally {
-      unsubscribe();
+      for (const stop of unsubscribe) stop();
     }
     return 0;
   });

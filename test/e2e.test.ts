@@ -1,6 +1,6 @@
 // test/e2e.test.ts — one node end to end: `meddle serve` against the replayer, driven by the client subcommands.
 import { test, expect } from "bun:test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { initColocated } from "../src/jj";
 import { meddle, replay, startServe } from "./helpers";
 
@@ -90,3 +90,42 @@ test("a client command without a running node asks for one", async () => {
   expect(result.stdout).toBe("");
   expect(result.stderr).toBe('meddle: start "meddle serve" first\n');
 });
+
+test("task prompt fails fast when the turn fails", async () => {
+  const { dir, env } = await home();
+  await writeFile(`${dir}/token`, "tok\n");
+  expect((await meddle(["token", "set", "--file", `${dir}/token`], env)).code).toBe(0);
+  const node = await startServe({ ...env, MEDDLE_PORT: "0", MEDDLE_CLAUDE_PATH: `${dir}/no-such-claude` });
+  const client = { ...env, MEDDLE_PORT: String(node.port) };
+  try {
+    const projectId = (await meddle(["project", "add", `${dir}/repo`], client)).stdout.trim();
+    const taskId = (await meddle(["task", "new", "--title", "t", "--project", projectId], client)).stdout.trim();
+    expect(taskId).toMatch(/^\S+$/);
+
+    // the child never starts: the turn logs `turn_failed`
+    const prompted = await meddle(["task", "prompt", taskId, "hi"], client);
+    expect(prompted.code).toBe(1);
+    expect(prompted.stderr).toEndWith("meddle/turn_failed\nmeddle: the turn failed\n");
+
+    // no token: the turn fails before it logs anything, and the task goes idle again
+    await rm(`${dir}/d/secrets/claude-token`);
+    const tokenless = await meddle(["task", "prompt", taskId, "hi"], client);
+    expect(tokenless.code).toBe(1);
+    expect(tokenless.stderr).toBe("meddle: the turn failed\n");
+  } finally {
+    await node.stop();
+  }
+}, 30_000);
+
+test("serve exits 1 when its port is taken", async () => {
+  const { env } = await home();
+  const taken = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  try {
+    const result = await meddle(["serve"], { ...env, MEDDLE_PORT: String(taken.port) });
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toStartWith("meddle: ");
+  } finally {
+    await taken.stop(true);
+  }
+}, 30_000);

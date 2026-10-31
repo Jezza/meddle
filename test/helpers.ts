@@ -66,9 +66,12 @@ export async function meddle(args: string[], env: Record<string, string>) {
   return { stdout, stderr, code };
 }
 
+const SERVE_DEADLINE_MS = 15_000;
+
 /**
  * Starts `meddle serve` with `env` and resolves once it prints its `dashboard at` line, with the bound port and
- * the dashboard's URL. `stop` sends SIGTERM and resolves with the exit code; `stderr` is what it printed so far.
+ * the dashboard's URL; after 15 s without one it stops the child and rejects with its stderr. `stop` sends SIGTERM
+ * (SIGKILL 15 s later if the child is still running) and resolves with the exit code; `stderr` is what it printed so far.
  */
 export async function startServe(env: Record<string, string>) {
   const proc = Bun.spawn(["bun", "run", "src/cli.ts", "serve"], {
@@ -85,19 +88,27 @@ export async function startServe(env: Record<string, string>) {
   })();
   const stop = async () => {
     proc.kill("SIGTERM");
+    // A serve hung in startup only acts on SIGTERM once startup is done; it gets SIGKILL after a while.
+    const kill = setTimeout(() => proc.kill("SIGKILL"), SERVE_DEADLINE_MS);
     const code = await proc.exited;
+    clearTimeout(kill);
     await drainErr;
     return code;
   };
   const url = await new Promise<string>((resolve, reject) => {
+    const deadline = setTimeout(() => reject(new Error(`meddle serve printed no dashboard line in ${SERVE_DEADLINE_MS} ms:\n`)), SERVE_DEADLINE_MS);
     let stdout = "";
     const decoder = new TextDecoder();
     (async () => {
       for await (const chunk of proc.stdout) {
         stdout += decoder.decode(chunk, { stream: true });
         const match = /^dashboard at (http:\/\/127\.0\.0\.1:\d+\/)$/m.exec(stdout);
-        if (match) resolve(match[1]!);
+        if (match) {
+          clearTimeout(deadline);
+          resolve(match[1]!);
+        }
       }
+      clearTimeout(deadline);
       reject(new Error(`meddle serve exited before its dashboard was up:\n${stdout}`));
     })().catch(reject);
   }).catch(async (err: Error) => {
