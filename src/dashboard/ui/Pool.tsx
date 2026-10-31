@@ -4,7 +4,7 @@ import type { Host, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
 import { NodeObject, PoolObject, ProjectObject, TaskObject, type Notification } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
-import { type Hosts, useAction, useObject, useValue } from "./hooks";
+import { type Hosts, type HostStatus, useAction, useObject, useValue } from "./hooks";
 import type { Open } from "./routes";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -40,15 +40,24 @@ function NodeCard({ hosts, row, selfRow, open }: { hosts: Hosts; row: PoolNode; 
       </section>
     );
   }
-  if (!row.online) {
+  const host = row.online ? hosts.for(row.nodeId) : undefined;
+  if (host === undefined) {
     return (
       <section class="card" title={row.nodeId}>
         <CardHead row={row} hostname={row.hostname} />
+        {row.online && <Unavailable status={hosts.status(row.nodeId)} />}
         <SummaryBody row={row} selfRow={selfRow} />
       </section>
     );
   }
-  return <OnlineCard host={hosts.for(row.nodeId)} row={row} selfRow={selfRow} open={open} />;
+  return <OnlineCard host={host} row={row} selfRow={selfRow} open={open} />;
+}
+
+/** Why an online node's objects cannot be had right now (`Hosts.for` gave no host). */
+export function Unavailable({ status }: { status: HostStatus }) {
+  if (status === "incompatible") return <p class="flag">Incompatible version: this dashboard cannot talk to it. Upgrade the older node.</p>;
+  if (status === "backoff") return <p class="muted">Unreachable; retrying shortly.</p>;
+  return <p class="muted">Connecting…</p>;
 }
 
 function CardHead({ row, hostname }: { row: PoolNode; hostname: string }) {
@@ -177,7 +186,10 @@ export function Notifications({ hosts, pool, open }: { hosts: Hosts; pool: PoolR
     .sort((a, b) => Date.parse(b.note.at) - Date.parse(a.note.at));
   return (
     <>
-      {online.map((row) => <NoteSource key={row.nodeId} host={hosts.for(row.nodeId)} nodeId={row.nodeId} report={report} />)}
+      {online.map((row) => {
+        const host = hosts.for(row.nodeId);
+        return host === undefined ? null : <NoteSource key={row.nodeId} host={host} nodeId={row.nodeId} report={report} />;
+      })}
       {merged.length > 0 && (
         <section class="notifications">
           {action.error !== null && <p class="error">{action.error}</p>}
@@ -224,14 +236,18 @@ function NewTask({ hosts, canHost, selfId, open }: { hosts: Hosts; canHost: read
               {canHost.map((n) => <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)})</option>)}
             </select>
           </label>
-          <NewTaskOn key={target.nodeId} host={hosts.for(target.nodeId)} open={(taskId) => open(target.nodeId, taskId)} />
+          <NewTaskOn key={target.nodeId} host={hosts.for(target.nodeId)} status={hosts.status(target.nodeId)} open={(taskId) => open(target.nodeId, taskId)} />
         </>
       )}
     </section>
   );
 }
 
-function NewTaskOn({ host, open }: { host: Host; open: (taskId: string) => void }) {
+function NewTaskOn({ host, status, open }: { host: Host | undefined; status: HostStatus; open: (taskId: string) => void }) {
+  return host === undefined ? <Unavailable status={status} /> : <NewTaskOnHost host={host} open={open} />;
+}
+
+function NewTaskOnHost({ host, open }: { host: Host; open: (taskId: string) => void }) {
   const node = useObject(host, NodeObject, {});
   if (node.error !== undefined) return <p class="error">{node.error}</p>;
   if (node.ref === undefined) return <p class="muted">Connecting…</p>;

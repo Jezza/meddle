@@ -7,44 +7,128 @@ export function nodeSocket(path: string): WebSocket {
   return new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${path}`);
 }
 
-/** A chord client host whose upstream is `socket`. */
-export function clientHost(socket: WebSocket): Host {
+/** A chord client host whose upstream is `socket`; `onMismatch` runs when the far side speaks another link protocol. */
+export function clientHost(socket: WebSocket, onMismatch: () => void): Host {
   return createHost({
     name: "browser",
     self: "browser",
     kind: "client",
-    upstream: { link: webSocketLink(socket), principal: "node", onProtocolMismatch: () => location.reload() },
+    upstream: { link: webSocketLink(socket), principal: "node", onProtocolMismatch: onMismatch },
   });
 }
 
-/** One client host per node, created on first use over `/ws/node/<nodeId>` and dropped when its socket closes. */
-export class Hosts {
-  readonly #hosts = new Map<string, Host>();
-  readonly #listeners = new Set<(nodeId: string) => void>();
+/** What a node's host is doing: none yet (`idle`), its socket opening or open, waiting to retry, or never again. */
+export type HostStatus = "idle" | "connecting" | "open" | "backoff" | "incompatible";
 
-  constructor(readonly selfId: string, readonly selfHost: Host) {}
+/** What one connection attempt reports back to `Hosts`. */
+export type HostEvents = { opened(): void; closed(): void; mismatch(): void };
 
-  /** The host for `nodeId`: the `/ws` host for this node, else a new one when none is open. */
-  for(nodeId: string): Host {
-    if (nodeId === this.selfId) return this.selfHost;
-    const open = this.#hosts.get(nodeId);
-    if (open !== undefined) return open;
+export type HostsDeps = {
+  /** Opens a host to `nodeId`, reporting its socket's open and close and a protocol mismatch through `events`. */
+  connect(nodeId: string, events: HostEvents): Host;
+  now(): number;
+  schedule(fn: () => void, ms: number): void;
+};
+
+const BACKOFF_FIRST_MS = 1000;
+const BACKOFF_MAX_MS = 30_000;
+/** A socket open at least this long counts as a success: the next failure backs off from the start again. */
+const STABLE_MS = 10_000;
+
+/** The browser's `HostsDeps`: a socket to `/ws/node/<nodeId>` and a client host over it. */
+const browserDeps: HostsDeps = {
+  connect(nodeId, events) {
     const socket = nodeSocket(`/ws/node/${encodeURIComponent(nodeId)}`);
-    const host = clientHost(socket);
-    this.#hosts.set(nodeId, host);
-    socket.addEventListener("close", () => {
-      if (this.#hosts.get(nodeId) !== host) return;
-      this.#hosts.delete(nodeId);
-      host.close().catch(() => {});
-      for (const cb of this.#listeners) cb(nodeId);
+    socket.addEventListener("open", () => events.opened());
+    socket.addEventListener("close", () => events.closed());
+    return clientHost(socket, () => events.mismatch());
+  },
+  now: () => Date.now(),
+  schedule: (fn, ms) => { setTimeout(fn, ms); },
+};
+
+type Entry =
+  | { status: "connecting" | "open"; host: Host; openedAt: number | null; failures: number }
+  | { status: "backoff" | "idle"; failures: number }
+  | { status: "incompatible" };
+
+/**
+ * One client host per node, created on first use over `/ws/node/<nodeId>` and dropped when its socket closes. A dropped
+ * node waits out a backoff (1 s doubling to 30 s, from the start again after a socket stayed open 10 s) before `for`
+ * opens another; a node whose link protocol differs is `incompatible` and never retried. `onChange` tells the views to
+ * re-render whenever a node's status changes.
+ */
+export class Hosts {
+  readonly #entries = new Map<string, Entry>();
+  readonly #listeners = new Set<(nodeId: string) => void>();
+  readonly #deps: HostsDeps;
+
+  constructor(readonly selfId: string, readonly selfHost: Host, deps: Partial<HostsDeps> = {}) {
+    this.#deps = { ...browserDeps, ...deps };
+  }
+
+  /** The host for `nodeId` (the `/ws` host for this node), opened now if need be; undefined while it may not be. */
+  for(nodeId: string): Host | undefined {
+    if (nodeId === this.selfId) return this.selfHost;
+    const entry = this.#entries.get(nodeId);
+    if (entry?.status === "connecting" || entry?.status === "open") return entry.host;
+    if (entry?.status === "backoff" || entry?.status === "incompatible") return undefined;
+    return this.#connect(nodeId, entry?.failures ?? 0);
+  }
+
+  status(nodeId: string): HostStatus {
+    if (nodeId === this.selfId) return "open";
+    return this.#entries.get(nodeId)?.status ?? "idle";
+  }
+
+  /** `cb` runs whenever a node's status changes, so views re-render and ask `for` again. Returns the unsubscribe. */
+  onChange(cb: (nodeId: string) => void): () => void {
+    this.#listeners.add(cb);
+    return () => { this.#listeners.delete(cb); };
+  }
+
+  #connect(nodeId: string, failures: number): Host {
+    let entry: Entry | undefined;
+    const current = () => entry !== undefined && this.#entries.get(nodeId) === entry;
+    const host = this.#deps.connect(nodeId, {
+      opened: () => {
+        if (!current() || entry!.status !== "connecting") return;
+        this.#set(nodeId, (entry = { ...entry!, status: "open", openedAt: this.#deps.now() }));
+      },
+      closed: () => {
+        if (!current()) return;
+        const was = entry as Extract<Entry, { host: Host }>;
+        const stable = was.openedAt !== null && this.#deps.now() - was.openedAt >= STABLE_MS;
+        this.#backoff(nodeId, was.host, stable ? 0 : was.failures);
+      },
+      mismatch: () => {
+        if (!current()) return;
+        (entry as Extract<Entry, { host: Host }>).host.close().catch(() => {});
+        this.#set(nodeId, { status: "incompatible" });
+      },
     });
+    entry = { status: "connecting", host, openedAt: null, failures };
+    this.#entries.set(nodeId, entry);
     return host;
   }
 
-  /** `cb` runs when a node's host is dropped, so views re-render and ask `for` again (once the node is back online). */
-  onClose(cb: (nodeId: string) => void): () => void {
-    this.#listeners.add(cb);
-    return () => { this.#listeners.delete(cb); };
+  #backoff(nodeId: string, host: Host, failures: number): void {
+    host.close().catch(() => {});
+    const entry = { status: "backoff", failures: failures + 1 } as const;
+    this.#set(nodeId, entry);
+    const delay = Math.min(BACKOFF_FIRST_MS * 2 ** failures, BACKOFF_MAX_MS);
+    this.#deps.schedule(() => {
+      if (this.#entries.get(nodeId) === entry) this.#set(nodeId, { status: "idle", failures: entry.failures });
+    }, delay);
+  }
+
+  #set(nodeId: string, entry: Entry): void {
+    this.#entries.set(nodeId, entry);
+    this.#notify(nodeId);
+  }
+
+  #notify(nodeId: string): void {
+    for (const cb of this.#listeners) cb(nodeId);
   }
 }
 

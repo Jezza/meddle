@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 import { NodeObject, PoolObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { clientHost, Hosts, nodeSocket, useObject, useValue } from "./hooks";
-import { Notifications, Pool, type PoolRef } from "./Pool";
+import { Notifications, Pool, Unavailable, type PoolRef } from "./Pool";
 import { Projects } from "./Projects";
 import { hashOf, viewOf, type Open, type View } from "./routes";
 import { Settings } from "./Settings";
@@ -15,7 +15,8 @@ import { Task } from "./Task";
 type NodeRef = Ref<typeof NodeObject>;
 
 const socket = nodeSocket("/ws");
-const host = clientHost(socket);
+// This node's own server changed its link protocol (it was upgraded): a reload picks up its new bundle.
+const host = clientHost(socket, () => location.reload());
 
 function App({ host }: { host: Host }) {
   const [view, setViewState] = useState<View>(() => viewOf(location.hash));
@@ -52,9 +53,9 @@ function App({ host }: { host: Host }) {
 function Body({ host, pool, node, view, open }: { host: Host; pool: PoolRef; node: NodeRef; view: View; open: Open }) {
   const selfId = useValue(pool.self);
   const hosts = useMemo(() => new Hosts(selfId, host), [selfId, host]);
-  // A node's host was dropped: render again, so the views ask for a new one once that node is back online.
+  // A node's host was dropped, its backoff ended or it is incompatible: render again, so the views ask anew.
   const [, tick] = useState(0);
-  useEffect(() => hosts.onClose(() => tick((n) => n + 1)), [hosts]);
+  useEffect(() => hosts.onChange(() => tick((n) => n + 1)), [hosts]);
   return (
     <main>
       <Notifications hosts={hosts} pool={pool} open={open} />
@@ -70,11 +71,12 @@ function Body({ host, pool, node, view, open }: { host: Host; pool: PoolRef; nod
 function TaskOn({ hosts, pool, nodeId, taskId }: { hosts: Hosts; pool: PoolRef; nodeId: string; taskId: string }) {
   const row = useValue(pool.nodes).find((n) => n.nodeId === nodeId);
   // This node's own tasks are always reachable over /ws.
-  if (nodeId === hosts.selfId) return <TaskOnline host={hosts.for(nodeId)} taskId={taskId} />;
+  if (nodeId === hosts.selfId) return <TaskOnline host={hosts.selfHost} taskId={taskId} />;
   if (row === undefined) return <p class="error">Node {shortId(nodeId)} is not in this pool.</p>;
   if (row.status === "removed") return <p class="error">{row.hostname} ({shortId(nodeId)}) was removed from the pool.</p>;
   if (!row.online) return <p class="muted">{row.hostname} ({shortId(nodeId)}) is offline; the task shows again once it is back.</p>;
-  return <TaskOnline host={hosts.for(nodeId)} taskId={taskId} />;
+  const host = hosts.for(nodeId);
+  return host === undefined ? <Unavailable status={hosts.status(nodeId)} /> : <TaskOnline host={host} taskId={taskId} />;
 }
 
 function TaskOnline({ host, taskId }: { host: Host; taskId: string }) {
