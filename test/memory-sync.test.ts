@@ -176,3 +176,58 @@ test("a conflicted memory bookmark on the home is resolved, and the next turn en
     await rm(A.home, { recursive: true, force: true });
   }
 }, 15_000);
+
+test("two tasks of one project whose turns start and end together sync memory one at a time", async () => {
+  const A = await startPoolNode(undefined, { MEDDLE_FIXTURE_MEMORY: "1" });
+  try {
+    const id = A.project.id;
+    const mem = paths(A.cfg).memory(id);
+    const tasks = [
+      await A.runner.create({ title: "one", projectIds: [id] }),
+      await A.runner.create({ title: "two", projectIds: [id] }),
+    ];
+    for (let round = 0; round < 2; round++) {
+      const idle = tasks.map((m) => new Promise<void>((res) => A.runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); })));
+      await Promise.all(tasks.map((m, i) => A.runner.prompt(m.id, `line ${round}.${i}`)));
+      await Promise.all(idle);
+    }
+    expect(A.logs.filter((l) => l.startsWith("meddle: git: memory of"))).toEqual([]);
+    expect(await jj(["log", "-r", "divergent()", "--no-graph", "-T", "change_id"], mem, A.cfg)).toBe("");
+    const atMemory = await jj(["file", "show", "-r", "memory", "MEMORY.md"], mem, A.cfg);
+    // Each task's first prompt is what the stand-in writes to memory.
+    for (const line of ["line 0.0", "line 0.1"]) expect(atMemory).toContain(line);
+    expect(await jj(["log", "-r", "memory", "--no-graph", "-T", "description"], mem, A.cfg)).toBe(`memory from ${shortId(A.id)}\n`);
+  } finally {
+    await A.close();
+    A.db.close();
+  }
+}, 15_000);
+
+test("overlapping memory syncs of one project run one at a time: one line of history, every write under memory", async () => {
+  const A = await startPoolNode();
+  try {
+    const deps: ReplicaDeps = { cfg: A.cfg, db: A.db, pool: A.pool };
+    const id = A.project.id;
+    const mem = paths(A.cfg).memory(id);
+    const logs: string[] = [];
+    const log = (line: string) => { logs.push(line); };
+    const revs = async (revset: string) => jj(["log", "-r", revset, "--no-graph", "-T", 'change_id ++ "\\n"'], mem, A.cfg);
+    for (let round = 0; round < 4; round++) {
+      await writeFile(`${mem}/R${round}.md`, `- round ${round}\n`);
+      const calls: Promise<void>[] = [];
+      for (let k = 0; k < 4; k++) calls.push(syncMemoryAfter(deps, id, log), syncMemoryBefore(deps, id, false, log));
+      await Promise.all(calls);
+    }
+    expect(logs).toEqual([]);
+    expect(await revs("divergent()")).toBe("");
+    // Run one at a time, the syncs leave no stray working-copy commits beside the history and no empty memory commits.
+    expect(await revs("heads(all()) ~ @")).toBe("");
+    expect(await revs('empty() & description(glob:"memory from*")')).toBe("");
+    for (let round = 0; round < 4; round++) {
+      expect(await jj(["file", "show", "-r", "memory", `R${round}.md`], mem, A.cfg)).toBe(`- round ${round}\n`);
+    }
+  } finally {
+    await A.close();
+    A.db.close();
+  }
+}, 15_000);

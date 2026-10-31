@@ -7,6 +7,7 @@ import { repoName, type Repo } from "../git/wire";
 import { bookmarkList, bookmarkSet, cloneColocated, fetch, isJjRepo, jj, push, remoteAdd, remoteList, track } from "../jj";
 import { cloneMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
+import { repoKey, serialised } from "../serial";
 import type { PoolRuntime } from "../pool/runtime";
 import { PeerObject } from "../state/contracts";
 import { getProject, registerReplica, type Project } from "./project";
@@ -106,14 +107,16 @@ export async function fetchBookmarks(cfg: NodeConfig, replica: string, nodeId: s
  * Points `bookmark` at `changeId` and pushes it to the home: fetch it from the home (nothing when the home has none),
  * track `<bookmark>@<shortId(home)>`, set the bookmark (backwards or sideways too), push. jj refuses a push over an
  * untracked or stale remote bookmark, or a new one while the bookmark tracks another remote; this order survives all
- * three.
+ * three. One push at a time per repo (`repoKey`): overlapping ones would clash on git's ref locks.
  */
 export async function pushBookmark(cfg: NodeConfig, replica: string, home: string, bookmark: string, changeId: string): Promise<void> {
   const remote = shortId(home);
-  await fetch(replica, remote, [`exact:${bookmark}`], cfg);
-  await track(replica, bookmark, remote, cfg);
-  await bookmarkSet(replica, bookmark, changeId, cfg);
-  await push(replica, remote, bookmark, cfg);
+  await serialised(repoKey(replica), async () => {
+    await fetch(replica, remote, [`exact:${bookmark}`], cfg);
+    await track(replica, bookmark, remote, cfg);
+    await bookmarkSet(replica, bookmark, changeId, cfg);
+    await push(replica, remote, bookmark, cfg);
+  });
 }
 
 /** The remote bookmarks `replica` knows, with the change each points at ("" and `conflicted` when conflicted). */

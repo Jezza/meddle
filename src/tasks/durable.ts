@@ -22,6 +22,7 @@ import { appendEvent, latestEventOfType, type EventRecord } from "../store/event
 import { SqliteSessionStore } from "../store/session-store";
 import { getTask, getTaskSettings, updateTask, updateTaskSettings, type TaskRow, type TaskSettings } from "../store/records";
 import { getToken } from "../token";
+import { repoKey, serialised } from "../serial";
 import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
 import { provisionTask } from "./provision";
 
@@ -335,7 +336,8 @@ export class TaskRunner {
         const workspace = join(paths(this.#cfg).task(taskId), p.workspace);
         const bookmark = `meddle/task/${taskId}/${p.name}`;
         const change = await changeId(workspace, this.#cfg);
-        await bookmarkSet(p.replica, bookmark, change, this.#cfg);
+        // Not under another task's push to the same replica (pushBookmark takes the same key).
+        await serialised(repoKey(p.replica), () => bookmarkSet(p.replica, bookmark, change, this.#cfg));
         moved.push({ projectId: p.id, replica: p.replica, bookmark, change });
       }
     } catch (err) {

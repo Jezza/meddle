@@ -1,12 +1,14 @@
 // The memory repo of a project follows its `memory` bookmark on every node, around turns (decision 15): before a
 // turn the working copy is brought onto `memory` (fetched from the home on other nodes); after a turn what the turn
 // wrote is committed, `memory` moves onto it, and other nodes push it to the home. Conflicts stay as jj's markers
-// for the next session to tidy. Nothing here throws: failures are logged and the next turn tries again.
+// for the next session to tidy. Nothing here throws: failures are logged and the next turn tries again. The syncs of
+// one memory repo run one at a time (`serialised`): overlapping ones would leave stray commits beside the history.
 import type { NodeConfig } from "../config";
 import { bookmarkList, bookmarkSet, fetch, isJjRepo, jj, track } from "../jj";
 import { MEMORY_BOOKMARK } from "../memory";
 import { paths } from "../paths";
 import { shortId } from "../pool/ids";
+import { serialised } from "../serial";
 import { getProject } from "./project";
 import { pushBookmark, type ReplicaDeps } from "./replicas";
 
@@ -80,6 +82,11 @@ async function memoryOf(deps: ReplicaDeps, projectId: string): Promise<{ home: s
   return { home: project.home, repo };
 }
 
+/** Runs `fn` after every other sync of the memory repo of `projectId` on this node has finished. */
+function oneAtATime(deps: ReplicaDeps, projectId: string, fn: () => Promise<void>): Promise<void> {
+  return serialised(`memory-sync\0${paths(deps.cfg).memory(projectId)}`, fn);
+}
+
 /**
  * Before a turn of `projectId` on this node (skipped while a task of the project is `live` here): a node that is not
  * the home fetches the home's `memory`; then the working copy is rebased onto `memory` when it is not a descendant.
@@ -87,6 +94,10 @@ async function memoryOf(deps: ReplicaDeps, projectId: string): Promise<{ home: s
  */
 export async function syncMemoryBefore(deps: ReplicaDeps, projectId: string, live: boolean, log: Log = defaultLog): Promise<void> {
   if (live) return;
+  await oneAtATime(deps, projectId, () => before(deps, projectId, log));
+}
+
+async function before(deps: ReplicaDeps, projectId: string, log: Log): Promise<void> {
   try {
     const { cfg, pool } = deps;
     const { home, repo } = await memoryOf(deps, projectId);
@@ -109,6 +120,10 @@ export async function syncMemoryBefore(deps: ReplicaDeps, projectId: string, liv
  * next turn end tries again.
  */
 export async function syncMemoryAfter(deps: ReplicaDeps, projectId: string, log: Log = defaultLog): Promise<void> {
+  await oneAtATime(deps, projectId, () => after(deps, projectId, log));
+}
+
+async function after(deps: ReplicaDeps, projectId: string, log: Log): Promise<void> {
   try {
     const { cfg, pool } = deps;
     const self = pool.identity.id;
