@@ -30,3 +30,11 @@ test("the recorded approval turn renders one Bash call with its result", async (
   expect(tools).toHaveLength(1);
   expect(tools[0]).toMatchObject({ kind: "tool", name: "Bash", result: { text: "hi", isError: false } });
 });
+
+test("a prompt meddle recorded becomes a user item", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "meddle", subtype: "turn_started", at: "", resume: false } },
+    { seq: 2, message: { type: "user", message: { role: "user", content: "Run: echo hi" }, parent_tool_use_id: null } },
+  ]);
+  expect(items[1]).toEqual({ kind: "user", text: "Run: echo hi" });
+});

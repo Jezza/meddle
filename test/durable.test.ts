@@ -57,6 +57,14 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   await runner.prompt(m.id, "Reply with the single word ok.");
   await initialised;
   expect(runner.state(m.id)).toBe("running");
+  // a steer into the live turn is recorded and told to listeners before it is sent
+  const steered: unknown[] = [];
+  runner.onEvent((tid, seq, msg) => { if (tid === m.id && msg.type === "user") steered.push([seq, msg]); });
+  await runner.prompt(m.id, "Also say why.");
+  const steer = { type: "user", message: { role: "user", content: "Also say why." }, parent_tool_use_id: null };
+  const logged = listEvents(db, m.id).filter(e => (e.message as any).type === "user");
+  expect(logged.map(e => e.message)).toEqual([{ ...steer, message: { role: "user", content: "Reply with the single word ok." } }, steer]);
+  expect(steered).toEqual([[logged[1]!.seq, steer]]);
   await h.close();
   expect(runner.liveQuery(m.id)).toBeNull();
   expect(turnsStarted()).toEqual([false]);
@@ -118,6 +126,7 @@ test("a task started without any Claude Code output is reconciled and starts its
   // a turn died before Claude Code said anything: started is set, the state is stuck running, no turn exists
   updateTask(db, m.id, { started: 1, state: "running" });
   appendEvent(db, m.id, { type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: false });
+  appendEvent(db, m.id, { type: "user", message: { role: "user", content: "lost" }, parent_tool_use_id: null });
   await expect(runner.retry(m.id)).rejects.toThrow(`no parked turn for task ${m.id}`);
   const done = settled(runner);
   await runner.prompt(m.id, "Reply with the single word ok.");

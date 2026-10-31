@@ -27,6 +27,8 @@ test("hello: every message is recorded, the result returns, the child exits", as
   expect(result.type).toBe("result");
   const types = listEvents(db, "abc").map(e => (e.message as any).type);
   expect(types[0]).toBe("meddle"); expect(types).toContain("system"); expect(types.at(-1)).toBe("result");
+  // the prompt is recorded right after turn_started: Claude Code does not echo it
+  expect(listEvents(db, "abc")[1]!.message).toEqual({ type: "user", message: { role: "user", content: "Reply with the single word ok." }, parent_tool_use_id: null });
 });
 test("approval: the dashboard's answer unblocks the tool", async () => {
   const { db, input, fixture } = await setup();
@@ -60,7 +62,7 @@ test("a turn that fails to record closes the child and logs turn_failed", async 
   const { done } = runTurn({
     input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1", MEDDLE_TEST_MARK: mark.split("=")[1]! } },
     prompt: "x", db, approvals: new Approvals(),
-    onMessage: (m) => { if (m.type !== "meddle") { childSeen = processesWith(mark).length > 0; throw boom; } },
+    onMessage: (m) => { if (m.type !== "meddle" && m.type !== "user") { childSeen = processesWith(mark).length > 0; throw boom; } },
   });
   await expect(done).rejects.toBe(boom);
   expect(childSeen).toBe(true);
@@ -80,13 +82,13 @@ test("an abort after the result resolves with the result", async () => {
 test("a synchronous failure to start still closes the turn in the log", async () => {
   const { db, input } = await setup();
   expect(() => runTurn({ input: { ...input, cfg: undefined as any }, prompt: "x", db, approvals: new Approvals() })).toThrow();
-  expect(listEvents(db, "abc").map(e => (e.message as any).subtype)).toEqual(["turn_started", "turn_failed"]);
+  expect(listEvents(db, "abc").map(e => (e.message as any).subtype ?? (e.message as any).type)).toEqual(["turn_started", "user", "turn_failed"]);
 });
 test("onMessage streams every recorded event, meddle's own included, in seq order", async () => {
   const { db, input, fixture } = await setup();
   const streamed: [number, unknown][] = [];
   const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: "x", db, approvals: new Approvals(), onMessage: (m, seq) => streamed.push([seq, m]) });
-  expect(streamed).toHaveLength(1);
+  expect(streamed).toHaveLength(2); // turn_started and the prompt, both before the child says anything
   await done;
   expect(streamed).toEqual(listEvents(db, "abc").map(e => [e.seq, e.message]));
 });

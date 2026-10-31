@@ -7,11 +7,11 @@ import type { NodeConfig } from "../config";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
-import { runTurn, type MeddleEvent } from "../engine/session";
+import { promptEvent, runTurn, type MeddleEvent } from "../engine/session";
 import { bookmarkSet, changeId } from "../jj";
 import { paths } from "../paths";
 import { loadContext, loadProjectSettings } from "../projects/context";
-import { hasSdkEvents } from "../store/events";
+import { appendEvent, hasSdkEvents } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import { getTask, updateTask, type TaskRow } from "../store/records";
 import { getToken } from "../token";
@@ -125,6 +125,9 @@ export class TaskRunner {
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
       if (live !== undefined) {
+        const steer = promptEvent(text);
+        const seq = appendEvent(this.#db, taskId, steer);
+        notify(this.#eventListeners, (cb) => cb(taskId, seq, steer));
         live.queue.push(text, "now");
         return;
       }

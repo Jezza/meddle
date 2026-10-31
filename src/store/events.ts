@@ -42,7 +42,10 @@ export function listEvents(
   return rows.map((row) => ({ seq: row.seq, message: JSON.parse(row.json) }));
 }
 
-/** Whether the task's log holds any message other than meddle's own: Claude Code has run for it. */
+/**
+ * Whether Claude Code has run for the task: its log holds a message other than meddle's own events and the `user`
+ * prompts meddle records as it sends them (Claude Code's first message of a session is never a `user` one).
+ */
 export function hasSdkEvents(db: Database, taskId: string): boolean {
-  return db.query("SELECT 1 FROM events WHERE task_id = ? AND type != 'meddle' LIMIT 1").get(taskId) !== null;
+  return db.query("SELECT 1 FROM events WHERE task_id = ? AND type NOT IN ('meddle', 'user') LIMIT 1").get(taskId) !== null;
 }

@@ -6,6 +6,7 @@ import {
   type Query,
   type SDKMessage,
   type SDKResultMessage,
+  type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { appendEvent } from "../store/events";
 import type { Approvals } from "./approvals";
@@ -18,6 +19,14 @@ export type MeddleEvent =
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
   | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput };
+
+/**
+ * The event meddle records for a prompt or steer it sends: Claude Code does not echo the user's text back, so the
+ * log would otherwise hold none. It has no `uuid`, unlike the SDK's own messages.
+ */
+export function promptEvent(text: string): SDKUserMessage {
+  return { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
+}
 
 /** How long the child may outlive its `result` (stdin closed) before it is closed for it. */
 const EXIT_GRACE_MS = 5_000;
@@ -44,6 +53,7 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
   const queue = args.queue ?? new InputQueue();
   queue.push(args.prompt);
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
+  record(promptEvent(args.prompt));
 
   const canUseTool: CanUseTool = (toolName, toolInput, options) => args.approvals.ask({
     requestId: options.requestId,

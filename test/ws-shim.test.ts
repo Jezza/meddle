@@ -31,6 +31,22 @@ test("the dashboard serves the UI and a chord link on /ws", async () => {
     expect(nodeObject.version.value).toBe(VERSION);
     expect(nodeObject.projectIds.value).toContain(node.project.id);
     nodeObject.release();
+
+    // another site's page, or a request reaching the port under another name, never gets a link
+    const ws = `${dashboard.url.replace("http", "ws")}ws`;
+    expect(await opens(ws, { Origin: "http://evil.example" })).toBe(false);
+    expect((await fetch(`${dashboard.url}ws`, { headers: { Origin: "http://evil.example" } })).status).toBe(403);
+    expect((await fetch(dashboard.url, { headers: { Host: `evil.example:${new URL(dashboard.url).port}` } })).status).toBe(403);
+    // the dashboard's own page does
+    const own = new WebSocket(ws, { headers: { Origin: dashboard.url.slice(0, -1) } } as any);
+    const ownClient = createHost({ name: "own", self: "own", kind: "client", upstream: { link: webSocketLink(own), principal: "node" } });
+    try {
+      const fromOwnPage = await ownClient.get(NodeObject, {});
+      expect(fromOwnPage.version.value).toBe(VERSION);
+      fromOwnPage.release();
+    } finally {
+      await ownClient.close();
+    }
   } finally {
     await client?.close();
     await dashboard?.stop();
@@ -38,3 +54,13 @@ test("the dashboard serves the UI and a chord link on /ws", async () => {
     await node.harness.close();
   }
 });
+
+/** Whether a WebSocket to `url` with `headers` opens (true) or is refused (false). */
+function opens(url: string, headers: Record<string, string>): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new WebSocket(url, { headers } as any);
+    socket.addEventListener("open", () => { socket.close(); resolve(true); });
+    socket.addEventListener("error", () => resolve(false));
+    socket.addEventListener("close", () => resolve(false));
+  });
+}
