@@ -6,13 +6,15 @@ Claude Code session running in auto mode, which you watch, approve, interrupt an
 the fidelity of sitting at that machine's terminal. The services find each other and form one pool, sharing one
 Claude login and each project's memory, and a task can move between machines without losing its conversation.
 
-Status: Plan 2, the pool. Nodes form a pool over iroh: they find each other through a lighthouse, share the login
-token, and the dashboard of any node shows every node and opens its tasks. Repo sync between nodes and moving tasks
-are not here yet.
+Status: Plan 3, repos across the pool and task moves. Nodes form a pool over iroh: they find each other through a
+lighthouse, share the login token, and the dashboard of any node shows every node and opens its tasks. A project's
+repo and memory follow its tasks to whichever node they run on, and a task moves between nodes with its workspaces,
+conversation and queued prompts. Moving a project's home to another node is not here yet (see
+[Known limits](#known-limits)).
 
 ## Install
 
-Requires [bun](https://bun.sh) and [jj](https://jj-vcs.github.io/jj/).
+Requires [bun](https://bun.sh), [jj](https://jj-vcs.github.io/jj/) and git.
 
 ```sh
 git clone <this repo> meddle
@@ -21,11 +23,24 @@ bun install
 bun test
 ```
 
+Every node needs your jj identity: the commits meddle makes in your repos carry it, and meddle does not invent one.
+Set it once per node, as the user that runs meddle:
+
+```sh
+jj config set --user user.name "Your Name"
+jj config set --user user.email you@example.com
+```
+
+Without it jj refuses to push the commits, so every push to a project's home fails and each turn end logs a
+`meddle: git: …` line saying so (see [Projects across the pool](#projects-across-the-pool)).
+
 The commands below run from the checkout as `bun run src/cli.ts <command>`. `bun run build` also produces a compiled
 `dist/meddle` for `status` and `token set`; the service itself runs from the checkout. The compiled binary embeds
-iroh's native modules (two `.node` files, its glibc and musl builds), which make it about 40 MB larger (147 MB on linux-x64). It carries no `node_modules`, so it
-reports its Claude Code version as `unknown`. A node served from it reports `unknown` to the pool too, so in a pool
-with nodes served from a checkout the dashboard flags the members' versions as mixed.
+iroh's native modules (two `.node` files, its glibc and musl builds), which make it about 40 MB larger (147 MB on
+linux-x64). It carries no `node_modules`, so it reports its Claude Code version as `unknown`. A node served from it
+reports `unknown` to the pool too, so in a pool with nodes served from a checkout the dashboard flags the members'
+versions as mixed, and it can neither move its tasks away nor take tasks from other nodes (see
+[Moving a task](#moving-a-task)).
 
 ## Task root
 
@@ -155,8 +170,8 @@ with `(this node)` after this node's line.
 
 ## Projects and tasks
 
-With the node running (next section), add a project from an existing folder or an upstream URL, then create a task
-on it and send it a prompt:
+With the node running (see [Dashboard](#dashboard)), add a project from an existing folder or an upstream URL, then
+create a task on it and send it a prompt:
 
 ```sh
 bun run src/cli.ts project add ~/src/myproject [--name myproject]   # prints the project id
@@ -164,7 +179,205 @@ bun run src/cli.ts project list
 bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id>   # prints the task id
 bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fix it"
 bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
+bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to another node
 ```
+
+`project list` prints one line per project this node holds: `<id>  <name>  <replica>  home <short id>`. A task is
+`idle`, `running` or `waiting` (for an approval) while it lives on a node; a task moving away is `moving` on the node
+it leaves and `receiving` on the node it goes to until it arrives, and the node it left keeps it as `moved`.
+
+## Projects across the pool
+
+### Homes and replicas
+
+The node a project is added on is its home, and the project keeps the id its home gave it on every node; adding the
+same folder or URL on two nodes makes two projects. A task can be created on any node that hosts tasks. On a node
+that has never seen the project, `task new --project <id>` (the id from the home's `project list` or the dashboard's
+Projects view) asks the online members which of them holds it, then clones the project from its home into
+`<data dir>/replicas/<id>` and its memory into `<data dir>/memory/<id>`. The dashboard's new-task form offers the
+projects the chosen node already holds.
+
+A new task starts from the home's `trunk`. On the home, meddle keeps a local `trunk` bookmark in the project's repo
+(your own folder, for a folder project) at the newest of jj's `trunk()` (the upstream's main, master or trunk) and
+the local `trunk`, `main` and `master` bookmarks. It moves it when the project is added, when a task is created on
+the home, and before another node fetches the project. Another node fetches `trunk` from the home as it creates a
+task, so creating a task of a project homed elsewhere needs the home online (`home <short id> is offline`
+otherwise). A project with nothing trunk-like starts its tasks at the root.
+
+At the end of every turn meddle points each of the task's bookmarks, `meddle/task/<task id>/<project name>`, at its
+workspace's working copy, and a node that is not the project's home pushes the bookmark to the home, so the home
+holds every task's latest work. A push that fails (the home offline, no jj identity) does not fail the turn: it is
+logged as `meddle: git: push of <bookmark> to <short id> failed: …`, and the next turn end pushes again.
+
+A replica names its remote for another node after that node's short id, the first 10 characters of its node id, so
+on a node that is not the home `trunk@<short id>` is the home's trunk.
+
+The dashboard's Projects view lists every project of the pool once, merged across the online nodes that hold a copy:
+its home, the nodes holding it, and each node's bookmarks (`name` or `name@<short id>` with its change id, flagged
+when conflicted). It also adds a project on this node.
+
+### Memory
+
+Each project has a memory repo on every node that holds it, `<data dir>/memory/<project id>`, shared under the
+`memory` bookmark. It is the memory directory of every task whose primary project it is (linked into the task's
+Claude Code config). A folder project's starts from the memory Claude Code already keeps for that folder, if any.
+
+The memory of a task's primary project is synced around each of its turns, on every node:
+
+- Before a turn, unless another task of the same project has a turn running on this node: a node that is not the
+  home fetches `memory` from the home, and the memory repo's working copy is rebased onto `memory` when it is not
+  already on it.
+- After every turn: what the turn wrote is committed as `memory from <short id>`, `memory` moves onto it (rebased
+  first when `memory` has moved meanwhile), and a node that is not the home pushes it to the home.
+
+A conflict between two nodes' edits stays in the files as jj's conflict markers, for a later session to tidy. A
+`memory` bookmark that is itself conflicted takes the home's when the home's is clean, and otherwise one of its own
+targets, logged as `meddle: git: memory of <short id> had a conflicted bookmark; resolved to <change>`. A sync that
+fails is logged as `meddle: git: memory of <short id> was not synced before the turn: …` (or `after`) and the turn
+goes ahead; the next turn tries again.
+
+### `meddle://` remotes
+
+Nodes move repos with git, over the pool's iroh connections. Before anything runs jj, `serve` writes into the data
+directory:
+
+- `bin/git-remote-meddle`, git's remote helper for `meddle://<node id>/project/<project id>` and
+  `meddle://<node id>/memory/<project id>` URLs. It runs `meddle git-remote`, which passes git's connection through
+  this node's git socket to the other node.
+- `git-hooks/update`, the hook every push from another node meets (below).
+
+It then listens on that socket, `<data dir>/git.sock` (mode 600; `MEDDLE_GIT_SOCKET` names another), replacing a
+stale socket file and refusing to start when another meddle serves it.
+
+meddle puts `<data dir>/bin` first on `PATH` and sets `MEDDLE_GIT_SOCKET` for every jj it runs and every Claude Code
+it starts, so jj and git inside a task reach `meddle://` remotes too. Your own jj in a terminal needs the same, in a
+replica or in a folder project that has a remote for another node (one is added for each node a task of the project
+moved here from). Add to your shell profile, with your data directory if `MEDDLE_DATA_DIR` names another:
+
+```sh
+export PATH="$HOME/.local/share/meddle/bin:$PATH"
+export MEDDLE_GIT_SOCKET="$HOME/.local/share/meddle/git.sock"
+```
+
+Without `MEDDLE_GIT_SOCKET` the helper uses `<data dir>/git.sock`. With no node running it fails at once with
+`meddle: cannot reach this node's git socket at <path> (is "meddle serve" running?)`, and when the other node is
+offline or does not hold the repo with `meddle: <short id> did not serve <repo> (offline, or it does not hold it)`.
+
+A node serves only members of its pool, only the repos it holds, and only fetches (`upload-pack`) and pushes
+(`receive-pack`); it logs a request for a repo it does not hold as `meddle: git: unknown repo <repo>`. A push runs
+under the `update` hook, which accepts task bookmarks (`refs/heads/meddle/task/*`) into a project repo and the
+`memory` bookmark into a memory repo, and refuses deletions (`meddle: deleting <ref> is not accepted here`) and every
+other ref (`meddle: ref <ref> is not accepted here`). So `trunk` and your own bookmarks change only on the home,
+whatever another node, or a model pushing from inside a task, sends it.
+
+## Moving a task
+
+A task moves to another node of the pool from its view in the dashboard (Move to, with an optional "move now") or
+from the CLI:
+
+```sh
+bun run src/cli.ts task move <task-id> <node>         # waits for the running turn, if any, to end
+bun run src/cli.ts task move <task-id> <node> --now   # interrupts it
+```
+
+`<node>` is a node id or a unique prefix of one, such as the short ids `meddle pool` prints. The command prints
+`moving <task-id> to <short id>` once the move has started; the node runs it to its end as a durable task, across
+restarts.
+
+### Who can take a task
+
+A move is refused before it starts unless the target is another online member of the pool, hosts tasks, and reports
+the same Claude Code version as this node, with neither reporting `unknown` (as a node served from the compiled
+binary does). The refusal names the reason, such as `<short id> does not host tasks` or
+`claude code <version> here, unknown there`. A task that is already moving, has moved or is being received is refused
+too, as is one whose turn is parked (retry it first). The dashboard offers only the nodes that can take the task.
+
+### What travels
+
+- The task's workspaces. meddle points each task bookmark at its workspace's working copy; the target fetches the
+  bookmarks from this node and starts its workspaces from them. Edits not yet committed travel in the working-copy
+  commit; files git ignores do not. The target first clones any project it does not hold from the project's home,
+  so moving a task of a project the target has never held needs the home online.
+- The conversation: the task's event log, the transcript mirror's rows, and Claude Code's transcript files in the
+  task's config dir (the session and its subagents' transcripts with their sidecar files). Symlinks are skipped (the
+  memory link among them).
+- The task's title, session, settings (model, effort, permission mode), turn count and queued prompts.
+
+The transfer is checked: the target answers with its counts and a SHA-256 over everything it received, and a
+mismatch fails the move. What does not travel: background shells and subagents (see "Move now" below); the rest of
+the task's Claude Code config dir, which the target sets up as for a new task; and memory, which the target syncs
+with the project's home around the task's turns there, as for any task.
+
+### Steps
+
+While a task moves, its view shows `Moving to <node>: <step>` and disables its controls and composer.
+
+1. `prepare` checks the move again, marks the task `moving` and waits for its turn to end (or interrupts it).
+2. `handoff` sets the task bookmarks; the target clones what it lacks, fetches them and provisions the task as
+   `receiving`; then the task's log, transcript and files go over one stream, and the two sides' receipts must match.
+3. `commit` has the target activate the task (it is `idle` there, and its queued prompts start), and records it here
+   as `moved`.
+4. `cleanup` archives and removes this node's copy.
+
+### "Move now"
+
+A move waits for a running turn to end. "Move now" (`--now`) interrupts the turn instead, and closes it if it has not
+ended 15 seconds later. Background shells and subagents that the turn started stop and do not travel; the dashboard
+warns of this but cannot list them (the Agent SDK has no way to). When a turn was cut short, the task's first turn
+on the target starts with:
+
+> The previous turn was interrupted to move this task to another machine. Background shells and subagents that were
+> running were stopped and did not travel. Carry on from where you were; do not redo work that is already done.
+
+### Prompts during a move
+
+While the move waits for the turn to end (`prepare`), a prompt sent to the task (with `task prompt`; the dashboard's
+composer is disabled) is queued and travels with it. Later in the move a prompt is refused with
+`task is moving; send it again once it has arrived`; interrupting, retrying and changing settings are refused with
+`task is moving` throughout. On the target the queued prompts, after the "move now" text if there is one, run one
+turn each, in order, each recorded as your prompt.
+
+### When a move fails
+
+Until the target's receipt is recorded, any failure rolls the move back: the target drops its partial copy, the task
+is live here again (prompts queued meanwhile run here), `meddle: move: <task id> failed at <step>: <error>` is logged
+and the dashboard notifies `Move to <short id> failed at <step>: <error>`.
+
+After the receipt is recorded, the move is rolled back only on a definite answer from the target: it could not
+activate the task, or holds no copy of it from this node. Without an answer (the target went offline, the link
+dropped, 30 seconds passed) the target may already be running the task, so the move does not roll back: the task
+stays `moving` here and this node asks again, after 2 seconds doubling up to 30, logging
+`meddle: move: <task id> waits for <short id> to activate it: …`, until it gets one.
+
+A node restarted in the middle of a move resumes it from its last step. A node restarted while it was receiving a
+task drops the partial copy. A task left `moving` with no move behind it is made live again at start, logged as
+`meddle: move: <task id> was left moving with no move in progress; it is live here again`.
+
+### On the node a task left
+
+Once the target has activated the task, this node writes its archive, `<data dir>/archive/<task id>.json.gz`
+(directory mode 700, file 600: the task's row, manifest, event log, transcript rows and transcript files), before it
+removes anything. It then forgets the task's workspaces and, unless it is the project's home (where they stay as the
+backup), its task bookmarks, and removes the task folder (with its Claude Code config dir) and its event and
+transcript rows. The task's row stays, as `moved`: its view here says where it went and links there, and commands on
+it answer `task has moved to <short id>`. A task can move back to a node it left.
+
+A janitor deletes archives older than seven days, when `serve` starts and every 24 hours after. meddle has no
+command to restore one.
+
+## Known limits
+
+- A project's home cannot be moved to another node yet (planned for Plan 4). While the home is offline, other nodes
+  cannot create tasks of its projects or clone them; their tasks' turns still run, and their pushes and memory syncs
+  are logged and retried at the next turn end.
+- When a node's last push of a project's memory to the home failed, the memory commits it has not pushed do not
+  travel with a task that moves away: the target syncs memory from the home. They stay in this node's memory repo
+  and reach the home only with a later turn of that project here.
+- A node whose Claude Code version is `unknown` (served from the compiled binary) cannot move tasks, either away or
+  to it.
+- Background shells and subagents do not travel on "move now", and the dashboard cannot list them.
+- When a node restarts in the middle of a turn, the turn's rerun resumes the session and tells Claude to carry on;
+  text you sent into that turn that Claude Code had not yet written to its transcript is not sent again.
 
 ## Dashboard
 
@@ -178,8 +391,9 @@ The dashboard of any node shows the whole pool: a card per node with its state (
 notifications of every online node; and a form for a new task on any online node that hosts tasks. An online node's
 card shows its meddle and Claude Code versions, token, task root, resources and tasks. An offline member's card shows
 what the roster last recorded of it (its versions, whether it hosts tasks and how many tasks it has) and when it was
-last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle or Claude Code
-versions.
+last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle
+or Claude Code versions. The Projects view lists every project of the pool (see
+[Homes and replicas](#homes-and-replicas)), and a task's view moves it (see [Moving a task](#moving-a-task)).
 
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an
@@ -203,3 +417,4 @@ and `systemctl --user enable --now meddle.service`, and prints the task-root com
 - [Design](docs/superpowers/specs/2026-10-30-meddle-design.md)
 - [Plan 1: single node](docs/superpowers/plans/2026-10-30-meddle-single-node.md)
 - [Plan 2: pool over iroh](docs/superpowers/plans/2026-10-31-meddle-pool.md)
+- [Plan 3: repos across the pool and task moves](docs/superpowers/plans/2026-10-31-meddle-mesh.md)
