@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
-    "serve": "bun run src/cli.ts serve"
+    "serve": "bun run src/cli.ts serve",
+    "build": "bun run scripts/build.ts",
+    "install:service": "bun run src/cli.ts service install"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.314",

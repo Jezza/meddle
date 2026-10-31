@@ -1,0 +1,11 @@
+[Unit]
+Description=meddle node
+
+[Service]
+ExecStart={{bun}} run src/cli.ts serve
+WorkingDirectory={{checkout}}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

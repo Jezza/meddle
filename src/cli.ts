@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
-import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdir, stat } from "node:fs/promises";
+import { homedir, userInfo } from "node:os";
+import { join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
 import { createRegistry } from "@earendil-works/pi-durable";
@@ -21,7 +22,8 @@ const USAGE = `usage: meddle --version
        meddle status
        meddle token set [--file <path>] | meddle token status
        meddle project add <path-or-url> [--name <n>] | meddle project list
-       meddle task new --title <t> --project <id>... | meddle task prompt <id> <text>`;
+       meddle task new --title <t> --project <id>... | meddle task prompt <id> <text>
+       meddle service install [--dry-run]`;
 
 /** A client subcommand found no node listening on the configured port. */
 class NoNode extends Error {
@@ -68,6 +70,8 @@ async function serve(): Promise<number> {
     }));
     metrics.start();
     const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion() }));
+    // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
+    await host.ready();
     node.dashboard = await startDashboard(cfg, host);
   } catch (err) {
     await shutdown(node);
@@ -244,6 +248,55 @@ function taskPrompt(id: string, text: string): Promise<number> {
   });
 }
 
+/** This checkout's root; inside a compiled binary it names a directory with no `src/cli.ts`. */
+const CHECKOUT = resolve(import.meta.dir, "..");
+
+/** The user unit from `install/meddle.service`: the running bun serving from this checkout. */
+async function renderUnit(): Promise<string> {
+  const template = await Bun.file(join(CHECKOUT, "install/meddle.service")).text();
+  return template.replaceAll("{{bun}}", process.execPath).replaceAll("{{checkout}}", CHECKOUT);
+}
+
+/** The command that creates the task root, owned by the current user and their primary group. */
+function taskRootCommand(): string {
+  const { username, gid } = userInfo();
+  const id = Bun.spawnSync(["id", "-gn"], { stdout: "pipe", stderr: "ignore" });
+  const group = id.success ? id.stdout.toString().trim() || String(gid) : String(gid);
+  return `sudo install -d -o ${username} -g ${group} -m 755 /opt/meddle/tasks`;
+}
+
+/** Runs a command, failing with its name when it exits non-zero. */
+function runOrFail(cmd: string[]): void {
+  const proc = Bun.spawnSync(cmd, { stdout: "inherit", stderr: "inherit" });
+  if (!proc.success) throw new Error(`${cmd.join(" ")} failed`);
+}
+
+/**
+ * Writes `~/.config/systemd/user/meddle.service`, reloads systemd and enables the unit now, then prints the one
+ * privileged command to run by hand. `dryRun` prints the unit and that command instead, writing and running nothing.
+ */
+async function serviceInstall(dryRun: boolean): Promise<number> {
+  if (!existsSync(join(CHECKOUT, "src/cli.ts"))) {
+    console.error("meddle: service install must run from the checkout (bun run src/cli.ts service install)");
+    return 1;
+  }
+  const unit = await renderUnit();
+  if (dryRun) {
+    process.stdout.write(unit);
+    console.log("# then run once:");
+    console.log(taskRootCommand());
+    return 0;
+  }
+  const dir = join(homedir(), ".config/systemd/user");
+  await mkdir(dir, { recursive: true });
+  await Bun.write(join(dir, "meddle.service"), unit);
+  runOrFail(["systemctl", "--user", "daemon-reload"]);
+  runOrFail(["systemctl", "--user", "enable", "--now", "meddle.service"]);
+  console.log(`installed ${join(dir, "meddle.service")}; run once:`);
+  console.log(taskRootCommand());
+  return 0;
+}
+
 /** `--title <t>` and `--project <id>...` (one or more ids, the flag repeatable). */
 function taskNewArgs(args: string[]): { title: string; projectIds: string[] } | null {
   let title: string | undefined;
@@ -273,6 +326,8 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
     return parsed === null ? null : () => taskNew(parsed.title, parsed.projectIds);
   }
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
+  if (command === "service" && sub === "install" && rest.length === 0) return () => serviceInstall(false);
+  if (command === "service" && sub === "install" && rest.length === 1 && rest[0] === "--dry-run") return () => serviceInstall(true);
   return null;
 }
 
