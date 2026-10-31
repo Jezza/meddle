@@ -8,10 +8,11 @@ import type { NodeConfig } from "../config";
 import { Discovery } from "./discovery";
 import { loadOrCreateIdentity, shortId, type Identity } from "./identity";
 import { createInvite, decodeTicket, handleJoin, joinPool } from "./invite";
-import { PeerClosed, PoolNet, fromEndpoint, openEndpoint, type RefusalReason } from "./net";
+import { DialFailed, PeerClosed, PoolNet, fromEndpoint, openEndpoint, type RefusalReason } from "./net";
 import type { PoolObjectDeps } from "./object";
+import { dedupe } from "./report";
 import { PoolStore, type NodeSummary, type WireAddr } from "./store";
-import { PoolSync } from "./sync";
+import { HoldFailed, PoolSync } from "./sync";
 
 export type PoolRuntime = {
   readonly identity: Identity;
@@ -35,8 +36,11 @@ export type PoolRuntime = {
 /** What this node reports about itself, apart from its hostname. */
 export type PoolSummaryDeps = { version: string; claudeCodeVersion: string; hostsTasks(): Promise<boolean>; taskCount(): number };
 
-/** Optional: `onError` sees every error the net and the sync report, after the runtime acted on it (tests). */
-export type PoolHooks = { onError?(err: unknown): void };
+/**
+ * Optional (tests): `onError` sees every error the net and the sync report, after the runtime acted on it; `log` gets
+ * the runtime's log lines instead of `console.error`.
+ */
+export type PoolHooks = { onError?(err: unknown): void; log?(line: string): void };
 
 /** How long `remove` waits for the removed node to see its removal and close its connection before cutting it off. */
 const REMOVAL_GRACE_MS = 1000;
@@ -48,7 +52,10 @@ const REMOVED_AT = /^closed by peer: removed (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2
 
 /**
  * Starts this node's part in its pool (a pool of one on first start): identity, endpoint, roster, the connection
- * to every member, sync, and lighthouse discovery unless `cfg.lighthouseUrl` is empty. Logs only discovery errors.
+ * to every member, sync, and lighthouse discovery unless `cfg.lighthouseUrl` is empty. Logs (`meddle: discovery: …`
+ * and `meddle: pool: …`, each distinct message at most once a minute) discovery errors and why a member cannot be
+ * reached: dial failures, admission timeouts, refusals that persist, a removal learned from a refusal, and a peer's
+ * PoolObject that could not be held. A healthy pool logs nothing.
  */
 export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSummaryDeps, hooks: PoolHooks = {}): Promise<PoolRuntime> {
   const identity = await loadOrCreateIdentity(cfg);
@@ -70,6 +77,13 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     throw err;
   }
 
+  let stopped = false;
+  const log = hooks.log ?? ((line: string) => console.error(line));
+  /** A connection diagnostic, each distinct message at most once a minute. */
+  const diagnose = dedupe((message) => { if (!stopped) log(`meddle: pool: ${message}`); });
+  /** Consecutive code-1 closes and refusals from each member since it was last online (or a dial to it failed). */
+  const refusals = new Map<string, number>();
+
   const listeners = new Set<() => void>();
   const notify = () => {
     for (const cb of [...listeners]) {
@@ -87,7 +101,6 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   /** The members this node keeps a connection with, and the address it last offered for each. */
   const followed = new Map<string, string | null>();
-  let stopped = false;
   let leftPool = false;
   let discovery: Discovery | null = null;
 
@@ -112,25 +125,47 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       },
     }),
     onError: (err) => {
-      if (err instanceof PeerClosed) learnRemoval(err);
+      if (err instanceof PeerClosed) refused(err);
+      else if (err instanceof DialFailed) {
+        // A failed dial breaks a run of refusals: the next one starts counting again.
+        refusals.delete(err.peerId);
+        diagnose(err.message);
+      }
       hooks.onError?.(err);
     },
   });
-  net.onPeer(() => notify());
+  net.onPeer((id, online) => {
+    if (online) refusals.delete(id);
+    notify();
+  });
+
+  /**
+   * A member closed or refused this node's connection with code 1. A removal newer than this node's join makes it
+   * leave. Any other refusal is logged once it persists past a redial: the first may come from a member that has not
+   * yet heard of this node's join. One from a node this roster does not have as a member is not logged at all.
+   */
+  function refused(err: PeerClosed): void {
+    if (learnRemoval(err) || !store.isMember(err.peerId)) return;
+    const count = (refusals.get(err.peerId) ?? 0) + 1;
+    refusals.set(err.peerId, count);
+    if (count >= 2) diagnose(err.message);
+  }
 
   /**
    * Another member closed or refused this node as removed: this node was removed while it could not hear of it. Only
    * a removal newer than this node's own row (its latest join) counts; an older one is a member that has not yet
-   * merged this node's re-join, and the refused dial is simply retried.
+   * merged this node's re-join, and the refused dial is simply retried. True when this node learned its removal.
    */
-  function learnRemoval(err: PeerClosed): void {
+  function learnRemoval(err: PeerClosed): boolean {
     const removedAt = REMOVED_AT.exec(err.reason)?.[1];
     const self = store.row(selfId);
-    if (removedAt === undefined || self?.status !== "member" || !store.isMember(err.peerId)) return;
-    if (!(removedAt > self.updatedAt)) return;
+    if (removedAt === undefined || self?.status !== "member" || !store.isMember(err.peerId)) return false;
+    if (!(removedAt > self.updatedAt)) return false;
     store.remove(selfId, removedAt);
+    diagnose(`${shortId(err.peerId)} says this node was removed from the pool at ${removedAt}; it has left the pool`);
     enforce();
     notify();
+    return true;
   }
 
   const sync = new PoolSync({
@@ -139,7 +174,10 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       enforce();
       notify();
     },
-    onError: (err) => hooks.onError?.(err),
+    onError: (err) => {
+      if (err instanceof HoldFailed) diagnose(err.message);
+      hooks.onError?.(err);
+    },
   });
 
   /**
@@ -159,15 +197,11 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       net.unwatch(id, !member ? "bye" : removalOf(id) ?? "not a member");
     }
     for (const [id, row] of keep) {
-      if (!followed.has(id)) {
-        followed.set(id, null);
-        net.watch(id);
-      }
       const addr = row.lastAddr === null ? null : JSON.stringify(row.lastAddr);
-      if (row.lastAddr !== null && followed.get(id) !== addr) {
-        followed.set(id, addr);
-        net.offerAddress(row.lastAddr);
-      }
+      // The address goes first, so that the first dial to a newly watched member already has it.
+      if (row.lastAddr !== null && followed.get(id) !== addr) net.offerAddress(row.lastAddr);
+      if (!followed.has(id)) net.watch(id);
+      followed.set(id, addr ?? followed.get(id) ?? null);
     }
     if (!member && !leftPool) {
       leftPool = true;
@@ -184,7 +218,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
         if (!store.isMember(selfId)) return;
         for (const p of peers) if (p.id !== selfId && store.isMember(p.id)) net.offerAddress(p);
       },
-      onError: (message) => console.error(`meddle: discovery: ${message}`),
+      onError: (message) => { if (!stopped) log(`meddle: discovery: ${message}`); },
     });
   }
 
@@ -217,8 +251,9 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     const joined = await joinPool(decodeTicket(ticket), { endpoint, store, identity, summary: liveSummary });
     leftPool = false;
     if (discovery !== null) await discovery.restart(store.pool());
-    enforce();
+    // The addresses first (offering one does not dial a node not yet watched), so the first dials have them.
     for (const addr of joined.addrs) net.offerAddress(addr);
+    enforce();
     notify();
     return { poolId: joined.poolId, members: joined.members };
   }

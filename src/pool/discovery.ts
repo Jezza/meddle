@@ -2,12 +2,11 @@ import type { Endpoint, WatchHandle } from "@number0/iroh";
 import { Lighthouse, NodeKey, Topic, type EndpointAddr as LighthouseEndpointAddr, type Peer } from "iroh-lighthouse";
 import { isNodeId, type Identity } from "./identity";
 import { fromEndpoint } from "./net";
+import { dedupe } from "./report";
 import type { PoolIdentity, WireAddr } from "./store";
 
 export const ANNOUNCE_TTL_SECS = 300;
 export const REQUEST_TIMEOUT_MS = 10_000;
-/** How long the same error message stays quiet after it was reported. */
-const ERROR_QUIET_MS = 60_000;
 /** The most `stop()` and `restart()` wait to unregister from a topic. */
 const LEAVE_CAP_MS = 2000;
 const MIN_REANNOUNCE_MS = 1000;
@@ -81,7 +80,8 @@ export class Discovery {
   private attempted: string | null = null;
   /** The peers last reported to `onPeers`: node id to address as JSON. */
   private known = new Map<string, string>();
-  private readonly reportedAt = new Map<string, number>();
+  /** Hands a message to `onError` unless the same message was handed over less than a minute ago. */
+  private readonly report = dedupe((message) => this.deps.onError?.(message));
   private joinedNow = false;
 
   constructor(private readonly deps: DiscoveryDeps) {
@@ -264,14 +264,5 @@ export class Discovery {
     } catch (err) {
       this.report(`handling discovered peers: ${messageOf(err)}`);
     }
-  }
-
-  /** Hands `message` to `onError` unless the same message was handed over less than a minute ago. */
-  private report(message: string): void {
-    const now = Date.now();
-    for (const [m, at] of this.reportedAt) if (now - at >= ERROR_QUIET_MS) this.reportedAt.delete(m);
-    if (this.reportedAt.has(message)) return;
-    this.reportedAt.set(message, now);
-    this.deps.onError?.(message);
   }
 }

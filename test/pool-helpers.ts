@@ -193,7 +193,8 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
 
 /**
  * A whole node (see `setupNode`) with its pool runtime started and its chord host (`createNodeHost`) serving it; the
- * metrics sampler is not started. `close()` stops the pool, the host and the harness.
+ * metrics sampler is not started; what the runtime logs is collected in `logs`. `close()` stops the pool, the host and
+ * the harness.
  */
 export async function startPoolNode(fixture?: string) {
   const node = await setupNode(fixture, POOL_ENV);
@@ -201,10 +202,12 @@ export async function startPoolNode(fixture?: string) {
   const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 60_000, dataDir: cfg.dataDir });
   /** Everything the runtime's net and sync reported. */
   const errors: unknown[] = [];
-  const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { onError: (err) => errors.push(err) });
+  /** The lines the runtime logged (instead of printing them). */
+  const logs: string[] = [];
+  const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { onError: (err) => errors.push(err), log: (line) => logs.push(line) });
   const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool });
   return {
-    ...node, metrics, pool, host, errors,
+    ...node, metrics, pool, host, errors, logs,
     id: pool.identity.id, identity: pool.identity, store: pool.store, net: pool.net,
     async close() {
       metrics.stop();

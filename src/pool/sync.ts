@@ -28,6 +28,13 @@ export type SyncDeps = {
 /** The peer's PoolObject as held over its link; `host` is this node's client host for that link. */
 type PeerView = { host: Host | null; abort: AbortController };
 
+/** Reported when this node could not hold a peer's PoolObject (it is tried again when the peer is next online). */
+export class HoldFailed extends Error {
+  constructor(readonly peerId: string, message: string) {
+    super(message);
+  }
+}
+
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -140,7 +147,7 @@ export class PoolSync {
       });
     } catch (err) {
       if (!current()) return;
-      this.report(new Error(`holding the pool of ${shortId(id)}: ${messageOf(view.abort.signal.reason ?? err)}`));
+      this.report(new HoldFailed(id, `holding the pool of ${shortId(id)}: ${messageOf(view.abort.signal.reason ?? err)}`));
       await this.drop(id);
     }
   }

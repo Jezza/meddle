@@ -1,10 +1,12 @@
 // test/pool-state.test.ts — the pool runtime behind a node host: PoolObject, joining, the token and removal.
 import { test, expect } from "bun:test";
 import { hostname } from "node:os";
+import { SecretKey } from "@number0/iroh";
 import type { Host } from "@earendil-works/chord";
+import { hexOf, shortId } from "../src/pool/identity";
 import { decodeTicket, joinPool } from "../src/pool/invite";
 import { PeerClosed, PoolNet } from "../src/pool/net";
-import { fromEndpoint } from "../src/pool/net";
+import { fromEndpoint, openEndpoint } from "../src/pool/net";
 import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
@@ -110,6 +112,8 @@ test("PoolObject shows a pool of one, invites, and a joined node appears online 
     expect(A.store.pool().poolSecret).toBe(B.store.pool().poolSecret);
     expect(b!.pool.poolId.value).toBe(poolA.poolId.value);
     expect(poolA.mixedVersions.value).toBe(false);
+    // A healthy pool logs nothing.
+    expect([...A.logs, ...B.logs]).toEqual([]);
   });
 }, 15_000);
 
@@ -149,6 +153,8 @@ test("a removed node is cut off, sees itself removed, and may join again", async
     const all = [A, B, C];
     const fullyLinked = () => all.every((n) => all.every((m) => m === n || n.net.isOnline(m.id)));
     await eventually(fullyLinked);
+    // C may have dialled B before B heard of C's join: a refusal that does not persist is not logged.
+    expect(all.flatMap((n) => n.logs)).toEqual([]);
 
     await a!.pool.remove({ nodeId: C.id });
     await eventually(() => B.store.row(C.id)?.status === "removed" && !B.net.isOnline(C.id) && !C.net.isOnline(B.id));
@@ -181,15 +187,17 @@ test("a node removed while it was offline learns it from the refusal when it com
 
     // B comes back (same identity, same store) and dials A, which refuses it as removed.
     const errors: unknown[] = [];
+    const logs: string[] = [];
     let back: PoolRuntime | undefined;
     try {
-      back = await startPool(B.cfg, B.db, poolSummaryOf(B.cfg, B.db), { onError: (err) => errors.push(err) });
+      back = await startPool(B.cfg, B.db, poolSummaryOf(B.cfg, B.db), { onError: (err) => errors.push(err), log: (line) => logs.push(line) });
       expect(back.identity.id).toBe(B.id);
       const refusals = () => errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === A.id);
       await eventually(() => B.store.row(B.id)?.status === "removed");
       expect(back.net.online()).toEqual([]);
       expect(refusals()).toHaveLength(1);
       expect(refusals()[0]!.reason).toMatch(/^closed by peer: removed \S+ \(code 1\)$/);
+      expect(logs).toEqual([`meddle: pool: ${shortId(A.id)} says this node was removed from the pool at ${B.store.row(B.id)!.updatedAt}; it has left the pool`]);
       // Past the 1 s and 2 s redial delays: B stopped dialing A.
       await Bun.sleep(2500);
       expect(refusals()).toHaveLength(1);
@@ -299,6 +307,62 @@ test("a removal refusal whose time is not an ISO time does not mark the node rem
     await B.pool.tokenChanged();
     const refusals = () => B.errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === X && e.reason.includes("removed zzz"));
     await eventually(() => refusals().length > 0);
+    expect(B.store.isMember(B.id)).toBe(true);
+  } finally {
+    await net.stop();
+    await B.close();
+  }
+}, 15_000);
+
+/** A fresh node id that sorts after `id`, so that the node `id` dials it. */
+function idAfter(id: string): { id: string; key: SecretKey } {
+  for (;;) {
+    const key = SecretKey.generate();
+    const candidate = hexOf(key.public());
+    if (candidate > id) return { id: candidate, key };
+  }
+}
+
+test("a member that cannot be dialled is logged at once, and the same message once a minute", async () => {
+  const B = await startPoolNode();
+  try {
+    // Y is a member B dials, with no address B could reach it at.
+    const Y = idAfter(B.id).id;
+    const now = new Date().toISOString();
+    B.store.upsert({ nodeId: Y, hostname: "y", status: "member", updatedAt: now, addedBy: B.id, summary: null, lastSeenAt: null, lastAddr: null });
+    await B.pool.tokenChanged();
+    const failures = () => B.errors.filter((e) => e instanceof Error && e.message.startsWith(`dialing ${shortId(Y)}: `));
+    await eventually(() => failures().length >= 2);
+    expect(B.logs).toEqual([`meddle: pool: ${(failures()[0] as Error).message}`]);
+  } finally {
+    await B.close();
+  }
+}, 15_000);
+
+test("a member that keeps refusing this node is logged once the refusal persists past a redial", async () => {
+  const B = await startPoolNode();
+  // X refuses every dial from B (B dials it: its id is the smaller).
+  const { key } = idAfter(B.id);
+  const identity = { id: hexOf(key.public()), secret: Uint8Array.from(key.toBytes()) };
+  const x = { identity, endpoint: await openEndpoint({ irohPreset: "minimal", irohBind: "127.0.0.1:0" }, identity) };
+  const X = identity.id;
+  const net = new PoolNet({ endpoint: x.endpoint, selfId: X, isMember: () => false, onJoin: async (conn) => conn.close(0n, []) });
+  try {
+    net.start();
+    const now = new Date().toISOString();
+    B.store.upsert({
+      nodeId: X, hostname: "x", status: "member", updatedAt: now, addedBy: B.id,
+      summary: null, lastSeenAt: now, lastAddr: fromEndpoint(x.endpoint),
+    });
+    await B.pool.tokenChanged();
+    const refusals = () => B.errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === X);
+    await eventually(() => refusals().length >= 1);
+    expect(B.logs).toEqual([]);
+    await eventually(() => refusals().length >= 2);
+    const line = `meddle: pool: ${shortId(X)} refused the connection: closed by peer: not a member (code 1)`;
+    expect(B.logs).toEqual([line]);
+    await eventually(() => refusals().length >= 3);
+    expect(B.logs).toEqual([line]);
     expect(B.store.isMember(B.id)).toBe(true);
   } finally {
     await net.stop();

@@ -92,6 +92,13 @@ export class PeerClosed extends Error {
   }
 }
 
+/** Reported when a dial attempt failed, or the peer neither admitted nor refused it within the bound. */
+export class DialFailed extends Error {
+  constructor(readonly peerId: string, message: string) {
+    super(message);
+  }
+}
+
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -429,7 +436,7 @@ export class PoolNet {
     try {
       conn = await this.endpoint.connect(toEndpointAddr(this.addrs.get(id) ?? { id, relay: null, direct: [] }), ALPN_POOL);
     } catch (err) {
-      this.report(new Error(`dialing ${shortId(id)}: ${messageOf(err)}`));
+      this.report(new DialFailed(id, `dialing ${shortId(id)}: ${messageOf(err)}`));
       return null;
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -442,7 +449,7 @@ export class PoolNet {
     if (outcome === "admitted") return conn;
     if (outcome === "timeout") {
       conn.close(0n, bytes("bye"));
-      this.report(new Error(`${shortId(id)} did not admit the connection within ${this.admitTimeoutMs} ms`));
+      this.report(new DialFailed(id, `${shortId(id)} did not admit the connection within ${this.admitTimeoutMs} ms`));
       return null;
     }
     const reason = await conn.closed().catch(messageOf);
