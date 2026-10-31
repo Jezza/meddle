@@ -28,6 +28,11 @@ export type PoolRuntime = {
   remove(nodeId: string): Promise<void>;
   /** The token file changed on this node: tell the pool. */
   tokenChanged(): Promise<void>;
+  /**
+   * This node's summary changed (a task was created): tell the pool now rather than at the next periodic refresh.
+   * Never rejects.
+   */
+  refresh(): Promise<void>;
   /** Fires whenever the roster, a peer's online state or the token changed. Returns the unsubscribe. */
   onChange(cb: () => void): () => void;
   stop(): Promise<void>;
@@ -275,6 +280,11 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     notify();
   }
 
+  async function refresh(): Promise<void> {
+    if (stopped) return;
+    await sync.refreshSelf().catch((err: unknown) => { if (!stopped) hooks.onError?.(err); });
+  }
+
   const changes: Subscribable<null> = { subscribe: (cb) => onChange(() => cb(null)) };
 
   return {
@@ -293,6 +303,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     join,
     remove,
     tokenChanged,
+    refresh,
     onChange,
     async stop() {
       if (stopped) return;

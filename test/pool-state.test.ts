@@ -369,3 +369,19 @@ test("a member that keeps refusing this node is logged once the refusal persists
     await B.close();
   }
 }, 15_000);
+
+test("a task created on one node shows in the other node's count at once", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+    // Past the refresh both nodes made on joining: the next periodic one is 15 s away.
+    await until(b!.pool.nodes, (rows) => rows.some((r) => r.nodeId === A.id && r.taskCount === 0));
+    const nodeA = await a!.client.get(NodeObject, {});
+    const began = Date.now();
+    await nodeA.createTask({ title: "t", projectIds: [A.project.id] });
+    await until(b!.pool.nodes, (rows) => rows.some((r) => r.nodeId === A.id && r.taskCount === 1));
+    expect(Date.now() - began).toBeLessThan(3000);
+  });
+}, 15_000);

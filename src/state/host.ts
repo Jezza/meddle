@@ -144,6 +144,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       createTask: async (input, ctx) => {
         const manifest = await runner.create(input);
         if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
+        // The pool sees the new task count now, not at the next periodic refresh.
+        void pool.refresh();
         return manifest;
       },
       addProjectFromFolder: async ({ path, name }, ctx) => {
