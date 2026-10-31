@@ -2,6 +2,7 @@
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { useAction, useValue } from "./hooks";
+import { joinStateOf, type JoinState } from "./join-state";
 import { tokenText, type PoolRef } from "./Pool";
 
 export function Settings({ pool }: { pool: PoolRef }) {
@@ -19,7 +20,7 @@ function PoolSection({ pool }: { pool: PoolRef }) {
   const selfId = useValue(pool.self);
   const nodes = useValue(pool.nodes);
   const self = nodes.find((n) => n.nodeId === selfId);
-  const othersPresent = nodes.some((n) => n.status === "member" && n.nodeId !== selfId);
+  const joinState = joinStateOf(nodes, selfId);
   const remove = useAction();
   return (
     <>
@@ -53,7 +54,7 @@ function PoolSection({ pool }: { pool: PoolRef }) {
         </tbody>
       </table>
       <Invite pool={pool} />
-      <Join pool={pool} othersPresent={othersPresent} />
+      <Join pool={pool} state={joinState} />
     </>
   );
 }
@@ -73,7 +74,7 @@ function Invite({ pool }: { pool: PoolRef }) {
   );
 }
 
-function Join({ pool, othersPresent }: { pool: PoolRef; othersPresent: boolean }) {
+function Join({ pool, state }: { pool: PoolRef; state: JoinState }) {
   const [ticket, setTicket] = useState("");
   const [joined, setJoined] = useState<string | null>(null);
   const action = useAction();
@@ -85,9 +86,9 @@ function Join({ pool, othersPresent }: { pool: PoolRef; othersPresent: boolean }
   return (
     <>
       <h3>Join another pool</h3>
-      {othersPresent && <p class="muted">This node already shares a pool with other members; remove them first to join another.</p>}
-      <textarea rows={3} value={ticket} disabled={othersPresent} placeholder="meddle1…" onInput={(e) => setTicket(e.currentTarget.value)} />
-      <button disabled={othersPresent || action.busy || ticket.trim() === ""} onClick={join}>Join</button>
+      {state.hint !== null && <p class="muted">{state.hint}</p>}
+      <textarea rows={3} value={ticket} disabled={state.blocked} placeholder="meddle1…" onInput={(e) => setTicket(e.currentTarget.value)} />
+      <button disabled={state.blocked || action.busy || ticket.trim() === ""} onClick={join}>Join</button>
       {action.error !== null && <p class="error">{action.error}</p>}
       {joined !== null && <p>{joined}</p>}
     </>
