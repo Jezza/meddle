@@ -84,11 +84,19 @@ export async function meddle(args: string[], env: Record<string, string>) {
   return { stdout, stderr, code };
 }
 
+/** A port on 127.0.0.1 that nothing listens on (it was free a moment ago). */
+export async function closedPort(): Promise<number> {
+  const free = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const port = free.port!;
+  await free.stop(true);
+  return port;
+}
+
 const SERVE_DEADLINE_MS = 15_000;
 
 /**
- * Starts `meddle serve` with `env` and resolves once it prints its `dashboard at` line, with the bound port and
- * the dashboard's URL; after 15 s without one it stops the child and rejects with its stderr. `stop` sends SIGTERM
+ * Starts `meddle serve` with `env` and resolves once it prints its `dashboard at` line, with its node id (from the
+ * `node <id>` line before it), the bound port and the dashboard's URL; after 15 s without one it stops the child and rejects with its stderr. `stop` sends SIGTERM
  * (SIGKILL 15 s later if the child is still running) and resolves with the exit code; `stderr` is what it printed so far.
  */
 export async function startServe(env: Record<string, string>) {
@@ -113,17 +121,17 @@ export async function startServe(env: Record<string, string>) {
     await drainErr;
     return code;
   };
-  const url = await new Promise<string>((resolve, reject) => {
+  const started = await new Promise<{ id: string; url: string }>((resolve, reject) => {
     const deadline = setTimeout(() => reject(new Error(`meddle serve printed no dashboard line in ${SERVE_DEADLINE_MS} ms:\n`)), SERVE_DEADLINE_MS);
     let stdout = "";
     const decoder = new TextDecoder();
     (async () => {
       for await (const chunk of proc.stdout) {
         stdout += decoder.decode(chunk, { stream: true });
-        const match = /^dashboard at (http:\/\/127\.0\.0\.1:\d+\/)$/m.exec(stdout);
+        const match = /^node ([0-9a-f]{64})\ndashboard at (http:\/\/127\.0\.0\.1:\d+\/)$/m.exec(stdout);
         if (match) {
           clearTimeout(deadline);
-          resolve(match[1]!);
+          resolve({ id: match[1]!, url: match[2]! });
         }
       }
       clearTimeout(deadline);
@@ -133,5 +141,6 @@ export async function startServe(env: Record<string, string>) {
     await stop();
     throw new Error(`${err.message}${stderr}`);
   });
-  return { port: Number(new URL(url).port), url, stop, stderr: () => stderr };
+  const { id, url } = started;
+  return { id, port: Number(new URL(url).port), url, stop, stderr: () => stderr };
 }

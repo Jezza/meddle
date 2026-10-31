@@ -1,11 +1,15 @@
 // test/e2e.test.ts — one node end to end: `meddle serve` against the replayer, driven by the client subcommands.
 import { test, expect } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { initColocated } from "../src/jj";
-import { errorResultFixture, meddle, replay, startServe } from "./helpers";
+import { closedPort, errorResultFixture, meddle, replay, startServe } from "./helpers";
 import { POOL_ENV } from "./pool-helpers";
 
-/** A temp home with a data dir, a created task root and a colocated jj repo, and the env a meddle child runs with. */
+/**
+ * A temp home with a data dir, a created task root and a colocated jj repo, and the env a meddle child runs with; its
+ * port is one nothing listens on, so a client command (`token set` tells a running node) never reaches a real node.
+ */
 async function home() {
   const dir = await mkdtemp("/tmp/meddle-e2e-");
   await mkdir(`${dir}/t`, { recursive: true });
@@ -18,6 +22,7 @@ async function home() {
     MEDDLE_CLAUDE_RUNTIME: "bun",
     MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl`,
     ...POOL_ENV,
+    MEDDLE_PORT: String(await closedPort()),
   };
   return { dir, env };
 }
@@ -81,11 +86,23 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     expect(lines[3]).toBe(`task root ${dir}/t ok`);
     expect(lines[4]).toMatch(/^token present expires \d{4}-\d\d-\d\dT[\d:.]+Z$/);
     expect(lines[5]).toBe("tasks 1");
-    expect(lines).toHaveLength(6);
+    expect(lines[6]).toBe(`node ${node.id}`);
+    expect(lines[7]).toMatch(/^pool [0-9a-f]+ members 1$/);
+    expect(lines).toHaveLength(8);
   } finally {
     if (!stopped) await node.stop();
   }
 }, 60_000);
+
+test("status before the first serve has no node and no pool, and creates neither", async () => {
+  const { dir, env } = await home();
+  const status = await meddle(["status"], env);
+  expect(status.stderr).toBe("");
+  expect(status.code).toBe(0);
+  expect(status.stdout).toEndWith("tasks 0\nnode (none yet)\npool (none yet)\n");
+  expect(existsSync(`${dir}/d/secrets/iroh.key`)).toBe(false);
+  expect(existsSync(`${dir}/d/meddle.sqlite`)).toBe(false);
+});
 
 test("a client command without a running node asks for one", async () => {
   const { env } = await home();

@@ -9,9 +9,12 @@ import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } fro
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { findTaskPids, MetricsSampler } from "./metrics";
+import { loadOrCreateIdentity, shortId } from "./pool/identity";
 import { startPool, type PoolRuntime } from "./pool/runtime";
+import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
 import { resultError } from "./engine/session";
+import { PoolObject } from "./state/contracts";
 import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
 import { listTasks } from "./store/records";
@@ -23,6 +26,9 @@ import { claudeCodeVersion, VERSION } from "./version";
 const USAGE = `usage: meddle --version
        meddle serve
        meddle status
+       meddle invite
+       meddle join <ticket>
+       meddle pool
        meddle token set [--file <path>] | meddle token status
        meddle project add <path-or-url> [--name <n>] | meddle project list
        meddle task new --title <t> --project <id>... | meddle task prompt <id> <text> | meddle task retry <id>
@@ -96,6 +102,7 @@ async function serve(): Promise<number> {
     await shutdown(node);
     throw err;
   }
+  console.log(`node ${node.pool!.identity.id}`);
   console.log(`dashboard at ${node.dashboard.url}`);
 
   await signalled.promise;
@@ -119,7 +126,10 @@ function runnerDeps(env = process.env): RunnerDeps {
   return deps;
 }
 
-/** Version, Claude Code version, data dir, task root, token and task count; reads the database read-only. */
+/**
+ * Version, Claude Code version, data dir, task root, token, task count, node id and pool; reads the database
+ * read-only and creates neither it nor the node's key.
+ */
 async function status(): Promise<number> {
   const cfg = loadConfig();
   const root = await checkTaskRoot(cfg);
@@ -129,26 +139,50 @@ async function status(): Promise<number> {
   console.log(`data dir ${cfg.dataDir}`);
   console.log(root.ok ? `task root ${cfg.taskRoot} ok` : root.reason);
   console.log(`token ${token.present ? `present expires ${token.expiresAt}` : "absent"}`);
-  console.log(`tasks ${taskCount(cfg)}`);
+  console.log(`tasks ${readDb(cfg, (db) => listTasks(db).length) ?? 0}`);
+  console.log(`node ${existsSync(paths(cfg).irohKey) ? (await loadOrCreateIdentity(cfg)).id : "(none yet)"}`);
+  console.log(readDb(cfg, poolLine) ?? "pool (none yet)");
   return 0;
 }
 
-function taskCount(cfg: NodeConfig): number {
+/** `read` over the database opened read-only, or null when there is none yet. */
+function readDb<T>(cfg: NodeConfig, read: (db: Database) => T): T | null {
   const file = paths(cfg).db;
-  if (!existsSync(file)) return 0;
+  if (!existsSync(file)) return null;
   const db = new Database(file, { readonly: true });
   try {
-    return listTasks(db).length;
+    return read(db);
   } finally {
     db.close();
   }
 }
 
+/** `pool <poolId> members <n>`, or null before this node first served (no pool table, or no pool in it). */
+function poolLine(db: Database): string | null {
+  if (db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pool'").get() === null) return null;
+  if (db.query("SELECT 1 FROM pool").get() === null) return null;
+  const store = new PoolStore(db);
+  return `pool ${store.pool().poolId} members ${store.members().length}`;
+}
+
+/**
+ * Writes the token file here, set by this node, then tells the running node (if any) so it tells the pool. The value
+ * never goes over the socket: other nodes pull it from this one.
+ */
 async function tokenSet(file: string | undefined): Promise<number> {
   const input = file !== undefined ? await Bun.file(file).text() : await Bun.stdin.text();
   const cfg = loadConfig();
   await ensureDataDirs(cfg);
-  await setToken(cfg, input);
+  const identity = await loadOrCreateIdentity(cfg);
+  await setToken(cfg, input, { setBy: identity.id });
+  try {
+    await withPool(async (pool) => {
+      await pool.tokenChanged({});
+      return 0;
+    });
+  } catch (err) {
+    if (!(err instanceof NoNode)) throw err;
+  }
   console.log("token set");
   return 0;
 }
@@ -184,6 +218,55 @@ async function withNode(use: (client: Host, socket: WebSocket) => Promise<number
   } finally {
     await client.close();
   }
+}
+
+/** The node's PoolObject as dashboards and the CLI see it (the `default` variant). */
+async function poolView(client: Host) {
+  const pool = await client.get(PoolObject, {});
+  if (pool.variant !== "default") throw new Error("expected the default pool view");
+  return pool;
+}
+
+/** Runs `use` against the running node's PoolObject. */
+function withPool(use: (pool: Awaited<ReturnType<typeof poolView>>) => Promise<number>): Promise<number> {
+  return withNode(async (client) => {
+    const pool = await poolView(client);
+    try {
+      return await use(pool);
+    } finally {
+      pool.release();
+    }
+  });
+}
+
+/** Prints a ticket another node joins this pool with. */
+function poolInvite(): Promise<number> {
+  return withPool(async (pool) => {
+    console.log((await pool.invite({})).ticket);
+    return 0;
+  });
+}
+
+/** Joins the pool a ticket from one of its members names. */
+function poolJoin(ticket: string): Promise<number> {
+  return withPool(async (pool) => {
+    const joined = await pool.join({ ticket });
+    console.log(`joined pool ${shortId(joined.poolId)} with ${joined.members} nodes`);
+    return 0;
+  });
+}
+
+/** One line per node of the roster. */
+function poolList(): Promise<number> {
+  return withPool(async (pool) => {
+    const self = pool.self.value;
+    for (const n of pool.nodes.value) {
+      const state = n.status === "removed" ? "removed" : n.online ? "online" : "offline";
+      const line = `${shortId(n.nodeId)} ${n.hostname} ${state} meddle ${n.version} claude ${n.claudeCodeVersion} tasks ${n.taskCount}`;
+      console.log(n.nodeId === self ? `${line} (this node)` : line);
+    }
+    return 0;
+  });
 }
 
 /** Adds an existing directory as a folder project, anything else as an upstream URL; prints the project id. */
@@ -353,6 +436,9 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (args.length === 1 && command === "--version") return async () => (console.log(`meddle ${VERSION}`), 0);
   if (args.length === 1 && command === "serve") return serve;
   if (args.length === 1 && command === "status") return status;
+  if (args.length === 1 && command === "invite") return poolInvite;
+  if (args.length === 2 && command === "join") return () => poolJoin(sub!);
+  if (args.length === 1 && command === "pool") return poolList;
   if (command === "token" && sub === "set" && rest.length === 0) return () => tokenSet(undefined);
   if (command === "token" && sub === "set" && rest.length === 2 && rest[0] === "--file") return () => tokenSet(rest[1]);
   if (command === "token" && sub === "status" && rest.length === 0) return tokenShow;
