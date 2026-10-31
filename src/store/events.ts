@@ -41,3 +41,8 @@ export function listEvents(
     .all(taskId, opts.fromSeq ?? 1, opts.limit ?? -1);
   return rows.map((row) => ({ seq: row.seq, message: JSON.parse(row.json) }));
 }
+
+/** Whether the task's log holds any message other than meddle's own: Claude Code has run for it. */
+export function hasSdkEvents(db: Database, taskId: string): boolean {
+  return db.query("SELECT 1 FROM events WHERE task_id = ? AND type != 'meddle' LIMIT 1").get(taskId) !== null;
+}

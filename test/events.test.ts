@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb } from "../src/store/db";
-import { appendEvent, listEvents } from "../src/store/events";
+import { appendEvent, hasSdkEvents, listEvents } from "../src/store/events";
 test("unknown message shapes are stored verbatim with sequence numbers", () => {
   const db = openDb(":memory:");
   expect(appendEvent(db, "t", { type: "assistant", uuid: "u1" })).toBe(1);
@@ -20,4 +20,14 @@ test("a message without a type is stored, and seq numbering is per task", () => 
   ]);
   expect(listEvents(db, "b")).toEqual([{ seq: 1, message: { type: "system", subtype: "init" } }]);
   expect(listEvents(db, "a", { limit: 1 })).toEqual([{ seq: 1, message: { foo: 1 } }]);
+});
+
+test("hasSdkEvents counts only messages other than meddle's own, per task", () => {
+  const db = openDb(":memory:");
+  expect(hasSdkEvents(db, "t")).toBe(false);
+  appendEvent(db, "t", { type: "meddle", subtype: "turn_started" });
+  appendEvent(db, "u", { type: "system", subtype: "init" });
+  expect(hasSdkEvents(db, "t")).toBe(false);
+  appendEvent(db, "t", { type: "system", subtype: "init" });
+  expect(hasSdkEvents(db, "t")).toBe(true);
 });

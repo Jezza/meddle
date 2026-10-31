@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { PermissionMode, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
-import { defineTask, type Harness, type TaskId, type TaskRuntime } from "@earendil-works/pi-durable";
+import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
@@ -11,6 +11,7 @@ import { runTurn, type MeddleEvent } from "../engine/session";
 import { bookmarkSet, changeId } from "../jj";
 import { paths } from "../paths";
 import { loadContext, loadProjectSettings } from "../projects/context";
+import { hasSdkEvents } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import { getTask, updateTask, type TaskRow } from "../store/records";
 import { getToken } from "../token";
@@ -20,7 +21,7 @@ import { provisionTask } from "./provision";
 export type TaskState = "idle" | "running" | "waiting" | "archived";
 
 type TurnInput = { taskId: string; prompt: string };
-type TurnCheckpoint = { phase: "run" };
+type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
 /** Installed by `openHarness`: how a phase finds the Harness it runs in. */
 type MeddleHooks = { harness(): Harness };
 type TurnRuntime = TaskRuntime<TurnInput, TurnCheckpoint, null, MeddleHooks>;
@@ -47,7 +48,10 @@ async function runnerFor(runtime: TurnRuntime, context: Context): Promise<TaskRu
   return awaitWithContext(runnerSlot(harness).promise, context);
 }
 
-/** One Claude Code turn of a task. A rerun after a crash resumes the task's session. */
+/**
+ * One Claude Code turn of a task. `run` drives the turn; a rerun after a crash resumes the task's
+ * session. `finish` does the bookkeeping once the turn is over, so a rerun from there skips the turn.
+ */
 export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHooks>({
   name: "meddle.turn",
   version: 1,
@@ -55,8 +59,14 @@ export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHook
   phases: {
     run: async (task, runtime, context) => {
       const runner = await runnerFor(runtime, context);
-      await runner.runTurnPhase(task.id, task.input, context);
+      await runner.runTurnPhase(task.input, context);
+      await runtime.commit(() => ({ status: "running", checkpoint: { phase: "finish" } }), context);
+    },
+    finish: async (task, runtime, context) => {
+      const runner = await runnerFor(runtime, context);
+      await runner.finishTurnPhase(task.input.taskId, context);
       await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+      runner.completeTurn(task.input.taskId);
     },
   },
   abort: async (task, runtime, context) => {
@@ -77,8 +87,8 @@ export class TaskRunner {
   #deps: RunnerDeps;
   #sessionStore: SqliteSessionStore;
   #live = new Map<string, LiveTurn>();
-  /** Task id → the durable id of its unfinished `meddle.turn`, as far as this process knows. */
-  #turns = new Map<string, TaskId>();
+  /** Tasks whose new `meddle.turn` is being created or has not started running yet. */
+  #pending = new Set<string>();
   #models = new Map<string, string | undefined>();
   #efforts = new Map<string, string>();
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
@@ -103,23 +113,40 @@ export class TaskRunner {
     return provisionTask(this.#cfg, this.#db, input);
   }
 
-  /** Steers the live turn, or starts a new durable turn when the task is idle. */
+  /**
+   * Steers the live turn, or starts a new durable turn when the task is idle. A task left `running`
+   * with no live turn here is reconciled against the Harness: a turn still pending or parked there
+   * refuses the prompt; with none, the task is idle again and the prompt starts a turn.
+   */
   async prompt(taskId: string, text: string): Promise<void> {
     const row = this.#row(taskId);
     if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
+    let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
-      if (live === undefined) throw new Error("task has no live turn");
-      live.queue.push(text, "now");
-      return;
+      if (live !== undefined) {
+        live.queue.push(text, "now");
+        return;
+      }
+      const turn = await this.#durableTurn(taskId);
+      if (turn !== undefined && isParked(turn)) throw new Error("task has a parked turn: retry it");
+      if (turn !== undefined) throw new Error("task is resuming");
+      stale = true;
     }
-    if (this.#turns.has(taskId)) throw new Error("task has a pending turn");
-    const root = await this.#harness.root(BACKGROUND_CONTEXT);
-    const id = await root.commit(
-      (tx) => tx.createTask(MeddleTurn, { taskId, prompt: text }, { ownership: { kind: "conversation" } }),
-      BACKGROUND_CONTEXT,
-    );
-    this.#turns.set(taskId, id);
+    // Reserved before the first await, so a concurrent prompt cannot create a second turn.
+    if (this.#pending.has(taskId)) throw new Error("task has a pending turn");
+    this.#pending.add(taskId);
+    try {
+      if (stale) this.#setState(taskId, "idle");
+      const root = await this.#harness.root(BACKGROUND_CONTEXT);
+      await root.commit(
+        (tx) => tx.createTask(MeddleTurn, { taskId, prompt: text }, { ownership: { kind: "conversation" } }),
+        BACKGROUND_CONTEXT,
+      );
+    } catch (err) {
+      this.#pending.delete(taskId);
+      throw err;
+    }
   }
 
   async interrupt(taskId: string): Promise<void> {
@@ -141,11 +168,11 @@ export class TaskRunner {
     this.#efforts.set(taskId, effort);
   }
 
-  /** Runs a turn parked by pi-durable's restart limit again. */
+  /** Runs the task's turn again after pi-durable's restart limit parked it. */
   async retry(taskId: string): Promise<void> {
-    const id = this.#turns.get(taskId);
-    if (id === undefined) throw new Error(`unknown task: ${taskId}`);
-    await this.#harness.retryTask(id, BACKGROUND_CONTEXT);
+    const turn = await this.#durableTurn(taskId);
+    if (turn === undefined || !isParked(turn)) throw new Error(`no parked turn for task ${taskId}`);
+    await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
   }
 
   onEvent(cb: (taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void): () => void {
@@ -166,24 +193,24 @@ export class TaskRunner {
     return this.#live.get(taskId)?.query ?? null;
   }
 
-  /** The `run` phase of `meddle.turn`; not for callers outside this module. */
-  async runTurnPhase(durableId: TaskId, input: TurnInput, context: Context): Promise<void> {
+  /** The `run` phase of `meddle.turn`: drives the turn to its end. Not for callers outside this module. */
+  async runTurnPhase(input: TurnInput, context: Context): Promise<void> {
     const { taskId } = input;
-    this.#turns.set(taskId, durableId);
-    const resume = this.#row(taskId).started === 1;
-    this.#db.transaction(() => updateTask(this.#db, taskId, { started: 1, state: "running" }))();
-    this.#emitState(taskId, "running");
-    const queue = new InputQueue();
     try {
-      const engineInput = await this.#engineInput(taskId, resume);
+      // Resume only a session Claude Code has shown it created, not one a turn merely set out to create.
+      const resume = this.#row(taskId).started === 1 && hasSdkEvents(this.#db, taskId);
+      this.#db.transaction(() => updateTask(this.#db, taskId, { started: 1, state: "running" }))();
+      this.#pending.delete(taskId);
+      this.#emitState(taskId, "running");
+      const queue = new InputQueue();
       const { query, done } = runTurn({
-        input: engineInput,
+        input: await this.#engineInput(taskId, resume),
         prompt: input.prompt,
         db: this.#db,
         approvals: this.approvals,
         queue,
         ...(context.abortSignal !== undefined ? { signal: context.abortSignal } : {}),
-        onMessage: (m, seq) => { for (const cb of [...this.#eventListeners]) cb(taskId, seq, m); },
+        onMessage: (m, seq) => notify(this.#eventListeners, (cb) => cb(taskId, seq, m)),
       });
       this.#live.set(taskId, { query, queue, state: "running" });
       try {
@@ -191,29 +218,48 @@ export class TaskRunner {
       } finally {
         this.#live.delete(taskId);
       }
-      const row = this.#row(taskId);
-      updateTask(this.#db, taskId, { turns: row.turns + 1 });
-      for (const p of engineInput.manifest.projects) {
+    } catch (err) {
+      this.#failTurn(taskId, context);
+      throw err;
+    }
+  }
+
+  /** The `finish` phase of `meddle.turn`: moves the task's bookmarks. Not for callers outside this module. */
+  async finishTurnPhase(taskId: string, context: Context): Promise<void> {
+    try {
+      const manifest = await readManifest(this.#cfg, taskId);
+      for (const p of manifest.projects) {
         const workspace = join(paths(this.#cfg).task(taskId), p.workspace);
         await bookmarkSet(p.replica, `meddle/task/${taskId}/${p.name}`, await changeId(workspace));
       }
     } catch (err) {
-      // An abort (close, abortTask) leaves the task running: a rerun resumes it, or the abort handler settles it.
-      if (!context.abortSignal?.aborted) this.#endTurn(taskId);
+      this.#failTurn(taskId, context);
       throw err;
     }
-    this.#endTurn(taskId);
+  }
+
+  /** After the turn's terminal commit: count it and make the task idle. Not for callers outside this module. */
+  completeTurn(taskId: string): void {
+    updateTask(this.#db, taskId, { turns: this.#row(taskId).turns + 1 });
+    this.#setState(taskId, "idle");
   }
 
   /** The `abort` phase of `meddle.turn`; not for callers outside this module. */
   abortTurnPhase(taskId: string): void {
     this.#live.get(taskId)?.query.close();
-    this.#endTurn(taskId);
+    this.#setState(taskId, "idle");
   }
 
-  #endTurn(taskId: string): void {
-    this.#turns.delete(taskId);
-    this.#setState(taskId, "idle");
+  /** A turn that failed of itself ends the task's turn; an aborted one (close, abortTask) stays running for its rerun or abort handler. */
+  #failTurn(taskId: string, context: Context): void {
+    this.#pending.delete(taskId);
+    if (!context.abortSignal?.aborted) this.#setState(taskId, "idle");
+  }
+
+  /** The task's live `meddle.turn` as the Harness sees it, if any. */
+  async #durableTurn(taskId: string): Promise<TaskInspection | undefined> {
+    const { tasks } = await this.#harness.inspect(BACKGROUND_CONTEXT);
+    return tasks.find((t) => t.record.kind === MeddleTurn.definition.name && (t.record.input as TurnInput).taskId === taskId);
   }
 
   async #engineInput(taskId: string, resume: boolean): Promise<Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">> {
@@ -245,13 +291,17 @@ export class TaskRunner {
     return input;
   }
 
-  /** `waiting` while a live turn has an approval pending, `running` otherwise. */
+  /** `waiting` while a live turn has an approval pending, `running` otherwise. Never throws into Approvals. */
   #syncWaiting(): void {
     for (const [taskId, live] of this.#live) {
       const state = this.approvals.pending(taskId).length > 0 ? "waiting" : "running";
       if (state === live.state) continue;
       live.state = state;
-      this.#setState(taskId, state);
+      try {
+        this.#setState(taskId, state);
+      } catch (err) {
+        console.error(`meddle: could not record task ${taskId} as ${state}:`, err);
+      }
     }
   }
 
@@ -273,6 +323,21 @@ export class TaskRunner {
   }
 
   #emitState(taskId: string, state: TaskState): void {
-    for (const cb of [...this.#stateListeners]) cb(taskId, state);
+    notify(this.#stateListeners, (cb) => cb(taskId, state));
   }
+}
+
+/** Calls each listener; one that throws is logged and never reaches the turn that told it. */
+function notify<T>(listeners: Set<T>, call: (cb: T) => void): void {
+  for (const cb of [...listeners]) {
+    try {
+      call(cb);
+    } catch (err) {
+      console.error("meddle: a task listener threw:", err);
+    }
+  }
+}
+
+function isParked(turn: TaskInspection): boolean {
+  return turn.state.kind === "blocked" && turn.state.reason === "restart_limit";
 }
