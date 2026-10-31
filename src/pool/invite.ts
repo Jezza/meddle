@@ -74,6 +74,7 @@ const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const NOT_A_TICKET = "not a meddle invite ticket";
 const BAD_REQUEST = "bad join request";
 const BAD_INVITE = "unknown or expired invite";
+const NOT_A_MEMBER = "inviter is not a member";
 
 const wireAddr = (a: WireAddr): WireAddr => ({ id: a.id, relay: a.relay, direct: [...a.direct] });
 
@@ -142,7 +143,10 @@ async function tokenMeta(cfg: NodeConfig): Promise<TokenMeta | null> {
   return s.present && s.setAt !== undefined ? { setAt: s.setAt, setBy: s.setBy ?? null } : null;
 }
 
-/** Serves one connection on ALPN_JOIN: reads one request line (≤ 4 KiB) from its first stream, answers, waits for the joiner to close (≤ 5 s), then closes. */
+/**
+ * Serves one connection on ALPN_JOIN: reads one request line (≤ 4 KiB) from its first stream, answers, waits for the
+ * joiner to close (≤ 5 s), then closes. A node that is not itself a member refuses with `inviter is not a member`.
+ */
 export async function handleJoin(conn: Connection, deps: JoinHostDeps): Promise<void> {
   const nodeId = hexOf(conn.remoteId());
   try {
@@ -158,6 +162,9 @@ export async function handleJoin(conn: Connection, deps: JoinHostDeps): Promise<
     let admitted: WireAddr | null = null;
     if (request === null) {
       reply = { t: "refused", reason: BAD_REQUEST };
+    } else if (!deps.store.isMember(deps.selfId)) {
+      // A node removed from its pool admits nobody into it; the invite stays unused.
+      reply = { t: "refused", reason: NOT_A_MEMBER };
     } else {
       const token = await tokenMeta(deps.cfg);
       if (!deps.store.consumeInvite(request.code)) {

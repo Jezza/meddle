@@ -20,6 +20,7 @@ export type PoolRuntime = {
   readonly endpoint: Endpoint;
   /** What `servePool` needs; `createNodeHost` passes it on. */
   readonly objectDeps: PoolObjectDeps;
+  /** A new invite ticket; throws "this node is not a member of a pool" once this node was removed. */
   invite(): string;
   join(ticket: string): Promise<{ poolId: string; members: number }>;
   /** Removes a node from the pool and cuts it off; rejects "a node cannot remove itself". */
@@ -206,7 +207,11 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   sync.start();
   if (!leftPool) discovery?.start();
 
-  const invite = () => createInvite(store, endpoint);
+  /** A ticket into this node's pool; a node removed from its pool has none to give. */
+  const invite = () => {
+    if (!store.isMember(selfId)) throw new Error("this node is not a member of a pool");
+    return createInvite(store, endpoint);
+  };
 
   async function join(ticket: string): Promise<{ poolId: string; members: number }> {
     const joined = await joinPool(decodeTicket(ticket), { endpoint, store, identity, summary: liveSummary });

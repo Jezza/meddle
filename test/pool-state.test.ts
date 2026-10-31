@@ -154,6 +154,8 @@ test("a removed node is cut off, sees itself removed, and may join again", async
     await eventually(() => B.store.row(C.id)?.status === "removed" && !B.net.isOnline(C.id) && !C.net.isOnline(B.id));
     await until(c!.pool.nodes, (rows) => rows.some((r) => r.nodeId === C.id && r.status === "removed"));
     expect(C.net.online()).toEqual([]);
+    // A removed node has no pool to invite anyone into.
+    expect(() => C.pool.invite()).toThrow("this node is not a member of a pool");
     // B was not removed: it still counts itself a member and keeps its link with A.
     expect(B.store.isMember(B.id)).toBe(true);
     expect(B.net.isOnline(A.id)).toBe(true);

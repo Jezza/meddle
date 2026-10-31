@@ -242,3 +242,21 @@ test("a node removed from its pool may join another", async () => {
     await a.close();
   }
 }, 15_000);
+
+test("a removed inviter refuses a joiner and leaves the invite unused", async () => {
+  const a = await inviter();
+  const b = await joiner();
+  try {
+    const ticket = decodeTicket(createInvite(a.store, a.node.endpoint));
+    a.store.remove(a.id);
+    const bPool = b.store.pool();
+    await expect(joinPool(ticket, b.deps)).rejects.toThrow("refused: inviter is not a member");
+    expect(b.store.pool()).toEqual(bPool);
+    expect(a.store.row(b.identity.id)).toBeNull();
+    expect(a.admitted).toEqual([]);
+    expect(a.store.consumeInvite(ticket.code)).toBe(true);
+  } finally {
+    await closeAll([b]);
+    await a.close();
+  }
+}, 15_000);
