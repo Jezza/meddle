@@ -10,7 +10,7 @@ import type { LinkTap } from "../src/pool/link";
 import { PoolNet, fromEndpoint, openEndpoint, toEndpointAddr } from "../src/pool/net";
 import { servePool, type PoolObjectDeps } from "../src/pool/object";
 import { PoolStore, type NodeSummary } from "../src/pool/store";
-import { startPool } from "../src/pool/runtime";
+import { startPool, type PoolSummaryDeps } from "../src/pool/runtime";
 import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
 import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
@@ -181,6 +181,16 @@ export async function twoNodes(options: { start?: boolean; offerAddresses?: bool
 /** The environment a pool node in a test reads: loopback only, no relays, no lighthouse. */
 export const POOL_ENV = { MEDDLE_IROH_PRESET: "minimal", MEDDLE_IROH_BIND: "127.0.0.1:0", MEDDLE_LIGHTHOUSE_URL: "" };
 
+/** What a test node reports to its pool, as `serve` does: this meddle, the pinned Claude Code, its task root and tasks. */
+export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
+  return {
+    version: VERSION,
+    claudeCodeVersion: claudeCodeVersion(),
+    hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
+    taskCount: () => listTasks(db).length,
+  };
+}
+
 /**
  * A whole node (see `setupNode`) with its pool runtime started and its chord host (`createNodeHost`) serving it; the
  * metrics sampler is not started. `close()` stops the pool, the host and the harness.
@@ -189,12 +199,7 @@ export async function startPoolNode(fixture?: string) {
   const node = await setupNode(fixture, POOL_ENV);
   const { cfg, db, runner } = node;
   const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 60_000, dataDir: cfg.dataDir });
-  const pool = await startPool(cfg, db, {
-    version: VERSION,
-    claudeCodeVersion: claudeCodeVersion(),
-    hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
-    taskCount: () => listTasks(db).length,
-  });
+  const pool = await startPool(cfg, db, poolSummaryOf(cfg, db));
   const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool });
   return {
     ...node, metrics, pool, host,

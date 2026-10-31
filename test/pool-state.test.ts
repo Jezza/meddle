@@ -2,10 +2,12 @@
 import { test, expect } from "bun:test";
 import { hostname } from "node:os";
 import type { Host } from "@earendil-works/chord";
+import { PeerClosed } from "../src/pool/net";
+import { startPool, type PoolRuntime } from "../src/pool/runtime";
 import { NodeObject, PoolObject } from "../src/state/contracts";
 import { getToken, setToken } from "../src/token";
 import { VERSION } from "../src/version";
-import { linkClient, startPoolNode } from "./pool-helpers";
+import { linkClient, poolSummaryOf, startPoolNode } from "./pool-helpers";
 
 type Node = Awaited<ReturnType<typeof startPoolNode>>;
 
@@ -148,5 +150,40 @@ test("a member that did not do the removing also cuts the removed node off", asy
 
     expect(await join(a!, c!)).toEqual({ poolId: a!.pool.poolId.value, members: 3 });
     await eventually(() => B.store.isMember(C.id) && fullyLinked());
+  });
+}, 15_000);
+
+test("a node removed while it was offline learns it from the refusal when it comes back", async () => {
+  await withNodes(2, async (nodes) => {
+    // The smaller id dials: the removed node must be the smaller one to come back and ask the other.
+    const [b, a] = [...nodes].sort((x, y) => (x.node.id < y.node.id ? -1 : 1)) as [Viewed, Viewed];
+    const [A, B] = [a.node, b.node];
+    await join(a, b);
+    await onlineOn(a, b);
+    await onlineOn(b, a);
+
+    await B.pool.stop();
+    await until(a.pool.nodes, (rows) => rows.some((r) => r.nodeId === B.id && !r.online));
+    await a.pool.remove({ nodeId: B.id });
+    expect(B.store.isMember(B.id)).toBe(true);
+
+    // B comes back (same identity, same store) and dials A, which refuses it as removed.
+    const errors: unknown[] = [];
+    let back: PoolRuntime | undefined;
+    try {
+      back = await startPool(B.cfg, B.db, poolSummaryOf(B.cfg, B.db), { onError: (err) => errors.push(err) });
+      expect(back.identity.id).toBe(B.id);
+      const refusals = () => errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === A.id);
+      await eventually(() => B.store.row(B.id)?.status === "removed");
+      expect(back.net.online()).toEqual([]);
+      expect(refusals().map((e) => e.reason)).toEqual(["closed by peer: removed (code 1)"]);
+      // Past the 1 s and 2 s redial delays: B stopped dialing A.
+      await Bun.sleep(2500);
+      expect(refusals()).toHaveLength(1);
+      expect(A.net.isOnline(B.id)).toBe(false);
+      expect(A.store.isMember(A.id)).toBe(true);
+    } finally {
+      await back?.stop();
+    }
   });
 }, 15_000);

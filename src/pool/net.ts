@@ -57,6 +57,8 @@ export type NetDeps = {
   backoff?: { initialMs: number; maxMs: number };
   /** How long a dialer waits for the acceptor to admit or refuse a connection before giving up on it; default 5000. */
   admitTimeoutMs?: number;
+  /** Why a dialer that is not a member is refused (consulted only then); default `not a member`. */
+  refusalReason?(id: string): "removed" | "not a member";
 };
 
 /** The connection held with a peer; `closed` is its one `conn.closed()` promise, shared by its streams. */
@@ -272,14 +274,16 @@ export class PoolNet {
     }
     const id = hexOf(conn.remoteId());
     let member = false;
+    let refusal: "removed" | "not a member" = "not a member";
     try {
       member = alpn === POOL && this.deps.isMember(id);
+      if (!member && alpn === POOL) refusal = this.deps.refusalReason?.(id) ?? "not a member";
     } catch (err) {
       // Membership could not be checked: refuse rather than leave the dialer waiting for an admission.
       this.report(err);
     }
     if (!member) {
-      conn.close(1n, bytes("not a member"));
+      conn.close(1n, bytes(refusal));
       return;
     }
     this.register(id, conn);

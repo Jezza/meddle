@@ -34,6 +34,9 @@ export type PoolRuntime = {
 /** What this node reports about itself, apart from its hostname. */
 export type PoolSummaryDeps = { version: string; claudeCodeVersion: string; hostsTasks(): Promise<boolean>; taskCount(): number };
 
+/** Optional: `onError` sees every error the net and the sync report, after the runtime acted on it (tests). */
+export type PoolHooks = { onError?(err: unknown): void };
+
 /** How long `remove` waits for the removed node to see its removal and close its connection before cutting it off. */
 const REMOVAL_GRACE_MS = 1000;
 /** What `closed()` resolves to when a peer closed or refused this node because it was removed. */
@@ -43,7 +46,7 @@ const REMOVED = "closed by peer: removed (code 1)";
  * Starts this node's part in its pool (a pool of one on first start): identity, endpoint, roster, the connection
  * to every member, sync, and lighthouse discovery unless `cfg.lighthouseUrl` is empty. Logs only discovery errors.
  */
-export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSummaryDeps): Promise<PoolRuntime> {
+export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSummaryDeps, hooks: PoolHooks = {}): Promise<PoolRuntime> {
   const identity = await loadOrCreateIdentity(cfg);
   const selfId = identity.id;
   const endpoint = await openEndpoint(cfg, identity);
@@ -86,9 +89,11 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   /** A removed node accepts no pool connection at all. */
   const admits = (id: string) => store.isMember(selfId) && store.isMember(id);
+  /** A dialer this (member) node has as removed is told so; it learns its removal from that refusal. */
+  const refusalReason = (id: string) => (store.isMember(selfId) && store.row(id)?.status === "removed" ? "removed" : "not a member");
 
   const net = new PoolNet({
-    endpoint, selfId, isMember: admits,
+    endpoint, selfId, isMember: admits, refusalReason,
     onJoin: (conn) => handleJoin(conn, {
       store, selfId, cfg, endpoint,
       // The new member's row (with the address it joined from) is in the roster now: follow it.
@@ -104,6 +109,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
         enforce();
         notify();
       }
+      hooks.onError?.(err);
     },
   });
   net.onPeer(() => notify());
@@ -114,6 +120,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       enforce();
       notify();
     },
+    onError: (err) => hooks.onError?.(err),
   });
 
   /**
