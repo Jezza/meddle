@@ -57,7 +57,7 @@ export type TappedFrame = { direction: "in" | "out"; text: string };
 
 /** One pool node of `twoNodes`: its store, net, chord host (serving PoolObject) and sync. */
 export type PoolNode = {
-  id: string; home: string; cfg: NodeConfig; db: Database; store: PoolStore; net: PoolNet; host: Host; sync: PoolSync;
+  id: string; identity: Identity; home: string; cfg: NodeConfig; db: Database; store: PoolStore; net: PoolNet; host: Host; sync: PoolSync;
   /** What this node reports about itself. */
   summary: NodeSummary;
   /** What `servePool` was given; `tokenChanged` refreshes the self row and tells the pool. */
@@ -121,16 +121,16 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
   const host = createHost({ name: "node", self: "node", onError });
   servePool(host, deps);
   const stopAccepting = acceptPeerLinks(net, host, (peer) => store.isMember(peer));
-  return { node: { id, home, cfg, db, store, net, host, sync, summary, deps, changed, errors }, frames, stopAccepting };
+  return { node: { id, identity, home, cfg, db, store, net, host, sync, summary, deps, changed, errors }, frames, stopAccepting };
 }
 
 /**
  * Two pool nodes in temp homes (presetMinimal on 127.0.0.1:0), each a member of the other's roster in one pool, with a
  * chord host serving PoolObject, `acceptPeerLinks` and a `PoolSync` whose frames `framesOf(node)` collects. The node
- * with the smaller id is offered the other's address. Started unless `start: false` (then call `start()`); `close()`
- * stops everything and removes the homes.
+ * with the smaller id is offered the other's address unless `offerAddresses: false` (then only discovery can connect
+ * them). Started unless `start: false` (then call `start()`); `close()` stops everything and removes the homes.
  */
-export async function twoNodes(options: { start?: boolean } = {}): Promise<{
+export async function twoNodes(options: { start?: boolean; offerAddresses?: boolean } = {}): Promise<{
   a: PoolNode; b: PoolNode;
   framesOf(node: PoolNode): TappedFrame[];
   start(): void;
@@ -142,7 +142,7 @@ export async function twoNodes(options: { start?: boolean } = {}): Promise<{
   b.store.replacePool(a.store.pool(), a.store.roster());
   for (const [self, other] of [[a, b], [b, a]] as const) {
     self.net.watch(other.id);
-    if (self.id < other.id) self.net.offerAddress(fromEndpoint(other.net.endpoint));
+    if (options.offerAddresses !== false && self.id < other.id) self.net.offerAddress(fromEndpoint(other.net.endpoint));
   }
   let started = false;
   const start = () => {
