@@ -23,7 +23,7 @@ bun test
 
 The commands below run from the checkout as `bun run src/cli.ts <command>`. `bun run build` also produces a compiled
 `dist/meddle` for `status` and `token set`; the service itself runs from the checkout. The compiled binary embeds
-iroh's native module, which makes it about 40 MB larger (147 MB on linux-x64). It carries no `node_modules`, so it
+iroh's native modules (two `.node` files, its glibc and musl builds), which make it about 40 MB larger (147 MB on linux-x64). It carries no `node_modules`, so it
 reports its Claude Code version as `unknown`. A node served from it reports `unknown` to the pool too, so in a pool
 with nodes served from a checkout the dashboard flags the members' versions as mixed.
 
@@ -108,7 +108,9 @@ addresses recorded in the roster, and a joining node at the address in its ticke
 
 Nodes talk over iroh: QUIC, encrypted end to end, through iroh's relays when there is no direct path. A node accepts
 pool connections only from nodes its roster lists as members, and closes any other before reading from it. Of two
-members, the one with the smaller node id dials and the other accepts.
+members, the one with the smaller node id dials and the other accepts. When a node cannot reach a member (a dial
+fails or is not answered, the member keeps refusing it, or it cannot read the member's pool state) it logs why, as
+`meddle: pool: …`, each distinct message at most once a minute; a healthy pool logs nothing.
 
 A member is removed from the dashboard's Settings view (a node cannot remove itself). The removal is a roster change
 every member merges, and every member enforces it: each one closes its connection to the removed node, and refuses
@@ -148,7 +150,7 @@ with `(this node)` after this node's line.
 | --- | --- | --- |
 | `MEDDLE_LIGHTHOUSE_URL` | `https://iroh.ichor.io` | The lighthouse for discovery; empty turns discovery off. |
 | `MEDDLE_DISCOVERY_POLL_MS` | `10000` | How often a node looks its pool's topic up; at least `500`. |
-| `MEDDLE_IROH_PRESET` | `n0` | iroh's `n0` preset (number 0's public relays and address lookup), or `minimal`. |
+| `MEDDLE_IROH_PRESET` | `n0` | iroh's `n0` preset (number 0's public relays and address lookup), or `minimal`: no relays and no address lookup, so nodes reach each other only at direct addresses (loopback setups and tests). |
 | `MEDDLE_IROH_BIND` | iroh's default | The address iroh's UDP socket binds, as `<ip>:<port>`. |
 
 ## Projects and tasks
@@ -172,9 +174,11 @@ bun run src/cli.ts serve
 
 Then open <http://127.0.0.1:7777/> (`MEDDLE_PORT` changes the port). The dashboard binds to localhost only.
 
-The dashboard of any node shows the whole pool: a card per node with its state (online, offline or removed), its
-meddle and Claude Code versions, token, resources and tasks; the notifications of every online node; and a form for a
-new task on any online node that hosts tasks. It flags a pool whose members run different meddle or Claude Code
+The dashboard of any node shows the whole pool: a card per node with its state (online, offline or removed); the
+notifications of every online node; and a form for a new task on any online node that hosts tasks. An online node's
+card shows its meddle and Claude Code versions, token, task root, resources and tasks. An offline member's card shows
+what the roster last recorded of it (its versions, whether it hosts tasks and how many tasks it has) and when it was
+last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle or Claude Code
 versions.
 
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
