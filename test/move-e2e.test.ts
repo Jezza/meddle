@@ -36,17 +36,22 @@ async function home(lighthouseUrl: string) {
   return { dir, env };
 }
 
-/** Runs `meddle <args>` until its stdout matches `pattern`, every 250 ms for at most 30 s; returns the match. */
+/** How long one poll may take, by the clock (each attempt spawns a CLI, which takes a while of its own). */
+const POLL_MS = 15_000;
+
+/** Runs `meddle <args>` until its stdout matches `pattern`, 250 ms apart, for at most `POLL_MS`; returns the match. */
 async function until(args: string[], env: Record<string, string>, pattern: RegExp): Promise<RegExpExecArray> {
+  const deadline = Date.now() + POLL_MS;
   let last = "";
-  for (let i = 0; i < 120; i++) {
+  for (;;) {
     const out = await meddle(args, env);
     last = `${out.stdout}${out.stderr}`;
     const match = pattern.exec(out.stdout);
     if (out.code === 0 && match) return match;
+    if (Date.now() >= deadline) break;
     await Bun.sleep(250);
   }
-  throw new Error(`meddle ${args.join(" ")} never matched ${pattern}; last output:\n${last}`);
+  throw new Error(`meddle ${args.join(" ")} never matched ${pattern} in ${POLL_MS} ms; last output:\n${last}`);
 }
 
 /** A chord client host over `ws://127.0.0.1:<port><path>`. */
@@ -115,8 +120,9 @@ test("a task moves from one node to another through the CLI and resumes there", 
     const tunnel = client(A.port, `/ws/node/${B.id}`);
     try {
       const task = await tunnel.get(TaskObject, { id: taskId });
-      for (let i = 0; task.state.value !== "idle"; i++) {
-        if (i === 120) throw new Error(`the task on B never went idle; last state ${task.state.value}`);
+      const deadline = Date.now() + POLL_MS;
+      while (task.state.value !== "idle") {
+        if (Date.now() >= deadline) throw new Error(`the task on B never went idle in ${POLL_MS} ms; last state ${task.state.value}`);
         await Bun.sleep(250);
       }
       expect(task.state.value).toBe("idle");

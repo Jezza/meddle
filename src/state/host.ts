@@ -54,6 +54,8 @@ type TaskEvent = { taskId: string; seq: number; message: SDKMessage | MeddleEven
 type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
 
 const NOTIFICATIONS_KEPT = 50;
+/** How often a `ProjectObject` re-reads its replica's bookmarks when nothing told it they changed (pushes from peers). */
+const HEADS_REFRESH_MS = 60_000;
 const WINDOW_SIZE = 200;
 
 export type PeerObjectDeps = {
@@ -136,6 +138,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const approvalChanges: Subscribable<null> = { subscribe: (cb) => approvals.onChange(() => cb(null)) };
   const samples: Subscribable<NodeMetrics> = { subscribe: (cb) => metrics.onSample(cb) };
   const poolChanges: Subscribable<null> = { subscribe: (cb) => pool.onChange(() => cb(null)) };
+  const headTicks: Subscribable<null> = {
+    subscribe: (cb) => {
+      const timer = setInterval(() => cb(null), HEADS_REFRESH_MS);
+      timer.unref();
+      return () => clearInterval(timer);
+    },
+  };
 
   const host = createHost({ name: "node", self: "node" });
   servePool(host, pool.objectDeps);
@@ -323,20 +332,36 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       }
     };
     const heads = self.state("heads", Type.Array(HeadSchema), { init: headsNow });
-    /** One listing at a time: a sample that arrives while jj still lists is skipped. */
+    /**
+     * One listing at a time: triggers that arrive while jj lists make one more listing after it (a turn's end follows
+     * its start closely, and its bookmark must not wait for the slow timer).
+     */
     let listing = false;
+    let again = false;
     const refreshHeads = async (ctx: Ctx) => {
-      if (listing) return;
+      if (listing) {
+        again = true;
+        return;
+      }
       listing = true;
       try {
-        const next = await headsNow();
-        if (!ctx.signal.aborted && JSON.stringify(next) !== JSON.stringify(heads.value)) heads.replace(ctx, next);
+        do {
+          again = false;
+          const next = await headsNow();
+          if (ctx.signal.aborted) return;
+          if (JSON.stringify(next) !== JSON.stringify(heads.value)) heads.replace(ctx, next);
+        } while (again);
       } finally {
         listing = false;
       }
     };
     self.on("projects", projectChanges, (_event, ctx) => refreshHeads(ctx));
-    self.on("samples", samples, (_event, ctx) => refreshHeads(ctx));
+    // A task of this project changed state: a turn's end moved (and pushed) its bookmark, or a move fetched or forgot one.
+    self.on("taskStates", states, ({ taskId }, ctx) => {
+      if (taskHasProject(taskId, id)) return refreshHeads(ctx);
+    });
+    // Bookmarks a peer pushes here, or a fetch elsewhere, tell nothing: a slow re-read catches them.
+    self.on("ticks", headTicks, (_event, ctx) => refreshHeads(ctx));
     return {
       variant: "default",
       id: self.derive([project], (p) => p.id),
@@ -453,6 +478,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const row = getTask(db, taskId);
     if (row === null) throw new Error(`unknown task: ${taskId}`);
     return JSON.parse(row.manifest) as TaskManifest;
+  }
+
+  /** Whether task `taskId` (its row's manifest) works in project `projectId`. */
+  function taskHasProject(taskId: string, projectId: string): boolean {
+    const row = getTask(db, taskId);
+    if (row === null) return false;
+    return (JSON.parse(row.manifest) as TaskManifest).projects.some((p) => p.id === projectId);
   }
 
   function projectIdsNow(): string[] {

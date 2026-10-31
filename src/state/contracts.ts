@@ -149,7 +149,10 @@ export const ProjectObject = remote("meddle.project", {
       state: {
         ...ProjectSchema.properties,
         contextLoaded: Type.Boolean(),
-        /** This node's replica's bookmarks, local and remote, re-read when projects change and at each metrics sample. */
+        /**
+         * This node's replica's bookmarks, local and remote: re-read when projects change, when a task of the project
+         * changes state, and every 60 s.
+         */
         heads: Type.Array(HeadSchema),
       },
     },

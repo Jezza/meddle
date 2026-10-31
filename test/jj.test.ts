@@ -1,7 +1,9 @@
 // test/jj.test.ts
 import { test, expect } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
-import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkSet } from "../src/jj";
+import { loadConfig } from "../src/config";
+import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkList, bookmarkSet, jj } from "../src/jj";
+import { refreshTrunk } from "../src/projects/replicas";
 test("init, workspace add, change id, bookmark, forget", async () => {
   const repo = await mkdtemp("/tmp/meddle-jj-");
   await initColocated(repo);
@@ -27,4 +29,21 @@ test("bookmarkDelete removes exactly the named bookmark", async () => {
   await bookmarkDelete(repo, "meddle/task/1/p");
   const names = (await jj(["bookmark", "list", "-T", 'name ++ "\\n"'], repo)).trim().split("\n");
   expect(names).toEqual(["meddle/task/1/px"]);
+});
+
+test("listing bookmarks and resolving the home's trunk never snapshot the working copy", async () => {
+  const repo = await mkdtemp("/tmp/meddle-jj-");
+  await initColocated(repo);
+  await bookmarkSet(repo, "main", "@");
+  const ops = async () => (await jj(["op", "log", "--ignore-working-copy", "--no-graph", "-T", 'id ++ "\\n"'], repo)).split("\n").filter(Boolean).length;
+  const before = await ops();
+  // an edit in the user's checkout, not snapshotted yet
+  await Bun.write(`${repo}/edited.txt`, "x\n");
+  const listed = await bookmarkList(repo);
+  expect(listed.map((b) => `${b.name}@${b.remote}`)).toEqual(["main@null"]);
+  expect(await ops()).toBe(before);
+  // the resolution reads without a snapshot; only its `bookmark set` is an operation (which snapshots)
+  const home = await mkdtemp("/tmp/meddle-jj-home-");
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
+  expect(await refreshTrunk(cfg, repo)).toBe(listed[0]!.changeId);
 });

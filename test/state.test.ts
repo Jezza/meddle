@@ -1,6 +1,6 @@
 // test/state.test.ts
 import { test, expect } from "bun:test";
-import { NodeObject, TaskObject, SessionObject } from "../src/state/host";
+import { NodeObject, ProjectObject, TaskObject, SessionObject } from "../src/state/host";
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent } from "../src/store/events";
 import { errorResultFixture } from "./helpers";
@@ -197,3 +197,22 @@ test("a task's activation reads its log summary from the newest events, and its 
     await close();
   }
 });
+
+test("a project's heads list its replica's bookmarks and follow a turn's end of a task of it, without a metrics sample", async () => {
+  const { client, project, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const view = await client.get(ProjectObject, { id: project.id });
+    expect(view.heads.value.some((h) => h.name.startsWith("meddle/task/"))).toBe(false);
+    const manifest = await node.createTask({ title: "t", projectIds: [project.id] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await task.prompt({ text: "Reply with the single word ok." });
+    const bookmark = `meddle/task/${manifest.id}/${project.name}`;
+    const heads = await until(view.heads, (list) => list.some((h) => h.name === bookmark));
+    const head = heads.find((h) => h.name === bookmark)!;
+    expect(head).toMatchObject({ remote: null, conflicted: false });
+    expect(head.changeId).toMatch(/^[k-z]+$/);
+  } finally {
+    await close();
+  }
+}, 15_000);

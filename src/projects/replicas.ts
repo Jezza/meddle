@@ -140,7 +140,8 @@ const HOME_TRUNK = 'latest(trunk() ~ root() | bookmarks(exact:"trunk") | bookmar
  * leaves the bookmarks alone) when nothing resolves.
  */
 export async function refreshTrunk(cfg: NodeConfig, replica: string): Promise<string | null> {
-  const [change] = (await jj(["log", "-r", HOME_TRUNK, "--no-graph", "-T", 'change_id ++ "\\n"'], replica, cfg)).split("\n");
+  // A read that never snapshots the working copy: a folder project's replica is the user's own checkout.
+  const [change] = (await jj(["log", "--ignore-working-copy", "-r", HOME_TRUNK, "--no-graph", "-T", 'change_id ++ "\\n"'], replica, cfg)).split("\n");
   if (change === undefined || change === "") return null;
   await bookmarkSet(replica, "trunk", change, cfg);
   return change;

@@ -125,10 +125,12 @@ const BOOKMARK_TEMPLATE = 'if(present, name ++ "\\t" ++ remote ++ "\\t" ++ if(no
 
 /**
  * Every local and remote bookmark (not the colocated `git` remote, not a local bookmark that was deleted) with the
- * change it points at; a conflicted bookmark has `changeId` "" and `conflicted` true.
+ * change it points at; a conflicted bookmark has `changeId` "" and `conflicted` true. A read that never snapshots the
+ * working copy (`--ignore-working-copy`): a folder project's replica is the user's own checkout, and a snapshot moves
+ * no bookmark to another change.
  */
 export async function bookmarkList(repo: string, cfg?: NodeConfig): Promise<Bookmark[]> {
-  const out = await jj(["bookmark", "list", "--all-remotes", "-T", BOOKMARK_TEMPLATE], repo, cfg);
+  const out = await jj(["bookmark", "list", "--ignore-working-copy", "--all-remotes", "-T", BOOKMARK_TEMPLATE], repo, cfg);
   const list: Bookmark[] = [];
   for (const line of out.split("\n")) {
     if (line === "") continue;
