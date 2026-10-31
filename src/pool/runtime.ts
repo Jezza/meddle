@@ -39,8 +39,11 @@ export type PoolHooks = { onError?(err: unknown): void };
 
 /** How long `remove` waits for the removed node to see its removal and close its connection before cutting it off. */
 const REMOVAL_GRACE_MS = 1000;
-/** What `closed()` resolves to when a peer closed or refused this node as removed at the captured `updatedAt`. */
-const REMOVED_AT = /^closed by peer: removed (\S+) \(code 1\)$/;
+/**
+ * What `closed()` resolves to when a peer closed or refused this node as removed at the captured `updatedAt`, an ISO
+ * time as the store writes it: anything else (`removed zzz`) is not a removal this node can date, and is ignored.
+ */
+const REMOVED_AT = /^closed by peer: removed (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) \(code 1\)$/;
 
 /**
  * Starts this node's part in its pool (a pool of one on first start): identity, endpoint, roster, the connection

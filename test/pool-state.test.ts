@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import type { Host } from "@earendil-works/chord";
 import { decodeTicket, joinPool } from "../src/pool/invite";
 import { PeerClosed, PoolNet } from "../src/pool/net";
+import { fromEndpoint } from "../src/pool/net";
 import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
@@ -271,4 +272,34 @@ test("a re-joined node refused as removed by a member that has not merged the re
     await eventually(() => B.store.isMember(C.id) && B.net.isOnline(C.id) && C.net.isOnline(B.id));
     expect(C.store.isMember(C.id)).toBe(true);
   });
+}, 15_000);
+
+test("a removal refusal whose time is not an ISO time does not mark the node removed", async () => {
+  const B = await startPoolNode();
+  const x = await testNode();
+  const X = x.identity.id;
+  // X closes or refuses B as `removed zzz`, which sorts after any ISO time; whichever of them dials.
+  const net = new PoolNet({
+    endpoint: x.endpoint, selfId: X, isMember: () => false, refusalReason: () => "removed zzz",
+    onJoin: async (conn) => conn.close(0n, []), backoff: { initialMs: 50, maxMs: 200 },
+  });
+  net.onPeer((id, online) => { if (online) net.unwatch(id, "removed zzz"); });
+  try {
+    const now = new Date().toISOString();
+    B.store.upsert({
+      nodeId: X, hostname: "x", status: "member", updatedAt: now, addedBy: B.id,
+      summary: null, lastSeenAt: now, lastAddr: fromEndpoint(x.endpoint),
+    });
+    net.start();
+    net.offerAddress(fromEndpoint(B.pool.endpoint));
+    net.watch(B.id);
+    // Refreshing B's self row makes B follow X.
+    await B.pool.tokenChanged();
+    const refusals = () => B.errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === X && e.reason.includes("removed zzz"));
+    await eventually(() => refusals().length > 0);
+    expect(B.store.isMember(B.id)).toBe(true);
+  } finally {
+    await net.stop();
+    await B.close();
+  }
 }, 15_000);
