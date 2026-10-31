@@ -13,7 +13,7 @@ export type NodeConfig = {
   /** The iroh-lighthouse used to find the pool's members; "" disables discovery. */
   lighthouseUrl: string;
   irohPreset: "n0" | "minimal";
-  /** The iroh endpoint's bind address; null for iroh's default. */
+  /** The iroh endpoint's bind address; null (unset or empty) for iroh's default. */
   irohBind: string | null;
   discoveryPollMs: number;
 };
@@ -59,7 +59,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       : env.MEDDLE_ENV_PASSTHROUGH.split(" ").filter((name) => name !== ""),
     lighthouseUrl: env.MEDDLE_LIGHTHOUSE_URL ?? "https://iroh.ichor.io",
     irohPreset: parseIrohPreset(env.MEDDLE_IROH_PRESET),
-    irohBind: env.MEDDLE_IROH_BIND ?? null,
+    // Empty is unset, as for the lighthouse: iroh's default bind address.
+    irohBind: env.MEDDLE_IROH_BIND === undefined || env.MEDDLE_IROH_BIND === "" ? null : env.MEDDLE_IROH_BIND,
     discoveryPollMs: parseDiscoveryPollMs(env.MEDDLE_DISCOVERY_POLL_MS),
   };
 }

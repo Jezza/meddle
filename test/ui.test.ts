@@ -13,3 +13,8 @@ test("viewOf and hashOf round-trip the pool routes", () => {
   expect(viewOf("#/task/t1")).toEqual({ name: "pool" });          // the Plan 1 shape no longer resolves
   expect(viewOf("#/settings")).toEqual({ name: "settings" });
 });
+
+test("viewOf falls back to the pool for a malformed escape instead of throwing", () => {
+  expect(viewOf("#/task/%zz/x")).toEqual({ name: "pool" });
+  expect(viewOf("#/task/abc/%E0%A4%A")).toEqual({ name: "pool" });
+});

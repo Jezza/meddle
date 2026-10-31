@@ -51,6 +51,7 @@ test("pool settings default and parse", () => {
   expect(t.irohPreset).toBe("minimal");
   expect(t.irohBind).toBe("127.0.0.1:0");
   expect(t.discoveryPollMs).toBe(1500);
+  expect(loadConfig({ HOME: "/h", MEDDLE_IROH_BIND: "" }).irohBind).toBeNull();
   expect(() => loadConfig({ HOME: "/h", MEDDLE_IROH_PRESET: "fast" })).toThrow("MEDDLE_IROH_PRESET must be n0 or minimal");
   expect(() => loadConfig({ HOME: "/h", MEDDLE_DISCOVERY_POLL_MS: "100" })).toThrow("MEDDLE_DISCOVERY_POLL_MS must be an integer of at least 500");
 });
