@@ -7,6 +7,7 @@ import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "./config";
 import { startDashboard, type Dashboard } from "./dashboard/server";
+import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { findTaskPids, MetricsSampler } from "./metrics";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { ensurePlugins, seedProfile } from "./profile";
@@ -37,11 +38,17 @@ class NoNode extends Error {
 /** What `serve` has opened so far, closed by `shutdown`. */
 type OpenNode = {
   db?: Database; harness?: { close(): Promise<void> }; metrics?: MetricsSampler; pool?: PoolRuntime; host?: Host; dashboard?: Dashboard;
+  /** Stops accepting dashboard streams other nodes tunnel here. */
+  stopTunnels?: () => void;
 };
 
-/** Closes whatever of the node is open: the dashboard, the pool, metrics, the harness, the host, then the database. */
+/**
+ * Closes whatever of the node is open: the dashboard, the tunnels, the pool, metrics, the harness, the host, then the
+ * database.
+ */
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
+  node.stopTunnels?.();
   await node.pool?.stop();
   node.metrics?.stop();
   await node.harness?.close();
@@ -83,7 +90,8 @@ async function serve(): Promise<number> {
     const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();
-    node.dashboard = await startDashboard(cfg, host);
+    node.stopTunnels = acceptDashboardStreams(pool.net, host, (id) => pool.store.isMember(id));
+    node.dashboard = await startDashboard(cfg, host, pool);
   } catch (err) {
     await shutdown(node);
     throw err;

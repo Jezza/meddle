@@ -1,24 +1,34 @@
-// The dashboard: the UI page, its script, and a chord link for every browser on /ws, on localhost only.
+// The dashboard: the UI page, its script, and a chord link for every browser on /ws, on localhost only; a browser
+// reaches another node of the pool on /ws/node/<nodeId>, tunnelled over iroh.
 import { join } from "node:path";
 import type { ServerWebSocket } from "bun";
 import { acceptWebSockets, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
+import type { PoolRuntime } from "../pool/runtime";
+import { DASHBOARD_PRINCIPAL, bridgeSocket } from "./tunnel";
 import { BunSocketShim, ShimServer } from "./ws-shim";
 
 const UI_DIR = join(import.meta.dir, "ui");
 const PREBUILT = join(import.meta.dir, "../../dist/ui/main.js");
 
 /** Every dashboard connection acts as this principal: the server binds to 127.0.0.1 only, and `trusted` holds. */
-const PRINCIPAL = "local";
+const PRINCIPAL = DASHBOARD_PRINCIPAL;
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
-type SocketData = { request: Request; shim?: BunSocketShim };
+const TUNNEL = /^\/ws\/node\/([^/]*)$/;
+const NODE_ID = /^[0-9a-f]{64}$/;
+
+/** `peerId` is set for a socket tunnelled to another node. */
+type SocketData = { request: Request; shim?: BunSocketShim; peerId?: string };
 
 export type Dashboard = { url: string; stop(): Promise<void> };
 
-/** Serves the dashboard on `127.0.0.1:<cfg.port>` (`0` picks a free port) with `host`'s objects on `/ws`. */
-export async function startDashboard(cfg: Pick<NodeConfig, "port">, host: Host): Promise<Dashboard> {
+/**
+ * Serves the dashboard on `127.0.0.1:<cfg.port>` (`0` picks a free port) with `host`'s objects on `/ws`, and with
+ * `pool`, each online member's objects on `/ws/node/<nodeId>` (this node's own id is `/ws`).
+ */
+export async function startDashboard(cfg: Pick<NodeConfig, "port">, host: Host, pool?: PoolRuntime): Promise<Dashboard> {
   const script = await uiScript();
   const sockets = new ShimServer<Request>();
   let port = 0;
@@ -36,8 +46,16 @@ export async function startDashboard(cfg: Pick<NodeConfig, "port">, host: Host):
       if (pathname === "/main.js") {
         return new Response(script, { headers: { "content-type": "text/javascript; charset=utf-8" } });
       }
-      if (pathname === "/ws") {
-        if (server.upgrade(request, { data: { request } })) return undefined;
+      const tunnel = TUNNEL.exec(pathname);
+      if (pathname === "/ws" || (tunnel !== null && pool !== undefined)) {
+        const id = tunnel?.[1];
+        let peerId: string | undefined;
+        if (pool !== undefined && id !== undefined && id !== pool.identity.id) {
+          if (!NODE_ID.test(id) || pool.store.row(id)?.status !== "member") return new Response("unknown node", { status: 404 });
+          if (!pool.net.isOnline(id)) return new Response("node offline", { status: 503 });
+          peerId = id;
+        }
+        if (server.upgrade(request, { data: { request, peerId } })) return undefined;
         return new Response("expected a WebSocket upgrade", { status: 400 });
       }
       return new Response("not found", { status: 404 });
@@ -48,7 +66,8 @@ export async function startDashboard(cfg: Pick<NodeConfig, "port">, host: Host):
       open(ws: ServerWebSocket<SocketData>) {
         const shim = new BunSocketShim(ws as ServerWebSocket<unknown>);
         ws.data.shim = shim;
-        sockets.emitConnection(shim, ws.data.request);
+        if (ws.data.peerId !== undefined && pool !== undefined) void bridgeSocket(shim, pool.net, ws.data.peerId);
+        else sockets.emitConnection(shim, ws.data.request);
       },
       message(ws: ServerWebSocket<SocketData>, data) {
         ws.data.shim?.dispatchMessage(data);
