@@ -58,6 +58,14 @@ export type MeddleHooks = { harness(): Harness };
 export type RunnerHooks = {
   /** Called as `activateTask` starts, before anything else; a throw fails the call. */
   beforeActivate?(taskId: string): void | Promise<void>;
+  /** Called once `activateTask` made the task live, before it answers. */
+  afterActivate?(taskId: string): void | Promise<void>;
+  /** Called as `receiveTask` starts its work on the task (after its checks, in the task's serialised section). */
+  beforeReceive?(taskId: string): void | Promise<void>;
+  /** Called as a failed move restores the task's state; a throw stands for a failure there. */
+  beforeRestore?(taskId: string): void | Promise<void>;
+  /** The time a move gives the target to answer `activateTask` (default 30 s). */
+  callMs?: number;
 };
 
 /** A move of a task in progress here: where to, the step it is at, and the error that is failing it (if any). */
@@ -138,9 +146,6 @@ type LiveTurn = { query: Query; queue: InputQueue; state: "running" | "waiting" 
 
 /** How long a turn interrupted by a "move now" has to end before it is closed. */
 const INTERRUPT_GRACE_MS = 15_000;
-
-/** The states of a task that lives here; a received task in one of them is already activated. */
-const ACTIVE_STATES = new Set(["idle", "running", "waiting"]);
 
 /** The key that serialises a task's receive, import, activation and abandonment. */
 function taskKey(taskId: string): string {
@@ -508,6 +513,7 @@ export class TaskRunner {
     }
     const taskId = manifest.id;
     return serialised<{ ok: true } | { ok: false; reason: string }>(taskKey(taskId), async () => {
+      await this.#deps.hooks?.beforeReceive?.(taskId);
       const existing = getTask(this.#db, taskId);
       if (existing !== null) {
         // A `moved` row is what is left of the task's earlier stay here: it is coming back.
@@ -565,25 +571,28 @@ export class TaskRunner {
   /**
    * Makes a task received from `from` live here (`idle`); a follow-up joins the front of its queued prompts, which
    * then run one turn each, in order (`startQueued`). A task already activated is a no-op: the sender's commit ran
-   * again. Refused `forbidden` unless the task is being received from `from`. Every answer is definite, so the sender
-   * can tell it from a lost one: `ok: true` when the task is live here, `ok: false` when activating it failed and it
-   * is not (its received copy stays, for the sender to abandon).
+   * again, also when this node has moved the task on since. Refused `forbidden` when this node has no copy of the
+   * task or is receiving it from another node. Every answer is definite, so the sender can tell it from a lost one:
+   * `ok: true` when this node activated the task, `ok: false` when activating it failed and it did not (its received
+   * copy stays, for the sender to abandon).
    */
   async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: boolean }> {
     return serialised(taskKey(taskId), async () => {
-      const live = () => {
+      // Received and no longer being received: this node activated it (a `receiveTask` replaces any earlier row with a
+      // `receiving` one), even if it has moved the task on since.
+      const activated = () => {
         const current = getTask(this.#db, taskId);
-        return current !== null && current.receiving_from === null && ACTIVE_STATES.has(current.state);
+        return current !== null && current.receiving_from === null && current.state !== "receiving";
       };
       try {
         await this.#deps.hooks?.beforeActivate?.(taskId);
-        if (live()) return { ok: true };
+        if (activated()) return { ok: true };
         const row = this.#receivingFrom(taskId, from);
         const queued = [...(followUp === null ? [] : [followUp]), ...queuedOf(row)];
         updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: queued.length === 0 ? null : JSON.stringify(queued) });
       } catch (err) {
         if (isChordError(err, "forbidden")) throw err;
-        if (live()) return { ok: true };
+        if (activated()) return { ok: true };
         this.#log(`meddle: move: could not activate ${taskId} from ${shortId(from)}: ${messageOf(err)}`);
         return { ok: false };
       }
@@ -595,6 +604,7 @@ export class TaskRunner {
         // The task is here now; its prompts stay queued, and the next prompt starts them.
         this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
       }
+      await this.#deps.hooks?.afterActivate?.(taskId);
       return { ok: true };
     });
   }
@@ -628,6 +638,26 @@ export class TaskRunner {
 
   #sweepOrphans(): void {
     this.abandonOrphans().catch((err: unknown) => this.#log(`meddle: move: could not abandon partly received tasks: ${messageOf(err)}`));
+    this.reconcileMoves().catch((err: unknown) => this.#log(`meddle: move: could not reconcile moving tasks: ${messageOf(err)}`));
+  }
+
+  /**
+   * Makes each task whose row says `moving` with no `meddle.move` of it left in the Harness (one that faulted, or a
+   * rollback that could not finish) live here again: `idle`, its queued prompts started.
+   */
+  async reconcileMoves(): Promise<void> {
+    const rows = listTasks(this.#db).filter((t) => t.state === "moving");
+    if (rows.length === 0) return;
+    const { tasks } = await this.#harness.inspect(BACKGROUND_CONTEXT);
+    const moving = new Set(tasks.filter((t) => t.record.kind === MeddleMove.definition.name).map((t) => (t.record.input as MoveInput).taskId));
+    for (const row of rows) {
+      if (moving.has(row.id) || this.#moving.has(row.id) || getTask(this.#db, row.id)?.state !== "moving") continue;
+      this.#setState(row.id, "idle");
+      this.#log(`meddle: move: ${row.id} was left moving with no move in progress; it is live here again`);
+      await this.startQueued(row.id).catch((err: unknown) => {
+        this.#log(`meddle: move: task ${row.id}'s next queued prompt did not start a turn: ${messageOf(err)}`);
+      });
+    }
   }
 
   /** The task's row when it is being received from `from`; otherwise refused `forbidden`. */
@@ -728,9 +758,9 @@ export class TaskRunner {
   }
 
   /** What a move's steps work with. Not for callers outside this module and `move.ts`. */
-  moveDeps(): { cfg: NodeConfig; db: Database; pool: PoolRuntime; log(line: string): void } {
+  moveDeps(): { cfg: NodeConfig; db: Database; pool: PoolRuntime; log(line: string): void; callMs: number | undefined } {
     if (this.#pool === undefined) throw new Error("this node has no pool");
-    return { cfg: this.#cfg, db: this.#db, pool: this.#pool, log: this.#log };
+    return { cfg: this.#cfg, db: this.#db, pool: this.#pool, log: this.#log, callMs: this.#deps.hooks?.callMs };
   }
 
   /** The move of the task to `to` is at `phase`: held here, the row says `moving`, and both are told. */
@@ -803,11 +833,22 @@ export class TaskRunner {
    * meanwhile run, and the failure is logged once and told (`onMove` with the error, then null).
    */
   async failMove(taskId: string, to: string, phase: string, error: string): Promise<void> {
+    // First, before anything that can throw: the row must never be left `moving` with no move behind it.
+    const row = getTask(this.#db, taskId);
+    const restore = row !== null && row.state !== "moved";
+    if (restore) updateTask(this.#db, taskId, { state: "idle" });
     this.#moving.set(taskId, { to, phase, error });
     this.#emitMove(taskId);
     this.#moving.delete(taskId);
-    const row = getTask(this.#db, taskId);
-    if (row !== null && row.state !== "moved") await this.#restoreState(taskId);
+    if (restore) {
+      try {
+        await this.#deps.hooks?.beforeRestore?.(taskId);
+        await this.#restoreState(taskId);
+      } catch (err) {
+        this.#log(`meddle: move: could not tell whether ${taskId} has a turn running: ${messageOf(err)}`);
+        this.#emitState(taskId, "idle");
+      }
+    }
     this.#emitMove(taskId);
     this.#log(`meddle: move: ${taskId} failed at ${phase}: ${error}`);
     this.startQueued(taskId).catch((err: unknown) => {

@@ -21,7 +21,12 @@ import type { TaskManifest } from "./manifest";
 import { exportTask, receiptsMatch, type Receipt } from "./transfer";
 
 export type MoveInput = { taskId: string; to: string; now: boolean };
-export type MoveCheckpoint = { phase: "prepare" } | { phase: "handoff" } | { phase: "commit"; receipt: Receipt } | { phase: "cleanup" };
+/** `attempt` counts the times `commit` had no answer from the target (absent: none yet). */
+export type MoveCheckpoint =
+  | { phase: "prepare" }
+  | { phase: "handoff" }
+  | { phase: "commit"; receipt: Receipt; attempt?: number }
+  | { phase: "cleanup" };
 type MoveRuntime = TaskRuntime<MoveInput, MoveCheckpoint, null, MeddleHooks>;
 type PeerRef = Extract<Ref<typeof PeerObject>, { variant: "peer" }>;
 
@@ -36,8 +41,11 @@ const CALL_MS = 30_000;
 /** The first wait before `commit` asks an unanswering target again; it doubles up to `RETRY_MAX_MS`. */
 const RETRY_FIRST_MS = 2_000;
 const RETRY_MAX_MS = 30_000;
-/** How long a rollback's best-effort `abandonTask` may take. */
-const ABANDON_MS = 15_000;
+/**
+ * How long a rollback's best-effort `abandonTask` may take: the target runs it after a `receiveTask` of the task still
+ * in progress there (both are serialised per task), which may be cloning a project.
+ */
+const ABANDON_MS = 120_000;
 /** How soon a commit whose bookkeeping failed after the target took the task tries again. */
 const COMMIT_RETRY_MS = 5_000;
 
@@ -84,7 +92,8 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       const manifest = JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest;
       await runner.setTaskBookmarks(manifest);
       // A rerun of this step finds its partial copy there: the target replaces it.
-      const answer = await withPeer(pool, to, context, (peer) => peer.receiveTask({ manifest, claudeCodeVersion: claudeCodeVersion() }));
+      // No time limit: the target may clone the project from its home first. A dropped link still fails it at once.
+      const answer = await withPeer(pool, to, context, (peer) => peer.receiveTask({ manifest, claudeCodeVersion: claudeCodeVersion() }), null);
       if (!answer.ok) throw new Error(answer.reason ?? `${shortId(to)} refused the task`);
       const receipt = await sendTask(cfg, db, pool, to, taskId, context);
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "commit", receipt } }), context);
@@ -92,44 +101,37 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
     commit: async (task, runtime, context) => {
       const runner = await runnerFor(runtime, context);
       const { taskId, to } = task.input;
-      const { db, pool, log } = runner.moveDeps();
+      const checkpoint = task.state.checkpoint;
+      const { db, pool, log, callMs } = runner.moveDeps();
       // A rerun after the task was recorded as moved: only the cleanup is left.
       if (getTask(db, taskId)?.state !== "moved") {
         // The receipt is recorded: from here on, only a definite answer from the target rolls the move back.
         let refusal: string | null = null;
-        let delay = RETRY_FIRST_MS;
         try {
           runner.enterMove(taskId, to, "commit");
           const cut = (await runtime.memo<boolean>(CUT_MEMO, context)) === true;
-          for (;;) {
-            try {
-              // A repeated call (a retry, or a rerun after a crash) is a no-op `ok` for a task the target activated.
-              const answer = await withPeer(pool, to, context, (peer) => peer.activateTask({ taskId, followUp: cut ? MOVE_NOW_FOLLOW_UP : null }));
-              if (!answer.ok) refusal = `${shortId(to)} could not activate the task`;
-              break;
-            } catch (err) {
-              if (stopping(runtime, context)) throw err;
-              // It has no copy of the task from this node to activate.
-              if (isChordError(err, "forbidden")) {
-                refusal = messageOf(err);
-                break;
-              }
-              // No answer (offline, a dropped link, a timeout): the target may have the task. The task stays moving.
-              log(`meddle: move: ${taskId} waits for ${shortId(to)} to activate it: ${messageOf(err)}`);
-              await pause(delay, runtime, context);
-              delay = Math.min(delay * 2, RETRY_MAX_MS);
-            }
-          }
+          // A repeated call (a retry, or a rerun after a crash) is a no-op `ok` for a task the target activated.
+          const answer = await withPeer(
+            pool, to, context, (peer) => peer.activateTask({ taskId, followUp: cut ? MOVE_NOW_FOLLOW_UP : null }), callMs ?? CALL_MS,
+          );
+          if (!answer.ok) refusal = `${shortId(to)} could not activate the task`;
         } catch (err) {
           if (stopping(runtime, context)) throw err;
-          // Before the target was asked (the row or the memo could not be read).
-          refusal = messageOf(err);
+          if (isChordError(err, "forbidden")) {
+            // It has no copy of the task from this node to activate.
+            refusal = messageOf(err);
+          } else {
+            // No answer (offline, a dropped link, a timeout): the target may have the task. The task stays moving, and
+            // the step sleeps durably before asking again (a sleep is progress: crashes meanwhile never park the move).
+            const attempt = (checkpoint.attempt ?? 0) + 1;
+            log(`meddle: move: ${taskId} waits for ${shortId(to)} to activate it: ${messageOf(err)}`);
+            const delay = Math.min(RETRY_FIRST_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
+            await runtime.sleepUntil(Date.now() + delay, { phase: "commit", receipt: checkpoint.receipt, attempt }, context);
+            return;
+          }
         }
         if (refusal !== null) {
-          const failure = refusal;
-          await abandonOnTarget(pool, to, taskId);
-          await runner.failMove(taskId, to, "commit", failure);
-          await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message: failure } } }), context);
+          await rollback(runner, runtime, context, task.input, "commit", refusal);
           return;
         }
         // The task is the target's now: nothing here rolls back any more.
@@ -137,7 +139,7 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
           runner.completeMove(taskId, to);
         } catch (err) {
           log(`meddle: move: ${taskId} is on ${shortId(to)}, but could not be recorded as moved here: ${messageOf(err)}; trying again`);
-          await runtime.sleepUntil(Date.now() + COMMIT_RETRY_MS, task.state.checkpoint, context);
+          await runtime.sleepUntil(Date.now() + COMMIT_RETRY_MS, checkpoint, context);
           return;
         }
       }
@@ -187,10 +189,23 @@ async function step(
     await body(runner);
   } catch (err) {
     if (stopping(runtime, context)) throw err;
-    const error = messageOf(err);
-    // Before the handoff the target was asked nothing.
+    await rollback(runner, runtime, context, input, phase, messageOf(err));
+  }
+}
+
+/**
+ * Rolls a move back and ends it `failed`: the target drops its copy (best effort; before the handoff it was asked
+ * nothing), the task is live here again. The terminal outcome is committed whatever happens before it.
+ */
+async function rollback(
+  runner: TaskRunner, runtime: MoveRuntime, context: Context, input: MoveInput, phase: MoveCheckpoint["phase"], error: string,
+): Promise<void> {
+  try {
     if (phase !== "prepare") await abandonOnTarget(runner.moveDeps().pool, input.to, input.taskId);
     await runner.failMove(input.taskId, input.to, phase, error);
+  } catch (err) {
+    runner.moveDeps().log(`meddle: move: ${input.taskId}: the rollback did not finish: ${messageOf(err)}`);
+  } finally {
     await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message: error } } }), context);
   }
 }
@@ -204,13 +219,15 @@ function taskRow(runner: TaskRunner, taskId: string) {
 /**
  * Calls the target's `PeerObject` through a Ref taken for this call (a reconnect replaces the client host) and released
  * after it; waits up to `PEER_WAIT_MS` for the connection to come up. A call that has not settled after `timeoutMs`
- * (connection wait included) rejects: a hung link counts as no answer.
+ * (connection wait included; null: no limit) rejects: a hung link counts as no answer.
  */
 async function withPeer<T>(
-  pool: PoolRuntime, to: string, outer: Context, call: (peer: PeerRef) => Promise<T>, timeoutMs = CALL_MS,
+  pool: PoolRuntime, to: string, outer: Context, call: (peer: PeerRef) => Promise<T>, timeoutMs: number | null,
 ): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`${shortId(to)} did not answer within ${timeoutMs / 1000} s`)), timeoutMs);
+  const timer = timeoutMs === null
+    ? undefined
+    : setTimeout(() => controller.abort(new Error(`${shortId(to)} did not answer within ${timeoutMs / 1000} s`)), timeoutMs);
   const follow = () => controller.abort(outer.abortSignal?.reason);
   if (outer.abortSignal?.aborted) follow();
   else outer.abortSignal?.addEventListener("abort", follow, { once: true });
@@ -242,36 +259,16 @@ async function withPeer<T>(
   }
 }
 
-/** Waits `ms`; throws once the Harness closes or the move is aborted meanwhile. */
-async function pause(ms: number, runtime: MoveRuntime, context: Context): Promise<void> {
-  await new Promise<void>((resolve) => {
-    const done = () => {
-      clearTimeout(timer);
-      context.abortSignal?.removeEventListener("abort", done);
-      runtime.signal.removeEventListener("abort", done);
-      resolve();
-    };
-    const timer = setTimeout(done, ms);
-    context.abortSignal?.addEventListener("abort", done, { once: true });
-    runtime.signal.addEventListener("abort", done, { once: true });
-  });
-  if (stopping(runtime, context)) throw new Error("the move stopped");
-}
-
 /**
  * Asks the target to drop its copy of the task, best effort: `abandoned` (it had none left, or a partial one),
  * `active` (it refused: the task is live there), or `unknown` (no answer).
  */
 async function abandonOnTarget(pool: PoolRuntime, to: string, taskId: string): Promise<"abandoned" | "active" | "unknown"> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error("no answer")), ABANDON_MS);
   try {
-    await withPeer(pool, to, withAbortSignal(controller.signal, BACKGROUND_CONTEXT), (peer) => peer.abandonTask({ taskId }), ABANDON_MS);
+    await withPeer(pool, to, BACKGROUND_CONTEXT, (peer) => peer.abandonTask({ taskId }), ABANDON_MS);
     return "abandoned";
   } catch (err) {
     return isChordError(err, "forbidden") ? "active" : "unknown";
-  } finally {
-    clearTimeout(timer);
   }
 }
 

@@ -656,6 +656,111 @@ test("a target that stops answering after the receipt is asked again until it an
   }
 }, 15_000);
 
+test("a target that activated the task and moved it on since still answers ok: the source completes, never rolls back", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    let calls = 0;
+    B.hooks.beforeActivate = () => { calls += 1; };
+    const lost = Promise.withResolvers<void>();
+    B.hooks.afterActivate = async () => {
+      if (calls > 1) return;
+      // B has activated the task; its answer is lost on the way back.
+      A.net.unwatch(B.id, "bye");
+      B.net.unwatch(A.id, "bye");
+      while (A.net.isOnline(B.id) || B.net.isOnline(A.id)) await Bun.sleep(10);
+      lost.resolve();
+    };
+    await A.runner.moveTo(m.id, B.id, false);
+    await lost.promise;
+    // Meanwhile B moved the task on to a third node.
+    updateTask(B.db, m.id, { state: "moved", moved_to: "c".repeat(64) });
+    A.net.watch(B.id);
+    B.net.watch(A.id);
+    B.net.offerAddress(B.pool.store.row(A.id)!.lastAddr!);
+    A.net.offerAddress(A.pool.store.row(B.id)!.lastAddr!);
+    await moveSettled(A.harness.harness);
+    expect(calls).toBe(2);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
+    expect(A.logs.filter((l) => l.includes(" failed at "))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("receiveTask has no time limit, while an activateTask slower than the limit counts as no answer", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    A.hooks.callMs = 1000;
+    B.hooks.beforeReceive = () => Bun.sleep(3000);
+    let calls = 0;
+    B.hooks.beforeActivate = async () => {
+      calls += 1;
+      if (calls === 1) await Bun.sleep(1500);
+    };
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
+    expect(calls).toBe(2);
+    expect(A.logs.filter((l) => l.startsWith(`meddle: move: ${m.id} waits for ${shortId(B.id)} to activate it: `))).toEqual([
+      `meddle: move: ${m.id} waits for ${shortId(B.id)} to activate it: ${shortId(B.id)} did not answer within 1 s`,
+    ]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a rollback that cannot tell the task's turn state still leaves the task idle and the move ended", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    B.hooks.beforeActivate = () => { throw new Error("activation broke"); };
+    A.hooks.beforeRestore = () => { throw new Error("inspect broke"); };
+    const states = statesOf(A, m.id);
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)!.state).toBe("idle");
+    expect(states.at(-1)).toBe("idle");
+    expect(A.runner.moveState(m.id)).toBeNull();
+    expect(A.logs).toContain(`meddle: move: could not tell whether ${m.id} has a turn running: inspect broke`);
+    expect(A.logs.filter((l) => l.startsWith(`meddle: move: ${m.id} failed at commit: `))).toHaveLength(1);
+    expect(getTask(B.db, m.id)).toBeNull();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a task left moving with no move in progress is live again when its node starts, and its queued prompts run", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  let reopened: { close(): Promise<void> } | undefined;
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    updateTask(A.db, m.id, { state: "moving", queued: JSON.stringify(["after the stuck move"]) });
+    await A.harness.close();
+    const harness = await openHarness(A.cfg, createRegistry());
+    reopened = harness;
+    const runner = new TaskRunner(A.cfg, A.db, harness.harness, {
+      claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl` },
+      pool: A.pool, log: (line) => A.logs.push(line),
+    });
+    const { done } = watchTurns({ runner, db: A.db } as unknown as GitPoolNode, m.id, 1);
+    await done;
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", queued: null, turns: 1 });
+    expect(turnMarks(listEvents(A.db, m.id))).toEqual(["start", "user:after the stuck move", "result"]);
+    expect(A.logs).toContain(`meddle: move: ${m.id} was left moving with no move in progress; it is live here again`);
+  } finally {
+    await reopened?.close();
+    await close();
+  }
+}, 15_000);
+
 test("a move is refused for this node, an offline target, one that hosts no tasks, or another or unknown Claude Code version", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
