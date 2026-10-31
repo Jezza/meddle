@@ -12,7 +12,7 @@ export function claudeSlot(absPath: string): string {
 export async function ensureMemoryReplica(cfg: NodeConfig, projectId: string): Promise<string> {
   const replica = paths(cfg).memory(projectId);
   await mkdir(replica, { recursive: true });
-  if (!(await isJjRepo(replica))) await initColocated(replica);
+  if (!(await isJjRepo(replica))) await initColocated(replica, cfg);
   return replica;
 }
 
@@ -30,7 +30,7 @@ export async function importMemory(cfg: NodeConfig, projectId: string, projectPa
     }
     throw err;
   }
-  await jj(["commit", "-m", `import memory from ${slot}`, "--config", 'snapshot.max-new-file-size="50MiB"'], replica);
+  await jj(["commit", "-m", `import memory from ${slot}`, "--config", 'snapshot.max-new-file-size="50MiB"'], replica, cfg);
   return true;
 }
 

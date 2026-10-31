@@ -7,6 +7,8 @@ export function paths(cfg: NodeConfig) {
   const data = cfg.dataDir;
   const secrets = join(data, "secrets");
   const task = (taskId: string) => join(cfg.taskRoot, taskId);
+  const bin = join(data, "bin");
+  const hooks = join(data, "git-hooks");
   return {
     profile: join(data, "profile"),
     plugins: join(data, "plugins"),
@@ -22,6 +24,13 @@ export function paths(cfg: NodeConfig) {
     taskMeta: (taskId: string) => join(task(taskId), ".meddle"),
     taskConfig: (taskId: string) => join(task(taskId), ".meddle", "claude"),
     taskManifest: (taskId: string) => join(task(taskId), ".meddle", "task.json"),
+    /** Prepended to `PATH` for every jj and Claude Code meddle runs: it holds the git remote helper. */
+    bin,
+    binHelper: join(bin, "git-remote-meddle"),
+    /** `core.hooksPath` of the `receive-pack` serving a peer's push. */
+    hooks,
+    hookUpdate: join(hooks, "update"),
+    gitSocket: cfg.gitSocket ?? join(data, "git.sock"),
   };
 }
 

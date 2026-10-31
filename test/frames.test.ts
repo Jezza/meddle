@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { ALPN_POOL, MAX_FRAME, StreamReader, parseHeader, writeFrame, writeLine } from "../src/pool/frames";
 import { endpointPair } from "./pool-helpers";
+import type { RecvStream } from "@number0/iroh";
 
 test("lines and frames round-trip, EOF is null, oversize is refused", async () => {
   const pair = await endpointPair();
@@ -53,4 +54,15 @@ test("parseHeader accepts {stream} objects and refuses the rest", () => {
   for (const bad of ["not json", "", "null", "[]", '"chord"', "1", "{}", '{"stream":1}', '{"stream":null}', '["stream"]']) {
     expect(() => parseHeader(bad)).toThrow("bad stream header");
   }
+});
+
+test("readChunk hands out buffered bytes first, then each read, then null", async () => {
+  const chunks = [Array.from(new TextEncoder().encode("head\nrest")), [1, 2, 3]];
+  const recv = { read: async () => chunks.shift() ?? [] } as unknown as RecvStream;
+  const reader = new StreamReader(recv);
+  expect(await reader.readLine()).toBe("head");
+  expect(new TextDecoder().decode((await reader.readChunk())!)).toBe("rest");
+  expect(await reader.readChunk()).toEqual(Uint8Array.from([1, 2, 3]));
+  expect(await reader.readChunk()).toBeNull();
+  expect(await reader.readChunk()).toBeNull();
 });

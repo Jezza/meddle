@@ -4,6 +4,9 @@ import type { Database } from "bun:sqlite";
 import { SecretKey, type Connection, type Endpoint } from "@number0/iroh";
 import { createHost, memoryLinkPair, type Host, type Subscribable } from "@earendil-works/chord";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "../src/config";
+import { writeHelperWrapper, writeUpdateHook } from "../src/git/scripts";
+import { acceptGitStreams } from "../src/git/serve";
+import { GitSocket } from "../src/git/socket";
 import { MetricsSampler, findTaskPids } from "../src/metrics";
 import { hexOf, shortId, type Identity } from "../src/pool/identity";
 import type { LinkTap } from "../src/pool/link";
@@ -224,4 +227,51 @@ export function linkClient(host: Host): { client: Host; close(): Promise<void> }
   host.accept(down, { principal: "owner", kind: "client" });
   const client = createHost({ name: "client", self: "client", kind: "client", upstream: { link: up, principal: "node" } });
   return { client, close: () => client.close() };
+}
+
+/** A pool node of `twoPoolNodes`: `startPoolNode` serving git, its `git` refusals logged to `logs`. */
+export type GitPoolNode = Awaited<ReturnType<typeof startPoolNode>>;
+
+/**
+ * Two whole nodes (`startPoolNode`), B joined to A's pool and both online to each other, each with the git remote
+ * helper's wrapper and the update hook written, a `GitSocket` started and `acceptGitStreams` registered (logging to
+ * the node's `logs`). `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
+ */
+export async function twoPoolNodes(): Promise<{ A: GitPoolNode; B: GitPoolNode; close(): Promise<void> }> {
+  const nodes: GitPoolNode[] = [];
+  const stops: Array<() => Promise<void>> = [];
+  const close = async () => {
+    for (const stop of stops.reverse()) await stop().catch(() => {});
+    for (const n of nodes) {
+      await n.close();
+      n.db.close();
+      await rm(n.home, { recursive: true, force: true });
+    }
+  };
+  try {
+    for (let i = 0; i < 2; i++) {
+      const node = await startPoolNode();
+      nodes.push(node);
+      await writeHelperWrapper(node.cfg);
+      await writeUpdateHook(node.cfg);
+      const socket = new GitSocket(node.cfg, node.net);
+      await socket.start();
+      stops.push(() => socket.stop());
+      const stopAccepting = acceptGitStreams(node.net, {
+        db: node.db, cfg: node.cfg, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
+      });
+      stops.push(async () => stopAccepting());
+    }
+    const [A, B] = nodes as [GitPoolNode, GitPoolNode];
+    await B.pool.join(A.pool.invite());
+    const deadline = Date.now() + 10_000;
+    while (!(A.net.isOnline(B.id) && B.net.isOnline(A.id))) {
+      if (Date.now() > deadline) throw new Error(`A and B never came online to each other (A sees B: ${A.net.isOnline(B.id)}, B sees A: ${B.net.isOnline(A.id)})`);
+      await Bun.sleep(10);
+    }
+    return { A, B, close };
+  } catch (err) {
+    await close();
+    throw err;
+  }
 }

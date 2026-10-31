@@ -8,8 +8,13 @@ import { createRegistry } from "@earendil-works/pi-durable";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "./config";
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { acceptDashboardStreams } from "./dashboard/tunnel";
+import { runRemoteHelper } from "./git/helper";
+import { writeHelperWrapper, writeUpdateHook } from "./git/scripts";
+import { acceptGitStreams } from "./git/serve";
+import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
 import { loadOrCreateIdentity, shortId } from "./pool/identity";
+import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
@@ -32,7 +37,8 @@ const USAGE = `usage: meddle --version
        meddle token set [--file <path>] | meddle token status
        meddle project add <path-or-url> [--name <n>] | meddle project list
        meddle task new --title <t> --project <id>... | meddle task prompt <id> <text> | meddle task retry <id>
-       meddle service install [--dry-run]`;
+       meddle service install [--dry-run]
+       meddle git-remote <name> <url>   (git's remote helper for meddle:// remotes)`;
 
 /** A client subcommand found no node listening on the configured port. */
 class NoNode extends Error {
@@ -46,15 +52,21 @@ type OpenNode = {
   db?: Database; harness?: { close(): Promise<void> }; metrics?: MetricsSampler; pool?: PoolRuntime; host?: Host; dashboard?: Dashboard;
   /** Stops accepting dashboard streams other nodes tunnel here. */
   stopTunnels?: () => void;
+  /** Stops serving git streams other nodes open here. */
+  stopGit?: () => void;
+  /** The unix socket this node's git remote helper connects to. */
+  gitSocket?: GitSocket;
 };
 
 /**
- * Closes whatever of the node is open: the dashboard, the tunnels, the pool, metrics, the harness, the host, then the
- * database.
+ * Closes whatever of the node is open: the dashboard, the tunnels, git (the acceptor, then the socket and its file),
+ * the pool, metrics, the harness, the host, then the database.
  */
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
   node.stopTunnels?.();
+  node.stopGit?.();
+  await node.gitSocket?.stop();
   await node.pool?.stop();
   node.metrics?.stop();
   await node.harness?.close();
@@ -71,6 +83,9 @@ async function serve(): Promise<number> {
 
   const cfg = loadConfig();
   await ensureDataDirs(cfg);
+  // Before anything runs jj: git finds the helper for meddle:// remotes, and a push from a peer meets the hook.
+  await writeHelperWrapper(cfg);
+  await writeUpdateHook(cfg);
   await seedProfile(cfg);
   await ensurePlugins(cfg);
   const root = await checkTaskRoot(cfg);
@@ -93,6 +108,10 @@ async function serve(): Promise<number> {
       hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
       taskCount: () => listLiveTasks(db).length,
     }));
+    const gitSocket = (node.gitSocket = new GitSocket(cfg, pool.net));
+    await gitSocket.start();
+    const logGit = dedupe((line) => console.error(line));
+    node.stopGit = acceptGitStreams(pool.net, { db, cfg, isMember: (id) => pool.store.isMember(id), log: logGit });
     const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();
@@ -430,6 +449,29 @@ function taskNewArgs(args: string[]): { title: string; projectIds: string[] } | 
   return title === undefined || projectIds.length === 0 ? null : { title, projectIds };
 }
 
+/**
+ * git's remote helper for a `meddle://` remote, run by the `git-remote-meddle` wrapper: the protocol on stdio, piped
+ * through the git socket `MEDDLE_GIT_SOCKET` (or this node's) names.
+ */
+async function gitRemote(url: string): Promise<number> {
+  const writable = (sink: ReturnType<typeof Bun.stdout.writer>) => new WritableStream<Uint8Array>({
+    async write(chunk) {
+      sink.write(chunk);
+      await sink.flush();
+    },
+    async close() {
+      await sink.flush();
+    },
+  });
+  return runRemoteHelper({
+    url,
+    socketPath: paths(loadConfig()).gitSocket,
+    stdin: Bun.stdin.stream(),
+    stdout: writable(Bun.stdout.writer()),
+    stderr: writable(Bun.stderr.writer()),
+  });
+}
+
 /** The subcommand `args` names, or null for a usage error. */
 function dispatch(args: string[]): (() => Promise<number>) | null {
   const [command, sub, ...rest] = args;
@@ -451,6 +493,8 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   }
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
   if (command === "task" && sub === "retry" && rest.length === 1) return () => taskRetry(rest[0]!);
+  // git runs a helper as `git-remote-<scheme> <remote> [<url>]`; without a url, the remote is the url.
+  if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);
   if (command === "service" && sub === "install" && rest.length === 0) return () => serviceInstall(false);
   if (command === "service" && sub === "install" && rest.length === 1 && rest[0] === "--dry-run") return () => serviceInstall(true);
   return null;

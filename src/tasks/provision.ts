@@ -77,11 +77,11 @@ export async function provisionTask(
     const entries: TaskManifest["projects"] = [];
     for (const project of projects) {
       const workspace = join(task, project.name);
-      const parent = input.parents?.[project.id] ?? (await trunkRevset(project.replica));
+      const parent = input.parents?.[project.id] ?? (await trunkRevset(project.replica, cfg));
       added.push(project.replica);
-      await workspaceAdd(project.replica, workspaceName, workspace, parent);
+      await workspaceAdd(project.replica, workspaceName, workspace, parent, cfg);
       const bookmark = `meddle/task/${id}/${project.name}`;
-      await bookmarkSet(project.replica, bookmark, await changeId(workspace));
+      await bookmarkSet(project.replica, bookmark, await changeId(workspace, cfg), cfg);
       bookmarks.push({ replica: project.replica, name: bookmark });
       entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent });
     }
@@ -110,8 +110,8 @@ export async function provisionTask(
     });
     return manifest;
   } catch (err) {
-    for (const { replica, name } of bookmarks) await bookmarkDelete(replica, name).catch(() => {});
-    for (const replica of added) await workspaceForget(replica, workspaceName).catch(() => {});
+    for (const { replica, name } of bookmarks) await bookmarkDelete(replica, name, cfg).catch(() => {});
+    for (const replica of added) await workspaceForget(replica, workspaceName, cfg).catch(() => {});
     await rm(task, { recursive: true, force: true }).catch(() => {});
     throw err;
   }

@@ -26,7 +26,7 @@ export async function seedProfile(cfg: NodeConfig): Promise<void> {
   if (await isJjRepo(profile)) return;
   const staging = `${profile}.seeding`;
   await rm(staging, { recursive: true, force: true });
-  await initColocated(staging);
+  await initColocated(staging, cfg);
   for (const entry of PROFILE_ENTRIES) {
     const src = join(cfg.claudeHome, entry);
     const dst = join(staging, entry);
@@ -36,6 +36,7 @@ export async function seedProfile(cfg: NodeConfig): Promise<void> {
   await jj(
     ["commit", "-m", `seed profile from ${cfg.claudeHome}`, "--config", 'snapshot.max-new-file-size="50MiB"'],
     staging,
+    cfg,
   );
   if (await exists(profile)) await rmdir(profile);
   await rename(staging, profile);

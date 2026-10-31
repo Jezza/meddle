@@ -8,6 +8,7 @@ import type {
   SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { NodeConfig } from "../config";
+import { jjEnv } from "../jj";
 import { paths } from "../paths";
 import { composeEnv, composeSettings, type Context } from "../projects/context";
 import type { TaskManifest } from "../tasks/manifest";
@@ -37,12 +38,15 @@ export type EngineInput = {
 
 function buildEnv(i: EngineInput): Record<string, string> {
   const env: Record<string, string> = {};
+  // PATH with `<data>/bin` first: jj and git inside a task find the remote helper for meddle:// remotes.
+  const meddle = jjEnv(i.cfg);
   for (const name of ["PATH", "HOME", ...i.cfg.envPassthrough]) {
-    const value = process.env[name];
+    const value = meddle[name];
     if (value !== undefined) env[name] = value;
   }
   return {
     ...env,
+    MEDDLE_GIT_SOCKET: meddle.MEDDLE_GIT_SOCKET!,
     CLAUDE_CONFIG_DIR: paths(i.cfg).taskConfig(i.manifest.id),
     CLAUDE_CODE_PROJECT_DIR_NAME: i.manifest.primaryProjectId,
     CLAUDE_CODE_OAUTH_TOKEN: i.token,

@@ -270,7 +270,7 @@ export class TaskRunner {
       const manifest = await readManifest(this.#cfg, taskId);
       for (const p of manifest.projects) {
         const workspace = join(paths(this.#cfg).task(taskId), p.workspace);
-        await bookmarkSet(p.replica, `meddle/task/${taskId}/${p.name}`, await changeId(workspace));
+        await bookmarkSet(p.replica, `meddle/task/${taskId}/${p.name}`, await changeId(workspace, this.#cfg), this.#cfg);
       }
     } catch (err) {
       this.#failTurn(taskId, context);

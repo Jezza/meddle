@@ -16,6 +16,8 @@ export type NodeConfig = {
   /** The iroh endpoint's bind address; null (unset or empty) for iroh's default. */
   irohBind: string | null;
   discoveryPollMs: number;
+  /** The unix socket the git remote helper reaches this node at; null (unset or empty) for `<data>/git.sock`. */
+  gitSocket: string | null;
 };
 
 export const DEFAULT_ENV_PASSTHROUGH = [
@@ -62,5 +64,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // Empty is unset, as for the lighthouse: iroh's default bind address.
     irohBind: env.MEDDLE_IROH_BIND === undefined || env.MEDDLE_IROH_BIND === "" ? null : env.MEDDLE_IROH_BIND,
     discoveryPollMs: parseDiscoveryPollMs(env.MEDDLE_DISCOVERY_POLL_MS),
+    gitSocket: env.MEDDLE_GIT_SOCKET === undefined || env.MEDDLE_GIT_SOCKET === "" ? null : resolve(env.MEDDLE_GIT_SOCKET),
   };
 }

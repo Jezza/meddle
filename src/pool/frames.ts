@@ -71,6 +71,15 @@ export class StreamReader {
     return data === null ? null : { kind: head[0]!, data };
   }
 
+  /**
+   * The bytes held after a line or frame read, if any; otherwise the stream's next read. Null at end of stream. Raw
+   * byte streams (git's pack protocol) read with this after their header line.
+   */
+  async readChunk(): Promise<Uint8Array | null> {
+    if (this.end === this.start && !(await this.fill())) return null;
+    return this.take(this.end - this.start);
+  }
+
   private take(n: number): Uint8Array {
     const out = this.buf.slice(this.start, this.start + n);
     this.start += n;

@@ -70,7 +70,7 @@ export async function addProjectFromFolder(cfg: NodeConfig, db: Database, folder
   const path = resolve(folder);
   if (!(await isDirectory(path))) throw new Error(`not a directory: ${folder}`);
   const id = newId();
-  if (!(await isJjRepo(path))) await initColocated(path);
+  if (!(await isJjRepo(path))) await initColocated(path, cfg);
   await ensureMemoryReplica(cfg, id);
   await importMemory(cfg, id, path);
   return save(db, { id, name: name ?? basename(path), source: { kind: "folder", path }, replica: path, home });
@@ -85,7 +85,7 @@ function upstreamName(url: string): string {
 export async function addProjectFromUpstream(cfg: NodeConfig, db: Database, url: string, home: string, name?: string): Promise<Project> {
   const id = newId();
   const replica = paths(cfg).replica(id);
-  await cloneColocated(url, replica);
+  await cloneColocated(url, replica, cfg);
   await ensureMemoryReplica(cfg, id);
   return save(db, { id, name: name ?? upstreamName(url), source: { kind: "upstream", url }, replica, home });
 }
