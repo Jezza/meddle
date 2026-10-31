@@ -219,7 +219,9 @@ export class Discovery {
       this.joinedNow = true;
       this.delay = this.backoff.initialMs;
       this.publish(granted.peers);
-      nextMs = Math.max(MIN_REANNOUNCE_MS, (granted.ttlSecs * 1000) / 2);
+      // A lighthouse that grants no usable TTL is re-announced to as if it granted the one asked for, never in a loop.
+      const ttlSecs = typeof granted.ttlSecs === "number" && Number.isFinite(granted.ttlSecs) ? granted.ttlSecs : ANNOUNCE_TTL_SECS;
+      nextMs = Math.max(MIN_REANNOUNCE_MS, (ttlSecs * 1000) / 2);
     } catch (err) {
       if (gen !== this.generation) return;
       this.joinedNow = false;

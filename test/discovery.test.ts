@@ -117,3 +117,30 @@ test("an unreachable lighthouse does not stop the node and is retried; a hanging
     for (const l of lighthouses) l.stop();
   }
 });
+
+test("a lighthouse that grants a malformed ttl is not re-announced to in a loop", async () => {
+  const pair = await endpointPair();
+  const lighthouses = [await startFakeLighthouse({ grantedTtl: "zzz" }), await startFakeLighthouse({ grantedTtl: undefined })];
+  const discoveries: Discovery[] = [];
+  try {
+    for (const [i, lighthouse] of lighthouses.entries()) {
+      const node = i === 0 ? pair.a : pair.b;
+      const d = new Discovery({
+        endpoint: node.endpoint, identity: node.identity, pool: POOL,
+        lighthouseUrl: () => lighthouse.url,
+        pollMs: 60_000,
+        onPeers: () => {},
+        backoff: { initialMs: 50, maxMs: 100 },
+      });
+      discoveries.push(d);
+      d.start();
+    }
+    await until(() => discoveries.every((d) => d.joined));
+    await Bun.sleep(500);
+    expect(lighthouses.map((l) => l.announces())).toEqual([1, 1]);
+  } finally {
+    await Promise.all(discoveries.map((d) => d.stop()));
+    await pair.close();
+    for (const l of lighthouses) l.stop();
+  }
+});

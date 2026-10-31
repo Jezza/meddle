@@ -11,14 +11,17 @@ export type FakeLighthouse = {
   stop(): void;
   /** Every topic id seen, each with its unexpired registrations by node id. */
   topics(): Map<string, Map<string, Peer>>;
+  /** How many announces it has answered. */
+  announces(): number;
 };
 
 /**
  * `Bun.serve` on 127.0.0.1:0 speaking the lighthouse's HTTP routes without checking signatures. With `hang: true`,
- * every request is accepted and never answered.
+ * every request is accepted and never answered; with `grantedTtl`, every announce reply carries it as `ttl_secs`.
  */
-export async function startFakeLighthouse(options: { hang?: boolean } = {}): Promise<FakeLighthouse> {
+export async function startFakeLighthouse(options: { hang?: boolean; grantedTtl?: unknown } = {}): Promise<FakeLighthouse> {
   const registry = new Map<string, Map<string, Entry>>();
+  let announces = 0;
 
   const live = (topic: string): Map<string, Entry> => {
     let entries = registry.get(topic);
@@ -47,7 +50,8 @@ export async function startFakeLighthouse(options: { hang?: boolean } = {}): Pro
         if (ttl === 0) entries.delete(body.addr.id);
         else entries.set(body.addr.id, { addr: body.addr, expiresAt: Date.now() + ttl * 1000 });
         const peers = [...entries.values()].filter((e) => e.addr.id !== body.addr.id).map(asPeer);
-        return Response.json({ type: "announced", ttl_secs: ttl, peers });
+        announces++;
+        return Response.json({ type: "announced", ttl_secs: "grantedTtl" in options ? options.grantedTtl : ttl, peers });
       }
       if (req.method === "POST" && path === "/v1/lookup") {
         const body = decodePayload<LookupBody>(((await req.json()) as { payload: string }).payload);
@@ -67,6 +71,7 @@ export async function startFakeLighthouse(options: { hang?: boolean } = {}): Pro
   return {
     url: `http://127.0.0.1:${server.port}`,
     stop: () => void server.stop(true),
+    announces: () => announces,
     topics() {
       const out = new Map<string, Map<string, Peer>>();
       for (const topic of registry.keys()) out.set(topic, new Map([...live(topic)].map(([id, e]) => [id, asPeer(e)])));
