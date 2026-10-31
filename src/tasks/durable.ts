@@ -12,7 +12,7 @@ import { promptEvent, runTurn, type MeddleEvent } from "../engine/session";
 import { bookmarkSet, changeId } from "../jj";
 import { paths } from "../paths";
 import { loadContext, loadProjectSettings } from "../projects/context";
-import { appendEvent } from "../store/events";
+import { appendEvent, latestEventOfType, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import { getTask, getTaskSettings, updateTask, updateTaskSettings, type TaskRow, type TaskSettings } from "../store/records";
 import { getToken } from "../token";
@@ -22,8 +22,7 @@ import { provisionTask } from "./provision";
 export type TaskState = "idle" | "running" | "waiting" | "archived";
 
 type TurnInput = { taskId: string; prompt: string };
-/** `attempt` counts the run phase's starts: 1 for the first, more for a rerun after the turn was cut off. */
-type TurnCheckpoint = { phase: "run"; attempt: number } | { phase: "finish" };
+type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
 /** Installed by `openHarness`: how a phase finds the Harness it runs in. */
 type MeddleHooks = { harness(): Harness };
 type TurnRuntime = TaskRuntime<TurnInput, TurnCheckpoint, null, MeddleHooks>;
@@ -61,20 +60,14 @@ export const CARRY_ON_PROMPT =
  */
 export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHooks>({
   name: "meddle.turn",
-  version: 2,
-  initial: () => ({ phase: "run", attempt: 0 }),
-  // Version 1 had no attempt count: a v1 turn still in `run` is treated as not yet started.
-  migrate: (input, checkpoint) => ({
-    input: input as TurnInput,
-    checkpoint: (checkpoint as { phase: string }).phase === "run" ? { phase: "run", attempt: 0 } : { phase: "finish" },
-  }),
+  version: 1,
+  initial: () => ({ phase: "run" }),
   phases: {
+    // Commits nothing before the turn ends: a commit would be progress to pi-durable and start its restart count
+    // over, so a turn that kept crashing the process would never park. Whether this is a rerun comes from the log.
     run: async (task, runtime, context) => {
-      // Counted before anything else, so a rerun knows an earlier attempt was cut off.
-      const attempt = task.state.checkpoint.attempt + 1;
-      await runtime.commit(() => ({ status: "running", checkpoint: { phase: "run", attempt } }), context);
       const runner = await runnerFor(runtime, context);
-      await runner.runTurnPhase(task.input, attempt, context);
+      await runner.runTurnPhase(task.input, context);
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "finish" } }), context);
     },
     finish: async (task, runtime, context) => {
@@ -228,13 +221,14 @@ export class TaskRunner {
   }
 
   /**
-   * The `run` phase of `meddle.turn`: drives the turn to its end. `attempt` counts this phase's starts; a later
-   * attempt that resumes the session sends `CARRY_ON_PROMPT` instead of the prompt. Not for callers outside this module.
+   * The `run` phase of `meddle.turn`: drives the turn to its end. A rerun of a cut-off turn that resumes the
+   * session sends `CARRY_ON_PROMPT` instead of the prompt. Not for callers outside this module.
    */
-  async runTurnPhase(input: TurnInput, attempt: number, context: Context): Promise<void> {
+  async runTurnPhase(input: TurnInput, context: Context): Promise<void> {
     const { taskId } = input;
     let failureLogged = false; // the turn's own turn_failed is in the log
     try {
+      const rerun = lastTurnCutOff(this.#db, taskId);
       const started = this.#row(taskId).started === 1;
       this.#db.transaction(() => updateTask(this.#db, taskId, { started: 1, state: "running" }))();
       this.#pending.delete(taskId);
@@ -246,7 +240,7 @@ export class TaskRunner {
       const { query, done } = runTurn({
         input: await this.#engineInput(taskId, manifest, resume),
         // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
-        prompt: attempt > 1 && resume ? CARRY_ON_PROMPT : input.prompt,
+        prompt: rerun && resume ? CARRY_ON_PROMPT : input.prompt,
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -396,6 +390,23 @@ function notify<T>(listeners: Set<T>, call: (cb: T) => void): void {
       console.error("meddle: a task listener threw:", err);
     }
   }
+}
+
+/**
+ * Whether the task's last turn was cut off, so this run is its rerun: of the events that start or end a turn, the
+ * newest is a `turn_started` (the process died mid-turn) or a `turn_aborted` (a close interrupted it). A `result` or
+ * `turn_failed`, or none, means a first attempt. A process that dies between a turn's `result` and the commit of its
+ * `finish` checkpoint (milliseconds) has its rerun send the prompt again: the one replay this accepts.
+ */
+function lastTurnCutOff(db: Database, taskId: string): boolean {
+  const latest = [
+    latestEventOfType(db, taskId, "meddle", "turn_started"),
+    latestEventOfType(db, taskId, "meddle", "turn_aborted"),
+    latestEventOfType(db, taskId, "meddle", "turn_failed"),
+    latestEventOfType(db, taskId, "result"),
+  ].reduce<EventRecord | null>((a, b) => (b !== null && (a === null || b.seq > a.seq) ? b : a), null);
+  const subtype = (latest?.message as { subtype?: unknown } | undefined)?.subtype;
+  return latest !== null && (latest.message as { type?: unknown }).type === "meddle" && (subtype === "turn_started" || subtype === "turn_aborted");
 }
 
 function isParked(turn: TaskInspection): boolean {

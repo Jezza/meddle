@@ -36,6 +36,9 @@ test("a prompt runs a durable turn and leaves the task idle", async () => {
   await runner.prompt(m.id, "Again.");
   await second; await secondIdle;
   expect(listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started").map(e => (e.message as any).resume)).toEqual([false, true]);
+  // the first turn ended with its result, so the new turn is no rerun: it sends its own prompt
+  const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  expect(prompts).toEqual(["Reply with the single word ok.", "Again."]);
   await h.close();
 });
 test("a turn interrupted by a process death resumes after reopen", async () => {
@@ -76,7 +79,7 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   // 3. one fresh start, one resume, and the task is idle again
   expect(turnsStarted()).toEqual([false, true]);
   expect(again.runner.state(m.id)).toBe("idle");
-  // the rerun told Claude to carry on rather than sending the prompt again
+  // the close logged turn_aborted, so the rerun told Claude to carry on rather than sending the prompt again
   const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
   expect(prompts).toEqual(["Reply with the single word ok.", "Also say why.", CARRY_ON_PROMPT]);
   await again.h.close();
@@ -275,4 +278,23 @@ test("a task's model, effort and permission mode outlive the runner and start it
   await again.runner.setModel(m.id);
   expect(again.runner.settings(m.id)).toEqual({ effort: "low", permissionMode: "plan" });
   await again.h.close();
+});
+test("a turn cut off by a hard kill, with no end in the log, carries on in the resumed session", async () => {
+  const { writeFile } = await import("node:fs/promises");
+  const { dirname } = await import("node:path");
+  const { transcriptPath } = await import("../src/tasks/manifest");
+  const { cfg, db, h, runner, m, turnsStarted, settled } = await setup();
+  // the killed process had started the turn and Claude Code had written the transcript; nothing ended the turn
+  updateTask(db, m.id, { started: 1, state: "running" });
+  appendEvent(db, m.id, { type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: false });
+  appendEvent(db, m.id, { type: "user", message: { role: "user", content: "Reply with the single word ok." }, parent_tool_use_id: null });
+  await mkdir(dirname(transcriptPath(cfg, m)), { recursive: true });
+  await writeFile(transcriptPath(cfg, m), "{}\n");
+  const done = settled(runner);
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await done;
+  expect(turnsStarted()).toEqual([false, true]);
+  const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  expect(prompts).toEqual(["Reply with the single word ok.", CARRY_ON_PROMPT]);
+  await h.close();
 });
