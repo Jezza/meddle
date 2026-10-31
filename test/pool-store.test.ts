@@ -76,11 +76,13 @@ test("replacePool swaps the identity and the roster wholesale", () => {
   const store = new PoolStore(openDb(":memory:"));
   store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
   store.upsert(row(C, "member", t1));
+  const stale = store.createInvite();
   store.replacePool({ poolId: "p2", poolSecret: "s2", createdAt: t2 }, [row(A, "member", t2), row(B, "member", t2)]);
   expect(store.pool()).toEqual({ poolId: "p2", poolSecret: "s2", createdAt: t2 });
   expect(store.pool().poolId).toBe("p2");
   expect(store.roster()).toHaveLength(2);
   expect(store.row(C)).toBeNull();
+  expect(store.consumeInvite(stale.code)).toBe(false);
 });
 
 test("invites are single use and expire after 24 hours", () => {

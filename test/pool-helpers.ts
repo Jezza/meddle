@@ -19,7 +19,8 @@ function freshIdentity(): Identity {
   return { id: hexOf(key.public()), secret: Uint8Array.from(key.toBytes()) };
 }
 
-async function node(): Promise<TestNode> {
+/** One endpoint with presetMinimal on 127.0.0.1:0 and a fresh identity. */
+export async function testNode(): Promise<TestNode> {
   const identity = freshIdentity();
   return { endpoint: await openEndpoint({ irohPreset: "minimal", irohBind: "127.0.0.1:0" }, identity), identity };
 }
@@ -33,8 +34,8 @@ export async function endpointPair(): Promise<{
   connect(alpn: number[]): Promise<{ a: Connection; b: Connection }>;
   close(): Promise<void>;
 }> {
-  const a = await node();
-  const b = await node();
+  const a = await testNode();
+  const b = await testNode();
   return {
     a, b,
     async connect(alpn) {
