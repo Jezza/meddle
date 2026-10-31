@@ -196,18 +196,18 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
 }
 
 /**
- * A whole node (see `setupNode`) with its pool runtime started and its chord host (`createNodeHost`) serving it; the
- * metrics sampler is not started; what the runtime logs is collected in `logs`. `close()` stops the pool, the host and
- * the harness.
+ * A whole node (see `setupNode`, `extraEnv` added to its environment) with its pool runtime started and its chord
+ * host (`createNodeHost`, which gives the runner the pool) serving it; the metrics sampler is not started; what the
+ * runtime and the runner log is collected in `logs`. `close()` stops the pool, the host and the harness.
  */
-export async function startPoolNode(fixture?: string) {
-  const node = await setupNode(fixture, POOL_ENV);
+export async function startPoolNode(fixture?: string, extraEnv: Record<string, string> = {}) {
+  /** The lines the runtime and the runner logged (instead of printing them). */
+  const logs: string[] = [];
+  const node = await setupNode(fixture, { ...POOL_ENV, ...extraEnv }, { log: (line) => logs.push(line) });
   const { cfg, db, runner } = node;
   const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 60_000, dataDir: cfg.dataDir });
   /** Everything the runtime's net and sync reported. */
   const errors: unknown[] = [];
-  /** The lines the runtime logged (instead of printing them). */
-  const logs: string[] = [];
   const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { onError: (err) => errors.push(err), log: (line) => logs.push(line) });
   const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool });
   return {
@@ -234,11 +234,11 @@ export function linkClient(host: Host): { client: Host; close(): Promise<void> }
 export type GitPoolNode = Awaited<ReturnType<typeof startPoolNode>>;
 
 /**
- * Two whole nodes (`startPoolNode`), B joined to A's pool and both online to each other, each with the git remote
- * helper's wrapper and the update hook written, a `GitSocket` started and `acceptGitStreams` registered (logging to
- * the node's `logs`). `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
+ * Two whole nodes (`startPoolNode`, with `extraEnv`), B joined to A's pool and both online to each other, each with the
+ * git remote helper's wrapper and the update hook written, a `GitSocket` started and `acceptGitStreams` registered
+ * (logging to the node's `logs`). `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
  */
-export async function twoPoolNodes(): Promise<{ A: GitPoolNode; B: GitPoolNode; close(): Promise<void> }> {
+export async function twoPoolNodes(options: { extraEnv?: Record<string, string> } = {}): Promise<{ A: GitPoolNode; B: GitPoolNode; close(): Promise<void> }> {
   const nodes: GitPoolNode[] = [];
   const stops: Array<() => Promise<void>> = [];
   const close = async () => {
@@ -251,7 +251,7 @@ export async function twoPoolNodes(): Promise<{ A: GitPoolNode; B: GitPoolNode; 
   };
   try {
     for (let i = 0; i < 2; i++) {
-      const node = await startPoolNode();
+      const node = await startPoolNode(undefined, options.extraEnv);
       nodes.push(node);
       await writeHelperWrapper(node.cfg);
       await writeUpdateHook(node.cfg);

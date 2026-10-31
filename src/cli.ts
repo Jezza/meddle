@@ -94,14 +94,7 @@ async function serve(): Promise<number> {
   const node: OpenNode = {};
   try {
     const db = (node.db = openDb(paths(cfg).db));
-    const harness = (node.harness = await openHarness(cfg, createRegistry()));
-    const runner = new TaskRunner(cfg, db, harness.harness, runnerDeps());
-    const metrics = (node.metrics = new MetricsSampler({
-      taskPids: () => findTaskPids(cfg.taskRoot),
-      intervalMs: 5000,
-      dataDir: cfg.dataDir,
-    }));
-    metrics.start();
+    // The pool and git first: the Harness reruns unfinished turns as it opens, and their turn ends push to homes.
     const pool = (node.pool = await startPool(cfg, db, {
       version: VERSION,
       claudeCodeVersion: claudeCodeVersion(),
@@ -112,6 +105,14 @@ async function serve(): Promise<number> {
     await gitSocket.start();
     const logGit = dedupe((line) => console.error(line));
     node.stopGit = acceptGitStreams(pool.net, { db, cfg, selfId: pool.identity.id, isMember: (id) => pool.store.isMember(id), log: logGit });
+    const harness = (node.harness = await openHarness(cfg, createRegistry()));
+    const runner = new TaskRunner(cfg, db, harness.harness, { ...runnerDeps(), pool });
+    const metrics = (node.metrics = new MetricsSampler({
+      taskPids: () => findTaskPids(cfg.taskRoot),
+      intervalMs: 5000,
+      dataDir: cfg.dataDir,
+    }));
+    metrics.start();
     const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();

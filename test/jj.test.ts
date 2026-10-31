@@ -1,13 +1,13 @@
 // test/jj.test.ts
 import { test, expect } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
-import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkSet, trunkRevset } from "../src/jj";
+import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkSet } from "../src/jj";
 test("init, workspace add, change id, bookmark, forget", async () => {
   const repo = await mkdtemp("/tmp/meddle-jj-");
   await initColocated(repo);
   expect(await isJjRepo(repo)).toBe(true);
   const ws = `${repo}-ws`;
-  await workspaceAdd(repo, "task1", ws, await trunkRevset(repo));
+  await workspaceAdd(repo, "task1", ws, "root()");
   const id = await changeId(ws);
   expect(id).toMatch(/^[k-z]{32}$/);
   expect(await Bun.file(`${ws}/.git`).exists()).toBe(true); // colocated: a Git worktree file

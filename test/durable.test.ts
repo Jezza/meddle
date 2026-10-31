@@ -1,7 +1,7 @@
 // test/durable.test.ts
 import { test, expect, spyOn } from "bun:test";
 import { mkdtemp, mkdir } from "node:fs/promises";
-import { loadConfig, ensureDataDirs, paths } from "../src/config";
+import { loadConfig, ensureDataDirs, paths, type NodeConfig } from "../src/config";
 import { openDb } from "../src/store/db";
 import { addProjectFromFolder } from "../src/projects/project";
 import { initColocated } from "../src/jj";
@@ -9,6 +9,12 @@ import { openHarness } from "../src/tasks/harness";
 import { CARRY_ON_PROMPT, TaskRunner } from "../src/tasks/durable";
 import { appendEvent, listEvents } from "../src/store/events";
 import { getTask, updateTask } from "../src/store/records";
+import { join } from "node:path";
+import { writeFile } from "node:fs/promises";
+import { bookmarkList, jj } from "../src/jj";
+import { shortId } from "../src/pool/identity";
+import { setupNode } from "./helpers";
+import { peerReady, twoPoolNodes } from "./pool-helpers";
 
 /** The home node id of the projects these tests add. */
 const PROJECT_HOME = "a".repeat(64);
@@ -301,3 +307,81 @@ test("a turn cut off by a hard kill, with no end in the log, carries on in the r
   expect(prompts).toEqual(["Reply with the single word ok.", CARRY_ON_PROMPT]);
   await h.close();
 });
+
+// ─── turns across the mesh ───
+
+async function changeOf(cfg: NodeConfig, repo: string, rev: string): Promise<string> {
+  return (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], repo, cfg)).trim();
+}
+
+/** Resolves with the next `result` of `taskId` and once the task is idle after it. */
+function turnEnd(runner: TaskRunner, taskId: string): { result: Promise<any>; idle: Promise<void> } {
+  const result = new Promise<any>((res) => runner.onEvent((tid, _s, msg: any) => { if (tid === taskId && msg.type === "result") res(msg); }));
+  const idle = new Promise<void>((res) => runner.onState((tid, s) => { if (tid === taskId && s === "idle") res(); }));
+  return { result, idle };
+}
+
+async function eventually(cond: () => boolean, what: () => string, ms = 10_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`timed out waiting: ${what()}`);
+    await Bun.sleep(10);
+  }
+}
+
+test("without a pool, a task of a folder project starts from its main bookmark, not root", async () => {
+  const { cfg, project, runner, harness } = await setupNode();
+  try {
+    await writeFile(`${project.replica}/README`, "hello\n");
+    await jj(["commit", "-m", "init"], project.replica, cfg);
+    await jj(["bookmark", "set", "main", "-r", "@-"], project.replica, cfg);
+    const main = await changeOf(cfg, project.replica, "main");
+    const m = await runner.create({ title: "t", projectIds: [project.id] });
+    expect(await changeOf(cfg, join(paths(cfg).task(m.id), "a"), "@-")).toBe(main);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("a turn-end push to an unreachable home is logged once and the turn completes; the next turn end pushes", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    await peerReady(B, A);
+    const short = shortId(A.id);
+    const m = await B.runner.create({ title: "t", projectIds: [A.project.id] });
+    const bookmark = `meddle/task/${m.id}/a`;
+    const workspace = join(paths(B.cfg).task(m.id), "a");
+    const onA = async () => (await bookmarkList(A.project.replica, A.cfg)).find((b) => b.name === bookmark && b.remote === null)?.changeId;
+    const pushLines = () => B.logs.filter((l) => l.startsWith("meddle: git: push "));
+
+    // The home goes away.
+    A.net.unwatch(B.id, "bye");
+    B.net.unwatch(A.id, "bye");
+    await eventually(() => !B.net.isOnline(A.id) && !A.net.isOnline(B.id), () => `B sees A: ${B.net.isOnline(A.id)}, A sees B: ${A.net.isOnline(B.id)}`);
+    const first = turnEnd(B.runner, m.id);
+    await B.runner.prompt(m.id, "Reply with the single word ok.");
+    expect((await first.result).subtype).toBe("success");
+    await first.idle;
+    expect(B.runner.state(m.id)).toBe("idle");
+    expect(pushLines()).toEqual([`meddle: git: push of ${bookmark} to ${short} failed: home ${short} is offline`]);
+    expect(await onA()).toBeUndefined();
+
+    // The home comes back; the task has moved on to a new change.
+    A.net.watch(B.id);
+    B.net.watch(A.id);
+    B.net.offerAddress(B.pool.store.row(A.id)!.lastAddr!);
+    A.net.offerAddress(A.pool.store.row(B.id)!.lastAddr!);
+    await eventually(() => B.net.isOnline(A.id), () => `B sees A: ${B.net.isOnline(A.id)}`);
+    await writeFile(`${workspace}/work`, "work\n");
+    await jj(["commit", "-m", "work"], workspace, B.cfg);
+    const change = await changeOf(B.cfg, workspace, "@");
+    const second = turnEnd(B.runner, m.id);
+    await B.runner.prompt(m.id, "Again.");
+    expect((await second.result).subtype).toBe("success");
+    await second.idle;
+    expect(await onA()).toBe(change);
+    expect(pushLines()).toHaveLength(1);
+  } finally {
+    await close();
+  }
+}, 15_000);

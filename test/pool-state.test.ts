@@ -15,7 +15,13 @@ import { getToken, setToken } from "../src/token";
 import { VERSION } from "../src/version";
 import { initColocated } from "../src/jj";
 import { addProjectFromFolder } from "../src/projects/project";
-import { linkClient, poolSummaryOf, startPoolNode, testNode } from "./pool-helpers";
+import { linkClient, peerReady, poolSummaryOf, startPoolNode, testNode, twoPoolNodes } from "./pool-helpers";
+import { join as joinPath } from "node:path";
+import { readFile, writeFile } from "node:fs/promises";
+import { paths } from "../src/config";
+import { bookmarkList, jj } from "../src/jj";
+import { getProject } from "../src/projects/project";
+import { syncMemoryBefore } from "../src/projects/memory-sync";
 
 type Node = Awaited<ReturnType<typeof startPoolNode>>;
 
@@ -442,5 +448,46 @@ test("peerRef rejects for a node this node is not connected to", async () => {
     await expect(B.pool.peerRef(other, PeerObject)).rejects.toThrow(`not connected to ${shortId(other)}`);
   } finally {
     await B.close();
+  }
+}, 15_000);
+
+test("a task created for a project a node has never seen clones it from home, starts at the home's trunk, and its turn reaches the home", async () => {
+  const { A, B, close } = await twoPoolNodes({ extraEnv: { MEDDLE_FIXTURE_MEMORY: "1" } });
+  const linked = linkClient(B.host);
+  try {
+    const id = A.project.id;
+    const repoA = A.project.replica;
+    const changeOf = async (cfg: typeof A.cfg, repo: string, rev: string) =>
+      (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], repo, cfg)).trim();
+    await writeFile(`${repoA}/README`, "hello\n");
+    await jj(["commit", "-m", "init"], repoA, A.cfg);
+    await jj(["bookmark", "set", "main", "-r", "@-"], repoA, A.cfg);
+    const main = await changeOf(A.cfg, repoA, "main");
+    await peerReady(B, A);
+    expect(getProject(B.db, id)).toBeNull();
+
+    const nodeB = await linked.client.get(NodeObject, {});
+    const manifest = await nodeB.createTask({ title: "t", projectIds: [id] });
+    expect(getProject(B.db, id)?.home).toBe(A.id);
+    const workspace = joinPath(paths(B.cfg).task(manifest.id), "a");
+    expect(await changeOf(B.cfg, workspace, "@-")).toBe(main);
+
+    const result = new Promise<any>((res) => B.runner.onEvent((tid, _s, msg: any) => { if (tid === manifest.id && msg.type === "result") res(msg); }));
+    const idle = new Promise<void>((res) => B.runner.onState((tid, s) => { if (tid === manifest.id && s === "idle") res(); }));
+    await B.runner.prompt(manifest.id, "remember this from b");
+    expect((await result).subtype).toBe("success");
+    await idle;
+    const change = await changeOf(B.cfg, workspace, "@");
+    const onA = (await bookmarkList(repoA, A.cfg)).find((b) => b.name === `meddle/task/${manifest.id}/a` && b.remote === null);
+    expect(onA?.changeId).toBe(change);
+    expect(B.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+
+    // A's next sync before a turn brings B's memory line into A's working copy.
+    await syncMemoryBefore({ cfg: A.cfg, db: A.db, pool: A.pool }, id, false, (line) => A.logs.push(line));
+    expect(await readFile(`${paths(A.cfg).memory(id)}/MEMORY.md`, "utf8")).toContain("remember this from b");
+    expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+  } finally {
+    await linked.close();
+    await close();
   }
 }, 15_000);

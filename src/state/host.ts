@@ -90,11 +90,13 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
 
 /**
  * A host named `node` serving `NodeObject`, `ProjectObject`, `TaskObject`, `SessionObject`, `PoolObject` and
- * `PeerObject`. Projects from before projects had a home get this node as theirs.
+ * `PeerObject`. Projects from before projects had a home get this node as theirs. The runner is given the pool (a
+ * no-op when it was built with it), so tasks created here replicate projects homed elsewhere.
  */
 export function createNodeHost(deps: NodeHostDeps): Host {
   const { cfg, db, runner, metrics, pool } = deps;
   claimHomelessProjects(db, pool.identity.id);
+  runner.attachPool(pool);
   const approvals = runner.approvals;
   const events: Subscribable<TaskEvent> = {
     subscribe: (cb) => runner.onEvent((taskId, seq, message) => cb({ taskId, seq, message })),

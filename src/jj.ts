@@ -85,11 +85,6 @@ export async function changeId(workspace: string, cfg?: NodeConfig): Promise<str
   return (await jj(["log", "-r", "@", "--no-graph", "-T", "change_id"], workspace, cfg)).trim();
 }
 
-export async function trunkRevset(repo: string, cfg?: NodeConfig): Promise<string> {
-  const out = await jj(["log", "-r", "trunk()", "--no-graph", "-T", "change_id"], repo, cfg);
-  return out.trim() ? "trunk()" : "root()";
-}
-
 export async function remoteAdd(repo: string, name: string, url: string, cfg?: NodeConfig): Promise<void> {
   await jj(["git", "remote", "add", name, url], repo, cfg);
 }
@@ -109,7 +104,8 @@ export async function fetch(repo: string, remote: string, bookmarks: string[], c
 }
 
 export async function push(repo: string, remote: string, bookmark: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["git", "push", "--remote", remote, "--bookmark", `exact:${bookmark}`], repo, cfg);
+  // A task bookmark points at its workspace's working copy, which is usually not described yet.
+  await jj(["git", "push", "--remote", remote, "--bookmark", `exact:${bookmark}`, "--allow-empty-description"], repo, cfg);
 }
 
 /** Tracks `bookmark@remote` (idempotent), so that a push may create or move it there. */

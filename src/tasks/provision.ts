@@ -3,10 +3,11 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { checkTaskRoot, ensurePrivateDir, paths } from "../paths";
-import { bookmarkDelete, bookmarkSet, changeId, trunkRevset, workspaceAdd, workspaceForget } from "../jj";
+import { bookmarkDelete, bookmarkSet, changeId, workspaceAdd, workspaceForget } from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
 import { ensureMemoryReplica, linkMemory } from "../memory";
 import { getProject, type Project } from "../projects/project";
+import { refreshTrunk } from "../projects/replicas";
 import { insertTask, newId } from "../store/records";
 import { writeManifest, type TaskManifest } from "./manifest";
 
@@ -77,7 +78,8 @@ export async function provisionTask(
     const entries: TaskManifest["projects"] = [];
     for (const project of projects) {
       const workspace = join(task, project.name);
-      const parent = input.parents?.[project.id] ?? (await trunkRevset(project.replica, cfg));
+      // The caller (a runner with a pool) passes the home's trunk; on its own, the project's trunk here (decision 5).
+      const parent = input.parents?.[project.id] ?? (await refreshTrunk(cfg, project.replica)) ?? "root()";
       added.push(project.replica);
       await workspaceAdd(project.replica, workspaceName, workspace, parent, cfg);
       const bookmark = `meddle/task/${id}/${project.name}`;

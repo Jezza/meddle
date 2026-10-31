@@ -11,7 +11,13 @@ import type { EngineInput } from "../engine/options";
 import { promptEvent, runTurn, type MeddleEvent } from "../engine/session";
 import { bookmarkSet, changeId } from "../jj";
 import { paths } from "../paths";
+import { shortId } from "../pool/ids";
+import { dedupe } from "../pool/report";
+import type { PoolRuntime } from "../pool/runtime";
 import { loadContext, loadProjectSettings } from "../projects/context";
+import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
+import { getProject } from "../projects/project";
+import { ensureReplica, pushBookmark, trunkFor, type ReplicaDeps } from "../projects/replicas";
 import { appendEvent, latestEventOfType, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import { getTask, getTaskSettings, updateTask, updateTaskSettings, type TaskRow, type TaskSettings } from "../store/records";
@@ -27,7 +33,18 @@ type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
 type MeddleHooks = { harness(): Harness };
 type TurnRuntime = TaskRuntime<TurnInput, TurnCheckpoint, null, MeddleHooks>;
 
-export type RunnerDeps = { claudePath?: string; claudeRuntime?: "bun" | "node"; extraEnv?: Record<string, string> };
+export type RunnerDeps = {
+  claudePath?: string;
+  claudeRuntime?: "bun" | "node";
+  extraEnv?: Record<string, string>;
+  /**
+   * The node's pool. With it, tasks replicate projects homed elsewhere, start from the home's trunk, push their
+   * bookmarks to the home and sync memory around turns; without it, the runner keeps to this node.
+   */
+  pool?: PoolRuntime;
+  /** Where `meddle: git: …` lines go (each distinct line at most once a minute); default `console.error`. */
+  log?(line: string): void;
+};
 
 /** One TaskRunner per Harness; a phase may start before its runner exists, so it waits for it. */
 type RunnerSlot = PromiseWithResolvers<TaskRunner> & { bound: boolean };
@@ -95,6 +112,13 @@ export class TaskRunner {
   #deps: RunnerDeps;
   #sessionStore: SqliteSessionStore;
   #live = new Map<string, LiveTurn>();
+  /**
+   * The primary project of each task whose turn is live or syncing memory to start, so whether a project is live here
+   * needs no manifest.
+   */
+  #primaries = new Map<string, string>();
+  #pool: PoolRuntime | undefined;
+  #log: (line: string) => void;
   /** Tasks whose new `meddle.turn` is being created or has not started running yet. */
   #pending = new Set<string>();
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
@@ -105,6 +129,9 @@ export class TaskRunner {
     this.#db = db;
     this.#harness = harness;
     this.#deps = deps;
+    this.#pool = deps.pool;
+    const sink = deps.log ?? ((line: string) => console.error(line));
+    this.#log = dedupe((line) => sink(line));
     this.#sessionStore = new SqliteSessionStore(db);
     const slot = runnerSlot(harness);
     if (slot.bound) throw new Error("this Harness already has a TaskRunner");
@@ -113,10 +140,31 @@ export class TaskRunner {
     this.approvals.onChange(() => this.#syncWaiting());
   }
 
+  /**
+   * Gives a runner built before the pool its pool, before any turn runs. Attaching the pool it already has is a no-op;
+   * another one is refused.
+   */
+  attachPool(pool: PoolRuntime): void {
+    if (this.#pool === pool) return;
+    if (this.#pool !== undefined) throw new Error("this TaskRunner already has a pool");
+    this.#pool = pool;
+  }
+
+  /**
+   * Provisions a task. With a pool, each project is first replicated here when it is homed elsewhere and unknown
+   * (cloned from its home), and the task starts from the home's trunk.
+   */
   async create(input: { title: string; projectIds: string[] }): Promise<TaskManifest> {
     const token = await getToken(this.#cfg);
     if (token === null || token === "") throw new Error("no token set");
-    return provisionTask(this.#cfg, this.#db, input);
+    const deps = this.#replicaDeps();
+    if (deps === null) return provisionTask(this.#cfg, this.#db, input);
+    const parents: Record<string, string> = {};
+    for (const id of input.projectIds) {
+      if (id in parents) continue; // provisionTask refuses the duplicate
+      parents[id] = await trunkFor(deps, await ensureReplica(deps, id));
+    }
+    return provisionTask(this.#cfg, this.#db, { ...input, parents });
   }
 
   /**
@@ -234,6 +282,13 @@ export class TaskRunner {
       this.#pending.delete(taskId);
       this.#emitState(taskId, "running");
       const manifest = await readManifest(this.#cfg, taskId);
+      const primary = manifest.primaryProjectId;
+      const deps = this.#replicaDeps();
+      if (deps !== null) {
+        const live = [...this.#primaries].some(([id, p]) => id !== taskId && p === primary);
+        this.#primaries.set(taskId, primary);
+        await syncMemoryBefore(deps, primary, live, this.#log);
+      }
       // Resume only a session whose transcript Claude Code wrote, not one a turn merely set out to create.
       const resume = started && existsSync(transcriptPath(this.#cfg, manifest));
       const queue = new InputQueue();
@@ -255,8 +310,10 @@ export class TaskRunner {
         await done;
       } finally {
         this.#live.delete(taskId);
+        this.#primaries.delete(taskId);
       }
     } catch (err) {
+      this.#primaries.delete(taskId);
       // A turn that failed before it ran (no token, a bad context.toml, …) says why in the log like any other.
       if (!context.abortSignal?.aborted && !failureLogged) this.#logFailure(taskId, err);
       this.#failTurn(taskId, context);
@@ -264,18 +321,49 @@ export class TaskRunner {
     }
   }
 
-  /** The `finish` phase of `meddle.turn`: moves the task's bookmarks. Not for callers outside this module. */
+  /**
+   * The `finish` phase of `meddle.turn`: moves the task's bookmarks; with a pool, pushes each to its project's home
+   * when that is another node and syncs the primary project's memory. A failed push or sync is logged, never thrown:
+   * the turn completed, and the next turn end tries again. Not for callers outside this module.
+   */
   async finishTurnPhase(taskId: string, context: Context): Promise<void> {
+    let manifest: TaskManifest;
+    const moved: Array<{ projectId: string; replica: string; bookmark: string; change: string }> = [];
     try {
-      const manifest = await readManifest(this.#cfg, taskId);
+      manifest = await readManifest(this.#cfg, taskId);
       for (const p of manifest.projects) {
         const workspace = join(paths(this.#cfg).task(taskId), p.workspace);
-        await bookmarkSet(p.replica, `meddle/task/${taskId}/${p.name}`, await changeId(workspace, this.#cfg), this.#cfg);
+        const bookmark = `meddle/task/${taskId}/${p.name}`;
+        const change = await changeId(workspace, this.#cfg);
+        await bookmarkSet(p.replica, bookmark, change, this.#cfg);
+        moved.push({ projectId: p.id, replica: p.replica, bookmark, change });
       }
     } catch (err) {
       this.#failTurn(taskId, context);
       throw err;
     }
+    const deps = this.#replicaDeps();
+    if (deps === null) return;
+    for (const m of moved) await this.#pushToHome(deps, m);
+    await syncMemoryAfter(deps, manifest.primaryProjectId, this.#log);
+  }
+
+  /** Pushes a task bookmark to its project's home when that is another node; a failure is logged. */
+  async #pushToHome(deps: ReplicaDeps, m: { projectId: string; replica: string; bookmark: string; change: string }): Promise<void> {
+    const home = getProject(this.#db, m.projectId)?.home;
+    if (home === undefined || home === "" || home === deps.pool.identity.id) return;
+    try {
+      if (!deps.pool.net.isOnline(home)) throw new Error(`home ${shortId(home)} is offline`);
+      await pushBookmark(this.#cfg, m.replica, home, m.bookmark, m.change);
+    } catch (err) {
+      const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+      this.#log(`meddle: git: push of ${m.bookmark} to ${shortId(home)} failed: ${message}`);
+    }
+  }
+
+  /** What the replica and memory functions need, or null without a pool. */
+  #replicaDeps(): ReplicaDeps | null {
+    return this.#pool === undefined ? null : { cfg: this.#cfg, db: this.#db, pool: this.#pool };
   }
 
   /** After the turn's terminal commit: count it and make the task idle. Not for callers outside this module. */
