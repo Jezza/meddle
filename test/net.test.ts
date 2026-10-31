@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { randomBytes } from "node:crypto";
+import type { Connection } from "@number0/iroh";
 import { ALPN_POOL, writeLine } from "../src/pool/frames";
 import { PoolNet, fromEndpoint, toEndpointAddr, type NetDeps, type PeerStream } from "../src/pool/net";
 import { endpointPair, type TestNode } from "./pool-helpers";
@@ -150,6 +151,62 @@ test("a dropped connection is noticed and redialled", async () => {
     void s;
   } finally {
     await stop();
+  }
+});
+
+/** `pair`'s nodes ordered so that `lo` has the smaller id (the dialer). */
+function ordered(pair: { a: TestNode; b: TestNode }): [TestNode, TestNode] {
+  return pair.a.identity.id < pair.b.identity.id ? [pair.a, pair.b] : [pair.b, pair.a];
+}
+
+test("an isMember that throws closes the connection and the dialer stays offline", async () => {
+  const pair = await endpointPair();
+  const [loNode, hiNode] = ordered(pair);
+  const lo = netOf(loNode);
+  const hi = netOf(hiNode, { isMember: () => { throw new Error("roster unavailable"); } });
+  lo.net.start();
+  hi.net.start();
+  try {
+    lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
+    lo.net.watch(hi.id);
+    await until(() => lo.errors.filter((e) => e.includes("not a member")).length >= 2);
+    expect(hi.errors.some((e) => e.includes("roster unavailable"))).toBe(true);
+    expect(lo.peers).toEqual([]);
+    expect(hi.peers).toEqual([]);
+    expect(lo.net.isOnline(hi.id)).toBe(false);
+  } finally {
+    await Promise.all([lo.net.stop(), hi.net.stop()]);
+    await pair.close();
+  }
+});
+
+test("an acceptor that neither admits nor closes is given up on within the bound and redialled", async () => {
+  const pair = await endpointPair();
+  const [loNode, hiNode] = ordered(pair);
+  const held: Connection[] = [];
+  const holding = (async () => {
+    for (;;) {
+      const incoming = await hiNode.endpoint.acceptNext();
+      if (!incoming) return;
+      held.push(await (await incoming.accept()).connect());
+    }
+  })();
+  const lo = netOf(loNode, { admitTimeoutMs: 200 });
+  lo.net.start();
+  try {
+    const started = Date.now();
+    lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
+    lo.net.watch(hiNode.identity.id);
+    await until(() => held.length >= 2);
+    expect(Date.now() - started).toBeLessThan(1500);
+    const reason = await held[0]!.closed();
+    expect(reason).toContain("(code 0)");
+    expect(lo.errors.some((e) => e.includes("did not admit the connection within 200 ms"))).toBe(true);
+    expect(lo.peers).toEqual([]);
+  } finally {
+    await lo.net.stop();
+    await pair.close();
+    await holding;
   }
 });
 

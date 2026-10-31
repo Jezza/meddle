@@ -55,6 +55,8 @@ export type NetDeps = {
   onError?(err: unknown): void;
   /** Redial delays, doubling from `initialMs` up to `maxMs`; default 1000 / 30000. */
   backoff?: { initialMs: number; maxMs: number };
+  /** How long a dialer waits for the acceptor to admit or refuse a connection before giving up on it; default 5000. */
+  admitTimeoutMs?: number;
 };
 
 /** The connection held with a peer; `closed` is its one `conn.closed()` promise, shared by its streams. */
@@ -91,6 +93,7 @@ function messageOf(err: unknown): string {
 export class PoolNet {
   readonly endpoint: Endpoint;
   private readonly backoff: { initialMs: number; maxMs: number };
+  private readonly admitTimeoutMs: number;
   private readonly watched = new Set<string>();
   private readonly addrs = new Map<string, WireAddr>();
   private readonly links = new Map<string, Link>();
@@ -104,6 +107,7 @@ export class PoolNet {
   constructor(private readonly deps: NetDeps) {
     this.endpoint = deps.endpoint;
     this.backoff = deps.backoff ?? { initialMs: 1000, maxMs: 30_000 };
+    this.admitTimeoutMs = deps.admitTimeoutMs ?? 5000;
   }
 
   start(): void {
@@ -256,7 +260,14 @@ export class PoolNet {
       return;
     }
     const id = hexOf(conn.remoteId());
-    if (alpn !== POOL || !this.deps.isMember(id)) {
+    let member = false;
+    try {
+      member = alpn === POOL && this.deps.isMember(id);
+    } catch (err) {
+      // Membership could not be checked: refuse rather than leave the dialer waiting for an admission.
+      this.report(err);
+    }
+    if (!member) {
       conn.close(1n, bytes("not a member"));
       return;
     }
@@ -375,7 +386,10 @@ export class PoolNet {
     });
   }
 
-  /** One dial attempt: the connection once the peer admitted it, or null (reported) when it failed or was refused. */
+  /**
+   * One dial attempt: the connection once the peer admitted it, or null (reported) when it failed, was refused, or
+   * was neither admitted nor refused within `admitTimeoutMs` (then it is closed `0 bye`).
+   */
   private async connect(id: string): Promise<Connection | null> {
     let conn: Connection;
     try {
@@ -384,11 +398,19 @@ export class PoolNet {
       this.report(new Error(`dialing ${shortId(id)}: ${messageOf(err)}`));
       return null;
     }
-    const admitted = await Promise.race([
-      conn.acceptUni().then(() => true, () => false),
-      conn.closed().then(() => false, () => false),
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      conn.acceptUni().then(() => "admitted" as const, () => "closed" as const),
+      conn.closed().then(() => "closed" as const, () => "closed" as const),
+      new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), this.admitTimeoutMs); }),
     ]);
-    if (admitted) return conn;
+    clearTimeout(timer);
+    if (outcome === "admitted") return conn;
+    if (outcome === "timeout") {
+      conn.close(0n, bytes("bye"));
+      this.report(new Error(`${shortId(id)} did not admit the connection within ${this.admitTimeoutMs} ms`));
+      return null;
+    }
     const reason = await conn.closed().catch(messageOf);
     this.report(new Error(`${shortId(id)} refused the connection: ${reason}`));
     return null;
