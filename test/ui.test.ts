@@ -1,6 +1,7 @@
 // test/ui.test.ts
 import { test, expect } from "bun:test";
 import { joinStateOf } from "../src/dashboard/ui/join-state";
+import { headText, mergeProjects, moveTargets } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 
 test("the dashboard bundle builds", async () => {
@@ -29,4 +30,39 @@ test("Settings blocks joining only while this node is a member with other member
   const removed = joinStateOf([{ nodeId: a, status: "removed" }, { nodeId: b, status: "member" }, { nodeId: c, status: "member" }], a);
   expect(removed.blocked).toBe(false);
   expect(removed.hint).toContain("removed from its pool");
+});
+
+test("a task moves only to another online member that hosts tasks and runs the same known Claude Code version", () => {
+  const [a, b, c, d, e, f] = ["a", "b", "c", "d", "e", "f"].map((x) => x.repeat(64)) as [string, string, string, string, string, string];
+  const row = (nodeId: string, over: Partial<{ status: "member" | "removed"; online: boolean; hostsTasks: boolean; claudeCodeVersion: string }> = {}) =>
+    ({ nodeId, status: "member" as const, online: true, hostsTasks: true, claudeCodeVersion: "2.1.0", ...over });
+  const nodes = [
+    row(a),
+    row(b),
+    row(c, { online: false }),
+    row(d, { hostsTasks: false }),
+    row(e, { claudeCodeVersion: "2.2.0" }),
+    row(f, { status: "removed" }),
+  ];
+  expect(moveTargets(nodes, a, "2.1.0").map((n) => n.nodeId)).toEqual([b]);
+  expect(moveTargets(nodes, b, "2.1.0").map((n) => n.nodeId)).toEqual([a]);
+  // an unknown version on this node (a compiled binary) moves nowhere, nor to a node that reports unknown
+  expect(moveTargets(nodes, a, "unknown")).toEqual([]);
+  expect(moveTargets([row(a, { claudeCodeVersion: "unknown" }), row(b, { claudeCodeVersion: "unknown" })], a, "unknown")).toEqual([]);
+});
+
+test("the projects view merges each project's holders by id, home's name first, holders in pool order", () => {
+  const [a, b, c] = ["a", "b", "c"].map((x) => x.repeat(64)) as [string, string, string];
+  const heads = [{ name: "trunk", remote: null, changeId: "kkkkkkkkkkkk", conflicted: false }];
+  const rows = mergeProjects([
+    { nodeId: c, id: "p1", name: "one", home: a, heads: [], contextLoaded: true },
+    { nodeId: a, id: "p1", name: "one", home: a, heads, contextLoaded: true },
+    { nodeId: b, id: "p2", name: "two", home: b, heads: [], contextLoaded: false },
+  ], [a, b, c]);
+  expect(rows).toEqual([
+    { id: "p1", name: "one", home: a, holders: [{ nodeId: a, heads, contextLoaded: true }, { nodeId: c, heads: [], contextLoaded: true }] },
+    { id: "p2", name: "two", home: b, holders: [{ nodeId: b, heads: [], contextLoaded: false }] },
+  ]);
+  expect(headText(heads[0]!)).toBe("trunk kkkkkkkk");
+  expect(headText({ name: "meddle/task/t1/one", remote: "0123456789", changeId: "", conflicted: true })).toBe("meddle/task/t1/one@0123456789 (conflicted)");
 });

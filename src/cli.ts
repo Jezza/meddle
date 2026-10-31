@@ -16,6 +16,7 @@ import { acceptBlobStreams } from "./tasks/blob";
 import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
 import { loadOrCreateIdentity, shortId } from "./pool/identity";
+import { resolveNodeId } from "./pool/ids";
 import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
@@ -39,6 +40,7 @@ const USAGE = `usage: meddle --version
        meddle token set [--file <path>] | meddle token status
        meddle project add <path-or-url> [--name <n>] | meddle project list
        meddle task new --title <t> --project <id>... | meddle task prompt <id> <text> | meddle task retry <id>
+       meddle task move <id> <node> [--now]
        meddle service install [--dry-run]
        meddle git-remote <name> <url>   (git's remote helper for meddle:// remotes)`;
 
@@ -322,7 +324,7 @@ function projectList(): Promise<number> {
     const node = await client.get(NodeObject, {});
     for (const id of node.projectIds.value) {
       const project = await client.get(ProjectObject, { id });
-      console.log(`${project.id.value}  ${project.name.value}  ${project.replica.value}`);
+      console.log(`${project.id.value}  ${project.name.value}  ${project.replica.value}  home ${shortId(project.home.value)}`);
       project.release();
     }
     return 0;
@@ -399,6 +401,26 @@ function taskRetry(id: string): Promise<number> {
     const task = await client.get(TaskObject, { id });
     await task.retry({});
     console.log("retrying");
+    return 0;
+  });
+}
+
+/**
+ * Moves a task to the node `nodeText` names (its id, or a unique prefix of one in the pool's roster); `now` interrupts
+ * a running turn. Returns once the move has started: the node runs it.
+ */
+function taskMove(id: string, nodeText: string, now: boolean): Promise<number> {
+  return withNode(async (client) => {
+    const pool = await poolView(client);
+    let nodeId: string;
+    try {
+      nodeId = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), nodeText);
+    } finally {
+      pool.release();
+    }
+    const task = await client.get(TaskObject, { id });
+    await task.moveTo({ nodeId, now });
+    console.log(`moving ${id} to ${shortId(nodeId)}`);
     return 0;
   });
 }
@@ -508,6 +530,9 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   }
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
   if (command === "task" && sub === "retry" && rest.length === 1) return () => taskRetry(rest[0]!);
+  if (command === "task" && sub === "move" && (rest.length === 2 || (rest.length === 3 && rest[2] === "--now"))) {
+    return () => taskMove(rest[0]!, rest[1]!, rest.length === 3);
+  }
   // git runs a helper as `git-remote-<scheme> <remote> [<url>]`; without a url, the remote is the url.
   if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);
   if (command === "service" && sub === "install" && rest.length === 0) return () => serviceInstall(false);

@@ -61,7 +61,7 @@ function Body({ host, pool, node, view, open }: { host: Host; pool: PoolRef; nod
       <Notifications hosts={hosts} pool={pool} open={open} />
       {view.name === "pool" && <Pool hosts={hosts} pool={pool} open={open} />}
       {view.name === "task" && <TaskOn key={`${view.nodeId}/${view.id}`} hosts={hosts} pool={pool} nodeId={view.nodeId} taskId={view.id} />}
-      {view.name === "projects" && <Projects host={host} node={node} />}
+      {view.name === "projects" && <Projects hosts={hosts} pool={pool} node={node} />}
       {view.name === "settings" && <Settings pool={pool} />}
     </main>
   );
@@ -71,19 +71,19 @@ function Body({ host, pool, node, view, open }: { host: Host; pool: PoolRef; nod
 function TaskOn({ hosts, pool, nodeId, taskId }: { hosts: Hosts; pool: PoolRef; nodeId: string; taskId: string }) {
   const row = useValue(pool.nodes).find((n) => n.nodeId === nodeId);
   // This node's own tasks are always reachable over /ws.
-  if (nodeId === hosts.selfId) return <TaskOnline host={hosts.selfHost} taskId={taskId} />;
+  if (nodeId === hosts.selfId) return <TaskOnline host={hosts.selfHost} pool={pool} taskId={taskId} />;
   if (row === undefined) return <p class="error">Node {shortId(nodeId)} is not in this pool.</p>;
   if (row.status === "removed") return <p class="error">{row.hostname} ({shortId(nodeId)}) was removed from the pool.</p>;
   if (!row.online) return <p class="muted">{row.hostname} ({shortId(nodeId)}) is offline; the task shows again once it is back.</p>;
   const host = hosts.for(nodeId);
-  return host === undefined ? <Unavailable status={hosts.status(nodeId)} /> : <TaskOnline host={host} taskId={taskId} />;
+  return host === undefined ? <Unavailable status={hosts.status(nodeId)} /> : <TaskOnline host={host} pool={pool} taskId={taskId} />;
 }
 
-function TaskOnline({ host, taskId }: { host: Host; taskId: string }) {
+function TaskOnline({ host, pool, taskId }: { host: Host; pool: PoolRef; taskId: string }) {
   const node = useObject(host, NodeObject, {});
   if (node.error !== undefined) return <p class="error">{node.error}</p>;
   if (node.ref === undefined) return <p class="muted">Loading task…</p>;
-  return <Task host={host} node={node.ref} taskId={taskId} />;
+  return <Task host={host} node={node.ref} pool={pool} taskId={taskId} />;
 }
 
 render(<App host={host} />, document.getElementById("app")!);

@@ -11,3 +11,11 @@ export function isNodeId(text: string): boolean {
 export function shortId(id: string): string {
   return id.slice(0, 10);
 }
+
+/** The one id of `ids` that is `text` or starts with it; throws `no such node` or `ambiguous node` otherwise. */
+export function resolveNodeId(ids: readonly string[], text: string): string {
+  if (ids.includes(text)) return text;
+  const matches = text === "" ? [] : ids.filter((id) => id.startsWith(text));
+  if (matches.length === 1) return matches[0]!;
+  throw new Error(`${matches.length === 0 ? "no such node" : "ambiguous node"}: ${text}`);
+}

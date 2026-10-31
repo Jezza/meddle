@@ -12,6 +12,7 @@ import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { peerOf, servePool } from "../pool/object";
 import type { PoolRuntime } from "../pool/runtime";
 import { acceptPeerLinks } from "../pool/sync";
+import { bookmarkList } from "../jj";
 import { loadContext } from "../projects/context";
 import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, type Project } from "../projects/project";
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
@@ -22,6 +23,7 @@ import { shortId } from "../pool/ids";
 import { tokenStatus } from "../token";
 import { VERSION } from "../version";
 import {
+  HeadSchema,
   NodeObject,
   NodeStore,
   PeerObject,
@@ -310,6 +312,31 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         return { ...found, contextLoaded };
       },
     });
+    /** The replica's bookmarks; [] while (or whenever) jj cannot list them. */
+    const headsNow = async () => {
+      const found = getProject(db, id);
+      if (found === null) return [];
+      try {
+        return await bookmarkList(found.replica, cfg);
+      } catch {
+        return [];
+      }
+    };
+    const heads = self.state("heads", Type.Array(HeadSchema), { init: headsNow });
+    /** One listing at a time: a sample that arrives while jj still lists is skipped. */
+    let listing = false;
+    const refreshHeads = async (ctx: Ctx) => {
+      if (listing) return;
+      listing = true;
+      try {
+        const next = await headsNow();
+        if (!ctx.signal.aborted && JSON.stringify(next) !== JSON.stringify(heads.value)) heads.replace(ctx, next);
+      } finally {
+        listing = false;
+      }
+    };
+    self.on("projects", projectChanges, (_event, ctx) => refreshHeads(ctx));
+    self.on("samples", samples, (_event, ctx) => refreshHeads(ctx));
     return {
       variant: "default",
       id: self.derive([project], (p) => p.id),
@@ -318,6 +345,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       replica: self.derive([project], (p) => p.replica),
       home: self.derive([project], (p) => p.home),
       contextLoaded: self.derive([project], (p) => p.contextLoaded),
+      heads,
     };
   });
 

@@ -3,6 +3,7 @@ import { test, expect } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { initColocated } from "../src/jj";
+import { shortId } from "../src/pool/ids";
 import { closedPort, errorResultFixture, meddle, replay, startServe } from "./helpers";
 import { POOL_ENV } from "./pool-helpers";
 
@@ -45,7 +46,7 @@ test("serve, add a project, run a task's turn, and report status", async () => {
 
     const listed = await meddle(["project", "list"], client);
     expect(listed.code).toBe(0);
-    expect(listed.stdout).toBe(`${projectId}  repo  ${dir}/repo\n`);
+    expect(listed.stdout).toBe(`${projectId}  repo  ${dir}/repo  home ${shortId(node.id)}\n`);
 
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], client);
     expect(created.stderr).toBe("");

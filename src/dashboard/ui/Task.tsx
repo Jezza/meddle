@@ -3,7 +3,11 @@ import type { EffortLevel, PermissionMode } from "@anthropic-ai/claude-agent-sdk
 import type { Host, Ref } from "@earendil-works/chord";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { NodeObject, SessionObject, TaskObject } from "../../state/contracts";
+import { shortId } from "../../pool/ids";
 import { useAction, useObject, useValue } from "./hooks";
+import type { PoolRef } from "./Pool";
+import { moveTargets } from "./pool-model";
+import { hashOf } from "./routes";
 import { buildThread, type ThreadItem } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -15,32 +19,58 @@ type LogEvent = SessionRef["window"]["value"][number];
 const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"];
 const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 const EARLIER_PAGE = 200;
+const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
 
-export function Task({ host, node, taskId }: { host: Host; node: NodeRef; taskId: string }) {
+export function Task({ host, node, pool, taskId }: { host: Host; node: NodeRef; pool: PoolRef; taskId: string }) {
   const task = useObject(host, TaskObject, { id: taskId });
   const session = useObject(host, SessionObject, { taskId });
   const error = task.error ?? session.error;
   if (error !== undefined) return <p class="error">{error}</p>;
   if (task.ref === undefined || session.ref === undefined) return <p class="muted">Loading task…</p>;
-  return <TaskLoaded node={node} task={task.ref} session={session.ref} />;
+  return <TaskLoaded node={node} pool={pool} task={task.ref} session={session.ref} />;
 }
 
-function TaskLoaded({ node, task, session }: { node: NodeRef; task: TaskRef; session: SessionRef }) {
+function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRef; task: TaskRef; session: SessionRef }) {
   const manifest = useValue(task.manifest);
   const state = useValue(task.state);
   const pending = useValue(task.pending);
+  const move = useValue(task.move);
+  const movedTo = useValue(task.movedTo);
+  const nodes = useValue(pool.nodes);
+  const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
+  const head = (
+    <header class="task-head">
+      <h2>{manifest.title} <span class={`state ${state}`}>{state}</span></h2>
+      <p class="muted">
+        {manifest.projects.map((p) => `${p.name} (${p.workspace})`).join(", ")} · session {manifest.sessionId}
+      </p>
+    </header>
+  );
+  // Nothing of a moved task is left here but its row: no thread, no controls, a link to it where it went.
+  if (state === "moved") {
+    return (
+      <>
+        {head}
+        {movedTo === null ? <p>Moved to another node.</p> : (
+          <p>Moved to <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })} title={movedTo}>{nameOf(movedTo)}</a>.</p>
+        )}
+      </>
+    );
+  }
+  const moving = state === "moving" || move !== null;
   return (
     <>
-      <header class="task-head">
-        <h2>{manifest.title} <span class={`state ${state}`}>{state}</span></h2>
-        <p class="muted">
-          {manifest.projects.map((p) => `${p.name} (${p.workspace})`).join(", ")} · session {manifest.sessionId}
-        </p>
-      </header>
-      <Controls node={node} task={task} />
+      {head}
+      {move !== null && (
+        <section class="moving">
+          <p class="flag">Moving to {nameOf(move.to)}: {move.phase}</p>
+          {move.error !== null && <p class="error">{move.error}</p>}
+        </section>
+      )}
+      <Controls node={node} pool={pool} task={task} disabled={moving} />
       <Thread session={session} />
       {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
-      <Composer task={task} running={state === "running" || state === "waiting"} />
+      <Composer task={task} running={state === "running" || state === "waiting"} disabled={moving} />
     </>
   );
 }
@@ -259,7 +289,8 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 
 // ─── controls and composer ───
 
-function Controls({ node, task }: { node: NodeRef; task: TaskRef }) {
+/** The task's controls; all of them `disabled` while it moves. */
+function Controls({ node, pool, task, disabled }: { node: NodeRef; pool: PoolRef; task: TaskRef; disabled: boolean }) {
   const state = useValue(task.state);
   const pending = useValue(task.pending);
   const models = useValue(node.models);
@@ -269,17 +300,18 @@ function Controls({ node, task }: { node: NodeRef; task: TaskRef }) {
   const contextUsage = useValue(task.contextUsage);
   const action = useAction();
   const modelOptions = model !== null && !models.includes(model) ? [model, ...models] : models;
+  const off = disabled || action.busy;
 
   return (
     <section class="controls">
       <div class="row">
-        <button disabled={action.busy} onClick={() => action.run(() => task.interrupt({}))}>Interrupt</button>
+        <button disabled={off} onClick={() => action.run(() => task.interrupt({}))}>Interrupt</button>
         {/* A turn that crashed the node too often is parked; retry says so when none is. */}
         {(state === "running" || state === "waiting") && pending.length === 0 && (
-          <button disabled={action.busy} onClick={() => action.run(() => task.retry({}))}>Retry turn</button>
+          <button disabled={off} onClick={() => action.run(() => task.retry({}))}>Retry turn</button>
         )}
         <label>Permission mode{" "}
-          <select value={permissionMode ?? ""} onChange={(e) => {
+          <select disabled={disabled} value={permissionMode ?? ""} onChange={(e) => {
             const mode = e.currentTarget.value as PermissionMode;
             void action.run(() => task.setPermissionMode({ mode }));
           }}>
@@ -288,7 +320,7 @@ function Controls({ node, task }: { node: NodeRef; task: TaskRef }) {
           </select>
         </label>
         <label>Model{" "}
-          <select value={model ?? ""} onChange={(e) => {
+          <select disabled={disabled} value={model ?? ""} onChange={(e) => {
             const value = e.currentTarget.value;
             void action.run(() => task.setModel(value === "" ? {} : { model: value }));
           }}>
@@ -297,7 +329,7 @@ function Controls({ node, task }: { node: NodeRef; task: TaskRef }) {
           </select>
         </label>
         <label>Effort{" "}
-          <select value={effort ?? ""} onChange={(e) => {
+          <select disabled={disabled} value={effort ?? ""} onChange={(e) => {
             const value = e.currentTarget.value;
             void action.run(() => task.setEffort({ effort: value }));
           }}>
@@ -306,9 +338,42 @@ function Controls({ node, task }: { node: NodeRef; task: TaskRef }) {
           </select>
         </label>
       </div>
+      <MoveControl node={node} pool={pool} task={task} disabled={disabled} />
       <p class="muted">{contextText(contextUsage)}</p>
       {action.error !== null && <p class="error">{action.error}</p>}
     </section>
+  );
+}
+
+/** Moves the task to another node that can take it (online, hosts tasks, the same known Claude Code version). */
+function MoveControl({ node, pool, task, disabled }: { node: NodeRef; pool: PoolRef; task: TaskRef; disabled: boolean }) {
+  const nodes = useValue(pool.nodes);
+  const selfId = useValue(node.nodeId);
+  const version = useValue(node.claudeCodeVersion);
+  const targets = moveTargets(nodes, selfId, version);
+  const [picked, setPicked] = useState<string | null>(null);
+  const [now, setNow] = useState(false);
+  const action = useAction();
+  const target = targets.find((n) => n.nodeId === picked) ?? targets[0];
+  const off = disabled || action.busy;
+  return (
+    <div class="row move">
+      <label>Move to{" "}
+        <select disabled={off || target === undefined} value={target?.nodeId ?? ""} onChange={(e) => setPicked(e.currentTarget.value)}>
+          {target === undefined && <option value="">(no node can take it)</option>}
+          {targets.map((n) => <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)})</option>)}
+        </select>
+      </label>
+      <label class="option">
+        <input type="checkbox" disabled={off} checked={now} onChange={(e) => setNow(e.currentTarget.checked)} /> move now{" "}
+        <span class="muted">({MOVE_NOW_WARNING})</span>
+      </label>
+      <button
+        disabled={off || target === undefined}
+        onClick={() => target !== undefined && action.run(() => task.moveTo({ nodeId: target.nodeId, now }))}
+      >Move</button>
+      {action.error !== null && <p class="error">{action.error}</p>}
+    </div>
   );
 }
 
@@ -327,23 +392,24 @@ function contextText(value: unknown): string {
     + (windows.length > 0 ? ` · context window ${windows.join(", ")}` : "");
 }
 
-function Composer({ task, running }: { task: TaskRef; running: boolean }) {
+function Composer({ task, running, disabled }: { task: TaskRef; running: boolean; disabled: boolean }) {
   const [text, setText] = useState("");
   const action = useAction();
   const send = async () => {
-    if (text.trim() === "") return;
+    if (disabled || text.trim() === "") return;
     if (await action.run(() => task.prompt({ text }))) setText("");
   };
   return (
     <section class="composer">
       <textarea
         rows={3}
+        disabled={disabled}
         value={text}
         placeholder={running ? "Steer the running turn… (Ctrl+Enter sends)" : "Prompt… (Ctrl+Enter sends)"}
         onInput={(e) => setText(e.currentTarget.value)}
         onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); } }}
       />
-      <button disabled={action.busy || text.trim() === ""} onClick={send}>{running ? "Steer" : "Send"}</button>
+      <button disabled={disabled || action.busy || text.trim() === ""} onClick={send}>{running ? "Steer" : "Send"}</button>
       {action.error !== null && <p class="error">{action.error}</p>}
     </section>
   );

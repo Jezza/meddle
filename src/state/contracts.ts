@@ -137,13 +137,21 @@ export const NodeStore = local("meddle.node-store", {
   },
 });
 
+/** A bookmark of a project's replica: local (`remote` null) or a remote's; a conflicted one has `changeId` "". */
+export const HeadSchema = Type.Object({ name: Type.String(), remote: Nullable(Type.String()), changeId: Type.String(), conflicted: Type.Boolean() });
+
 export const ProjectObject = remote("meddle.project", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
   host: hostNamed("node"),
   variants: {
     default: {
-      state: { ...ProjectSchema.properties, contextLoaded: Type.Boolean() },
+      state: {
+        ...ProjectSchema.properties,
+        contextLoaded: Type.Boolean(),
+        /** This node's replica's bookmarks, local and remote, re-read when projects change and at each metrics sample. */
+        heads: Type.Array(HeadSchema),
+      },
     },
   },
 });

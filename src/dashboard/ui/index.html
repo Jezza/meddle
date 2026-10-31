@@ -46,9 +46,12 @@
   .state { font-size: 12px; padding: 1px 6px; border-radius: 8px; background: var(--soft); }
   .state.running { color: var(--accent); }
   .state.waiting { color: var(--warn); }
+  .state.moving { color: var(--warn); }
+  .state.moved { color: var(--muted); }
   .notifications .note { padding: 4px 8px; border-left: 3px solid var(--line); margin: 4px 0; background: var(--soft); }
   .notifications .note.approval, .notifications .note.question { border-color: var(--warn); }
   .notifications .note.failed { border-color: var(--bad); }
+  .notifications .note.move { border-color: var(--warn); }
   .thread .item { margin: 6px 0; }
   .thread .text { white-space: pre-wrap; }
   .thread .user { padding: 6px 10px; background: var(--soft); border-radius: 6px; }
