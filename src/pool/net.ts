@@ -57,8 +57,8 @@ export type NetDeps = {
   backoff?: { initialMs: number; maxMs: number };
   /** How long a dialer waits for the acceptor to admit or refuse a connection before giving up on it; default 5000. */
   admitTimeoutMs?: number;
-  /** Why a dialer that is not a member is refused (consulted only then); default `not a member`. */
-  refusalReason?(id: string): "removed" | "not a member";
+  /** The close reason a dialer that is not a member is refused with (consulted only then); default `not a member`. */
+  refusalReason?(id: string): RefusalReason;
 };
 
 /** The connection held with a peer; `closed` is its one `conn.closed()` promise, shared by its streams. */
@@ -81,6 +81,9 @@ const POOL = decoder.decode(Uint8Array.from(ALPN_POOL));
 const JOIN = decoder.decode(Uint8Array.from(ALPN_JOIN));
 /** What `closed()` resolves to when the peer closed with code 1: it refused or removed this node. */
 const REFUSED = /^closed by peer: .* \(code 1\)$/;
+
+/** Why a peer is refused or cut off (code 1): `removed` may carry when, as `removed <updatedAt>`. */
+export type RefusalReason = "not a member" | "removed" | `removed ${string}`;
 
 /** Reported when a peer closed a connection, or refused a dial: `reason` is what `closed()` resolved to. */
 export class PeerClosed extends Error {
@@ -151,10 +154,10 @@ export class PoolNet {
   }
 
   /**
-   * Closes any connection with the peer (inbound or outbound) with `reason`, and stops dialing it: code 1 for
-   * `removed` and `not a member`, code 0 for `bye` (this node is leaving, not refusing the peer).
+   * Closes any connection with the peer (inbound or outbound) with `reason`, and stops dialing it: code 1 for a
+   * refusal (`removed…`, `not a member`), code 0 for `bye` (this node is leaving, not refusing the peer).
    */
-  unwatch(peerId: string, reason: "removed" | "not a member" | "bye"): void {
+  unwatch(peerId: string, reason: RefusalReason | "bye"): void {
     const code = reason === "bye" ? 0n : 1n;
     this.watched.delete(peerId);
     const d = this.dials.get(peerId);
@@ -274,7 +277,7 @@ export class PoolNet {
     }
     const id = hexOf(conn.remoteId());
     let member = false;
-    let refusal: "removed" | "not a member" = "not a member";
+    let refusal: RefusalReason = "not a member";
     try {
       member = alpn === POOL && this.deps.isMember(id);
       if (!member && alpn === POOL) refusal = this.deps.refusalReason?.(id) ?? "not a member";

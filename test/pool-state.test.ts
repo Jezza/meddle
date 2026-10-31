@@ -2,12 +2,15 @@
 import { test, expect } from "bun:test";
 import { hostname } from "node:os";
 import type { Host } from "@earendil-works/chord";
-import { PeerClosed } from "../src/pool/net";
+import { decodeTicket, joinPool } from "../src/pool/invite";
+import { PeerClosed, PoolNet } from "../src/pool/net";
+import { PoolStore } from "../src/pool/store";
+import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
 import { NodeObject, PoolObject } from "../src/state/contracts";
 import { getToken, setToken } from "../src/token";
 import { VERSION } from "../src/version";
-import { linkClient, poolSummaryOf, startPoolNode } from "./pool-helpers";
+import { linkClient, poolSummaryOf, startPoolNode, testNode } from "./pool-helpers";
 
 type Node = Awaited<ReturnType<typeof startPoolNode>>;
 
@@ -77,6 +80,12 @@ async function join(inviter: Viewed, joiner: Viewed): Promise<{ poolId: string; 
   return joiner.pool.join({ ticket });
 }
 
+/** A `removed <updatedAt>` close or refusal from `peer`. */
+function removedBy(errors: readonly unknown[], peer: string, how: "closed" | "refused"): PeerClosed[] {
+  return errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === peer
+    && e.message.includes(`${how} the connection`) && /^closed by peer: removed \S+ \(code 1\)$/.test(e.reason));
+}
+
 function onlineOn(viewer: Viewed, other: Viewed): Promise<unknown> {
   return until(viewer.pool.nodes, (rows) => rows.some((r) => r.nodeId === other.node.id && r.online));
 }
@@ -131,7 +140,7 @@ test("tokenChanged replicates the token; remove propagates and the removed node 
   });
 }, 15_000);
 
-test("a member that did not do the removing also cuts the removed node off", async () => {
+test("a removed node is cut off, sees itself removed, and may join again", async () => {
   await withNodes(3, async ([a, b, c]) => {
     const [A, B, C] = [a!.node, b!.node, c!.node];
     await join(a!, b!);
@@ -176,7 +185,8 @@ test("a node removed while it was offline learns it from the refusal when it com
       const refusals = () => errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === A.id);
       await eventually(() => B.store.row(B.id)?.status === "removed");
       expect(back.net.online()).toEqual([]);
-      expect(refusals().map((e) => e.reason)).toEqual(["closed by peer: removed (code 1)"]);
+      expect(refusals()).toHaveLength(1);
+      expect(refusals()[0]!.reason).toMatch(/^closed by peer: removed \S+ \(code 1\)$/);
       // Past the 1 s and 2 s redial delays: B stopped dialing A.
       await Bun.sleep(2500);
       expect(refusals()).toHaveLength(1);
@@ -185,5 +195,80 @@ test("a node removed while it was offline learns it from the refusal when it com
     } finally {
       await back?.stop();
     }
+  });
+}, 15_000);
+
+test("a member that did not do the removing closes the removed node's live connection", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const [A, B] = [a!.node, b!.node];
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+
+    // C joins through A but is only a bare connection manager: it never syncs, so it can neither learn its removal
+    // nor leave on its own, and only the members can close its connections.
+    const c = await testNode();
+    const C = c.identity.id;
+    const store = new PoolStore(openDb(":memory:"));
+    store.ensurePool({ nodeId: C, hostname: "bare-c" });
+    const errors: unknown[] = [];
+    const net = new PoolNet({
+      endpoint: c.endpoint, selfId: C, isMember: () => true, onJoin: async (conn) => conn.close(0n, []),
+      onError: (err) => errors.push(err), backoff: { initialMs: 50, maxMs: 200 },
+    });
+    try {
+      const { ticket } = await a!.pool.invite({});
+      const joined = await joinPool(decodeTicket(ticket), {
+        endpoint: c.endpoint, store, identity: c.identity,
+        summary: () => ({ hostname: "bare-c", version: VERSION, claudeCodeVersion: "2.1.314", hostsTasks: false, taskCount: 0 }),
+      });
+      net.start();
+      for (const addr of joined.addrs) net.offerAddress(addr);
+      net.watch(A.id);
+      net.watch(B.id);
+      await eventually(() => net.isOnline(A.id) && net.isOnline(B.id) && B.net.isOnline(C));
+
+      await a!.pool.remove({ nodeId: C });
+      await eventually(() => removedBy(errors, B.id, "closed").length > 0);
+      expect(B.store.row(C)?.status).toBe("removed");
+      expect(B.net.isOnline(C)).toBe(false);
+      expect(net.isOnline(B.id)).toBe(false);
+    } finally {
+      await net.stop();
+    }
+  });
+}, 15_000);
+
+test("a re-joined node refused as removed by a member that has not merged the re-join stays a member", async () => {
+  await withNodes(3, async ([a, x, y]) => {
+    // C dials B (the smaller id dials), so C's dial can reach B before B hears of the re-join.
+    const [c, b] = [x!, y!].sort((p, q) => (p.node.id < q.node.id ? -1 : 1)) as [Viewed, Viewed];
+    const [A, B, C] = [a!.node, b.node, c.node];
+    const all = [A, B, C];
+    const fullyLinked = () => all.every((n) => all.every((m) => m === n || n.net.isOnline(m.id)));
+    await join(a!, b);
+    await join(a!, c);
+    await eventually(fullyLinked);
+    await a!.pool.remove({ nodeId: C.id });
+    await eventually(() => B.store.row(C.id)?.status === "removed" && !C.store.isMember(C.id) && C.net.online().length === 0);
+
+    // B stops merging rosters, so it keeps C as removed while C re-joins through A.
+    const merge = B.store.merge.bind(B.store);
+    let paused = true;
+    B.store.merge = (rows) => (paused ? false : merge(rows));
+    const refusedByB = () => removedBy(C.errors, B.id, "refused").length;
+    const before = refusedByB();
+    expect(await join(a!, c)).toEqual({ poolId: a!.pool.poolId.value, members: 3 });
+    await eventually(() => refusedByB() > before);
+    // The refusal names a removal older than C's re-join: C stays a member and keeps its link with A.
+    expect(C.store.isMember(C.id)).toBe(true);
+    await eventually(() => C.net.isOnline(A.id));
+    expect(B.store.row(C.id)?.status).toBe("removed");
+
+    paused = false;
+    // A's refreshed row changes its roster, which B now merges, re-join included; C's next dial is admitted.
+    await a!.pool.tokenChanged({});
+    await eventually(() => B.store.isMember(C.id) && B.net.isOnline(C.id) && C.net.isOnline(B.id));
+    expect(C.store.isMember(C.id)).toBe(true);
   });
 }, 15_000);

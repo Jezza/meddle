@@ -8,7 +8,7 @@ import type { NodeConfig } from "../config";
 import { Discovery } from "./discovery";
 import { loadOrCreateIdentity, shortId, type Identity } from "./identity";
 import { createInvite, decodeTicket, handleJoin, joinPool } from "./invite";
-import { PeerClosed, PoolNet, fromEndpoint, openEndpoint } from "./net";
+import { PeerClosed, PoolNet, fromEndpoint, openEndpoint, type RefusalReason } from "./net";
 import type { PoolObjectDeps } from "./object";
 import { PoolStore, type NodeSummary, type WireAddr } from "./store";
 import { PoolSync } from "./sync";
@@ -39,8 +39,8 @@ export type PoolHooks = { onError?(err: unknown): void };
 
 /** How long `remove` waits for the removed node to see its removal and close its connection before cutting it off. */
 const REMOVAL_GRACE_MS = 1000;
-/** What `closed()` resolves to when a peer closed or refused this node because it was removed. */
-const REMOVED = "closed by peer: removed (code 1)";
+/** What `closed()` resolves to when a peer closed or refused this node as removed at the captured `updatedAt`. */
+const REMOVED_AT = /^closed by peer: removed (\S+) \(code 1\)$/;
 
 /**
  * Starts this node's part in its pool (a pool of one on first start): identity, endpoint, roster, the connection
@@ -89,8 +89,13 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   /** A removed node accepts no pool connection at all. */
   const admits = (id: string) => store.isMember(selfId) && store.isMember(id);
+  /** `removed <updatedAt>` for a node the roster has as removed: the refused node can tell how recent that is. */
+  const removalOf = (id: string): RefusalReason | null => {
+    const row = store.row(id);
+    return row?.status === "removed" ? `removed ${row.updatedAt}` : null;
+  };
   /** A dialer this (member) node has as removed is told so; it learns its removal from that refusal. */
-  const refusalReason = (id: string) => (store.isMember(selfId) && store.row(id)?.status === "removed" ? "removed" : "not a member");
+  const refusalReason = (id: string): RefusalReason => (store.isMember(selfId) ? removalOf(id) : null) ?? "not a member";
 
   const net = new PoolNet({
     endpoint, selfId, isMember: admits, refusalReason,
@@ -103,16 +108,26 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       },
     }),
     onError: (err) => {
-      // Another member closed or refused this node as removed: this node was removed while it could not hear of it.
-      if (err instanceof PeerClosed && err.reason === REMOVED && store.isMember(err.peerId) && store.isMember(selfId)) {
-        store.remove(selfId);
-        enforce();
-        notify();
-      }
+      if (err instanceof PeerClosed) learnRemoval(err);
       hooks.onError?.(err);
     },
   });
   net.onPeer(() => notify());
+
+  /**
+   * Another member closed or refused this node as removed: this node was removed while it could not hear of it. Only
+   * a removal newer than this node's own row (its latest join) counts; an older one is a member that has not yet
+   * merged this node's re-join, and the refused dial is simply retried.
+   */
+  function learnRemoval(err: PeerClosed): void {
+    const removedAt = REMOVED_AT.exec(err.reason)?.[1];
+    const self = store.row(selfId);
+    if (removedAt === undefined || self?.status !== "member" || !store.isMember(err.peerId)) return;
+    if (!(removedAt > self.updatedAt)) return;
+    store.remove(selfId, removedAt);
+    enforce();
+    notify();
+  }
 
   const sync = new PoolSync({
     cfg, store, net, selfId, summary: liveSummary,
@@ -137,7 +152,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     for (const id of cut) {
       if (id === selfId || keep.has(id)) continue;
       followed.delete(id);
-      net.unwatch(id, !member ? "bye" : store.row(id) === null ? "not a member" : "removed");
+      net.unwatch(id, !member ? "bye" : removalOf(id) ?? "not a member");
     }
     for (const [id, row] of keep) {
       if (!followed.has(id)) {

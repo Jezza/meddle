@@ -199,10 +199,12 @@ export async function startPoolNode(fixture?: string) {
   const node = await setupNode(fixture, POOL_ENV);
   const { cfg, db, runner } = node;
   const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 60_000, dataDir: cfg.dataDir });
-  const pool = await startPool(cfg, db, poolSummaryOf(cfg, db));
+  /** Everything the runtime's net and sync reported. */
+  const errors: unknown[] = [];
+  const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { onError: (err) => errors.push(err) });
   const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool });
   return {
-    ...node, metrics, pool, host,
+    ...node, metrics, pool, host, errors,
     id: pool.identity.id, identity: pool.identity, store: pool.store, net: pool.net,
     async close() {
       metrics.stop();
