@@ -211,3 +211,83 @@ export const SessionViewSchema = Type.Object({
   live: Nullable(Type.Object({ text: Type.String(), thinking: Type.String() })),
 });
 export type SessionView = Type.Static<typeof SessionViewSchema>;
+
+// ─── the pool ───
+
+/** An iroh endpoint address in JSON form (`WireAddr`): `id` is the node id. */
+export const WireAddrSchema = Type.Object({ id: Type.String(), relay: Nullable(Type.String()), direct: Type.Array(Type.String()) });
+
+/** What a node reports about itself to the rest of the pool (`NodeSummary`). */
+export const NodeSummarySchema = Type.Object({
+  hostname: Type.String(),
+  version: Type.String(),
+  claudeCodeVersion: Type.String(),
+  hostsTasks: Type.Boolean(),
+  taskCount: Type.Number(),
+});
+
+/** One node of the pool's roster (`RosterRow`). */
+export const RosterRowSchema = Type.Object({
+  nodeId: Type.String(),
+  hostname: Type.String(),
+  status: Type.Union([Type.Literal("member"), Type.Literal("removed")]),
+  updatedAt: Type.String(),
+  addedBy: Type.String(),
+  summary: Nullable(NodeSummarySchema),
+  lastSeenAt: Nullable(Type.String()),
+  lastAddr: Nullable(WireAddrSchema),
+});
+
+/** When the token was set and the node it came from (null: set on that node by hand). Never the value. */
+export const TokenMetaSchema = Type.Object({ setAt: Type.String(), setBy: Nullable(Type.String()) });
+export type TokenMeta = Type.Static<typeof TokenMetaSchema>;
+
+export const PoolNodeSchema = Type.Object({
+  nodeId: Type.String(),
+  hostname: Type.String(),
+  status: Type.Union([Type.Literal("member"), Type.Literal("removed")]),
+  online: Type.Boolean(),
+  version: Type.String(),
+  claudeCodeVersion: Type.String(),
+  hostsTasks: Type.Boolean(),
+  taskCount: Type.Number(),
+  lastSeenAt: Nullable(Type.String()),
+});
+
+export const PoolObject = remote("meddle.pool", {
+  version: 1,
+  input: Type.Object({}),
+  host: hostNamed("node"),
+  variants: {
+    /** Dashboards and the CLI (principal `local`, `cli`, …). */
+    default: {
+      state: {
+        poolId: Type.String(),
+        self: Type.String(),
+        nodes: Type.Array(PoolNodeSchema),
+        token: Type.Object({
+          present: Type.Boolean(),
+          setAt: Nullable(Type.String()),
+          setBy: Nullable(Type.String()),
+          expiresAt: Nullable(Type.String()),
+        }),
+        /** Members report more than one meddle or Claude Code version. */
+        mixedVersions: Type.Boolean(),
+      },
+      methods: {
+        invite: method(Type.Object({}), Type.Object({ ticket: Type.String() })),
+        join: method(Type.Object({ ticket: Type.String() }), Type.Object({ poolId: Type.String(), members: Type.Number() })),
+        remove: method(Type.Object({ nodeId: Type.String() })),
+        /** The token file changed on this node (written by the CLI); re-read it and tell the pool. */
+        tokenChanged: method(Type.Object({})),
+      },
+    },
+    /** Other nodes (principal `peer:<nodeId>`). */
+    peer: {
+      state: { roster: Type.Array(RosterRowSchema), token: Nullable(TokenMetaSchema) },
+      methods: {
+        fetchToken: method(Type.Object({}), Type.Object({ value: Type.String(), setAt: Type.String(), setBy: Nullable(Type.String()) })),
+      },
+    },
+  },
+});
