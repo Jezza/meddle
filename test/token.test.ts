@@ -4,6 +4,7 @@ import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { loadConfig, ensureDataDirs, paths } from "../src/config";
 import { setToken, getToken, tokenStatus } from "../src/token";
+import { childEnv, closedPort } from "./helpers";
 const A = "a".repeat(64);
 async function cfg() { const d = await mkdtemp("/tmp/meddle-tok-"); const c = loadConfig({ HOME: d, MEDDLE_DATA_DIR: d, MEDDLE_TASK_ROOT: d }); await ensureDataDirs(c); return c; }
 test("trims CRLF and sets mode 600", async () => {
@@ -27,7 +28,8 @@ test("cli token set --file then status round-trips without printing the token", 
   const tokenPath = join(d, "token-input");
   const fake = "sk-ant-oat01-abc";
   await writeFile(tokenPath, `${fake}\n`);
-  const env = { ...process.env, HOME: d, MEDDLE_DATA_DIR: d, MEDDLE_TASK_ROOT: d };
+  // a port nothing listens on: `token set` tells a running node, and must never reach a real one
+  const env = childEnv({ HOME: d, MEDDLE_DATA_DIR: d, MEDDLE_TASK_ROOT: d, MEDDLE_PORT: String(await closedPort()) });
   const cwd = join(import.meta.dir, "..");
   const run = async (...args: string[]) => {
     const p = Bun.spawn([process.execPath, "run", "src/cli.ts", ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
