@@ -10,9 +10,11 @@ import { fromEndpoint, openEndpoint } from "../src/pool/net";
 import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
-import { NodeObject, PoolObject } from "../src/state/contracts";
+import { NodeObject, PeerObject, PoolObject } from "../src/state/contracts";
 import { getToken, setToken } from "../src/token";
 import { VERSION } from "../src/version";
+import { initColocated } from "../src/jj";
+import { addProjectFromFolder } from "../src/projects/project";
 import { linkClient, poolSummaryOf, startPoolNode, testNode } from "./pool-helpers";
 
 type Node = Awaited<ReturnType<typeof startPoolNode>>;
@@ -384,4 +386,61 @@ test("a task created on one node shows in the other node's count at once", async
     await until(b!.pool.nodes, (rows) => rows.some((r) => r.nodeId === A.id && r.taskCount === 1));
     expect(Date.now() - began).toBeLessThan(3000);
   });
+}, 15_000);
+
+test("a node holds a peer's PeerObject: its projects with their home, and projectInfo; a non-peer is refused", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    const B = b!.node;
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+    // B's client host for A comes up just after A shows online.
+    const end = Date.now() + WAIT_MS;
+    let peer: Awaited<ReturnType<typeof B.pool.peerRef<typeof PeerObject>>> | null = null;
+    let last: unknown = null;
+    while (peer === null) {
+      peer = await B.pool.peerRef(A.id, PeerObject).catch((err: unknown) => { last = err; return null; });
+      if (peer === null && Date.now() > end) throw new Error(`no PeerObject of A: ${String(last)}`);
+      if (peer === null) await Bun.sleep(20);
+    }
+    try {
+      expect(peer.variant).toBe("peer");
+      if (peer.variant !== "peer") return;
+      expect(peer.projects.value).toEqual([{ id: A.project.id, name: A.project.name, home: A.id }]);
+      expect(typeof peer.claudeCodeVersion.value).toBe("string");
+      expect(peer.hostsTasks.value).toBe(true);
+
+      const folder = `${A.home}/second`;
+      await initColocated(folder);
+      const added = await addProjectFromFolder(A.cfg, A.db, folder, A.id, "second");
+      const projects = await until(peer.projects, (list) => list.some((p) => p.id === added.id));
+      expect(projects.find((p) => p.id === added.id)).toEqual({ id: added.id, name: "second", home: A.id });
+      expect(await peer.projectInfo({ id: added.id })).toEqual({ id: added.id, name: "second", home: A.id });
+      expect(await peer.projectInfo({ id: "nope" })).toBeNull();
+    } finally {
+      peer.release();
+    }
+
+    const owner = linkClient(A.host);
+    try {
+      let refusal: unknown = null;
+      await owner.client.get(PeerObject, {}).catch((err: unknown) => { refusal = err; });
+      expect(refusal).toMatchObject({ code: "forbidden" });
+      expect(String((refusal as Error).message)).toContain("peers only");
+    } finally {
+      await owner.close();
+    }
+  });
+}, 15_000);
+
+test("peerRef rejects for a node this node is not connected to", async () => {
+  const B = await startPoolNode();
+  try {
+    await B.host.ready();
+    const other = "c".repeat(64);
+    await expect(B.pool.peerRef(other, PeerObject)).rejects.toThrow(`not connected to ${shortId(other)}`);
+  } finally {
+    await B.close();
+  }
 }, 15_000);

@@ -17,7 +17,7 @@ import { resultError } from "./engine/session";
 import { PoolObject } from "./state/contracts";
 import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
-import { listTasks } from "./store/records";
+import { listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
 import { setToken, tokenStatus } from "./token";
@@ -91,7 +91,7 @@ async function serve(): Promise<number> {
       version: VERSION,
       claudeCodeVersion: claudeCodeVersion(),
       hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
-      taskCount: () => listTasks(db).length,
+      taskCount: () => listLiveTasks(db).length,
     }));
     const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
@@ -139,7 +139,7 @@ async function status(): Promise<number> {
   console.log(`data dir ${cfg.dataDir}`);
   console.log(root.ok ? `task root ${cfg.taskRoot} ok` : root.reason);
   console.log(`token ${token.present ? `present expires ${token.expiresAt}` : "absent"}`);
-  console.log(`tasks ${readDb(cfg, (db) => listTasks(db).length) ?? 0}`);
+  console.log(`tasks ${readDb(cfg, (db) => listLiveTasks(db).length) ?? 0}`);
   console.log(`node ${existsSync(paths(cfg).irohKey) ? (await loadOrCreateIdentity(cfg)).id : "(none yet)"}`);
   console.log(readDb(cfg, poolLine) ?? "pool (none yet)");
   return 0;

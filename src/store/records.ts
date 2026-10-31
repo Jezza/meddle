@@ -13,6 +13,8 @@ export type ProjectRow = {
   source: string;
   replica: string;
   created_at: string;
+  /** The home's node id; NULL in a row from before homes, until the node claims it (`claimHomelessProjects`). */
+  home: string | null;
 };
 
 export type TaskRow = {
@@ -34,7 +36,7 @@ export type TaskSettings = { model?: string; effort?: string; permissionMode?: P
 
 export function insertProject(db: Database, row: ProjectRow): void {
   db.query(
-    "INSERT INTO projects (id, name, source_kind, source, replica, created_at) VALUES ($id, $name, $source_kind, $source, $replica, $created_at)",
+    "INSERT INTO projects (id, name, source_kind, source, replica, created_at, home) VALUES ($id, $name, $source_kind, $source, $replica, $created_at, $home)",
   ).run({
     $id: row.id,
     $name: row.name,
@@ -42,7 +44,13 @@ export function insertProject(db: Database, row: ProjectRow): void {
     $source: row.source,
     $replica: row.replica,
     $created_at: row.created_at,
+    $home: row.home,
   });
+}
+
+/** Gives every project without a home (added before projects had one) the home `nodeId`: this node. */
+export function claimHomelessProjects(db: Database, nodeId: string): void {
+  db.query("UPDATE projects SET home = ? WHERE home IS NULL").run(nodeId);
 }
 
 export function getProjectRow(db: Database, id: string): ProjectRow | null {
@@ -93,8 +101,14 @@ export function updateTask(
   db.query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $id`).run(params);
 }
 
+/** Every task row, moved and received ones included. */
 export function listTasks(db: Database): TaskRow[] {
   return db.query<TaskRow, []>("SELECT * FROM tasks ORDER BY created_at, id").all();
+}
+
+/** The tasks that live on this node: every state but `moved` (gone to another node) and `receiving` (not here yet). */
+export function listLiveTasks(db: Database): TaskRow[] {
+  return db.query<TaskRow, []>("SELECT * FROM tasks WHERE state NOT IN ('moved', 'receiving') ORDER BY created_at, id").all();
 }
 
 /** The task's settings; `{}` for a task with none, or an unknown task. */

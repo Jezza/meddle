@@ -6,6 +6,9 @@ import { openDb } from "../src/store/db";
 import { addProjectFromFolder } from "../src/projects/project";
 import { provisionTask, cwdFor } from "../src/tasks/provision";
 import { initColocated, isJjRepo } from "../src/jj";
+
+/** The home node id of the projects these tests add. */
+const PROJECT_HOME = "a".repeat(64);
 test("provision creates workspaces, config dir links and CLAUDE.md, seeding the profile first", async () => {
   const home = await mkdtemp("/tmp/meddle-prov-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/data`, MEDDLE_TASK_ROOT: `${home}/tasks` });
@@ -13,7 +16,7 @@ test("provision creates workspaces, config dir links and CLAUDE.md, seeding the 
   await (await import("node:fs/promises")).mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(`${home}/data/meddle.sqlite`);
   const a = `${home}/a`; await initColocated(a);
-  const pa = await addProjectFromFolder(cfg, db, a, "a");
+  const pa = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   const m = await provisionTask(cfg, db, { title: "t", projectIds: [pa.id] });
   const task = paths(cfg).task(m.id);
   expect((await lstat(`${task}/a/.jj`)).isDirectory()).toBe(true);
@@ -47,8 +50,8 @@ test("a two-project task gets a workspace per project and runs from the task fol
   const db = openDb(`${home}/data/meddle.sqlite`);
   const a = `${home}/a`; await initColocated(a);
   const b = `${home}/b`; await initColocated(b);
-  const pa = await addProjectFromFolder(cfg, db, a, "a");
-  const pb = await addProjectFromFolder(cfg, db, b, "b");
+  const pa = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
+  const pb = await addProjectFromFolder(cfg, db, b, PROJECT_HOME, "b");
   const m = await provisionTask(cfg, db, { title: "pair", projectIds: [pa.id, pb.id] });
   const task = paths(cfg).task(m.id);
   expect(m.id).toMatch(/^[0-9a-f]{12}$/);
@@ -88,8 +91,8 @@ test("a provision failing after a workspace exists undoes workspaces, bookmarks 
   const db = openDb(`${home}/data/meddle.sqlite`);
   const a = `${home}/a`; await initColocated(a);
   const b = `${home}/b`; await initColocated(b);
-  const pa = await addProjectFromFolder(cfg, db, a, "a");
-  const pb = await addProjectFromFolder(cfg, db, b, "b");
+  const pa = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
+  const pb = await addProjectFromFolder(cfg, db, b, PROJECT_HOME, "b");
   await expect(
     provisionTask(cfg, db, { title: "t", projectIds: [pa.id, pb.id], parents: { [pb.id]: "nonexistent_rev" } }),
   ).rejects.toThrow(/nonexistent_rev/);

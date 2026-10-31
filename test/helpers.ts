@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { ensureDataDirs, loadConfig, paths } from "../src/config";
 import { initColocated } from "../src/jj";
+import { loadOrCreateIdentity } from "../src/pool/identity";
 import { addProjectFromFolder } from "../src/projects/project";
 import { openDb } from "../src/store/db";
 import { TaskRunner } from "../src/tasks/durable";
@@ -12,7 +13,8 @@ import { setToken } from "../src/token";
 export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 
 /**
- * A node in a temp home: data dirs, task root, database, one colocated project added from a folder,
+ * A node in a temp home: data dirs, task root, database, its pool identity (the key a later `startPool` loads), one
+ * colocated project added from a folder with this node as its home,
  * a token, and a Harness with a TaskRunner that runs Claude Code turns from the `fixture` recording
  * (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the environment the config is read from.
  */
@@ -24,7 +26,8 @@ export async function setupNode(fixture = "hello.jsonl", extraEnv: Record<string
   const db = openDb(paths(cfg).db);
   const folder = `${home}/a`;
   await initColocated(folder);
-  const project = await addProjectFromFolder(cfg, db, folder, "a");
+  const { id } = await loadOrCreateIdentity(cfg);
+  const project = await addProjectFromFolder(cfg, db, folder, id, "a");
   await setToken(cfg, "tok");
   const harness = await openHarness(cfg, createRegistry());
   const runner = new TaskRunner(cfg, db, harness.harness, {

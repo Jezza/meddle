@@ -14,7 +14,7 @@ import { startPool, type PoolSummaryDeps } from "../src/pool/runtime";
 import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
 import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
-import { listTasks } from "../src/store/records";
+import { listLiveTasks } from "../src/store/records";
 import { VERSION, claudeCodeVersion } from "../src/version";
 import { setupNode } from "./helpers";
 
@@ -187,7 +187,7 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
     version: VERSION,
     claudeCodeVersion: claudeCodeVersion(),
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
-    taskCount: () => listTasks(db).length,
+    taskCount: () => listLiveTasks(db).length,
   };
 }
 

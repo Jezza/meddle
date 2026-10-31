@@ -72,6 +72,14 @@ const MIGRATIONS = [
 const ADDED_COLUMNS = [
   // A task's model, effort and permission mode overrides, as JSON (`TaskSettings`); NULL for none.
   { table: "tasks", column: "settings", type: "TEXT" },
+  // The node id of the project's home: the node whose `trunk` is the project's.
+  { table: "projects", column: "home", type: "TEXT" },
+  // Prompts sent while the task was moving, as a JSON array of strings; NULL for none.
+  { table: "tasks", column: "queued", type: "TEXT" },
+  // The node a `moved` task went to.
+  { table: "tasks", column: "moved_to", type: "TEXT" },
+  // The node a `receiving` task comes from.
+  { table: "tasks", column: "receiving_from", type: "TEXT" },
 ];
 
 export function openDb(path: string): Database {

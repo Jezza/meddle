@@ -3,19 +3,19 @@
 import { hostname } from "node:os";
 import Type from "typebox";
 import type { Database } from "bun:sqlite";
-import { createHost, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
+import { createHost, forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { checkTaskRoot, type NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
 import { resultError, type MeddleEvent } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
-import { servePool } from "../pool/object";
+import { peerOf, servePool } from "../pool/object";
 import type { PoolRuntime } from "../pool/runtime";
 import { acceptPeerLinks } from "../pool/sync";
 import { loadContext } from "../projects/context";
-import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects } from "../projects/project";
+import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, type Project } from "../projects/project";
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
-import { getTaskSettings, listTasks } from "../store/records";
+import { claimHomelessProjects, getTaskSettings, listLiveTasks, listTasks } from "../store/records";
 import type { TaskRunner, TaskState } from "../tasks/durable";
 import { readManifest } from "../tasks/manifest";
 import { tokenStatus } from "../token";
@@ -23,6 +23,7 @@ import { VERSION } from "../version";
 import {
   NodeObject,
   NodeStore,
+  PeerObject,
   ProjectObject,
   ProjectViewSchema,
   SessionObject,
@@ -52,9 +53,48 @@ type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
 const NOTIFICATIONS_KEPT = 50;
 const WINDOW_SIZE = 200;
 
-/** A host named `node` serving `NodeObject`, `ProjectObject`, `TaskObject`, `SessionObject` and `PoolObject`. */
+export type PeerObjectDeps = {
+  db: Database;
+  claudeCodeVersion: string;
+  hostsTasks(): Promise<boolean>;
+  /** Fires after a project was added or registered on this node. */
+  changes: Subscribable<null>;
+};
+
+/** A project as another node sees it. */
+function projectInfo(p: Project): { id: string; name: string; home: string } {
+  return { id: p.id, name: p.name, home: p.home };
+}
+
+/** Serves `PeerObject` on `host` to `peer:<nodeId>` principals; anyone else is refused `forbidden`. */
+export function servePeer(host: Host, deps: PeerObjectDeps): void {
+  const { db } = deps;
+  const projectsNow = () => listProjects(db).map(projectInfo);
+  host.serve(PeerObject, (_input, principal, self) => {
+    if (peerOf(principal) === null) throw forbidden("peers only");
+    const state = PeerObject.def.variants.peer.state;
+    const projects = self.state("projects", state.projects, { init: projectsNow });
+    self.on("projects", deps.changes, (_event, ctx) => projects.replace(ctx, projectsNow()));
+    return {
+      variant: "peer",
+      projects,
+      claudeCodeVersion: self.state("claudeCodeVersion", state.claudeCodeVersion, deps.claudeCodeVersion),
+      hostsTasks: self.state("hostsTasks", state.hostsTasks, { init: () => deps.hostsTasks() }),
+      projectInfo: async ({ id }) => {
+        const found = getProject(db, id);
+        return found === null ? null : projectInfo(found);
+      },
+    };
+  });
+}
+
+/**
+ * A host named `node` serving `NodeObject`, `ProjectObject`, `TaskObject`, `SessionObject`, `PoolObject` and
+ * `PeerObject`. Projects from before projects had a home get this node as theirs.
+ */
 export function createNodeHost(deps: NodeHostDeps): Host {
   const { cfg, db, runner, metrics, pool } = deps;
+  claimHomelessProjects(db, pool.identity.id);
   const approvals = runner.approvals;
   const events: Subscribable<TaskEvent> = {
     subscribe: (cb) => runner.onEvent((taskId, seq, message) => cb({ taskId, seq, message })),
@@ -68,10 +108,16 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   const host = createHost({ name: "node", self: "node" });
   servePool(host, pool.objectDeps);
+  servePeer(host, {
+    db,
+    claudeCodeVersion: deps.claudeCodeVersion,
+    hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
+    changes: projectChanges,
+  });
   acceptPeerLinks(pool.net, host, (id) => pool.store.isMember(id));
 
   host.serve(NodeStore, (_input, _principal, self) => {
-    const taskIds = self.state("taskIds", NodeStore.def.members.taskIds, { init: () => listTasks(db).map((t) => t.id) });
+    const taskIds = self.state("taskIds", NodeStore.def.members.taskIds, { init: () => listLiveTasks(db).map((t) => t.id) });
     const projectIds = self.state("projectIds", NodeStore.def.members.projectIds, { init: projectIdsNow });
     const token = self.state("token", NodeStore.def.members.token, { init: () => tokenNow(cfg) });
     const metricsNow = self.state("metrics", NodeStore.def.members.metrics, { init: () => metrics.latest() });
@@ -120,6 +166,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       metricsNow.replace(ctx, sample);
       token.replace(ctx, await tokenNow(cfg));
     });
+    // A project added or registered elsewhere than through this object (a replica a task needed).
+    self.on("projects", projectChanges, (_event, ctx) => projectIds.replace(ctx, projectIdsNow()));
     // A token pulled from a peer changes the file without a metrics sample.
     self.on("pool", poolChanges, async (_event, ctx) => {
       const next = await tokenNow(cfg);
@@ -149,12 +197,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         return manifest;
       },
       addProjectFromFolder: async ({ path, name }, ctx) => {
-        const project = await addProjectFromFolder(cfg, db, path, name);
+        const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name);
         projectIds.replace(ctx, projectIdsNow());
         return project;
       },
       addProjectFromUpstream: async ({ url, name }, ctx) => {
-        const project = await addProjectFromUpstream(cfg, db, url, name);
+        const project = await addProjectFromUpstream(cfg, db, url, pool.identity.id, name);
         projectIds.replace(ctx, projectIdsNow());
         return project;
       },
@@ -211,6 +259,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       name: self.derive([project], (p) => p.name),
       source: self.derive([project], (p) => p.source),
       replica: self.derive([project], (p) => p.replica),
+      home: self.derive([project], (p) => p.home),
       contextLoaded: self.derive([project], (p) => p.contextLoaded),
     };
   });

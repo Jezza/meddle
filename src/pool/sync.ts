@@ -88,6 +88,14 @@ export class PoolSync {
     await this.pulls;
   }
 
+  /**
+   * This node's client host on its link to the peer, when it holds one (the peer is online and its stream opened): a
+   * reconnect replaces it, so callers take what they need from it fresh for each step.
+   */
+  hostFor(peerId: string): Host | undefined {
+    return this.views.get(peerId)?.host ?? undefined;
+  }
+
   /** Records this node's current summary and address in its own row, then tells the node. */
   async refreshSelf(): Promise<void> {
     const { store, net, selfId } = this.deps;

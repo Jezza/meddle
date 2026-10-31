@@ -9,6 +9,9 @@ import { openHarness } from "../src/tasks/harness";
 import { CARRY_ON_PROMPT, TaskRunner } from "../src/tasks/durable";
 import { appendEvent, listEvents } from "../src/store/events";
 import { getTask, updateTask } from "../src/store/records";
+
+/** The home node id of the projects these tests add. */
+const PROJECT_HOME = "a".repeat(64);
 const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 test("a prompt runs a durable turn and leaves the task idle", async () => {
   const home = await mkdtemp("/tmp/meddle-dur-");
@@ -16,7 +19,7 @@ test("a prompt runs a durable turn and leaves the task idle", async () => {
   await ensureDataDirs(cfg); await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(paths(cfg).db);
   const a = `${home}/a`; await initColocated(a);
-  const p = await addProjectFromFolder(cfg, db, a, "a");
+  const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   await (await import("../src/token")).setToken(cfg, "tok");
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
   const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };
@@ -47,7 +50,7 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   await ensureDataDirs(cfg); await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(paths(cfg).db);
   const a = `${home}/a`; await initColocated(a);
-  const p = await addProjectFromFolder(cfg, db, a, "a");
+  const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   await (await import("../src/token")).setToken(cfg, "tok");
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
   const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };
@@ -90,7 +93,7 @@ test("a pending approval makes the task waiting until it is answered", async () 
   await ensureDataDirs(cfg); await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(paths(cfg).db);
   const a = `${home}/a`; await initColocated(a);
-  const p = await addProjectFromFolder(cfg, db, a, "a");
+  const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   const { createRegistry } = await import("@earendil-works/pi-durable");
   const h = await openHarness(cfg, createRegistry());
   const runner = new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/approval.jsonl` } });
@@ -112,7 +115,7 @@ async function setup() {
   await ensureDataDirs(cfg); await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(paths(cfg).db);
   const a = `${home}/a`; await initColocated(a);
-  const p = await addProjectFromFolder(cfg, db, a, "a");
+  const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   await (await import("../src/token")).setToken(cfg, "tok");
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
   const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };

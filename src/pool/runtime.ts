@@ -3,7 +3,7 @@
 import { hostname } from "node:os";
 import type { Database } from "bun:sqlite";
 import type { Endpoint } from "@number0/iroh";
-import type { Subscribable } from "@earendil-works/chord";
+import type { AnyContract, InputOf, Ref, Subscribable } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
 import { Discovery } from "./discovery";
 import { loadOrCreateIdentity, shortId, type Identity } from "./identity";
@@ -35,6 +35,11 @@ export type PoolRuntime = {
   refresh(): Promise<void>;
   /** Fires whenever the roster, a peer's online state or the token changed. Returns the unsubscribe. */
   onChange(cb: () => void): () => void;
+  /**
+   * A reference to `contract` (input `{}`) on the peer, over this node's client host for it; rejects
+   * `not connected to <shortId>` when there is none. The caller releases it when done.
+   */
+  peerRef<C extends AnyContract>(nodeId: string, contract: C): Promise<Ref<C>>;
   stop(): Promise<void>;
 };
 
@@ -287,6 +292,12 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   const changes: Subscribable<null> = { subscribe: (cb) => onChange(() => cb(null)) };
 
+  async function peerRef<C extends AnyContract>(nodeId: string, contract: C): Promise<Ref<C>> {
+    const host = sync.hostFor(nodeId);
+    if (host === undefined) throw new Error(`not connected to ${shortId(nodeId)}`);
+    return host.get(contract, {} as InputOf<C>);
+  }
+
   return {
     identity, store, net, endpoint,
     objectDeps: {
@@ -305,6 +316,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     tokenChanged,
     refresh,
     onChange,
+    peerRef,
     async stop() {
       if (stopped) return;
       stopped = true;

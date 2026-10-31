@@ -67,7 +67,12 @@ export const ProjectSchema = Type.Object({
   name: Type.String(),
   source: ProjectSourceSchema,
   replica: Type.String(),
+  /** The node id of the project's home. */
+  home: Type.String(),
 });
+
+/** A project as another node sees it. */
+export const ProjectInfoSchema = Type.Object({ id: Type.String(), name: Type.String(), home: Type.String() });
 
 export const EventSchema = Type.Object({ seq: Type.Number(), message: Type.Unknown() });
 
@@ -254,6 +259,27 @@ export const PoolNodeSchema = Type.Object({
   hostsTasks: Type.Boolean(),
   taskCount: Type.Number(),
   lastSeenAt: Nullable(Type.String()),
+});
+
+/** What one node asks of another (principal `peer:<nodeId>` only); bulk goes over `git` and `blob` streams. */
+export const PeerObject = remote("meddle.peer", {
+  version: 1,
+  input: Type.Object({}),
+  host: hostNamed("node"),
+  variants: {
+    peer: {
+      state: {
+        /** The projects this node holds, its own and its replicas of others'. */
+        projects: Type.Array(ProjectInfoSchema),
+        claudeCodeVersion: Type.String(),
+        hostsTasks: Type.Boolean(),
+      },
+      methods: {
+        /** The project with this id, or null when this node does not hold it. */
+        projectInfo: method(Type.Object({ id: Type.String() }), Nullable(ProjectInfoSchema)),
+      },
+    },
+  },
 });
 
 export const PoolObject = remote("meddle.pool", {
