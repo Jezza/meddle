@@ -25,6 +25,8 @@ test("provision creates workspaces, config dir links and CLAUDE.md, seeding the 
   expect(await Bun.file(`${task}/a/.git`).exists()).toBe(true);
   expect(await (await import("../src/jj")).jj(["bookmark", "list", `meddle/task/${m.id}/a`], a)).toContain(`meddle/task/${m.id}/a`);
   expect(cwdFor(m, cfg)).toEqual({ cwd: `${task}/a`, projectConfigRoot: a, settingSources: ["user", "project", "local"] });
+  // the transcripts live under .meddle: only this user may read it
+  expect((await lstat(`${task}/.meddle`)).mode & 0o777).toBe(0o700);
 });
 test("provision refuses without a task root", async () => {
   const home = await mkdtemp("/tmp/meddle-prov-");

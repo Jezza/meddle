@@ -17,18 +17,27 @@ export function paths(cfg: NodeConfig) {
     memory: (projectId: string) => join(data, "memory", projectId),
     replica: (projectId: string) => join(data, "replicas", projectId),
     task,
+    /** meddle's own files in a task folder, the Claude Code config dir and its transcripts among them. */
+    taskMeta: (taskId: string) => join(task(taskId), ".meddle"),
     taskConfig: (taskId: string) => join(task(taskId), ".meddle", "claude"),
     taskManifest: (taskId: string) => join(task(taskId), ".meddle", "task.json"),
   };
 }
 
+/** Creates `dir` with mode 700, or tightens it to 700 when it exists: it holds what only this user may read. */
+export async function ensurePrivateDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await chmod(dir, 0o700);
+}
+
+/** The data dir (mode 700: its database holds every task's transcript) and the directories under it. */
 export async function ensureDataDirs(cfg: NodeConfig): Promise<void> {
   const p = paths(cfg);
-  for (const dir of [cfg.dataDir, p.profile, p.plugins, join(cfg.dataDir, "memory"), join(cfg.dataDir, "replicas")]) {
+  await ensurePrivateDir(cfg.dataDir);
+  for (const dir of [p.profile, p.plugins, join(cfg.dataDir, "memory"), join(cfg.dataDir, "replicas")]) {
     await mkdir(dir, { recursive: true });
   }
-  await mkdir(p.secrets, { recursive: true, mode: 0o700 });
-  await chmod(p.secrets, 0o700);
+  await ensurePrivateDir(p.secrets);
 }
 
 export async function checkTaskRoot(cfg: NodeConfig): Promise<{ ok: true } | { ok: false; reason: string }> {

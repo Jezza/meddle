@@ -29,3 +29,14 @@ test("ensureDataDirs creates secrets with mode 700", async () => {
   const st = await import("node:fs/promises").then(fs => fs.stat(paths(cfg).secrets));
   expect(st.mode & 0o777).toBe(0o700);
 });
+test("ensureDataDirs makes the data dir 700, tightening one that exists", async () => {
+  const { mkdtemp, mkdir, stat } = await import("node:fs/promises");
+  const home = await mkdtemp("/tmp/meddle-cfg-");
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
+  await ensureDataDirs(cfg);
+  expect((await stat(cfg.dataDir)).mode & 0o777).toBe(0o700);
+  const existing = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/e`, MEDDLE_TASK_ROOT: `${home}/t` });
+  await mkdir(existing.dataDir, { mode: 0o755 });
+  await ensureDataDirs(existing);
+  expect((await stat(existing.dataDir)).mode & 0o777).toBe(0o700);
+});

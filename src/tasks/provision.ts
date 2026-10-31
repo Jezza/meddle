@@ -2,7 +2,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
-import { checkTaskRoot, paths } from "../paths";
+import { checkTaskRoot, ensurePrivateDir, paths } from "../paths";
 import { bookmarkDelete, bookmarkSet, changeId, trunkRevset, workspaceAdd, workspaceForget } from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
 import { ensureMemoryReplica, linkMemory } from "../memory";
@@ -71,6 +71,8 @@ export async function provisionTask(
   const bookmarks: Array<{ replica: string; name: string }> = [];
   try {
     const configDir = p.taskConfig(id);
+    await mkdir(task, { recursive: true });
+    await ensurePrivateDir(p.taskMeta(id)); // the transcripts live under it
     await mkdir(configDir, { recursive: true });
     const entries: TaskManifest["projects"] = [];
     for (const project of projects) {
