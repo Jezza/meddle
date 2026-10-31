@@ -58,6 +58,18 @@ test("remove marks a node removed at the given time", () => {
   expect(store.row(C)).toBeNull();
 });
 
+test("a removal is never older than the row it removes", () => {
+  const store = new PoolStore(openDb(":memory:"));
+  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  // B's row was stamped by a node whose clock is ahead of this one's.
+  store.upsert(row(B, "member", t3));
+  store.remove(B, t2);
+  expect(store.row(B)).toMatchObject({ status: "removed", updatedAt: "2026-10-31T03:00:00.001Z" });
+  // So the member row it removed, sent back by a peer, cannot resurrect it.
+  expect(store.merge([row(B, "member", t3)])).toBe(false);
+  expect(store.isMember(B)).toBe(false);
+});
+
 test("seen updates summary, lastSeenAt and lastAddr without touching updatedAt; merge takes the newer lastSeenAt", () => {
   const store = new PoolStore(openDb(":memory:"));
   store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);

@@ -137,8 +137,18 @@ export class PoolStore {
     })();
   }
 
+  /**
+   * Marks `nodeId` removed at `now`, or 1 ms after its row's `updatedAt` when that is later (another node's clock may
+   * be ahead of this one's): a removal always supersedes the row it acts on.
+   */
   remove(nodeId: string, now: string = new Date().toISOString()): void {
-    this.db.query("UPDATE roster SET status = 'removed', updated_at = ? WHERE node_id = ?").run(now, nodeId);
+    this.db.transaction(() => {
+      const row = this.row(nodeId);
+      if (row === null) return;
+      const after = Date.parse(row.updatedAt);
+      const floor = Number.isFinite(after) ? new Date(after + 1).toISOString() : now;
+      this.db.query("UPDATE roster SET status = 'removed', updated_at = ? WHERE node_id = ?").run(floor > now ? floor : now, nodeId);
+    })();
   }
 
   /** Records that `nodeId` was heard from at `at`; membership and `updatedAt` are left alone. */
