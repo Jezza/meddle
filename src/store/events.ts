@@ -80,3 +80,11 @@ export function latestEventOfType(db: Database, taskId: string, type: string, su
     ).get(taskId, type, subtype);
   return row === null ? null : { seq: row.seq, message: JSON.parse(row.json) };
 }
+
+/** The task's newest `type`/`subtype` event whose JSON has a non-null top-level `field`, or null. */
+export function latestEventWithField(db: Database, taskId: string, type: string, subtype: string, field: string): EventRecord | null {
+  const row = db.query<{ seq: number; json: string }, [string, string, string, string]>(
+    "SELECT seq, json FROM events WHERE task_id = ? AND type = ? AND subtype = ? AND json_extract(json, ?) IS NOT NULL ORDER BY seq DESC LIMIT 1",
+  ).get(taskId, type, subtype, `$.${field}`);
+  return row === null ? null : { seq: row.seq, message: JSON.parse(row.json) };
+}

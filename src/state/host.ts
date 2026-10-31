@@ -11,7 +11,7 @@ import { resultError, type MeddleEvent } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { loadContext } from "../projects/context";
 import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects } from "../projects/project";
-import { latestEventOfType, listEvents, listEventsTail, type EventRecord } from "../store/events";
+import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
 import { getTaskSettings, listTasks } from "../store/records";
 import type { TaskRunner, TaskState } from "../tasks/durable";
 import { readManifest } from "../tasks/manifest";
@@ -297,11 +297,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     return out;
   }
 
-  /** A task's log summary from its newest `init`, `status` and `result` and its newest seq, not its whole log. */
+  /** A task's log summary from its newest `init`, mode-carrying `status` and `result` and its newest seq, not its whole log. */
   function taskLogNow(taskId: string): TaskLog {
+    // Not every status carries a mode (compaction notices do not), so the newest status alone can hide a mode change.
     const latest = [
       latestEventOfType(db, taskId, "system", "init"),
-      latestEventOfType(db, taskId, "system", "status"),
+      latestEventWithField(db, taskId, "system", "status", "permissionMode"),
       latestEventOfType(db, taskId, "result"),
     ].filter((e) => e !== null).sort((a, b) => a.seq - b.seq);
     const log = foldTaskLog(EMPTY_TASK_LOG, latest);

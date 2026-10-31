@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb } from "../src/store/db";
-import { appendEvent, latestEventOfType, listEvents, listEventsTail } from "../src/store/events";
+import { appendEvent, latestEventOfType, latestEventWithField, listEvents, listEventsTail } from "../src/store/events";
 test("unknown message shapes are stored verbatim with sequence numbers", () => {
   const db = openDb(":memory:");
   expect(appendEvent(db, "t", { type: "assistant", uuid: "u1" })).toBe(1);
@@ -48,6 +48,16 @@ test("latestEventOfType finds the task's newest event of a type, and of a subtyp
   expect(latestEventOfType(db, "t", "system", "init")).toEqual({ seq: 3, message: { type: "system", subtype: "init", model: "b" } });
   expect(latestEventOfType(db, "t", "system")?.seq).toBe(4);
   expect(latestEventOfType(db, "t", "result")).toBeNull();
+});
+
+test("latestEventWithField finds the newest event of a subtype whose JSON carries the field", () => {
+  const db = openDb(":memory:");
+  appendEvent(db, "t", { type: "system", subtype: "status", permissionMode: "plan" });
+  appendEvent(db, "t", { type: "system", subtype: "status", status: "compacting" });
+  appendEvent(db, "t", { type: "system", subtype: "status", permissionMode: null });
+  appendEvent(db, "u", { type: "system", subtype: "status", permissionMode: "auto" });
+  expect(latestEventWithField(db, "t", "system", "status", "permissionMode")?.seq).toBe(1);
+  expect(latestEventWithField(db, "t", "system", "init", "permissionMode")).toBeNull();
 });
 
 test("openDb adds the tasks settings column to an older database, once", async () => {

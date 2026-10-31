@@ -182,7 +182,9 @@ test("a task's activation reads its log summary from the newest events, and its 
     appendEvent(db, id, { type: "result", subtype: "success", usage: { input_tokens: 1 } });
     appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "auto", model: "new" });
     appendEvent(db, id, { type: "system", subtype: "status", permissionMode: "plan" });
-    for (let i = 0; i < 250; i++) appendEvent(db, id, { type: "assistant", n: i });
+    // A later status without a mode (a compaction notice) must not hide the mode change.
+    appendEvent(db, id, { type: "system", subtype: "status", status: "compacting" });
+    for (let i = 0; i < 249; i++) appendEvent(db, id, { type: "assistant", n: i });
     appendEvent(db, id, { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } } });
     const task = await client.get(TaskObject, { id });
     expect(task.lastSeq.value).toBe(255);
