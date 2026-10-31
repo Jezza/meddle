@@ -96,6 +96,12 @@ export class PoolSync {
     return this.views.get(peerId)?.host ?? undefined;
   }
 
+  /** `hostFor` with the signal that aborts when this view of the peer is dropped (the peer went offline). */
+  viewFor(peerId: string): { host: Host; signal: AbortSignal } | undefined {
+    const view = this.views.get(peerId);
+    return view?.host ? { host: view.host, signal: view.abort.signal } : undefined;
+  }
+
   /** Records this node's current summary and address in its own row, then tells the node. */
   async refreshSelf(): Promise<void> {
     const { store, net, selfId } = this.deps;

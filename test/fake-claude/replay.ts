@@ -1,5 +1,7 @@
 // Stands in for the `claude` binary: replays a recorded stream-json session (see record.ts).
-// Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause forever before `result`),
+// Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause before `result` until stdin ends or,
+// as Claude Code ends an interrupted turn, an `interrupt` arrives: then the `result` comes as `error_during_execution`
+// and the stand-in exits),
 // MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`).
 // Any argv is accepted; only `--session-id` / `--resume` are read (see `transcribe`). Dependency-free so it
 // starts fast.
@@ -54,6 +56,8 @@ let eof = false;
 let wake: () => void = () => {};
 let lastEmittedRequestId: string | undefined;
 let stalling = false;
+/** While stalling: the `result` line held back, sent (as an interrupted turn's) when an interrupt arrives. */
+let heldResult: string | undefined;
 
 const write = (line: string) => process.stdout.write(line + "\n");
 /** Exits 0 once everything written to stdout has been flushed. */
@@ -81,6 +85,13 @@ process.stdin.on("data", (chunk: Buffer) => {
     let f: Frame;
     try { f = JSON.parse(line); } catch { continue; }
     if (f.type === "control_request") answer(f);
+    if (f.type === "control_request" && f.request?.subtype === "interrupt" && stalling && heldResult !== undefined) {
+      write(JSON.stringify({ ...JSON.parse(heldResult), subtype: "error_during_execution", is_error: true, errors: [] }));
+      heldResult = undefined;
+      // The SDK keeps stdin open after an interrupted turn's result (meddle closes it after a grace period): the
+      // stand-in ends the session itself instead.
+      void finish();
+    }
     arrived.push({ frame: f, used: false });
   }
   wake();
@@ -165,6 +176,7 @@ for (const step of steps.slice(0, lastEmit + 1)) {
   if ("need" in step) { await waitFor(step.need); continue; }
   if (step.frame.type === "result" && stall) {
     stalling = true;
+    heldResult = step.emit;
     if (eof) await finish();
     await new Promise<never>(() => {}); // still answering control requests; exits on stdin EOF or SIGTERM
   }

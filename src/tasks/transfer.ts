@@ -53,7 +53,7 @@ type EventRow = { seq: number; json: string };
 type TranscriptRow = { project_key: string; session_id: string; subpath: string; seq: number; uuid: string | null; ts: number; json: string };
 
 /** The regular files under `root`, depth first in name order, as forward-slash paths relative to it; symlinks skipped. */
-async function regularFiles(root: string, rel = ""): Promise<string[]> {
+export async function regularFiles(root: string, rel = ""): Promise<string[]> {
   let names: string[];
   try {
     names = (await readdir(join(root, rel))).sort();

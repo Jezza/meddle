@@ -6,7 +6,7 @@ import { initColocated } from "../src/jj";
 import { loadOrCreateIdentity } from "../src/pool/identity";
 import { addProjectFromFolder } from "../src/projects/project";
 import { openDb } from "../src/store/db";
-import { TaskRunner } from "../src/tasks/durable";
+import { TaskRunner, type RunnerHooks } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
 import { setToken } from "../src/token";
 
@@ -17,10 +17,14 @@ export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
  * colocated project added from a folder with this node as its home,
  * a token, and a Harness with a TaskRunner that runs Claude Code turns from the `fixture` recording
  * (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the environment the config is read from;
- * its `MEDDLE_FIXTURE_MEMORY` also reaches the stand-in Claude Code. `log` receives the runner's log lines (default
- * `console.error`).
+ * its `MEDDLE_FIXTURE_MEMORY` and `MEDDLE_FIXTURE_STALL` also reach the stand-in Claude Code. `log` receives the
+ * runner's log lines (default `console.error`); `hooks` are the runner's test hooks.
  */
-export async function setupNode(fixture = "hello.jsonl", extraEnv: Record<string, string> = {}, options: { log?: (line: string) => void } = {}) {
+export async function setupNode(
+  fixture = "hello.jsonl",
+  extraEnv: Record<string, string> = {},
+  options: { log?: (line: string) => void; hooks?: RunnerHooks } = {},
+) {
   const home = await mkdtemp("/tmp/meddle-node-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t`, ...extraEnv });
   await ensureDataDirs(cfg);
@@ -38,8 +42,10 @@ export async function setupNode(fixture = "hello.jsonl", extraEnv: Record<string
     extraEnv: {
       MEDDLE_FIXTURE: fixture.startsWith("/") ? fixture : `${import.meta.dir}/fixtures/${fixture}`,
       ...(extraEnv.MEDDLE_FIXTURE_MEMORY === undefined ? {} : { MEDDLE_FIXTURE_MEMORY: extraEnv.MEDDLE_FIXTURE_MEMORY }),
+      ...(extraEnv.MEDDLE_FIXTURE_STALL === undefined ? {} : { MEDDLE_FIXTURE_STALL: extraEnv.MEDDLE_FIXTURE_STALL }),
     },
     ...(options.log === undefined ? {} : { log: options.log }),
+    ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
   });
   return { home, cfg, db, project, harness, runner };
 }

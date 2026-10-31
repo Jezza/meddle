@@ -21,7 +21,7 @@ import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
 import type { StreamReader } from "../pool/frames";
 import { getProject, type Project } from "../projects/project";
 import { ensureRemote, ensureReplica, fetchBookmarks, pushBookmark, trunkFor, type ReplicaDeps } from "../projects/replicas";
-import { appendEvent, latestEventOfType, type EventRecord } from "../store/events";
+import { appendEvent, latestEventOfType, listEventsTail, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
   clearTaskLog,
@@ -39,16 +39,29 @@ import { getToken } from "../token";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
 import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
+import { MeddleMove, type MoveInput } from "./move";
 import { checkReceivedManifest, provisionFromManifest, provisionTask } from "./provision";
 import { importTask, type Receipt } from "./transfer";
 
-export type TaskState = "idle" | "running" | "waiting" | "receiving" | "archived";
+export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" | "moved" | "archived";
 
-type TurnInput = { taskId: string; prompt: string };
+/**
+ * One turn's input. `freshAfter` (the first turn of a task received from another node): the cut-off check looks only at
+ * events after this seq, so a turn the sender ended (by moving the task) is never taken for one this node must carry on.
+ */
+type TurnInput = { taskId: string; prompt: string; freshAfter?: number };
 type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
 /** Installed by `openHarness`: how a phase finds the Harness it runs in. */
-type MeddleHooks = { harness(): Harness };
-type TurnRuntime = TaskRuntime<TurnInput, TurnCheckpoint, null, MeddleHooks>;
+export type MeddleHooks = { harness(): Harness };
+
+/** Test hooks of a runner. */
+export type RunnerHooks = {
+  /** Called as `activateTask` starts, before anything else; a throw fails the call. */
+  beforeActivate?(taskId: string): void | Promise<void>;
+};
+
+/** A move of a task in progress here: where to, the step it is at, and the error that is failing it (if any). */
+export type MoveState = { to: string; phase: string; error: string | null };
 
 export type RunnerDeps = {
   claudePath?: string;
@@ -61,6 +74,8 @@ export type RunnerDeps = {
   pool?: PoolRuntime;
   /** Where `meddle: git: …` lines go (each distinct line at most once a minute); default `console.error`. */
   log?(line: string): void;
+  /** Tests only. */
+  hooks?: RunnerHooks;
 };
 
 /** One TaskRunner per Harness; a phase may start before its runner exists, so it waits for it. */
@@ -76,7 +91,8 @@ function runnerSlot(harness: Harness): RunnerSlot {
   return slot;
 }
 
-async function runnerFor(runtime: TurnRuntime, context: Context): Promise<TaskRunner> {
+/** The TaskRunner of the Harness a phase of a meddle task runs in. */
+export async function runnerFor(runtime: { hooks: TaskRuntime<unknown, unknown, unknown, MeddleHooks>["hooks"] }, context: Context): Promise<TaskRunner> {
   let harness: Harness | undefined;
   await runtime.hooks.each("harness", (get) => { harness = get(); });
   if (harness === undefined) throw new Error("the meddle extension is not installed");
@@ -120,6 +136,9 @@ export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHook
 
 type LiveTurn = { query: Query; queue: InputQueue; state: "running" | "waiting" };
 
+/** How long a turn interrupted by a "move now" has to end before it is closed. */
+const INTERRUPT_GRACE_MS = 15_000;
+
 /** The states of a task that lives here; a received task in one of them is already activated. */
 const ACTIVE_STATES = new Set(["idle", "running", "waiting"]);
 
@@ -152,6 +171,14 @@ export class TaskRunner {
   #pending = new Set<string>();
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
   #stateListeners = new Set<(taskId: string, state: TaskState) => void>();
+  /**
+   * The moves of tasks running here (decision 11). While a task is in it, its turns do not write its state, prompts are
+   * queued and the rest is refused; its row says `moving` for a restart and the dashboard.
+   */
+  #moving = new Map<string, MoveState>();
+  #moveListeners = new Set<(taskId: string, move: MoveState | null) => void>();
+  /** Woken whenever a turn of the task ends (completed, failed or aborted): a move waits for it. */
+  #turnWaiters = new Map<string, Set<() => void>>();
 
   constructor(cfg: NodeConfig, db: Database, harness: Harness, deps: RunnerDeps) {
     this.#cfg = cfg;
@@ -208,6 +235,14 @@ export class TaskRunner {
     const row = this.#row(taskId);
     if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
     refuseReceiving(row);
+    refuseMoved(row);
+    if (this.#isMoving(row)) {
+      // Queued prompts travel with the task, and its export reads them once the handoff has begun: one sent after that
+      // would be left behind.
+      if (this.#moving.get(taskId)?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
+      this.#enqueue(taskId, text);
+      return;
+    }
     let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
@@ -255,16 +290,17 @@ export class TaskRunner {
    * Starts the task's next turn from its queued prompts (decision 13 as amended: one turn per text, in order) when it
    * is idle with a prompt queued and no turn pending or live; otherwise does nothing. The text leaves `queued` only
    * once its turn is created, so a crash never loses it; a crash in the moment between the two runs it twice.
-   * `completeTurn` calls this after every turn, so the queue drains turn by turn.
+   * `completeTurn` calls this after every turn, so the queue drains turn by turn. A moving task's queue waits for the
+   * node it goes to. `freshAfter`: see `TurnInput`.
    */
-  async startQueued(taskId: string): Promise<void> {
+  async startQueued(taskId: string, options: { freshAfter?: number } = {}): Promise<void> {
     const row = getTask(this.#db, taskId);
-    if (row === null || row.state !== "idle" || this.#pending.has(taskId) || this.#live.has(taskId)) return;
+    if (row === null || row.state !== "idle" || this.#moving.has(taskId) || this.#pending.has(taskId) || this.#live.has(taskId)) return;
     const [head] = queuedOf(row);
     if (head === undefined) return;
     this.#pending.add(taskId);
     try {
-      await this.#createTurn({ taskId, prompt: head });
+      await this.#createTurn({ taskId, prompt: head, ...(options.freshAfter === undefined ? {} : { freshAfter: options.freshAfter }) });
     } catch (err) {
       this.#pending.delete(taskId);
       throw err;
@@ -292,27 +328,27 @@ export class TaskRunner {
   }
 
   async interrupt(taskId: string): Promise<void> {
-    refuseReceiving(this.#row(taskId));
+    this.#refuseElsewhere(taskId);
     await this.#liveQueryOrThrow(taskId).interrupt();
   }
 
   /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
-    refuseReceiving(this.#row(taskId));
+    this.#refuseElsewhere(taskId);
     await this.liveQuery(taskId)?.setPermissionMode(mode);
     updateTaskSettings(this.#db, taskId, { permissionMode: mode });
   }
 
   /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the default. */
   async setModel(taskId: string, model?: string): Promise<void> {
-    refuseReceiving(this.#row(taskId));
+    this.#refuseElsewhere(taskId);
     await this.liveQuery(taskId)?.setModel(model);
     updateTaskSettings(this.#db, taskId, { model });
   }
 
   /** Effort for the task's later turns; a live turn keeps its own. */
   async setEffort(taskId: string, effort: string): Promise<void> {
-    refuseReceiving(this.#row(taskId));
+    this.#refuseElsewhere(taskId);
     updateTaskSettings(this.#db, taskId, { effort });
   }
 
@@ -324,7 +360,7 @@ export class TaskRunner {
 
   /** Runs the task's turn again after pi-durable's restart limit parked it. */
   async retry(taskId: string): Promise<void> {
-    refuseReceiving(this.#row(taskId));
+    this.#refuseElsewhere(taskId);
     const turn = await this.#durableTurn(taskId);
     if (turn === undefined || !isParked(turn)) throw new Error(`no parked turn for task ${taskId}`);
     await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
@@ -356,11 +392,13 @@ export class TaskRunner {
     const { taskId } = input;
     let failureLogged = false; // the turn's own turn_failed is in the log
     try {
-      const rerun = lastTurnCutOff(this.#db, taskId);
-      const started = this.#row(taskId).started === 1;
-      this.#db.transaction(() => updateTask(this.#db, taskId, { started: 1, state: "running" }))();
+      const rerun = lastTurnCutOff(this.#db, taskId, input.freshAfter ?? 0);
+      const row = this.#row(taskId);
+      const started = row.started === 1;
+      const moving = this.#isMoving(row);
+      this.#db.transaction(() => updateTask(this.#db, taskId, moving ? { started: 1 } : { started: 1, state: "running" }))();
       this.#pending.delete(taskId);
-      this.#emitState(taskId, "running");
+      if (!moving) this.#emitState(taskId, "running");
       const manifest = await readManifest(this.#cfg, taskId);
       const primary = manifest.primaryProjectId;
       const deps = this.#replicaDeps();
@@ -408,17 +446,10 @@ export class TaskRunner {
    */
   async finishTurnPhase(taskId: string, context: Context): Promise<void> {
     let manifest: TaskManifest;
-    const moved: Array<{ projectId: string; replica: string; bookmark: string; change: string }> = [];
+    let moved: TaskBookmark[];
     try {
       manifest = await readManifest(this.#cfg, taskId);
-      for (const p of manifest.projects) {
-        const workspace = join(paths(this.#cfg).task(taskId), p.workspace);
-        const bookmark = `meddle/task/${taskId}/${p.name}`;
-        const change = await changeId(workspace, this.#cfg);
-        // Not under another task's push to the same replica (pushBookmark takes the same key).
-        await serialised(repoKey(p.replica), () => bookmarkSet(p.replica, bookmark, change, this.#cfg));
-        moved.push({ projectId: p.id, replica: p.replica, bookmark, change });
-      }
+      moved = await this.setTaskBookmarks(manifest);
     } catch (err) {
       this.#failTurn(taskId, context);
       throw err;
@@ -429,8 +460,22 @@ export class TaskRunner {
     await syncMemoryAfter(deps, manifest.primaryProjectId, this.#log);
   }
 
+  /** Points each of the task's bookmarks at its workspace's working-copy change; what it set. */
+  async setTaskBookmarks(manifest: TaskManifest): Promise<TaskBookmark[]> {
+    const set: TaskBookmark[] = [];
+    for (const p of manifest.projects) {
+      const workspace = join(paths(this.#cfg).task(manifest.id), p.workspace);
+      const bookmark = `meddle/task/${manifest.id}/${p.name}`;
+      const change = await changeId(workspace, this.#cfg);
+      // Not under another task's push to the same replica (pushBookmark takes the same key).
+      await serialised(repoKey(p.replica), () => bookmarkSet(p.replica, bookmark, change, this.#cfg));
+      set.push({ projectId: p.id, replica: p.replica, bookmark, change });
+    }
+    return set;
+  }
+
   /** Pushes a task bookmark to its project's home when that is another node; a failure is logged. */
-  async #pushToHome(deps: ReplicaDeps, m: { projectId: string; replica: string; bookmark: string; change: string }): Promise<void> {
+  async #pushToHome(deps: ReplicaDeps, m: TaskBookmark): Promise<void> {
     const home = getProject(this.#db, m.projectId)?.home;
     if (home === undefined || home === "" || home === deps.pool.identity.id) return;
     try {
@@ -465,7 +510,9 @@ export class TaskRunner {
     return serialised<{ ok: true } | { ok: false; reason: string }>(taskKey(taskId), async () => {
       const existing = getTask(this.#db, taskId);
       if (existing !== null) {
-        if (existing.state !== "receiving" || existing.receiving_from !== from) return { ok: false, reason: `task ${taskId} already exists here` };
+        // A `moved` row is what is left of the task's earlier stay here: it is coming back.
+        const replaces = existing.state === "moved" || (existing.state === "receiving" && existing.receiving_from === from);
+        if (!replaces) return { ok: false, reason: `task ${taskId} already exists here` };
         await this.#discard(existing);
       } else {
         await this.#clearLeftovers(manifest);
@@ -522,6 +569,7 @@ export class TaskRunner {
    */
   async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: true }> {
     return serialised(taskKey(taskId), async () => {
+      await this.#deps.hooks?.beforeActivate?.(taskId);
       const current = getTask(this.#db, taskId);
       if (current !== null && current.receiving_from === null && ACTIVE_STATES.has(current.state)) return { ok: true as const };
       const row = this.#receivingFrom(taskId, from);
@@ -529,7 +577,8 @@ export class TaskRunner {
       updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: queued.length === 0 ? null : JSON.stringify(queued) });
       this.#emitState(taskId, "idle");
       try {
-        await this.startQueued(taskId);
+        // However the sender's last turn ended, this one starts the task's stay here: it is never a rerun of that.
+        await this.startQueued(taskId, { freshAfter: listEventsTail(this.#db, taskId, { limit: 1 })[0]?.seq ?? 0 });
       } catch (err) {
         // The task is here now; its prompts stay queued, and the next prompt starts them.
         this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
@@ -604,6 +653,180 @@ export class TaskRunner {
     deleteTask(this.#db, row.id, row.session_id);
   }
 
+  // ─── moving a task to another node ───
+
+  /**
+   * Starts moving task `taskId` to node `to` (a durable `meddle.move`); with `now`, a live turn is interrupted rather
+   * than waited for. Refused, before anything starts, as `checkMove` says, or when the task's turn is parked. Resolves
+   * once the move has started; `onMove` and `onState` tell how it goes.
+   */
+  async moveTo(taskId: string, to: string, now: boolean): Promise<void> {
+    const row = this.#row(taskId);
+    this.checkMove(row, to);
+    // Reserved before the first await: one move per task.
+    const reservation: MoveState = { to, phase: "prepare", error: null };
+    this.#moving.set(taskId, reservation);
+    try {
+      const turn = await this.#durableTurn(taskId);
+      if (turn !== undefined && isParked(turn)) throw new Error("the task's turn is parked; retry it first");
+      const input: MoveInput = { taskId, to, now };
+      const root = await this.#harness.root(BACKGROUND_CONTEXT);
+      await root.commit((tx) => tx.createTask(MeddleMove, input, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
+    } catch (err) {
+      if (this.#moving.get(taskId) === reservation) {
+        this.#moving.delete(taskId);
+        // A turn that ended meanwhile left its state to the move.
+        await this.#restoreState(taskId);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Throws why task `row` cannot move to `to` (decision 16): it is not live here (received, moved, archived) or is
+   * already moving (unless `own`: the move's own steps check again), there is no pool, `to` is this node, not a
+   * member, offline or hosts no tasks, or the two report different or unknown Claude Code versions.
+   */
+  checkMove(row: TaskRow, to: string, own = false): void {
+    refuseReceiving(row);
+    refuseMoved(row);
+    if (row.state === "archived") throw new Error(`task is archived: ${row.id}`);
+    if (!own && this.#isMoving(row)) throw new Error("task is moving");
+    const pool = this.#pool;
+    if (pool === undefined) throw new Error("this node has no pool");
+    const short = shortId(to);
+    if (to === pool.identity.id) throw new Error("the task is already on this node");
+    if (!pool.store.isMember(to)) throw new Error(`${short} is not a member of this pool`);
+    if (!pool.net.isOnline(to)) throw new Error(`${short} is offline`);
+    const summary = pool.store.row(to)?.summary ?? null;
+    if (summary === null || !summary.hostsTasks) throw new Error(`${short} does not host tasks`);
+    const ours = claudeCodeVersion();
+    const theirs = summary.claudeCodeVersion;
+    if (ours !== theirs || ours === "unknown" || theirs === "unknown") throw new Error(`claude code ${ours} here, ${theirs} there`);
+  }
+
+  onMove(cb: (taskId: string, move: MoveState | null) => void): () => void {
+    this.#moveListeners.add(cb);
+    return () => { this.#moveListeners.delete(cb); };
+  }
+
+  /** The task's move in progress here, or null. */
+  moveState(taskId: string): MoveState | null {
+    return this.#moving.get(taskId) ?? null;
+  }
+
+  /** What a move's steps work with. Not for callers outside this module and `move.ts`. */
+  moveDeps(): { cfg: NodeConfig; db: Database; pool: PoolRuntime; log(line: string): void } {
+    if (this.#pool === undefined) throw new Error("this node has no pool");
+    return { cfg: this.#cfg, db: this.#db, pool: this.#pool, log: this.#log };
+  }
+
+  /** The move of the task to `to` is at `phase`: held here, the row says `moving`, and both are told. */
+  enterMove(taskId: string, to: string, phase: string): void {
+    this.#moving.set(taskId, { to, phase, error: null });
+    if (this.#row(taskId).state !== "moving") this.#setState(taskId, "moving");
+    this.#emitMove(taskId);
+  }
+
+  /**
+   * Resolves once the task has no turn here: none pending, live, finishing or reran by the Harness. With `interrupt`,
+   * a live turn that has not yet had its `result` is interrupted (after `onCut`), and closed when it has not ended
+   * `INTERRUPT_GRACE_MS` later. Throws when the turn is parked or `context` aborts.
+   */
+  async awaitTurnEnd(taskId: string, interrupt: boolean, context: Context, onCut: () => Promise<void>): Promise<void> {
+    let cutting: Query | null = null;
+    let cutAt = 0;
+    for (;;) {
+      context.abortSignal?.throwIfAborted();
+      const live = this.#live.get(taskId);
+      const busy = live !== undefined || this.#pending.has(taskId);
+      const turn = busy ? undefined : await this.#durableTurn(taskId);
+      if (!busy && turn === undefined) return;
+      if (turn !== undefined && isParked(turn)) throw new Error("the task's turn is parked");
+      if (interrupt && live !== undefined && (cutting === live.query || !live.queue.ended)) {
+        if (cutting !== live.query) {
+          cutting = live.query;
+          cutAt = Date.now();
+          await onCut();
+          await live.query.interrupt().catch(() => {});
+        } else if (Date.now() - cutAt > INTERRUPT_GRACE_MS) {
+          live.query.close();
+        }
+      }
+      await this.#nextTurnEnd(taskId, 250, context);
+    }
+  }
+
+  /** Resolves when a turn of the task ends, after `ms`, or when `context` aborts. */
+  #nextTurnEnd(taskId: string, ms: number, context: Context): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const waiters = this.#turnWaiters.get(taskId) ?? new Set<() => void>();
+      this.#turnWaiters.set(taskId, waiters);
+      const done = () => {
+        clearTimeout(timer);
+        waiters.delete(done);
+        if (waiters.size === 0 && this.#turnWaiters.get(taskId) === waiters) this.#turnWaiters.delete(taskId);
+        context.abortSignal?.removeEventListener("abort", done);
+        resolve();
+      };
+      waiters.add(done);
+      const timer = setTimeout(done, ms);
+      context.abortSignal?.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  /**
+   * The task now lives on `to`: its row says `moved` and where (its queue went with it), it is no longer moving, and
+   * that is told.
+   */
+  completeMove(taskId: string, to: string): void {
+    updateTask(this.#db, taskId, { state: "moved", moved_to: to, queued: null });
+    this.#moving.delete(taskId);
+    this.#emitState(taskId, "moved");
+    this.#emitMove(taskId);
+  }
+
+  /**
+   * Ends a move that did not happen: the task is live here again (idle, or its turn's state), the prompts queued
+   * meanwhile run, and the failure is logged once and told (`onMove` with the error, then null).
+   */
+  async failMove(taskId: string, to: string, phase: string, error: string): Promise<void> {
+    this.#moving.set(taskId, { to, phase, error });
+    this.#emitMove(taskId);
+    this.#moving.delete(taskId);
+    const row = getTask(this.#db, taskId);
+    if (row !== null && row.state !== "moved") await this.#restoreState(taskId);
+    this.#emitMove(taskId);
+    this.#log(`meddle: move: ${taskId} failed at ${phase}: ${error}`);
+    this.startQueued(taskId).catch((err: unknown) => {
+      this.#log(`meddle: move: task ${taskId}'s next queued prompt did not start a turn: ${messageOf(err)}`);
+    });
+  }
+
+  /** Writes the state the task's turn has, if any (`running` for one between its phases), else `idle`. */
+  async #restoreState(taskId: string): Promise<void> {
+    const live = this.#live.get(taskId);
+    const busy = live !== undefined || this.#pending.has(taskId) || (await this.#durableTurn(taskId)) !== undefined;
+    this.#setState(taskId, live?.state ?? (busy ? "running" : "idle"));
+  }
+
+  #isMoving(row: TaskRow): boolean {
+    return this.#moving.has(row.id) || row.state === "moving";
+  }
+
+  /** Refuses what only a task live here takes (interrupt, retry, settings): received, moved and moving tasks. */
+  #refuseElsewhere(taskId: string): void {
+    const row = this.#row(taskId);
+    refuseReceiving(row);
+    refuseMoved(row);
+    if (this.#isMoving(row)) throw new Error("task is moving");
+  }
+
+  #emitMove(taskId: string): void {
+    const move = this.#moving.get(taskId) ?? null;
+    notify(this.#moveListeners, (cb) => cb(taskId, move === null ? null : { ...move }));
+  }
+
   /** What the replica and memory functions need, or null without a pool. */
   #replicaDeps(): ReplicaDeps | null {
     return this.#pool === undefined ? null : { cfg: this.#cfg, db: this.#db, pool: this.#pool };
@@ -612,7 +835,7 @@ export class TaskRunner {
   /** After the turn's terminal commit: count it and make the task idle. Not for callers outside this module. */
   completeTurn(taskId: string): void {
     updateTask(this.#db, taskId, { turns: this.#row(taskId).turns + 1 });
-    this.#setState(taskId, "idle");
+    this.#turnState(taskId, "idle");
     this.startQueued(taskId).catch((err: unknown) => {
       this.#log(`meddle: move: task ${taskId}'s next queued prompt did not start a turn: ${messageOf(err)}`);
     });
@@ -621,7 +844,24 @@ export class TaskRunner {
   /** The `abort` phase of `meddle.turn`; not for callers outside this module. */
   abortTurnPhase(taskId: string): void {
     this.#live.get(taskId)?.query.close();
-    this.#setState(taskId, "idle");
+    this.#turnState(taskId, "idle");
+  }
+
+  /**
+   * A turn path's state change: written and told, except while the task moves (the row says `moving`, and the move is
+   * told the turn ended instead). An `idle` is the end of the turn.
+   */
+  #turnState(taskId: string, state: "idle" | "running" | "waiting"): void {
+    if (!this.#isMoving(this.#row(taskId))) this.#setState(taskId, state);
+    if (state === "idle") this.#turnOver(taskId);
+  }
+
+  /** Wakes whatever waits for the end of the task's turn. */
+  #turnOver(taskId: string): void {
+    const waiters = this.#turnWaiters.get(taskId);
+    if (waiters === undefined) return;
+    this.#turnWaiters.delete(taskId);
+    for (const wake of waiters) wake();
   }
 
   /** Appends a `turn_failed` for `err` and tells the listeners; a failure to do so never hides `err`. */
@@ -638,7 +878,7 @@ export class TaskRunner {
   /** A turn that failed of itself ends the task's turn; an aborted one (close, abortTask) stays running for its rerun or abort handler. */
   #failTurn(taskId: string, context: Context): void {
     this.#pending.delete(taskId);
-    if (!context.abortSignal?.aborted) this.#setState(taskId, "idle");
+    if (!context.abortSignal?.aborted) this.#turnState(taskId, "idle");
   }
 
   /** The task's live `meddle.turn` as the Harness sees it, if any. */
@@ -686,7 +926,7 @@ export class TaskRunner {
       if (state === live.state) continue;
       live.state = state;
       try {
-        this.#setState(taskId, state);
+        this.#turnState(taskId, state);
       } catch (err) {
         console.error(`meddle: could not record task ${taskId} as ${state}:`, err);
       }
@@ -720,6 +960,14 @@ function refuseReceiving(row: TaskRow): void {
   if (row.state === "receiving") throw new Error("task is being received");
 }
 
+/** Refuses a task that has moved to another node. */
+function refuseMoved(row: TaskRow): void {
+  if (row.state === "moved") throw new Error(`task has moved to ${shortId(row.moved_to ?? "")}`);
+}
+
+/** One task bookmark `setTaskBookmarks` set. */
+type TaskBookmark = { projectId: string; replica: string; bookmark: string; change: string };
+
 /** Calls each listener; one that throws is logged and never reaches the turn that told it. */
 function notify<T>(listeners: Set<T>, call: (cb: T) => void): void {
   for (const cb of [...listeners]) {
@@ -734,16 +982,16 @@ function notify<T>(listeners: Set<T>, call: (cb: T) => void): void {
 /**
  * Whether the task's last turn was cut off, so this run is its rerun: of the events that start or end a turn, the
  * newest is a `turn_started` (the process died mid-turn) or a `turn_aborted` (a close interrupted it). A `result` or
- * `turn_failed`, or none, means a first attempt. A process that dies between a turn's `result` and the commit of its
+ * `turn_failed`, or none (after `afterSeq`), means a first attempt. A process that dies between a turn's `result` and the commit of its
  * `finish` checkpoint (milliseconds) has its rerun send the prompt again: the one replay this accepts.
  */
-function lastTurnCutOff(db: Database, taskId: string): boolean {
+function lastTurnCutOff(db: Database, taskId: string, afterSeq: number): boolean {
   const latest = [
     latestEventOfType(db, taskId, "meddle", "turn_started"),
     latestEventOfType(db, taskId, "meddle", "turn_aborted"),
     latestEventOfType(db, taskId, "meddle", "turn_failed"),
     latestEventOfType(db, taskId, "result"),
-  ].reduce<EventRecord | null>((a, b) => (b !== null && (a === null || b.seq > a.seq) ? b : a), null);
+  ].reduce<EventRecord | null>((a, b) => (b !== null && b.seq > afterSeq && (a === null || b.seq > a.seq) ? b : a), null);
   const subtype = (latest?.message as { subtype?: unknown } | undefined)?.subtype;
   return latest !== null && (latest.message as { type?: unknown }).type === "meddle" && (subtype === "turn_started" || subtype === "turn_aborted");
 }

@@ -1,18 +1,24 @@
 // test/move.test.ts — moving a task between nodes: the receiving side.
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createRegistry, type Harness } from "@earendil-works/pi-durable";
 import { join } from "node:path";
 import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
-import { NodeObject, PeerObject } from "../src/state/contracts";
+import { NodeObject, PeerObject, TaskObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
-import { getTask } from "../src/store/records";
+import { getTask, updateTask } from "../src/store/records";
+import { readArchive, runJanitor, writeArchive } from "../src/tasks/archive";
+import { TaskRunner } from "../src/tasks/durable";
+import { openHarness } from "../src/tasks/harness";
 import { readManifest, transcriptPath, type TaskManifest } from "../src/tasks/manifest";
+import { MOVE_NOW_FOLLOW_UP } from "../src/tasks/move";
 import { exportTask, receiptsMatch, type Receipt } from "../src/tasks/transfer";
 import { claudeCodeVersion } from "../src/version";
-import { setupNode } from "./helpers";
+import { replay, setupNode } from "./helpers";
 import { linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** A task on `node`'s own project after one replayed turn. */
@@ -337,3 +343,349 @@ test("a receive is refused for another Claude Code version, an unknown one, an u
     await close();
   }
 }, 15_000);
+
+// ─── the sending side: meddle.move ───
+
+/** Polls the Harness until it holds no `meddle.move`; fails with the move's last state after 10 s. */
+async function moveSettled(harness: Harness): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const { tasks } = await harness.inspect(BACKGROUND_CONTEXT);
+    const move = tasks.find((t) => t.record.kind === "meddle.move");
+    if (move === undefined) return;
+    if (Date.now() > deadline) throw new Error(`the move is still ${JSON.stringify(move.state)} at ${JSON.stringify(move.record.state)}`);
+    await Bun.sleep(25);
+  }
+}
+
+/** Every state the task's runner tells from now on. */
+function statesOf(node: GitPoolNode, taskId: string): string[] {
+  const seen: string[] = [];
+  node.runner.onState((id, s) => { if (id === taskId) seen.push(s); });
+  return seen;
+}
+
+function countRows(node: GitPoolNode, m: TaskManifest): { events: number; transcript: number } {
+  const n = (sql: string, id: string) => (node.db.query(sql).get(id) as { n: number }).n;
+  return {
+    events: n("SELECT COUNT(*) AS n FROM events WHERE task_id = ?", m.id),
+    transcript: n("SELECT COUNT(*) AS n FROM transcript WHERE session_id = ?", m.sessionId),
+  };
+}
+
+/** Resolves once `node` has emitted `state` for the task. */
+function stateOn(node: GitPoolNode, taskId: string, state: string): Promise<void> {
+  return new Promise<void>((res) => {
+    const off = node.runner.onState((id, s) => { if (id === taskId && s === state) { off(); res(); } });
+  });
+}
+
+test("an idle task moves to another node: the source keeps only its row and an archive, the target runs it", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const owner = linkClient(A.host);
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    // A real transcript row travels and is archived too.
+    A.db.query("INSERT INTO transcript (project_key, session_id, subpath, seq, uuid, ts, json) VALUES (?, ?, '', 1, NULL, 0, '{}')").run(m.primaryProjectId, m.sessionId);
+    const before = countRows(A, m);
+    const states = statesOf(A, m.id);
+    const task = await owner.client.get(TaskObject, { id: m.id });
+    try {
+      const moves: unknown[] = [];
+      task.move.subscribe((mv) => moves.push(mv));
+      await task.moveTo({ nodeId: B.id, now: false });
+      await moveSettled(A.harness.harness);
+      await until("the task's state", () => task.state.value, "moved");
+      await until("the task's movedTo", () => task.movedTo.value, B.id);
+      expect(task.move.value).toBeNull();
+      expect(moves).toContainEqual({ to: B.id, phase: "commit", error: null });
+      // Rendered from the row: nothing else is left here.
+      const again = await owner.client.get(TaskObject, { id: m.id });
+      expect(again.manifest.value).toEqual(m);
+      expect(again.state.value).toBe("moved");
+      again.release();
+    } finally {
+      task.release();
+    }
+    expect(states).toEqual(["moving", "moved"]);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id, queued: null });
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
+    expect(countRows(A, m)).toEqual({ events: 0, transcript: 0 });
+    expect((await jj(["workspace", "list", "-T", 'name ++ "\\n"'], A.project.replica, A.cfg)).includes(m.id)).toBe(false);
+    const file = paths(A.cfg).archiveFile(m.id);
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    expect((await stat(paths(A.cfg).archive)).mode & 0o777).toBe(0o700);
+    const archive = await readArchive(file);
+    expect(archive.manifest).toEqual(m);
+    expect({ events: archive.events.length, transcript: archive.transcript.length }).toEqual(before);
+    expect(archive.files.map((f) => f.path)).toContain(`${m.primaryProjectId}/${m.sessionId}.jsonl`);
+    // A is the project's home: its task bookmark stays as the backup.
+    expect(await taskBookmark(A, A.project.replica, m.id)).toBeDefined();
+
+    const moved = `task has moved to ${shortId(B.id)}`;
+    await expect(A.runner.prompt(m.id, "hi")).rejects.toThrow(moved);
+    await expect(A.runner.interrupt(m.id)).rejects.toThrow(moved);
+    await expect(A.runner.setModel(m.id, "x")).rejects.toThrow(moved);
+    await expect(A.runner.moveTo(m.id, B.id, false)).rejects.toThrow(moved);
+
+    expect(B.runner.state(m.id)).toBe("idle");
+    await promptAndWait(B, m.id, "Carry on.");
+    const started = listEvents(B.db, m.id).filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
+    expect(started.map((e) => (e.message as { resume: boolean }).resume)).toEqual([false, true]);
+    // B's turn end pushed its change to the home: A's bookmark follows the task.
+    const workspaceB = join(paths(B.cfg).task(m.id), "a");
+    expect(await taskBookmark(A, A.project.replica, m.id)).toBe(await changeAt(B, workspaceB, "@"));
+    expect(B.logs.filter((l) => l.includes("push"))).toEqual([]);
+  } finally {
+    await owner.close();
+    await close();
+  }
+}, 15_000);
+
+test("a task moves to another node and back: the old row is replaced, and the non-home node forgets its bookmark", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    await peerReady(B, A);
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    await promptAndWait(B, m.id, "On B.");
+    await B.runner.moveTo(m.id, A.id, false);
+    await moveSettled(B.harness.harness);
+
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "moved", moved_to: A.id });
+    const replicaB = paths(B.cfg).replica(A.project.id);
+    expect((await bookmarkList(replicaB, B.cfg)).filter((b) => b.name.includes(m.id))).toEqual([]);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", moved_to: null, receiving_from: null, turns: 2 });
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(true);
+    await promptAndWait(A, m.id, "Home again.");
+    const started = listEvents(A.db, m.id).filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
+    expect(started.map((e) => (e.message as { resume: boolean }).resume)).toEqual([false, true, true]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a move without `now` waits for the running turn; prompts sent meanwhile run on the target one turn each, in order", async () => {
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ fixture: "approval.jsonl" }, {}] });
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    await peerReady(A, B);
+    const waiting = stateOn(A, m.id, "waiting");
+    await A.runner.prompt(m.id, "Run: echo hi");
+    await waiting;
+    const states = statesOf(A, m.id);
+    await A.runner.moveTo(m.id, B.id, false);
+    await expect(A.runner.moveTo(m.id, B.id, false)).rejects.toThrow("task is moving");
+    await until("A's row", () => getTask(A.db, m.id)!.state, "moving");
+    await expect(A.runner.interrupt(m.id)).rejects.toThrow("task is moving");
+    await expect(A.runner.setEffort(m.id, "low")).rejects.toThrow("task is moving");
+    await expect(A.runner.retry(m.id)).rejects.toThrow("task is moving");
+    await A.runner.prompt(m.id, "first while moving");
+    await A.runner.prompt(m.id, "second while moving");
+    expect(JSON.parse(getTask(A.db, m.id)!.queued!)).toEqual(["first while moving", "second while moving"]);
+    await Bun.sleep(300);
+    // Still waiting for the turn, which keeps running.
+    expect(getTask(A.db, m.id)!.state).toBe("moving");
+    expect(A.runner.liveQuery(m.id)).not.toBeNull();
+
+    const { done } = watchTurns(B, m.id, 2);
+    for (const q of A.runner.approvals.pending(m.id)) A.runner.approvals.answer(q.requestId, { behavior: "allow", updatedInput: q.input });
+    await moveSettled(A.harness.harness);
+    await done;
+    // The turn's own ending (running, idle) never reached the row or the listeners.
+    expect(states).toEqual(["moving", "moved"]);
+    expect(getTask(A.db, m.id)!.turns).toBe(1);
+    expect(turnMarks(listEvents(B.db, m.id)).slice(-6)).toEqual([
+      "start", "user:first while moving", "result", "start", "user:second while moving", "result",
+    ]);
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", queued: null, turns: 3 });
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a move `now` interrupts the running turn, and the target's first turn carries on with the follow-up", async () => {
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }, {}] });
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    await peerReady(A, B);
+    const initialised = new Promise<void>((res) => A.runner.onEvent((id, _s, msg) => { if (id === m.id && msg.type === "system" && msg.subtype === "init") res(); }));
+    await A.runner.prompt(m.id, "Reply with the single word ok.");
+    await initialised;
+    const { done } = watchTurns(B, m.id, 1);
+    await A.runner.moveTo(m.id, B.id, true);
+    await moveSettled(A.harness.harness);
+    await done;
+    expect(getTask(A.db, m.id)!.state).toBe("moved");
+    const events = listEvents(B.db, m.id);
+    // A's turn ended with the interrupted turn's result; B's first turn is a resumed, fresh one with the follow-up.
+    expect(turnMarks(events)).toEqual(["start", "user:Reply with the single word ok.", "result", "start", `user:${MOVE_NOW_FOLLOW_UP}`, "result"]);
+    const results = events.filter((e) => (e.message as { type?: string }).type === "result").map((e) => (e.message as { subtype: string }).subtype);
+    expect(results[0]).toBe("error_during_execution");
+    const started = events.filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
+    expect(started.map((e) => (e.message as { resume: boolean }).resume)).toEqual([false, true]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a target that fails between the receipt and activation rolls the move back (Review Focus 2)", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const owner = linkClient(A.host);
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    let calls = 0;
+    B.hooks.beforeActivate = () => {
+      calls += 1;
+      if (calls === 1) throw new Error("activation broke");
+    };
+    const before = countRows(A, m);
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+
+    expect(calls).toBe(1);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", moved_to: null });
+    expect(existsSync(paths(A.cfg).taskManifest(m.id))).toBe(true);
+    expect(countRows(A, m)).toEqual(before);
+    expect(getTask(B.db, m.id)).toBeNull();
+    expect(existsSync(paths(B.cfg).task(m.id))).toBe(false);
+    const failed = A.logs.filter((l) => l.startsWith(`meddle: move: ${m.id} failed at commit: `));
+    expect(failed).toHaveLength(1);
+    const node = await owner.client.get(NodeObject, {});
+    try {
+      const moves = () => node.notifications.value.filter((n) => n.kind === "move" && n.taskId === m.id);
+      await until("the move notifications", () => moves().length, 1);
+      expect(moves()[0]!.text.startsWith(`Move to ${shortId(B.id)} failed at commit: `)).toBe(true);
+    } finally {
+      node.release();
+    }
+    // The task is A's again.
+    await promptAndWait(A, m.id, "Again.");
+    expect(getTask(A.db, m.id)!.turns).toBe(2);
+  } finally {
+    await owner.close();
+    await close();
+  }
+}, 15_000);
+
+test("a source that stops after the receipt finishes the move when it starts again (Review Focus 3)", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  let reopened: { close(): Promise<void> } | undefined;
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    let calls = 0;
+    // A stops while its first activation is in flight; B activates once A has gone.
+    const stopped = Promise.withResolvers<void>();
+    B.hooks.beforeActivate = async () => {
+      calls += 1;
+      if (calls === 1) {
+        await A.harness.close();
+        stopped.resolve();
+      }
+    };
+    await A.runner.moveTo(m.id, B.id, false);
+    await stopped.promise;
+    await until("B's row", () => getTask(B.db, m.id)?.state, "idle");
+    expect(getTask(A.db, m.id)!.state).toBe("moving");
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(true);
+
+    const harness = await openHarness(A.cfg, createRegistry());
+    reopened = harness;
+    new TaskRunner(A.cfg, A.db, harness.harness, {
+      claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl` },
+      pool: A.pool, log: (line) => A.logs.push(line),
+    });
+    await moveSettled(harness.harness);
+    // The commit ran again: a second, no-op activation, then the cleanup.
+    expect(calls).toBe(2);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(true);
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", receiving_from: null, turns: 1 });
+    expect(A.logs.filter((l) => l.startsWith("meddle: move:"))).toEqual([]);
+  } finally {
+    await reopened?.close();
+    await close();
+  }
+}, 15_000);
+
+test("a move is refused for this node, an offline target, one that hosts no tasks, or another or unknown Claude Code version", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    await peerReady(A, B);
+    const ours = claudeCodeVersion();
+    const short = shortId(B.id);
+    const row = A.store.row(B.id)!;
+    // What A last heard of B, dated later than anything B sends meanwhile.
+    const heard = (summary: Partial<NonNullable<typeof row.summary>>) => A.store.seen(B.id, "9999-01-01T00:00:00.000Z", { ...row.summary!, ...summary }, row.lastAddr);
+    heard({ claudeCodeVersion: "0.0.1" });
+    await expect(A.runner.moveTo(m.id, B.id, false)).rejects.toThrow(`claude code ${ours} here, 0.0.1 there`);
+    heard({ claudeCodeVersion: "unknown" });
+    await expect(A.runner.moveTo(m.id, B.id, false)).rejects.toThrow(`claude code ${ours} here, unknown there`);
+    heard({ hostsTasks: false });
+    await expect(A.runner.moveTo(m.id, B.id, false)).rejects.toThrow(`${short} does not host tasks`);
+    heard({});
+    await expect(A.runner.moveTo(m.id, A.id, false)).rejects.toThrow("the task is already on this node");
+    A.net.unwatch(B.id, "bye");
+    B.net.unwatch(A.id, "bye");
+    await until("B online to A", () => A.net.isOnline(B.id), false);
+    await expect(A.runner.moveTo(m.id, B.id, false)).rejects.toThrow(`${short} is offline`);
+    expect(getTask(A.db, m.id)!.state).toBe("idle");
+    expect(A.runner.moveState(m.id)).toBeNull();
+    expect(getTask(B.db, m.id)).toBeNull();
+    const { tasks } = await A.harness.harness.inspect(BACKGROUND_CONTEXT);
+    expect(tasks.filter((t) => t.record.kind === "meddle.move")).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("the archive janitor deletes archives older than seven days", async () => {
+  const node = await setupNode();
+  try {
+    const dir = paths(node.cfg).archive;
+    await mkdir(dir, { recursive: true });
+    const now = Date.now();
+    const day = 24 * 60 * 60 * 1000;
+    for (const [name, age] of [["old.json.gz", 8], ["new.json.gz", 6], ["other.txt", 30]] as const) {
+      await writeFile(join(dir, name), "x");
+      const at = new Date(now - age * day);
+      await utimes(join(dir, name), at, at);
+    }
+    expect(await runJanitor(node.cfg, now)).toBe(1);
+    expect((await readdir(dir)).sort()).toEqual(["new.json.gz", "other.txt"]);
+  } finally {
+    await node.harness.close();
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
+  }
+});
+
+test("an archive is written once per stay: kept on a rerun, replaced after the task changed", async () => {
+  const node = await setupNode();
+  try {
+    const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
+    const file = await writeArchive(node.cfg, node.db, m.id);
+    const first = (await readArchive(file)).archivedAt;
+    await Bun.sleep(5);
+    expect(await writeArchive(node.cfg, node.db, m.id)).toBe(file);
+    expect((await readArchive(file)).archivedAt).toBe(first);
+    // A later stay of the task here (its row changed since): archived anew.
+    await Bun.sleep(5);
+    updateTask(node.db, m.id, { turns: 3 });
+    await writeArchive(node.cfg, node.db, m.id);
+    const second = await readArchive(file);
+    expect(second.archivedAt > first).toBe(true);
+    expect(second.row.turns).toBe(3);
+  } finally {
+    await node.harness.close();
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
+  }
+});

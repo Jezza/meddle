@@ -15,9 +15,10 @@ import { acceptPeerLinks } from "../pool/sync";
 import { loadContext } from "../projects/context";
 import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, type Project } from "../projects/project";
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
-import { claimHomelessProjects, getTaskSettings, listLiveTasks, listTasks } from "../store/records";
-import type { TaskRunner, TaskState } from "../tasks/durable";
-import { readManifest } from "../tasks/manifest";
+import { claimHomelessProjects, getTask, getTaskSettings, listLiveTasks, listTasks } from "../store/records";
+import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
+import type { TaskManifest } from "../tasks/manifest";
+import { shortId } from "../pool/ids";
 import { tokenStatus } from "../token";
 import { VERSION } from "../version";
 import {
@@ -127,6 +128,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const states: Subscribable<{ taskId: string; state: TaskState }> = {
     subscribe: (cb) => runner.onState((taskId, state) => cb({ taskId, state })),
   };
+  const moves: Subscribable<{ taskId: string; move: MoveState | null }> = {
+    subscribe: (cb) => runner.onMove((taskId, move) => cb({ taskId, move })),
+  };
   const approvalChanges: Subscribable<null> = { subscribe: (cb) => approvals.onChange(() => cb(null)) };
   const samples: Subscribable<NodeMetrics> = { subscribe: (cb) => metrics.onSample(cb) };
   const poolChanges: Subscribable<null> = { subscribe: (cb) => pool.onChange(() => cb(null)) };
@@ -206,7 +210,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       token.replace(ctx, await tokenNow(cfg));
       await refreshHostsTasks(ctx);
     });
-    // A task received from another node turns live through the runner, not through createTask.
+    // A move that failed says where and why; the task is live here again.
+    self.on("moves", moves, ({ taskId, move }, ctx) => {
+      if (move?.error) notify(ctx, { taskId, kind: "move", text: `Move to ${shortId(move.to)} failed at ${move.phase}: ${move.error}` });
+    });
+    // A task received from another node turns live through the runner, not through createTask; a moved one leaves.
     self.on("taskStates", states, (_event, ctx) => {
       const ids = listLiveTasks(db).map((t) => t.id);
       if (ids.join() !== taskIds.value.join()) {
@@ -316,8 +324,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   host.serve(TaskObject, ({ id }, _principal, self) => {
     const store = self.get(NodeStore, {});
     const members = TaskObject.def.variants.default.state;
-    const manifest = self.state("manifest", members.manifest, { init: () => readManifest(cfg, id) });
+    // From the row, not the task folder: a task that moved away has a row and nothing else.
+    const manifest = self.state("manifest", members.manifest, { init: () => manifestOf(id) });
     const state = self.state("state", members.state, { init: () => runner.state(id) });
+    const move = self.state("move", members.move, { init: () => runner.moveState(id) });
+    const movedTo = self.state("movedTo", members.movedTo, { init: () => getTask(db, id)?.moved_to ?? null });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
 
@@ -327,11 +338,19 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (fresh.length > 0) log.replace(ctx, foldTaskLog(log.value, fresh));
     };
     self.on("events", events, (event, ctx) => { if (event.taskId === id) catchUpLog(ctx); });
-    self.on("states", states, (event, ctx) => { if (event.taskId === id) state.replace(ctx, event.state); });
+    self.on("states", states, (event, ctx) => {
+      if (event.taskId !== id) return;
+      state.replace(ctx, event.state);
+      const to = getTask(db, id)?.moved_to ?? null;
+      if (to !== movedTo.value) movedTo.replace(ctx, to);
+    });
+    self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
     // What changed between the cells' init and the listeners starting.
     self.task(async (ctx) => {
       state.replace(ctx, runner.state(id));
+      move.replace(ctx, runner.moveState(id));
+      movedTo.replace(ctx, getTask(db, id)?.moved_to ?? null);
       pending.replace(ctx, approvals.pending(id));
       catchUpLog(ctx);
     });
@@ -352,6 +371,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       model: self.derive([log], (l) => l.model),
       effort: self.derive([store.efforts], (e) => e[id] ?? null),
       contextUsage: self.derive([log], (l) => l.contextUsage),
+      move,
+      movedTo,
       prompt: ({ text }) => runner.prompt(id, text),
       interrupt: () => runner.interrupt(id),
       retry: () => runner.retry(id),
@@ -367,6 +388,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       setPermissionMode: ({ mode }) => runner.setPermissionMode(id, mode),
       setModel: ({ model }) => runner.setModel(id, model),
       setEffort: ({ effort }, ctx) => store.setEffort({ taskId: id, effort }, ctx),
+      moveTo: ({ nodeId, now }) => runner.moveTo(id, nodeId, now),
     };
   });
 
@@ -398,6 +420,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       },
     };
   });
+
+  function manifestOf(taskId: string): TaskManifest {
+    const row = getTask(db, taskId);
+    if (row === null) throw new Error(`unknown task: ${taskId}`);
+    return JSON.parse(row.manifest) as TaskManifest;
+  }
 
   function projectIdsNow(): string[] {
     return listProjects(db).map((p) => p.id);

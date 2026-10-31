@@ -31,6 +31,9 @@ export function paths(cfg: NodeConfig) {
     hooks,
     hookUpdate: join(hooks, "update"),
     gitSocket: cfg.gitSocket ?? join(data, "git.sock"),
+    /** What a task that moved away left here (decision 18): mode 700, each archive 600. */
+    archive: join(data, "archive"),
+    archiveFile: (taskId: string) => join(data, "archive", `${taskId}.json.gz`),
   };
 }
 

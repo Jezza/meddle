@@ -20,6 +20,7 @@ import { PeerObject } from "../src/state/contracts";
 import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
 import { listLiveTasks } from "../src/store/records";
+import type { RunnerHooks } from "../src/tasks/durable";
 import { VERSION, claudeCodeVersion } from "../src/version";
 import { setupNode } from "./helpers";
 
@@ -199,12 +200,14 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
 /**
  * A whole node (see `setupNode`, `extraEnv` added to its environment) with its pool runtime started and its chord
  * host (`createNodeHost`, which gives the runner the pool) serving it; the metrics sampler is not started; what the
- * runtime and the runner log is collected in `logs`. `close()` stops the pool, the host and the harness.
+ * runtime and the runner log is collected in `logs`; `hooks` are the runner's test hooks, set them at will. `close()`
+ * stops the pool, the host and the harness.
  */
 export async function startPoolNode(fixture?: string, extraEnv: Record<string, string> = {}) {
   /** The lines the runtime and the runner logged (instead of printing them). */
   const logs: string[] = [];
-  const node = await setupNode(fixture, { ...POOL_ENV, ...extraEnv }, { log: (line) => logs.push(line) });
+  const hooks: RunnerHooks = {};
+  const node = await setupNode(fixture, { ...POOL_ENV, ...extraEnv }, { log: (line) => logs.push(line), hooks });
   const { cfg, db, runner } = node;
   const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 60_000, dataDir: cfg.dataDir });
   /** Everything the runtime's net and sync reported. */
@@ -212,7 +215,7 @@ export async function startPoolNode(fixture?: string, extraEnv: Record<string, s
   const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { onError: (err) => errors.push(err), log: (line) => logs.push(line) });
   const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool });
   return {
-    ...node, metrics, pool, host, errors, logs,
+    ...node, metrics, pool, host, errors, logs, hooks,
     id: pool.identity.id, identity: pool.identity, store: pool.store, net: pool.net,
     async close() {
       metrics.stop();
@@ -234,13 +237,19 @@ export function linkClient(host: Host): { client: Host; close(): Promise<void> }
 /** A pool node of `twoPoolNodes`: `startPoolNode` serving git and moved tasks, its `git` refusals logged to `logs`. */
 export type GitPoolNode = Awaited<ReturnType<typeof startPoolNode>>;
 
+/** What one node of `poolNodes` runs its turns with, on top of the options for all. */
+export type NodeOptions = { fixture?: string; extraEnv?: Record<string, string> };
+
 /**
- * `count` whole nodes (`startPoolNode`, with `extraEnv`), each after the first joined to the first's pool and all
+ * `count` whole nodes (`startPoolNode`, with `extraEnv` and the node's own `nodes[i]`), each after the first joined to the first's pool and all
  * online to each other, each with the git remote helper's wrapper and the update hook written, a `GitSocket` started,
  * `acceptGitStreams` (logging to the node's `logs`) and `acceptBlobStreams` registered. `close()` stops the acceptors,
  * the sockets and the nodes, and removes the homes.
  */
-export async function poolNodes(count: number, options: { extraEnv?: Record<string, string> } = {}): Promise<{ nodes: GitPoolNode[]; close(): Promise<void> }> {
+export async function poolNodes(
+  count: number,
+  options: { extraEnv?: Record<string, string>; nodes?: NodeOptions[] } = {},
+): Promise<{ nodes: GitPoolNode[]; close(): Promise<void> }> {
   const nodes: GitPoolNode[] = [];
   const stops: Array<() => Promise<void>> = [];
   const close = async () => {
@@ -253,7 +262,8 @@ export async function poolNodes(count: number, options: { extraEnv?: Record<stri
   };
   try {
     for (let i = 0; i < count; i++) {
-      const node = await startPoolNode(undefined, options.extraEnv);
+      const own = options.nodes?.[i] ?? {};
+      const node = await startPoolNode(own.fixture, { ...options.extraEnv, ...own.extraEnv });
       nodes.push(node);
       await writeHelperWrapper(node.cfg);
       await writeUpdateHook(node.cfg);
@@ -275,6 +285,12 @@ export async function poolNodes(count: number, options: { extraEnv?: Record<stri
       if (Date.now() > deadline) throw new Error(`the nodes never came online to each other: ${offline().join(", ")}`);
       await Bun.sleep(10);
     }
+    // A move checks what its node last heard of the target's summary.
+    const unheard = () => nodes.flatMap((a) => nodes.filter((b) => b !== a && a.store.row(b.id)?.summary?.hostsTasks !== true).map((b) => `${shortId(a.id)} has ${shortId(b.id)} hosting no tasks`));
+    while (unheard().length > 0) {
+      if (Date.now() > deadline) throw new Error(`the nodes never heard each other's summaries: ${unheard().join(", ")}`);
+      await Bun.sleep(10);
+    }
     return { nodes, close };
   } catch (err) {
     await close();
@@ -283,7 +299,9 @@ export async function poolNodes(count: number, options: { extraEnv?: Record<stri
 }
 
 /** Two nodes of `poolNodes`: B joined to A's pool. */
-export async function twoPoolNodes(options: { extraEnv?: Record<string, string> } = {}): Promise<{ A: GitPoolNode; B: GitPoolNode; close(): Promise<void> }> {
+export async function twoPoolNodes(
+  options: { extraEnv?: Record<string, string>; nodes?: NodeOptions[] } = {},
+): Promise<{ A: GitPoolNode; B: GitPoolNode; close(): Promise<void> }> {
   const { nodes, close } = await poolNodes(2, options);
   const [A, B] = nodes as [GitPoolNode, GitPoolNode];
   return { A, B, close };

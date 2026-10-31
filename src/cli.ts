@@ -11,6 +11,7 @@ import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { runRemoteHelper } from "./git/helper";
 import { writeHelperWrapper, writeUpdateHook } from "./git/scripts";
 import { acceptGitStreams } from "./git/serve";
+import { JANITOR_INTERVAL_MS, runJanitor } from "./tasks/archive";
 import { acceptBlobStreams } from "./tasks/blob";
 import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
@@ -59,6 +60,8 @@ type OpenNode = {
   stopBlobs?: () => void;
   /** The unix socket this node's git remote helper connects to. */
   gitSocket?: GitSocket;
+  /** The daily run of the archive janitor. */
+  janitor?: ReturnType<typeof setInterval>;
 };
 
 /**
@@ -67,6 +70,7 @@ type OpenNode = {
  */
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
+  clearInterval(node.janitor);
   node.stopTunnels?.();
   node.stopBlobs?.();
   node.stopGit?.();
@@ -112,6 +116,11 @@ async function serve(): Promise<number> {
     const harness = (node.harness = await openHarness(cfg, createRegistry()));
     const runner = new TaskRunner(cfg, db, harness.harness, { ...runnerDeps(), pool });
     node.stopBlobs = acceptBlobStreams(pool.net, runner);
+    // Archives of tasks that moved away are kept for seven days (decision 18).
+    const janitor = () => runJanitor(cfg).catch((err: unknown) => console.error("meddle: archive janitor:", err));
+    void janitor();
+    node.janitor = setInterval(janitor, JANITOR_INTERVAL_MS);
+    node.janitor.unref();
     const metrics = (node.metrics = new MetricsSampler({
       taskPids: () => findTaskPids(cfg.taskRoot),
       intervalMs: 5000,

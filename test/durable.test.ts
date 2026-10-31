@@ -385,3 +385,22 @@ test("a turn-end push to an unreachable home is logged once and the turn complet
     await close();
   }
 }, 15_000);
+
+test("a turn started fresh after a seq sends its prompt, though the log before it ends in a cut-off turn", async () => {
+  const { mkdir: mkdirp, writeFile: write } = await import("node:fs/promises");
+  const { dirname } = await import("node:path");
+  const { transcriptPath } = await import("../src/tasks/manifest");
+  const { cfg, db, h, runner, m, turnsStarted, settled } = await setup();
+  // Another node's log ends mid-turn (as a received task's can), and the session's transcript exists.
+  updateTask(db, m.id, { started: 1, queued: JSON.stringify(["carry on after the move"]) });
+  const last = appendEvent(db, m.id, { type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: false });
+  await mkdirp(dirname(transcriptPath(cfg, m)), { recursive: true });
+  await write(transcriptPath(cfg, m), "{}\n");
+  const done = settled(runner);
+  await runner.startQueued(m.id, { freshAfter: last });
+  await done;
+  expect(turnsStarted()).toEqual([false, true]);
+  const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  expect(prompts).toEqual(["carry on after the move"]);
+  await h.close();
+});

@@ -10,6 +10,10 @@ export const TaskStateSchema = Type.Union([
   Type.Literal("waiting"),
   /** Being moved here from another node: not live here until the sender activates it. */
   Type.Literal("receiving"),
+  /** Being moved to another node: prompts are queued for it there. */
+  Type.Literal("moving"),
+  /** Moved to another node (`movedTo`); nothing of it is left here but its row. */
+  Type.Literal("moved"),
   Type.Literal("archived"),
 ]);
 
@@ -54,7 +58,7 @@ export const NotificationSchema = Type.Object({
   id: Type.String(),
   at: Type.String(),
   taskId: Type.String(),
-  kind: Type.Union([Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed")]),
+  kind: Type.Union([Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed"), Type.Literal("move")]),
   text: Type.String(),
 });
 export type Notification = Type.Static<typeof NotificationSchema>;
@@ -160,6 +164,10 @@ export const TaskObject = remote("meddle.task", {
         effort: Nullable(Type.String()),
         /** `usage` and `modelUsage` of the latest `result`. */
         contextUsage: Type.Unknown(),
+        /** The task's move in progress: to which node, the step it is at, and the error failing it (if any). */
+        move: Nullable(Type.Object({ to: Type.String(), phase: Type.String(), error: Nullable(Type.String()) })),
+        /** The node a `moved` task went to. */
+        movedTo: Nullable(Type.String()),
       },
       methods: {
         prompt: method(Type.Object({ text: Type.String() })),
@@ -172,6 +180,11 @@ export const TaskObject = remote("meddle.task", {
         setPermissionMode: method(Type.Object({ mode: PermissionModeSchema })),
         setModel: method(Type.Object({ model: Type.Optional(Type.String()) })),
         setEffort: method(Type.Object({ effort: Type.String() })),
+        /**
+         * Moves the task to node `nodeId`; with `now`, a running turn is interrupted rather than waited for. Rejects
+         * with the reason when the move is refused; resolves once it has started (`move` follows it).
+         */
+        moveTo: method(Type.Object({ nodeId: Type.String(), now: Type.Boolean() })),
       },
     },
   },
@@ -287,7 +300,7 @@ export const PeerObject = remote("meddle.peer", {
           Type.Object({ manifest: TaskManifestSchema, claudeCodeVersion: Type.String() }),
           Type.Object({ ok: Type.Boolean(), reason: Type.Optional(Type.String()) }),
         ),
-        /** Makes a task received from the caller live here, sending `followUp` and its queued prompts as one turn. */
+        /** Makes a task received from the caller live here, running `followUp` and its queued prompts one turn each. */
         activateTask: method(Type.Object({ taskId: Type.String(), followUp: Nullable(Type.String()) }), Type.Object({ ok: Type.Boolean() })),
         /** Removes a task still being received from the caller. */
         abandonTask: method(Type.Object({ taskId: Type.String() })),

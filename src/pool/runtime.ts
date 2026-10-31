@@ -265,6 +265,9 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     for (const addr of joined.addrs) net.offerAddress(addr);
     enforce();
     notify();
+    // The admitting node recorded this one as hosting no tasks (it cannot tell); the pool hears the truth now, not at
+    // the next periodic refresh: a move to this node is refused until then.
+    await refresh();
     return { poolId: joined.poolId, members: joined.members };
   }
 
@@ -293,9 +296,10 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   const changes: Subscribable<null> = { subscribe: (cb) => onChange(() => cb(null)) };
 
   async function peerRef<C extends AnyContract>(nodeId: string, contract: C): Promise<Ref<C>> {
-    const host = sync.hostFor(nodeId);
-    if (host === undefined) throw new Error(`not connected to ${shortId(nodeId)}`);
-    return host.get(contract, {} as InputOf<C>);
+    const view = sync.viewFor(nodeId);
+    if (view === undefined) throw new Error(`not connected to ${shortId(nodeId)}`);
+    // A peer that drops while the reference is being taken fails it at once, not after chord's ready timeout.
+    return view.host.get(contract, {} as InputOf<C>, { signal: view.signal });
   }
 
   return {
