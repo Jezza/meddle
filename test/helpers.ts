@@ -16,7 +16,8 @@ export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
  * A node in a temp home: data dirs, task root, database, its pool identity (the key a later `startPool` loads), one
  * colocated project added from a folder with this node as its home,
  * a token, and a Harness with a TaskRunner that runs Claude Code turns from the `fixture` recording
- * (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the environment the config is read from.
+ * (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the environment the config is read from;
+ * its `MEDDLE_FIXTURE_MEMORY` also reaches the stand-in Claude Code.
  */
 export async function setupNode(fixture = "hello.jsonl", extraEnv: Record<string, string> = {}) {
   const home = await mkdtemp("/tmp/meddle-node-");
@@ -33,7 +34,10 @@ export async function setupNode(fixture = "hello.jsonl", extraEnv: Record<string
   const runner = new TaskRunner(cfg, db, harness.harness, {
     claudePath: replay,
     claudeRuntime: "bun",
-    extraEnv: { MEDDLE_FIXTURE: fixture.startsWith("/") ? fixture : `${import.meta.dir}/fixtures/${fixture}` },
+    extraEnv: {
+      MEDDLE_FIXTURE: fixture.startsWith("/") ? fixture : `${import.meta.dir}/fixtures/${fixture}`,
+      ...(extraEnv.MEDDLE_FIXTURE_MEMORY === undefined ? {} : { MEDDLE_FIXTURE_MEMORY: extraEnv.MEDDLE_FIXTURE_MEMORY }),
+    },
   });
   return { home, cfg, db, project, harness, runner };
 }

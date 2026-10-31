@@ -15,6 +15,7 @@ import { servePool, type PoolObjectDeps } from "../src/pool/object";
 import { PoolStore, type NodeSummary } from "../src/pool/store";
 import { startPool, type PoolSummaryDeps } from "../src/pool/runtime";
 import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
+import { PeerObject } from "../src/state/contracts";
 import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
 import { listLiveTasks } from "../src/store/records";
@@ -273,5 +274,20 @@ export async function twoPoolNodes(): Promise<{ A: GitPoolNode; B: GitPoolNode; 
   } catch (err) {
     await close();
     throw err;
+  }
+}
+
+/** Waits until `from` holds `to`'s PeerObject (its client host comes up just after `to` shows online). */
+export async function peerReady(from: GitPoolNode, to: GitPoolNode): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  let last: unknown = null;
+  for (;;) {
+    const ref = await from.pool.peerRef(to.id, PeerObject).catch((err: unknown) => { last = err; return null; });
+    if (ref !== null) {
+      ref.release();
+      return;
+    }
+    if (Date.now() > deadline) throw new Error(`no PeerObject of ${shortId(to.id)}: ${String(last)}`);
+    await Bun.sleep(20);
   }
 }

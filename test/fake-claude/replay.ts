@@ -1,18 +1,20 @@
 // Stands in for the `claude` binary: replays a recorded stream-json session (see record.ts).
-// Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause forever before `result`).
+// Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause forever before `result`),
+// MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`).
 // Any argv is accepted; only `--session-id` / `--resume` are read (see `transcribe`). Dependency-free so it
 // starts fast.
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t: number } | { dir: "exit"; t: number; code: number | null };
-type Frame = { type: string; subtype?: string; request_id?: string; request?: { subtype?: string }; response?: { request_id?: string } };
+type Frame = { type: string; subtype?: string; message?: { content?: unknown }; request_id?: string; request?: { subtype?: string }; response?: { request_id?: string } };
 type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
 type Step = { need: Need } | { emit: string; frame: Frame };
 
 const fixture = process.env.MEDDLE_FIXTURE;
 if (!fixture) { process.stderr.write("replay.ts: MEDDLE_FIXTURE is not set\n"); process.exit(2); }
 const stall = process.env.MEDDLE_FIXTURE_STALL === "1";
+const memory = process.env.MEDDLE_FIXTURE_MEMORY === "1";
 const EOF_CAP_MS = 5_000;
 
 // Turn the recording into steps: wait for an `in` line, or emit an `out` line. Responses to the
@@ -110,7 +112,8 @@ let transcribed = false;
 /**
  * Like the real CLI, writes the session's transcript once it reads the first user message: one line, that message,
  * appended to `<CLAUDE_CONFIG_DIR>/projects/<CLAUDE_CODE_PROJECT_DIR_NAME>/<session id>.jsonl`. Without a session id
- * or those variables it writes nothing.
+ * or those variables it writes nothing. With MEDDLE_FIXTURE_MEMORY=1 it also appends the message's text as one line
+ * to `memory/MEMORY.md` in that directory, as a session that saves a memory would.
  */
 function transcribe(f: Frame) {
   if (transcribed) return;
@@ -122,6 +125,18 @@ function transcribe(f: Frame) {
   const dir = join(configDir, "projects", projectDir);
   mkdirSync(dir, { recursive: true });
   appendFileSync(join(dir, `${id}.jsonl`), JSON.stringify(f) + "\n");
+  if (memory) {
+    mkdirSync(join(dir, "memory"), { recursive: true });
+    appendFileSync(join(dir, "memory", "MEMORY.md"), promptText(f).replace(/\n/g, " ") + "\n");
+  }
+}
+
+/** The text of a user message: its content string, or its text blocks joined. */
+function promptText(f: Frame): string {
+  const content = f.message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((b: { type?: string; text?: string }) => (b.type === "text" && typeof b.text === "string" ? b.text : "")).join("");
 }
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms).unref());
