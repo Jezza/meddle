@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>meddle</title>
+<style>
+  :root { --fg: #1d1d1f; --muted: #6b6b70; --line: #d8d8dc; --bg: #fff; --soft: #f4f4f6; --accent: #2557c7; --bad: #b3261e; --warn: #8a5a00; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6e6e9; --muted: #9a9aa2; --line: #3a3a40; --bg: #18181b; --soft: #232328; --accent: #7aa2ff; --bad: #ff8a80; --warn: #ffcc66; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  nav { display: flex; gap: 8px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); }
+  nav strong { margin-right: 12px; }
+  nav button.on { border-color: var(--accent); color: var(--accent); }
+  main { max-width: 1000px; margin: 0 auto; padding: 12px 16px 48px; }
+  section { margin: 16px 0; }
+  h2 { font-size: 18px; margin: 8px 0; }
+  h3 { font-size: 15px; margin: 8px 0; }
+  a { color: var(--accent); }
+  button, input, select, textarea { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; }
+  button { cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  textarea { width: 100%; font-family: ui-monospace, monospace; }
+  pre { margin: 4px 0; padding: 6px 8px; background: var(--soft); border-radius: 4px; white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace, monospace; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 16px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; }
+  fieldset { border: 1px solid var(--line); border-radius: 4px; margin: 8px 0; }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 8px 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .option { display: block; margin: 2px 0; }
+  .muted { color: var(--muted); }
+  .error { color: var(--bad); }
+  .state { font-size: 12px; padding: 1px 6px; border-radius: 8px; background: var(--soft); }
+  .state.running { color: var(--accent); }
+  .state.waiting { color: var(--warn); }
+  .notifications .note { padding: 4px 8px; border-left: 3px solid var(--line); margin: 4px 0; background: var(--soft); }
+  .notifications .note.approval, .notifications .note.question { border-color: var(--warn); }
+  .notifications .note.failed { border-color: var(--bad); }
+  .thread .item { margin: 6px 0; }
+  .thread .text { white-space: pre-wrap; }
+  .thread .user { padding: 6px 10px; background: var(--soft); border-radius: 6px; }
+  .thread .live { opacity: 0.8; border-left: 2px solid var(--accent); padding-left: 8px; }
+  .thread .tool, .thread .unknown { border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; }
+  .thread .children { margin-left: 12px; padding-left: 8px; border-left: 2px solid var(--line); }
+  .thread .denied { color: var(--bad); }
+  .thread .question { border-left: 3px solid var(--warn); padding-left: 8px; }
+  .thread .status { font-size: 12px; }
+  .pending { border: 2px solid var(--warn); border-radius: 6px; padding: 8px 12px; }
+  .composer { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="/main.js"></script>
+</body>
+</html>
