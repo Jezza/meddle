@@ -59,6 +59,8 @@ export type PeerObjectDeps = {
   hostsTasks(): Promise<boolean>;
   /** Fires after a project was added or registered on this node. */
   changes: Subscribable<null>;
+  /** Receives tasks other nodes move here; each call names the calling node. */
+  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask">;
 };
 
 /** A project as another node sees it. */
@@ -71,19 +73,36 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
   const { db } = deps;
   const projectsNow = () => listProjects(db).map(projectInfo);
   host.serve(PeerObject, (_input, principal, self) => {
-    if (peerOf(principal) === null) throw forbidden("peers only");
+    const from = peerOf(principal);
+    if (from === null) throw forbidden("peers only");
     const state = PeerObject.def.variants.peer.state;
     const projects = self.state("projects", state.projects, { init: projectsNow });
-    self.on("projects", deps.changes, (_event, ctx) => projects.replace(ctx, projectsNow()));
+    const hostsTasks = self.state("hostsTasks", state.hostsTasks, { init: () => deps.hostsTasks() });
+    /** The task root can come and go while the node runs: re-read it whenever a peer may be deciding on a move. */
+    const refreshHostsTasks = async (ctx: Ctx) => {
+      const now = await deps.hostsTasks();
+      if (!ctx.signal.aborted && now !== hostsTasks.value) hostsTasks.replace(ctx, now);
+    };
+    self.on("projects", deps.changes, async (_event, ctx) => {
+      projects.replace(ctx, projectsNow());
+      await refreshHostsTasks(ctx);
+    });
     return {
       variant: "peer",
       projects,
       claudeCodeVersion: self.state("claudeCodeVersion", state.claudeCodeVersion, deps.claudeCodeVersion),
-      hostsTasks: self.state("hostsTasks", state.hostsTasks, { init: () => deps.hostsTasks() }),
+      hostsTasks,
       projectInfo: async ({ id }) => {
         const found = getProject(db, id);
         return found === null ? null : projectInfo(found);
       },
+      receiveTask: async ({ manifest, claudeCodeVersion }, ctx) => {
+        const result = await deps.runner.receiveTask(manifest, from, claudeCodeVersion);
+        await refreshHostsTasks(ctx);
+        return result;
+      },
+      activateTask: ({ taskId, followUp }) => deps.runner.activateTask(taskId, from, followUp),
+      abandonTask: ({ taskId }) => deps.runner.abandonTask(taskId, from),
     };
   });
 }
@@ -115,6 +134,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     claudeCodeVersion: deps.claudeCodeVersion,
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
     changes: projectChanges,
+    runner,
   });
   acceptPeerLinks(pool.net, host, (id) => pool.store.isMember(id));
 
@@ -167,6 +187,14 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("samples", samples, async (sample, ctx) => {
       metricsNow.replace(ctx, sample);
       token.replace(ctx, await tokenNow(cfg));
+    });
+    // A task received from another node turns live through the runner, not through createTask.
+    self.on("taskStates", states, (_event, ctx) => {
+      const ids = listLiveTasks(db).map((t) => t.id);
+      if (ids.join() !== taskIds.value.join()) {
+        taskIds.replace(ctx, ids);
+        void pool.refresh();
+      }
     });
     // A project added or registered elsewhere than through this object (a replica a task needed).
     self.on("projects", projectChanges, (_event, ctx) => projectIds.replace(ctx, projectIdsNow()));

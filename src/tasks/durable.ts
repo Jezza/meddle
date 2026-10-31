@@ -1,7 +1,9 @@
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { PermissionMode, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { forbidden } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
@@ -9,26 +11,41 @@ import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
 import { promptEvent, runTurn, type MeddleEvent } from "../engine/session";
-import { bookmarkSet, changeId } from "../jj";
-import { paths } from "../paths";
+import { bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceForget } from "../jj";
+import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
 import { dedupe } from "../pool/report";
 import type { PoolRuntime } from "../pool/runtime";
 import { loadContext, loadProjectSettings } from "../projects/context";
 import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
-import { getProject } from "../projects/project";
-import { ensureReplica, pushBookmark, trunkFor, type ReplicaDeps } from "../projects/replicas";
+import type { StreamReader } from "../pool/frames";
+import { getProject, type Project } from "../projects/project";
+import { ensureRemote, ensureReplica, fetchBookmarks, pushBookmark, trunkFor, type ReplicaDeps } from "../projects/replicas";
 import { appendEvent, latestEventOfType, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
-import { getTask, getTaskSettings, updateTask, updateTaskSettings, type TaskRow, type TaskSettings } from "../store/records";
+import {
+  clearTaskLog,
+  deleteTask,
+  getTask,
+  getTaskSettings,
+  listTasks,
+  queuedOf,
+  updateTask,
+  updateTaskSettings,
+  type TaskRow,
+  type TaskSettings,
+} from "../store/records";
 import { getToken } from "../token";
 import { repoKey, serialised } from "../serial";
+import { claudeCodeVersion } from "../version";
 import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
-import { provisionTask } from "./provision";
+import { checkReceivedManifest, provisionFromManifest, provisionTask } from "./provision";
+import { importTask, type Receipt } from "./transfer";
 
-export type TaskState = "idle" | "running" | "waiting" | "archived";
+export type TaskState = "idle" | "running" | "waiting" | "receiving" | "archived";
 
-type TurnInput = { taskId: string; prompt: string };
+/** `followUps` (a moved task's queued prompts) are sent with priority `next` once the turn is live. */
+type TurnInput = { taskId: string; prompt: string; followUps?: string[] };
 type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
 /** Installed by `openHarness`: how a phase finds the Harness it runs in. */
 type MeddleHooks = { harness(): Harness };
@@ -104,6 +121,18 @@ export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHook
 
 type LiveTurn = { query: Query; queue: InputQueue; state: "running" | "waiting" };
 
+/** The states of a task that lives here; a received task in one of them is already activated. */
+const ACTIVE_STATES = new Set(["idle", "running", "waiting"]);
+
+/** The key that serialises a task's receive, import, activation and abandonment. */
+function taskKey(taskId: string): string {
+  return `task\0${taskId}`;
+}
+
+function messageOf(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+}
+
 /** Creates tasks and drives their turns as durable `meddle.turn` tasks on one Harness. */
 export class TaskRunner {
   readonly approvals = new Approvals();
@@ -139,6 +168,7 @@ export class TaskRunner {
     slot.bound = true;
     slot.resolve(this);
     this.approvals.onChange(() => this.#syncWaiting());
+    if (this.#pool !== undefined) this.#sweepOrphans();
   }
 
   /**
@@ -149,6 +179,7 @@ export class TaskRunner {
     if (this.#pool === pool) return;
     if (this.#pool !== undefined) throw new Error("this TaskRunner already has a pool");
     this.#pool = pool;
+    this.#sweepOrphans();
   }
 
   /**
@@ -177,6 +208,7 @@ export class TaskRunner {
   async prompt(taskId: string, text: string): Promise<void> {
     const row = this.#row(taskId);
     if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
+    refuseReceiving(row);
     let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
@@ -184,10 +216,7 @@ export class TaskRunner {
         // Sent first: after the turn's `result` its input is closed while the turn is still live, and a steer then
         // is refused rather than logged as sent.
         if (live.queue.ended) throw new Error("the turn just ended; send it as a new prompt");
-        live.queue.push(text, "now");
-        const steer = promptEvent(text);
-        const seq = appendEvent(this.#db, taskId, steer);
-        notify(this.#eventListeners, (cb) => cb(taskId, seq, steer));
+        this.#send(taskId, live.queue, text, "now");
         return;
       }
       const turn = await this.#durableTurn(taskId);
@@ -203,38 +232,49 @@ export class TaskRunner {
     this.#pending.add(taskId);
     try {
       if (stale) this.#setState(taskId, "idle");
-      const root = await this.#harness.root(BACKGROUND_CONTEXT);
-      await root.commit(
-        (tx) => tx.createTask(MeddleTurn, { taskId, prompt: text }, { ownership: { kind: "conversation" } }),
-        BACKGROUND_CONTEXT,
-      );
+      await this.#createTurn({ taskId, prompt: text });
     } catch (err) {
       this.#pending.delete(taskId);
       throw err;
     }
   }
 
+  /** Creates the task's next `meddle.turn`; the caller has reserved it in `#pending`. */
+  async #createTurn(input: TurnInput): Promise<void> {
+    const root = await this.#harness.root(BACKGROUND_CONTEXT);
+    await root.commit((tx) => tx.createTask(MeddleTurn, input, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
+  }
+
+  /** Sends `text` into a live turn's input and records it as a user event. */
+  #send(taskId: string, queue: InputQueue, text: string, priority: "now" | "next"): void {
+    queue.push(text, priority);
+    const event = promptEvent(text);
+    const seq = appendEvent(this.#db, taskId, event);
+    notify(this.#eventListeners, (cb) => cb(taskId, seq, event));
+  }
+
   async interrupt(taskId: string): Promise<void> {
+    refuseReceiving(this.#row(taskId));
     await this.#liveQueryOrThrow(taskId).interrupt();
   }
 
   /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
-    this.#row(taskId);
+    refuseReceiving(this.#row(taskId));
     await this.liveQuery(taskId)?.setPermissionMode(mode);
     updateTaskSettings(this.#db, taskId, { permissionMode: mode });
   }
 
   /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the default. */
   async setModel(taskId: string, model?: string): Promise<void> {
-    this.#row(taskId);
+    refuseReceiving(this.#row(taskId));
     await this.liveQuery(taskId)?.setModel(model);
     updateTaskSettings(this.#db, taskId, { model });
   }
 
   /** Effort for the task's later turns; a live turn keeps its own. */
   async setEffort(taskId: string, effort: string): Promise<void> {
-    this.#row(taskId);
+    refuseReceiving(this.#row(taskId));
     updateTaskSettings(this.#db, taskId, { effort });
   }
 
@@ -246,6 +286,7 @@ export class TaskRunner {
 
   /** Runs the task's turn again after pi-durable's restart limit parked it. */
   async retry(taskId: string): Promise<void> {
+    refuseReceiving(this.#row(taskId));
     const turn = await this.#durableTurn(taskId);
     if (turn === undefined || !isParked(turn)) throw new Error(`no parked turn for task ${taskId}`);
     await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
@@ -307,6 +348,8 @@ export class TaskRunner {
         },
       });
       this.#live.set(taskId, { query, queue, state: "running" });
+      // A rerun that carries on a resumed session already sent them.
+      if (!(rerun && resume)) for (const text of input.followUps ?? []) this.#send(taskId, queue, text, "next");
       try {
         await done;
       } finally {
@@ -361,6 +404,174 @@ export class TaskRunner {
       const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
       this.#log(`meddle: git: push of ${m.bookmark} to ${shortId(home)} failed: ${message}`);
     }
+  }
+
+  // ─── receiving a moved task ───
+
+  /**
+   * Prepares to receive task `manifest.id` from node `from`: refused unless both report the same, known Claude Code
+   * version, this node hosts tasks and has a pool, and no other copy of the task is here (a partial one still being
+   * received from `from` is abandoned first: the sender's handoff ran again). Replicates each project (from its home),
+   * fetches the task's bookmarks from `from`, and provisions the task at the fetched changes as `receiving`.
+   */
+  async receiveTask(manifest: TaskManifest, from: string, version: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const ours = claudeCodeVersion();
+    if (version !== ours || ours === "unknown" || version === "unknown") return { ok: false, reason: `claude code ${ours} here, ${version} there` };
+    if (!(await checkTaskRoot(this.#cfg)).ok) return { ok: false, reason: "this node does not host tasks" };
+    const deps = this.#replicaDeps();
+    if (deps === null) return { ok: false, reason: "this node has no pool" };
+    try {
+      checkReceivedManifest(manifest);
+    } catch (err) {
+      return { ok: false, reason: messageOf(err) };
+    }
+    const taskId = manifest.id;
+    return serialised<{ ok: true } | { ok: false; reason: string }>(taskKey(taskId), async () => {
+      const existing = getTask(this.#db, taskId);
+      if (existing !== null) {
+        if (existing.state !== "receiving" || existing.receiving_from !== from) return { ok: false, reason: `task ${taskId} already exists here` };
+        await this.#discard(existing);
+      } else {
+        await this.#clearLeftovers(manifest);
+      }
+      try {
+        const parents: Record<string, string> = {};
+        for (const p of manifest.projects) {
+          parents[p.id] = await this.#fetchTaskChange(await ensureReplica(deps, p.id), from, `meddle/task/${taskId}/${p.name}`);
+        }
+        await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "receiving");
+        updateTask(this.#db, taskId, { receiving_from: from });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, reason: messageOf(err) };
+      }
+    });
+  }
+
+  /** Fetches `bookmark` from node `from` into the project's replica (never tracking it); the change it points at. */
+  async #fetchTaskChange(project: Project, from: string, bookmark: string): Promise<string> {
+    const remote = shortId(from);
+    return serialised(repoKey(project.replica), async () => {
+      await ensureRemote(this.#cfg, project.replica, from, { kind: "project", id: project.id });
+      await fetchBookmarks(this.#cfg, project.replica, from, [bookmark]);
+      const found = (await bookmarkList(project.replica, this.#cfg)).find((b) => b.name === bookmark && b.remote === remote);
+      if (found === undefined || found.conflicted || found.changeId === "") throw new Error(`bookmark ${bookmark}@${remote} is conflicted`);
+      return found.changeId;
+    });
+  }
+
+  /**
+   * Imports the task `from` sends over a `blob` stream into its `receiving` row (what an earlier attempt imported is
+   * replaced), keeping its settings, queued prompts and turn count. Refused `forbidden` unless the task is being
+   * received from `from`.
+   */
+  async importIncoming(taskId: string, from: string, reader: StreamReader): Promise<Receipt> {
+    return serialised(taskKey(taskId), async () => {
+      const row = this.#receivingFrom(taskId, from);
+      clearTaskLog(this.#db, taskId, row.session_id);
+      const got = await importTask(this.#cfg, this.#db, reader, { taskId });
+      updateTask(this.#db, taskId, {
+        settings: got.settings === null ? null : JSON.stringify(got.settings),
+        queued: got.queued.length === 0 ? null : JSON.stringify(got.queued),
+        turns: got.turns,
+      });
+      return got.receipt;
+    });
+  }
+
+  /**
+   * Makes a task received from `from` live here (`idle`); then, when there is a follow-up or prompts were queued
+   * while it moved, starts one turn: the first of them (the follow-up first) is its prompt, the rest follow with
+   * priority `next` (decision 13). A task already activated is a no-op: the sender's commit ran again. Refused
+   * `forbidden` unless the task is being received from `from`.
+   */
+  async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: true }> {
+    return serialised(taskKey(taskId), async () => {
+      const current = getTask(this.#db, taskId);
+      if (current !== null && current.receiving_from === null && ACTIVE_STATES.has(current.state)) return { ok: true as const };
+      const row = this.#receivingFrom(taskId, from);
+      const [first, ...rest] = [...(followUp === null ? [] : [followUp]), ...queuedOf(row)];
+      // Reserved before the task turns idle, so a prompt arriving meanwhile waits for this turn.
+      if (first !== undefined) this.#pending.add(taskId);
+      updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: null });
+      this.#emitState(taskId, "idle");
+      if (first === undefined) return { ok: true as const };
+      try {
+        await this.#createTurn({ taskId, prompt: first, ...(rest.length > 0 ? { followUps: rest } : {}) });
+      } catch (err) {
+        // The task is here now; its prompts stay queued rather than lost.
+        this.#pending.delete(taskId);
+        updateTask(this.#db, taskId, { queued: JSON.stringify([first, ...rest]) });
+        this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
+      }
+      return { ok: true as const };
+    });
+  }
+
+  /**
+   * Removes a task still being received from `from`: its rows, folder and config dir, workspaces and (except on a
+   * project's home, where they are the backup) its task bookmarks. An unknown task is a no-op; any other is refused
+   * `forbidden`.
+   */
+  async abandonTask(taskId: string, from: string): Promise<void> {
+    await serialised(taskKey(taskId), async () => {
+      if (getTask(this.#db, taskId) === null) return;
+      await this.#discard(this.#receivingFrom(taskId, from));
+    });
+  }
+
+  /** Abandons every task still `receiving`: a move that did not finish before this node stopped. */
+  async abandonOrphans(): Promise<void> {
+    for (const orphan of listTasks(this.#db).filter((t) => t.state === "receiving")) {
+      await serialised(taskKey(orphan.id), async () => {
+        const row = getTask(this.#db, orphan.id);
+        if (row?.state !== "receiving") return;
+        try {
+          await this.#discard(row);
+        } catch (err) {
+          this.#log(`meddle: move: could not abandon the partly received task ${orphan.id}: ${messageOf(err)}`);
+        }
+      });
+    }
+  }
+
+  #sweepOrphans(): void {
+    this.abandonOrphans().catch((err: unknown) => this.#log(`meddle: move: could not abandon partly received tasks: ${messageOf(err)}`));
+  }
+
+  /** The task's row when it is being received from `from`; otherwise refused `forbidden`. */
+  #receivingFrom(taskId: string, from: string): TaskRow {
+    const row = getTask(this.#db, taskId);
+    if (row === null || row.state !== "receiving" || row.receiving_from !== from) throw forbidden(`not receiving ${taskId} from ${shortId(from)}`);
+    return row;
+  }
+
+  /**
+   * What a receive that died while provisioning (the process stopped; no row was written) left of a task this node
+   * has no row for: its folder and its workspaces.
+   */
+  async #clearLeftovers(manifest: TaskManifest): Promise<void> {
+    const task = paths(this.#cfg).task(manifest.id);
+    if (!existsSync(task)) return;
+    for (const p of manifest.projects) {
+      const replica = getProject(this.#db, p.id)?.replica;
+      if (replica !== undefined) await workspaceForget(replica, `meddle-${manifest.id}`, this.#cfg).catch(() => {});
+    }
+    await rm(task, { recursive: true, force: true });
+  }
+
+  /** Removes a received task's workspaces, task bookmarks (not on the home), folder and rows. */
+  async #discard(row: TaskRow): Promise<void> {
+    const manifest = JSON.parse(row.manifest) as TaskManifest;
+    const self = this.#pool?.identity.id;
+    for (const p of manifest.projects) {
+      await workspaceForget(p.replica, `meddle-${row.id}`, this.#cfg).catch(() => {});
+      if (self !== undefined && getProject(this.#db, p.id)?.home === self) continue;
+      const bookmark = `meddle/task/${row.id}/${p.name}`;
+      await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, bookmark, this.#cfg)).catch(() => {});
+    }
+    await rm(paths(this.#cfg).task(row.id), { recursive: true, force: true });
+    deleteTask(this.#db, row.id, row.session_id);
   }
 
   /** What the replica and memory functions need, or null without a pool. */
@@ -469,6 +680,11 @@ export class TaskRunner {
   #emitState(taskId: string, state: TaskState): void {
     notify(this.#stateListeners, (cb) => cb(taskId, state));
   }
+}
+
+/** Refuses a task that is still being received. */
+function refuseReceiving(row: TaskRow): void {
+  if (row.state === "receiving") throw new Error("task is being received");
 }
 
 /** Calls each listener; one that throws is logged and never reaches the turn that told it. */

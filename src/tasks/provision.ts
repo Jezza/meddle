@@ -3,12 +3,14 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { checkTaskRoot, ensurePrivateDir, paths } from "../paths";
-import { bookmarkDelete, bookmarkSet, changeId, workspaceAdd, workspaceForget } from "../jj";
+import { bookmarkDelete, bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceAdd, workspaceForget } from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
 import { ensureMemoryReplica, linkMemory } from "../memory";
 import { getProject, type Project } from "../projects/project";
 import { refreshTrunk } from "../projects/replicas";
 import { insertTask, newId } from "../store/records";
+import { repoKey, serialised } from "../serial";
+import type { TaskState } from "./durable";
 import { writeManifest, type TaskManifest } from "./manifest";
 
 export type SettingSource = "user" | "project" | "local";
@@ -113,6 +115,108 @@ export async function provisionTask(
     return manifest;
   } catch (err) {
     for (const { replica, name } of bookmarks) await bookmarkDelete(replica, name, cfg).catch(() => {});
+    for (const replica of added) await workspaceForget(replica, workspaceName, cfg).catch(() => {});
+    await rm(task, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
+}
+
+/** An id from another node (task, session): letters, digits, `-` and `_`. */
+const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
+/** A folder or project name from another node: one path segment, as `provisionTask` admits. */
+function safeName(name: string): boolean {
+  return name !== "" && name !== "." && name !== ".." && !/[/\\\0]/.test(name);
+}
+
+/**
+ * Throws unless a manifest from another node is safe to provision here: ids and folder names are single path
+ * segments, workspaces are distinct, and the primary project is one of the task's.
+ */
+export function checkReceivedManifest(m: TaskManifest): void {
+  if (!SAFE_ID.test(m.id)) throw new Error(`invalid task id: ${m.id}`);
+  if (!SAFE_ID.test(m.sessionId)) throw new Error(`invalid session id: ${m.sessionId}`);
+  if (m.projects.length === 0) throw new Error("a task needs at least one project");
+  const workspaces = new Set<string>();
+  for (const p of m.projects) {
+    if (!safeName(p.name)) throw new Error(`invalid project name: ${p.name}`);
+    if (!safeName(p.workspace)) throw new Error(`invalid workspace: ${p.workspace}`);
+    if (workspaces.has(p.workspace)) throw new Error(`duplicate workspace in task: ${p.workspace}`);
+    workspaces.add(p.workspace);
+  }
+  if (!m.projects.some((p) => p.id === m.primaryProjectId)) throw new Error("the primary project is not one of the task's");
+}
+
+/**
+ * Provisions a task another node sent: the steps of `provisionTask`, keeping the manifest's id, title, session,
+ * primary project, creation time and projects (ids, names, workspaces), with each project's `replica` this node's and
+ * its `parent` the change `parents[projectId]` (fetched from the sender), where the workspace starts and the task's
+ * bookmark points. Writes `task.json` and the row (`started` 1, `state`, no turns). On failure, removes what it made.
+ */
+export async function provisionFromManifest(
+  cfg: NodeConfig,
+  db: Database,
+  manifest: TaskManifest,
+  parents: Record<string, string>,
+  state: TaskState,
+): Promise<TaskManifest> {
+  const root = await checkTaskRoot(cfg);
+  if (!root.ok) throw new Error(root.reason);
+  checkReceivedManifest(manifest);
+  const { id } = manifest;
+  const projects: Project[] = [];
+  for (const entry of manifest.projects) {
+    const project = getProject(db, entry.id);
+    if (project === null) throw new Error(`unknown project: ${entry.id}`);
+    if (parents[entry.id] === undefined) throw new Error(`no parent for project ${entry.id}`);
+    projects.push({ ...project, name: entry.name });
+  }
+  await seedProfile(cfg);
+  await ensurePlugins(cfg);
+
+  const p = paths(cfg);
+  const task = p.task(id);
+  const workspaceName = `meddle-${id}`;
+  const added: string[] = [];
+  /** Bookmarks this call created; one the replica already had (the home's backup) is left alone. */
+  const bookmarks: Array<{ replica: string; name: string }> = [];
+  try {
+    const configDir = p.taskConfig(id);
+    await mkdir(task, { recursive: true });
+    await ensurePrivateDir(p.taskMeta(id));
+    await mkdir(configDir, { recursive: true });
+    const entries: TaskManifest["projects"] = [];
+    for (const [i, entry] of manifest.projects.entries()) {
+      const replica = projects[i]!.replica;
+      const parent = parents[entry.id]!;
+      added.push(replica);
+      await workspaceAdd(replica, workspaceName, join(task, entry.workspace), parent, cfg);
+      const bookmark = `meddle/task/${id}/${entry.name}`;
+      await serialised(repoKey(replica), async () => {
+        const existed = (await bookmarkList(replica, cfg)).some((b) => b.name === bookmark && b.remote === null);
+        await bookmarkSet(replica, bookmark, parent, cfg);
+        if (!existed) bookmarks.push({ replica, name: bookmark });
+      });
+      entries.push({ ...entry, replica, parent });
+    }
+    await linkProfile(configDir, cfg);
+    await ensureMemoryReplica(cfg, manifest.primaryProjectId);
+    await linkMemory(configDir, cfg, manifest.primaryProjectId);
+    const received: TaskManifest = { ...manifest, projects: entries };
+    await writeFile(join(task, "CLAUDE.md"), generatedClaudeMd(received, projects));
+    await writeManifest(cfg, received);
+    insertTask(db, {
+      id,
+      title: received.title,
+      state,
+      session_id: received.sessionId,
+      manifest: JSON.stringify(received),
+      started: 1,
+      turns: 0,
+    });
+    return received;
+  } catch (err) {
+    for (const { replica, name } of bookmarks) await serialised(repoKey(replica), () => bookmarkForget(replica, name, cfg)).catch(() => {});
     for (const replica of added) await workspaceForget(replica, workspaceName, cfg).catch(() => {});
     await rm(task, { recursive: true, force: true }).catch(() => {});
     throw err;

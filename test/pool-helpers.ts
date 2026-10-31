@@ -7,6 +7,7 @@ import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } fro
 import { writeHelperWrapper, writeUpdateHook } from "../src/git/scripts";
 import { acceptGitStreams } from "../src/git/serve";
 import { GitSocket } from "../src/git/socket";
+import { acceptBlobStreams } from "../src/tasks/blob";
 import { MetricsSampler, findTaskPids } from "../src/metrics";
 import { hexOf, shortId, type Identity } from "../src/pool/identity";
 import type { LinkTap } from "../src/pool/link";
@@ -230,15 +231,16 @@ export function linkClient(host: Host): { client: Host; close(): Promise<void> }
   return { client, close: () => client.close() };
 }
 
-/** A pool node of `twoPoolNodes`: `startPoolNode` serving git, its `git` refusals logged to `logs`. */
+/** A pool node of `twoPoolNodes`: `startPoolNode` serving git and moved tasks, its `git` refusals logged to `logs`. */
 export type GitPoolNode = Awaited<ReturnType<typeof startPoolNode>>;
 
 /**
- * Two whole nodes (`startPoolNode`, with `extraEnv`), B joined to A's pool and both online to each other, each with the
- * git remote helper's wrapper and the update hook written, a `GitSocket` started and `acceptGitStreams` registered
- * (logging to the node's `logs`). `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
+ * `count` whole nodes (`startPoolNode`, with `extraEnv`), each after the first joined to the first's pool and all
+ * online to each other, each with the git remote helper's wrapper and the update hook written, a `GitSocket` started,
+ * `acceptGitStreams` (logging to the node's `logs`) and `acceptBlobStreams` registered. `close()` stops the acceptors,
+ * the sockets and the nodes, and removes the homes.
  */
-export async function twoPoolNodes(options: { extraEnv?: Record<string, string> } = {}): Promise<{ A: GitPoolNode; B: GitPoolNode; close(): Promise<void> }> {
+export async function poolNodes(count: number, options: { extraEnv?: Record<string, string> } = {}): Promise<{ nodes: GitPoolNode[]; close(): Promise<void> }> {
   const nodes: GitPoolNode[] = [];
   const stops: Array<() => Promise<void>> = [];
   const close = async () => {
@@ -250,7 +252,7 @@ export async function twoPoolNodes(options: { extraEnv?: Record<string, string> 
     }
   };
   try {
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < count; i++) {
       const node = await startPoolNode(undefined, options.extraEnv);
       nodes.push(node);
       await writeHelperWrapper(node.cfg);
@@ -262,19 +264,29 @@ export async function twoPoolNodes(options: { extraEnv?: Record<string, string> 
         db: node.db, cfg: node.cfg, selfId: node.id, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
       });
       stops.push(async () => stopAccepting());
+      const stopBlobs = acceptBlobStreams(node.net, node.runner);
+      stops.push(async () => stopBlobs());
     }
-    const [A, B] = nodes as [GitPoolNode, GitPoolNode];
-    await B.pool.join(A.pool.invite());
+    const [first, ...rest] = nodes as [GitPoolNode, ...GitPoolNode[]];
+    for (const n of rest) await n.pool.join(first.pool.invite());
     const deadline = Date.now() + 10_000;
-    while (!(A.net.isOnline(B.id) && B.net.isOnline(A.id))) {
-      if (Date.now() > deadline) throw new Error(`A and B never came online to each other (A sees B: ${A.net.isOnline(B.id)}, B sees A: ${B.net.isOnline(A.id)})`);
+    const offline = () => nodes.flatMap((a) => nodes.filter((b) => b !== a && !a.net.isOnline(b.id)).map((b) => `${shortId(a.id)} sees ${shortId(b.id)} offline`));
+    while (offline().length > 0) {
+      if (Date.now() > deadline) throw new Error(`the nodes never came online to each other: ${offline().join(", ")}`);
       await Bun.sleep(10);
     }
-    return { A, B, close };
+    return { nodes, close };
   } catch (err) {
     await close();
     throw err;
   }
+}
+
+/** Two nodes of `poolNodes`: B joined to A's pool. */
+export async function twoPoolNodes(options: { extraEnv?: Record<string, string> } = {}): Promise<{ A: GitPoolNode; B: GitPoolNode; close(): Promise<void> }> {
+  const { nodes, close } = await poolNodes(2, options);
+  const [A, B] = nodes as [GitPoolNode, GitPoolNode];
+  return { A, B, close };
 }
 
 /** Waits until `from` holds `to`'s PeerObject (its client host comes up just after `to` shows online). */

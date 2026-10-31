@@ -8,6 +8,8 @@ export const TaskStateSchema = Type.Union([
   Type.Literal("idle"),
   Type.Literal("running"),
   Type.Literal("waiting"),
+  /** Being moved here from another node: not live here until the sender activates it. */
+  Type.Literal("receiving"),
   Type.Literal("archived"),
 ]);
 
@@ -277,6 +279,18 @@ export const PeerObject = remote("meddle.peer", {
       methods: {
         /** The project with this id, or null when this node does not hold it. */
         projectInfo: method(Type.Object({ id: Type.String() }), Nullable(ProjectInfoSchema)),
+        /**
+         * Prepares to receive a task from the caller: fetches its bookmarks from the caller and provisions it as
+         * `receiving`. `ok: false` says why it was refused (versions, no task root, a task already here, …).
+         */
+        receiveTask: method(
+          Type.Object({ manifest: TaskManifestSchema, claudeCodeVersion: Type.String() }),
+          Type.Object({ ok: Type.Boolean(), reason: Type.Optional(Type.String()) }),
+        ),
+        /** Makes a task received from the caller live here, sending `followUp` and its queued prompts as one turn. */
+        activateTask: method(Type.Object({ taskId: Type.String(), followUp: Nullable(Type.String()) }), Type.Object({ ok: Type.Boolean() })),
+        /** Removes a task still being received from the caller. */
+        abandonTask: method(Type.Object({ taskId: Type.String() })),
       },
     },
   },

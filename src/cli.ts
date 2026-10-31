@@ -11,6 +11,7 @@ import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { runRemoteHelper } from "./git/helper";
 import { writeHelperWrapper, writeUpdateHook } from "./git/scripts";
 import { acceptGitStreams } from "./git/serve";
+import { acceptBlobStreams } from "./tasks/blob";
 import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
 import { loadOrCreateIdentity, shortId } from "./pool/identity";
@@ -54,6 +55,8 @@ type OpenNode = {
   stopTunnels?: () => void;
   /** Stops serving git streams other nodes open here. */
   stopGit?: () => void;
+  /** Stops accepting the blob streams of tasks moved here. */
+  stopBlobs?: () => void;
   /** The unix socket this node's git remote helper connects to. */
   gitSocket?: GitSocket;
 };
@@ -65,6 +68,7 @@ type OpenNode = {
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
   node.stopTunnels?.();
+  node.stopBlobs?.();
   node.stopGit?.();
   await node.gitSocket?.stop();
   await node.pool?.stop();
@@ -107,6 +111,7 @@ async function serve(): Promise<number> {
     node.stopGit = acceptGitStreams(pool.net, { db, cfg, selfId: pool.identity.id, isMember: (id) => pool.store.isMember(id), log: logGit });
     const harness = (node.harness = await openHarness(cfg, createRegistry()));
     const runner = new TaskRunner(cfg, db, harness.harness, { ...runnerDeps(), pool });
+    node.stopBlobs = acceptBlobStreams(pool.net, runner);
     const metrics = (node.metrics = new MetricsSampler({
       taskPids: () => findTaskPids(cfg.taskRoot),
       intervalMs: 5000,

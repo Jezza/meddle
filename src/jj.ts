@@ -81,6 +81,11 @@ export async function bookmarkDelete(repo: string, name: string, cfg?: NodeConfi
   await jj(["bookmark", "delete", `exact:${name}`], repo, cfg);
 }
 
+/** Forgets `name` here and its remote entries, leaving nothing for a push to delete (decision 19). */
+export async function bookmarkForget(repo: string, name: string, cfg?: NodeConfig): Promise<void> {
+  await jj(["bookmark", "forget", "--include-remotes", `exact:${name}`], repo, cfg);
+}
+
 export async function changeId(workspace: string, cfg?: NodeConfig): Promise<string> {
   return (await jj(["log", "-r", "@", "--no-graph", "-T", "change_id"], workspace, cfg)).trim();
 }

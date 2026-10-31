@@ -29,6 +29,12 @@ export type TaskRow = {
   updated_at: string;
   /** `TaskSettings` as JSON, or NULL for none. */
   settings: string | null;
+  /** Prompts sent while the task was moving, as a JSON array of strings; NULL for none. */
+  queued: string | null;
+  /** The node a `moved` task went to. */
+  moved_to: string | null;
+  /** The node a `receiving` task comes from. */
+  receiving_from: string | null;
 };
 
 /** What the user chose for a task's later turns; an absent field takes the default. */
@@ -61,7 +67,10 @@ export function listProjectRows(db: Database): ProjectRow[] {
   return db.query<ProjectRow, []>("SELECT * FROM projects ORDER BY created_at, id").all();
 }
 
-export function insertTask(db: Database, row: Omit<TaskRow, "created_at" | "updated_at" | "settings">): void {
+export function insertTask(
+  db: Database,
+  row: Omit<TaskRow, "created_at" | "updated_at" | "settings" | "queued" | "moved_to" | "receiving_from">,
+): void {
   const now = new Date().toISOString();
   db.query(
     `INSERT INTO tasks (id, title, state, session_id, manifest, started, turns, created_at, updated_at)
@@ -83,15 +92,12 @@ export function getTask(db: Database, id: string): TaskRow | null {
   return db.query<TaskRow, [string]>("SELECT * FROM tasks WHERE id = ?").get(id);
 }
 
-const TASK_PATCH_COLUMNS = ["state", "started", "turns", "session_id", "manifest"] as const;
+const TASK_PATCH_COLUMNS = ["state", "started", "turns", "session_id", "manifest", "settings", "queued", "moved_to", "receiving_from"] as const;
 
-export function updateTask(
-  db: Database,
-  id: string,
-  patch: Partial<Pick<TaskRow, "state" | "started" | "turns" | "session_id" | "manifest">>,
-): void {
+/** Sets the given columns of a task row (`null` clears a nullable one; `undefined` leaves it). */
+export function updateTask(db: Database, id: string, patch: Partial<Pick<TaskRow, (typeof TASK_PATCH_COLUMNS)[number]>>): void {
   const sets = ["updated_at = $updated_at"];
-  const params: Record<string, string | number> = { $id: id, $updated_at: new Date().toISOString() };
+  const params: Record<string, string | number | null> = { $id: id, $updated_at: new Date().toISOString() };
   for (const column of TASK_PATCH_COLUMNS) {
     const value = patch[column];
     if (value === undefined) continue;
@@ -127,4 +133,25 @@ export function updateTaskSettings(db: Database, id: string, patch: { [K in keyo
     }
     db.query("UPDATE tasks SET settings = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(settings), new Date().toISOString(), id);
   })();
+}
+
+/** Deletes task `id`'s event log and its session's transcript rows. */
+export function clearTaskLog(db: Database, id: string, sessionId: string): void {
+  db.transaction(() => {
+    db.query("DELETE FROM events WHERE task_id = ?").run(id);
+    db.query("DELETE FROM transcript WHERE session_id = ?").run(sessionId);
+  })();
+}
+
+/** Deletes task `id`'s row, its event log and its session's transcript rows. */
+export function deleteTask(db: Database, id: string, sessionId: string): void {
+  db.transaction(() => {
+    clearTaskLog(db, id, sessionId);
+    db.query("DELETE FROM tasks WHERE id = ?").run(id);
+  })();
+}
+
+/** The task's queued prompts (`[]` for none). */
+export function queuedOf(row: Pick<TaskRow, "queued">): string[] {
+  return row.queued === null ? [] : (JSON.parse(row.queued) as string[]);
 }
