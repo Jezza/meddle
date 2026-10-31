@@ -43,6 +43,29 @@ const MIGRATIONS = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS transcript_uuid
     ON transcript (project_key, session_id, subpath, uuid) WHERE uuid IS NOT NULL`,
+  // The pool this node belongs to: one row.
+  `CREATE TABLE IF NOT EXISTS pool (
+    pool_id TEXT PRIMARY KEY,
+    pool_secret TEXT,
+    created_at TEXT
+  )`,
+  // The pool's members, past and present; summary and last_addr are JSON.
+  `CREATE TABLE IF NOT EXISTS roster (
+    node_id TEXT PRIMARY KEY,
+    hostname TEXT,
+    status TEXT,
+    updated_at TEXT,
+    added_by TEXT,
+    summary TEXT,
+    last_seen_at TEXT,
+    last_addr TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS invites (
+    code TEXT PRIMARY KEY,
+    created_at TEXT,
+    expires_at TEXT,
+    used_at TEXT
+  )`,
 ];
 
 /** Columns added to a table after its first release: each is added to a database that lacks it. */

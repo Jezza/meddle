@@ -14,6 +14,8 @@
     "@earendil-works/chord": "1.4.0",
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",
+    "@number0/iroh": "1.2.0",
+    "iroh-lighthouse": "0.1.0",
     "preact": "11.1.0",
     "smol-toml": "1.9.1",
     "typebox": "1.4.3"

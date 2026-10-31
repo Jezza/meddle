@@ -4,6 +4,7 @@ import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { loadConfig, ensureDataDirs, paths } from "../src/config";
 import { setToken, getToken, tokenStatus } from "../src/token";
+const A = "a".repeat(64);
 async function cfg() { const d = await mkdtemp("/tmp/meddle-tok-"); const c = loadConfig({ HOME: d, MEDDLE_DATA_DIR: d, MEDDLE_TASK_ROOT: d }); await ensureDataDirs(c); return c; }
 test("trims CRLF and sets mode 600", async () => {
   const c = await cfg();
@@ -40,4 +41,9 @@ test("cli token set --file then status round-trips without printing the token", 
   expect(status.code).toBe(0);
   expect(status.stdout).toContain("present: true");
   expect(status.stdout).not.toContain(fake);
+});
+test("setToken records setBy and a given setAt; tokenStatus returns both", async () => {
+  const c = await cfg();
+  await setToken(c, "tok", { setAt: "2026-10-31T10:00:00.000Z", setBy: A });
+  expect(await tokenStatus(c)).toEqual({ present: true, setAt: "2026-10-31T10:00:00.000Z", setBy: A, expiresAt: "2027-10-31T10:00:00.000Z" });
 });

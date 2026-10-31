@@ -12,6 +12,7 @@ export function paths(cfg: NodeConfig) {
     plugins: join(data, "plugins"),
     secrets,
     tokenFile: join(secrets, "claude-token"),
+    irohKey: join(secrets, "iroh.key"),
     db: join(data, "meddle.sqlite"),
     durableDb: join(data, "durable.sqlite"),
     memory: (projectId: string) => join(data, "memory", projectId),

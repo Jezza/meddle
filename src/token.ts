@@ -17,11 +17,15 @@ async function writePrivate(file: string, contents: string): Promise<void> {
   await chmod(file, 0o600);
 }
 
-export async function setToken(cfg: NodeConfig, token: string): Promise<void> {
+/** Who set the token and when: `setBy` is the node id it came from, absent when set on this node by hand. */
+type TokenMeta = { setAt?: string; setBy?: string };
+
+export async function setToken(cfg: NodeConfig, token: string, meta?: TokenMeta): Promise<void> {
   const trimmed = token.trim();
   if (trimmed === "") throw new Error("empty token");
   await writePrivate(paths(cfg).tokenFile, trimmed);
-  await writePrivate(metaFile(cfg), JSON.stringify({ setAt: new Date().toISOString() }));
+  const setAt = meta?.setAt ?? new Date().toISOString();
+  await writePrivate(metaFile(cfg), JSON.stringify({ setAt, setBy: meta?.setBy ?? null }));
 }
 
 export async function getToken(cfg: NodeConfig): Promise<string | null> {
@@ -33,7 +37,9 @@ export async function getToken(cfg: NodeConfig): Promise<string | null> {
   }
 }
 
-export async function tokenStatus(cfg: NodeConfig): Promise<{ present: boolean; setAt?: string; expiresAt?: string }> {
+export async function tokenStatus(
+  cfg: NodeConfig,
+): Promise<{ present: boolean; setAt?: string; setBy?: string; expiresAt?: string }> {
   let mtime: Date;
   try {
     mtime = (await stat(paths(cfg).tokenFile)).mtime;
@@ -42,12 +48,15 @@ export async function tokenStatus(cfg: NodeConfig): Promise<{ present: boolean; 
     throw err;
   }
   let setAt: string;
+  let setBy: string | null = null;
   try {
-    setAt = (JSON.parse(await readFile(metaFile(cfg), "utf8")) as { setAt: string }).setAt;
+    const meta = JSON.parse(await readFile(metaFile(cfg), "utf8")) as { setAt: string; setBy?: string | null };
+    setAt = meta.setAt;
+    setBy = meta.setBy ?? null;
   } catch (err) {
     if (!isMissing(err)) throw err;
     setAt = mtime.toISOString();
   }
   const expiresAt = new Date(new Date(setAt).getTime() + YEAR_MS).toISOString();
-  return { present: true, setAt, expiresAt };
+  return setBy === null ? { present: true, setAt, expiresAt } : { present: true, setAt, setBy, expiresAt };
 }

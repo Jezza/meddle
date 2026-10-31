@@ -40,3 +40,17 @@ test("ensureDataDirs makes the data dir 700, tightening one that exists", async 
   await ensureDataDirs(existing);
   expect((await stat(existing.dataDir)).mode & 0o777).toBe(0o700);
 });
+test("pool settings default and parse", () => {
+  const cfg = loadConfig({ HOME: "/h" });
+  expect(cfg.lighthouseUrl).toBe("https://iroh.ichor.io");
+  expect(cfg.irohPreset).toBe("n0");
+  expect(cfg.irohBind).toBeNull();
+  expect(cfg.discoveryPollMs).toBe(10000);
+  const t = loadConfig({ HOME: "/h", MEDDLE_LIGHTHOUSE_URL: "", MEDDLE_IROH_PRESET: "minimal", MEDDLE_IROH_BIND: "127.0.0.1:0", MEDDLE_DISCOVERY_POLL_MS: "1500" });
+  expect(t.lighthouseUrl).toBe("");
+  expect(t.irohPreset).toBe("minimal");
+  expect(t.irohBind).toBe("127.0.0.1:0");
+  expect(t.discoveryPollMs).toBe(1500);
+  expect(() => loadConfig({ HOME: "/h", MEDDLE_IROH_PRESET: "fast" })).toThrow("MEDDLE_IROH_PRESET must be n0 or minimal");
+  expect(() => loadConfig({ HOME: "/h", MEDDLE_DISCOVERY_POLL_MS: "100" })).toThrow("MEDDLE_DISCOVERY_POLL_MS must be an integer of at least 500");
+});
