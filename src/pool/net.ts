@@ -96,11 +96,18 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Resets a stream both ways: its opener's reads and writes fail. */
+async function resetStream(stream: BiStream): Promise<void> {
+  await stream.send.reset(0n).catch(() => {});
+  await stream.recv.stop(0n).catch(() => {});
+}
+
 /**
  * Keeps one connection per member over ALPN_POOL and hands out streams on it. Of two members the one with the smaller
  * id dials (with backoff); the other only accepts. The acceptor admits a dialer by opening a uni stream and finishing
  * it, so a dialer counts as online only once admitted, never for a connection about to be refused. Every bidirectional
- * stream starts with a header line. Never logs: errors go to `deps.onError`.
+ * stream starts with a header line, and goes to the `onStream` listener that takes its kind (reset when none does).
+ * Never logs: errors go to `deps.onError`.
  */
 export class PoolNet {
   readonly endpoint: Endpoint;
@@ -112,7 +119,7 @@ export class PoolNet {
   private readonly dials = new Map<string, Dial>();
   private readonly tasks = new Set<Promise<void>>();
   private readonly peerListeners = new Set<(peerId: string, online: boolean) => void>();
-  private readonly streamListeners = new Set<(s: PeerStream) => void>();
+  private readonly streamListeners = new Set<(s: PeerStream) => boolean>();
   private started = false;
   private stopped = false;
 
@@ -199,7 +206,11 @@ export class PoolNet {
     return () => this.peerListeners.delete(cb);
   }
 
-  onStream(cb: (s: PeerStream) => void): () => void {
+  /**
+   * `cb` sees every inbound stream (header read) and returns true when it took it, as its kind is the listener's; a
+   * stream no listener takes is reset, so its opener fails instead of waiting for an answer.
+   */
+  onStream(cb: (s: PeerStream) => boolean): () => void {
     this.streamListeners.add(cb);
     return () => this.streamListeners.delete(cb);
   }
@@ -233,14 +244,16 @@ export class PoolNet {
     }
   }
 
+  /** Hands `s` to the listeners until one takes it; resets it when none does. */
   private emitStream(s: PeerStream): void {
     for (const cb of [...this.streamListeners]) {
       try {
-        cb(s);
+        if (cb(s)) return;
       } catch (err) {
         this.report(err);
       }
     }
+    void resetStream(s.stream);
   }
 
   private async acceptLoop(): Promise<void> {
@@ -344,11 +357,14 @@ export class PoolNet {
       header = parseHeader(line);
     } catch (err) {
       this.report(new Error(`stream from ${shortId(id)}: ${messageOf(err)}`));
-      await stream.send.reset(0n).catch(() => {});
-      await stream.recv.stop(0n).catch(() => {});
+      await resetStream(stream);
       return;
     }
-    if (this.links.get(id) !== link) return;
+    // The link was replaced (or dropped) while the header was read: nobody is to answer this stream.
+    if (this.links.get(id) !== link) {
+      await resetStream(stream);
+      return;
+    }
     this.emitStream({ peerId: id, header, stream, reader, closed: link.closed });
   }
 

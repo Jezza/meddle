@@ -15,8 +15,8 @@ async function until(cond: () => boolean, ms = 2000): Promise<void> {
   }
 }
 
-/** A PoolNet on `node` that records its peer events, streams and errors. */
-function netOf(node: TestNode, deps: Partial<NetDeps> = {}) {
+/** A PoolNet on `node` that records its peer events, streams (those `claims` takes; all by default) and errors. */
+function netOf(node: TestNode, deps: Partial<NetDeps> = {}, claims: (s: PeerStream) => boolean = () => true) {
   const peers: [string, boolean][] = [];
   const streams: PeerStream[] = [];
   const errors: string[] = [];
@@ -26,16 +26,20 @@ function netOf(node: TestNode, deps: Partial<NetDeps> = {}) {
     onError: (err) => { raw.push(err); errors.push(String(err)); }, backoff: fast, ...deps,
   });
   net.onPeer((id, online) => peers.push([id, online]));
-  net.onStream((s) => streams.push(s));
+  net.onStream((s) => {
+    if (!claims(s)) return false;
+    streams.push(s);
+    return true;
+  });
   return { net, peers, streams, errors, raw, id: node.identity.id };
 }
 
 /** Both ends of a pair as PoolNets, `lo` the one with the smaller id (the dialer). */
-async function poolPair(isMember: { lo?: (id: string) => boolean; hi?: (id: string) => boolean } = {}) {
+async function poolPair(isMember: { lo?: (id: string) => boolean; hi?: (id: string) => boolean } = {}, claims?: (s: PeerStream) => boolean) {
   const pair = await endpointPair();
   const [loNode, hiNode] = pair.a.identity.id < pair.b.identity.id ? [pair.a, pair.b] : [pair.b, pair.a];
-  const lo = netOf(loNode, isMember.lo ? { isMember: isMember.lo } : {});
-  const hi = netOf(hiNode, isMember.hi ? { isMember: isMember.hi } : {});
+  const lo = netOf(loNode, isMember.lo ? { isMember: isMember.lo } : {}, claims);
+  const hi = netOf(hiNode, isMember.hi ? { isMember: isMember.hi } : {}, claims);
   lo.net.start();
   hi.net.start();
   lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
@@ -239,5 +243,34 @@ test("openStream on an offline peer rejects", async () => {
   } finally {
     await a.net.stop();
     await pair.close();
+  }
+});
+
+test("a stream of a kind nobody takes is reset: the opener fails at once instead of waiting", async () => {
+  // A listener that looks at every stream but takes only the kinds it knows; holding on to the stream keeps it from
+  // being dropped (and so finished) by the garbage collector.
+  const looked: PeerStream[] = [];
+  const { lo, hi, stop } = await poolPair({}, (s) => {
+    looked.push(s);
+    return s.header.stream !== "unknown";
+  });
+  try {
+    const s = await lo.net.openStream(hi.id, { stream: "unknown" });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      s.reader.readLine().then((line) => line, () => "rejected"),
+      new Promise<string>((resolve) => { timer = setTimeout(() => resolve("still waiting"), 1000); }),
+    ]);
+    clearTimeout(timer);
+    expect(outcome === null || outcome === "rejected").toBe(true);
+    expect(looked.map((x) => x.header)).toEqual([{ stream: "unknown" }]);
+    expect(hi.streams).toEqual([]);
+    // Only the stream was reset: the connection stays and a known kind still gets through.
+    expect(lo.net.isOnline(hi.id)).toBe(true);
+    await lo.net.openStream(hi.id, { stream: "x" });
+    await until(() => hi.streams.length === 1);
+    expect(hi.errors).toEqual([]);
+  } finally {
+    await stop();
   }
 });

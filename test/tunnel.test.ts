@@ -232,11 +232,12 @@ test("the tunnel carries binary frames both ways", async () => {
     const atRemote: unknown[] = [];
     const remoteReady = Promise.withResolvers<IrohSocketShim>();
     const off = b.net.onStream((s) => {
-      if (s.header.stream !== "dashboard") return;
+      if (s.header.stream !== "dashboard") return false;
       const shim = new IrohSocketShim(s);
       shim.addEventListener("message", (event) => atRemote.push(event.data));
       shim.start();
       remoteReady.resolve(shim);
+      return true;
     });
     try {
       browser = new WebSocket(`ws://127.0.0.1:${server.port}/`);

@@ -175,15 +175,19 @@ export class PoolSync {
   }
 }
 
-/** Accepts every `chord` stream a member opens as a client link on `host` acting as `peer:<peerId>`. Returns the unsubscribe. */
+/**
+ * Accepts every `chord` stream a member opens as a client link on `host` acting as `peer:<peerId>` (a non-member's is
+ * reset), and takes no other kind. Returns the unsubscribe.
+ */
 export function acceptPeerLinks(net: PoolNet, host: Host, isMember: (id: string) => boolean): () => void {
   return net.onStream((s) => {
-    if (s.header.stream !== "chord") return;
+    if (s.header.stream !== "chord") return false;
     if (!isMember(s.peerId)) {
       void s.stream.send.reset(0n).catch(() => {});
       void s.stream.recv.stop(0n).catch(() => {});
-      return;
+      return true;
     }
     host.accept(new IrohLink(s), { principal: `${PEER_PRINCIPAL_PREFIX}${s.peerId}`, kind: "client" });
+    return true;
   });
 }

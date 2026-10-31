@@ -104,19 +104,23 @@ export class IrohSocketShim implements WebSocketLike {
   }
 }
 
-/** Accepts every `dashboard` stream a member opens as a browser-grade link on `host`. Returns the unsubscribe. */
+/**
+ * Accepts every `dashboard` stream a member opens as a browser-grade link on `host` (a non-member's is reset), and
+ * takes no other kind. Returns the unsubscribe.
+ */
 export function acceptDashboardStreams(net: PoolNet, host: Host, isMember: (id: string) => boolean): () => void {
   return net.onStream((s) => {
-    if (s.header.stream !== "dashboard") return;
+    if (s.header.stream !== "dashboard") return false;
     if (!isMember(s.peerId)) {
       void s.stream.send.reset(0n).catch(() => {});
       void s.stream.recv.stop(0n).catch(() => {});
-      return;
+      return true;
     }
     const shim = new IrohSocketShim(s);
     // As `acceptWebSockets` does for a browser: large payloads go out deflated, and packed frames are not accepted.
     host.accept(webSocketLink(shim, { compress: true, acceptPacked: false }), { principal: DASHBOARD_PRINCIPAL, kind: "client" });
     shim.start();
+    return true;
   });
 }
 
