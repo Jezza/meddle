@@ -59,6 +59,8 @@ export type PeerObjectDeps = {
   hostsTasks(): Promise<boolean>;
   /** Fires after a project was added or registered on this node. */
   changes: Subscribable<null>;
+  /** Fires when this node's own state may have changed (each metrics sample, each pool change): `hostsTasks` is re-read. */
+  recheck?: Subscribable<null>;
   /** Receives tasks other nodes move here; each call names the calling node. */
   runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask">;
 };
@@ -87,6 +89,8 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
       projects.replace(ctx, projectsNow());
       await refreshHostsTasks(ctx);
     });
+    // Peers pick move targets by `hostsTasks` before asking anything, so a task root that comes back must show here.
+    if (deps.recheck !== undefined) self.on("recheck", deps.recheck, (_event, ctx) => refreshHostsTasks(ctx));
     return {
       variant: "peer",
       projects,
@@ -134,6 +138,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     claudeCodeVersion: deps.claudeCodeVersion,
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
     changes: projectChanges,
+    recheck: {
+      subscribe: (cb) => {
+        const offSamples = metrics.onSample(() => cb(null));
+        const offPool = pool.onChange(() => cb(null));
+        return () => { offSamples(); offPool(); };
+      },
+    },
     runner,
   });
   acceptPeerLinks(pool.net, host, (id) => pool.store.isMember(id));
@@ -149,6 +160,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const efforts = self.state("efforts", NodeStore.def.members.efforts, { init: effortsNow });
     /** Pending request ids already notified, so each request is announced once. */
     const announced = self.state("announced", Type.Array(Type.String()), []);
+
+    /** The task root can come and go while the node runs. */
+    const refreshHostsTasks = async (ctx: Ctx) => {
+      const now = (await checkTaskRoot(cfg)).ok;
+      if (!ctx.signal.aborted && now !== hostsTasks.value) hostsTasks.replace(ctx, now);
+    };
 
     const notify = (ctx: Ctx, n: Omit<Notification, "id" | "at">) => {
       const note = { id: crypto.randomUUID(), at: new Date().toISOString(), ...n };
@@ -187,6 +204,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("samples", samples, async (sample, ctx) => {
       metricsNow.replace(ctx, sample);
       token.replace(ctx, await tokenNow(cfg));
+      await refreshHostsTasks(ctx);
     });
     // A task received from another node turns live through the runner, not through createTask.
     self.on("taskStates", states, (_event, ctx) => {
@@ -203,6 +221,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const next = await tokenNow(cfg);
       // The host may have closed while the file was read (a change as the node shuts down).
       if (!ctx.signal.aborted) token.replace(ctx, next);
+      await refreshHostsTasks(ctx);
     });
 
     return {

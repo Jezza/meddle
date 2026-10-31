@@ -44,8 +44,7 @@ import { importTask, type Receipt } from "./transfer";
 
 export type TaskState = "idle" | "running" | "waiting" | "receiving" | "archived";
 
-/** `followUps` (a moved task's queued prompts) are sent with priority `next` once the turn is live. */
-type TurnInput = { taskId: string; prompt: string; followUps?: string[] };
+type TurnInput = { taskId: string; prompt: string };
 type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
 /** Installed by `openHarness`: how a phase finds the Harness it runs in. */
 type MeddleHooks = { harness(): Harness };
@@ -227,6 +226,13 @@ export class TaskRunner {
       if (turn !== undefined) throw new Error("task is resuming");
       stale = true;
     }
+    // Prompts queued while the task moved run first, one turn each; this one waits its turn behind them.
+    if (queuedOf(this.#row(taskId)).length > 0) {
+      if (stale) this.#setState(taskId, "idle");
+      this.#enqueue(taskId, text);
+      await this.startQueued(taskId);
+      return;
+    }
     // Reserved before the first await, so a concurrent prompt cannot create a second turn.
     if (this.#pending.has(taskId)) throw new Error("task has a pending turn");
     this.#pending.add(taskId);
@@ -243,6 +249,38 @@ export class TaskRunner {
   async #createTurn(input: TurnInput): Promise<void> {
     const root = await this.#harness.root(BACKGROUND_CONTEXT);
     await root.commit((tx) => tx.createTask(MeddleTurn, input, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
+  }
+
+  /**
+   * Starts the task's next turn from its queued prompts (decision 13 as amended: one turn per text, in order) when it
+   * is idle with a prompt queued and no turn pending or live; otherwise does nothing. The text leaves `queued` only
+   * once its turn is created, so a crash never loses it; a crash in the moment between the two runs it twice.
+   * `completeTurn` calls this after every turn, so the queue drains turn by turn.
+   */
+  async startQueued(taskId: string): Promise<void> {
+    const row = getTask(this.#db, taskId);
+    if (row === null || row.state !== "idle" || this.#pending.has(taskId) || this.#live.has(taskId)) return;
+    const [head] = queuedOf(row);
+    if (head === undefined) return;
+    this.#pending.add(taskId);
+    try {
+      await this.#createTurn({ taskId, prompt: head });
+    } catch (err) {
+      this.#pending.delete(taskId);
+      throw err;
+    }
+    // Only appends happened meanwhile (a prompt joins the tail; this is the one taker, kept single by `#pending`).
+    this.#db.transaction(() => {
+      const rest = queuedOf(this.#row(taskId)).slice(1);
+      updateTask(this.#db, taskId, { queued: rest.length === 0 ? null : JSON.stringify(rest) });
+    })();
+  }
+
+  /** Appends `text` to the task's queued prompts. */
+  #enqueue(taskId: string, text: string): void {
+    this.#db.transaction(() => {
+      updateTask(this.#db, taskId, { queued: JSON.stringify([...queuedOf(this.#row(taskId)), text]) });
+    })();
   }
 
   /** Sends `text` into a live turn's input and records it as a user event. */
@@ -348,8 +386,6 @@ export class TaskRunner {
         },
       });
       this.#live.set(taskId, { query, queue, state: "running" });
-      // A rerun that carries on a resumed session already sent them.
-      if (!(rerun && resume)) for (const text of input.followUps ?? []) this.#send(taskId, queue, text, "next");
       try {
         await done;
       } finally {
@@ -480,28 +516,22 @@ export class TaskRunner {
   }
 
   /**
-   * Makes a task received from `from` live here (`idle`); then, when there is a follow-up or prompts were queued
-   * while it moved, starts one turn: the first of them (the follow-up first) is its prompt, the rest follow with
-   * priority `next` (decision 13). A task already activated is a no-op: the sender's commit ran again. Refused
-   * `forbidden` unless the task is being received from `from`.
+   * Makes a task received from `from` live here (`idle`); a follow-up joins the front of its queued prompts, which
+   * then run one turn each, in order (`startQueued`). A task already activated is a no-op: the sender's commit ran
+   * again. Refused `forbidden` unless the task is being received from `from`.
    */
   async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: true }> {
     return serialised(taskKey(taskId), async () => {
       const current = getTask(this.#db, taskId);
       if (current !== null && current.receiving_from === null && ACTIVE_STATES.has(current.state)) return { ok: true as const };
       const row = this.#receivingFrom(taskId, from);
-      const [first, ...rest] = [...(followUp === null ? [] : [followUp]), ...queuedOf(row)];
-      // Reserved before the task turns idle, so a prompt arriving meanwhile waits for this turn.
-      if (first !== undefined) this.#pending.add(taskId);
-      updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: null });
+      const queued = [...(followUp === null ? [] : [followUp]), ...queuedOf(row)];
+      updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: queued.length === 0 ? null : JSON.stringify(queued) });
       this.#emitState(taskId, "idle");
-      if (first === undefined) return { ok: true as const };
       try {
-        await this.#createTurn({ taskId, prompt: first, ...(rest.length > 0 ? { followUps: rest } : {}) });
+        await this.startQueued(taskId);
       } catch (err) {
-        // The task is here now; its prompts stay queued rather than lost.
-        this.#pending.delete(taskId);
-        updateTask(this.#db, taskId, { queued: JSON.stringify([first, ...rest]) });
+        // The task is here now; its prompts stay queued, and the next prompt starts them.
         this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
       }
       return { ok: true as const };
@@ -583,6 +613,9 @@ export class TaskRunner {
   completeTurn(taskId: string): void {
     updateTask(this.#db, taskId, { turns: this.#row(taskId).turns + 1 });
     this.#setState(taskId, "idle");
+    this.startQueued(taskId).catch((err: unknown) => {
+      this.#log(`meddle: move: task ${taskId}'s next queued prompt did not start a turn: ${messageOf(err)}`);
+    });
   }
 
   /** The `abort` phase of `meddle.turn`; not for callers outside this module. */

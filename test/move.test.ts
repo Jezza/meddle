@@ -1,18 +1,19 @@
 // test/move.test.ts — moving a task between nodes: the receiving side.
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
-import { PeerObject } from "../src/state/contracts";
+import { NodeObject, PeerObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
 import { getTask } from "../src/store/records";
 import { readManifest, transcriptPath, type TaskManifest } from "../src/tasks/manifest";
 import { exportTask, receiptsMatch, type Receipt } from "../src/tasks/transfer";
 import { claudeCodeVersion } from "../src/version";
-import { peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+import { setupNode } from "./helpers";
+import { linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** A task on `node`'s own project after one replayed turn. */
 async function turnedTask(node: GitPoolNode): Promise<TaskManifest> {
@@ -120,7 +121,38 @@ test("a task is received, imported, activated and resumed", async () => {
   }
 }, 15_000);
 
-test("activation replays the follow-up and the queued prompts as one turn", async () => {
+/** What a turn's events come to: `start`, `user:<text>` for a prompt, `result`. */
+function turnMarks(events: Array<{ message: unknown }>): string[] {
+  return events.flatMap(({ message }) => {
+    const e = message as { type?: string; subtype?: string; message?: { content?: unknown } };
+    if (e.subtype === "turn_started") return ["start"];
+    if (e.type === "result") return ["result"];
+    if (e.type === "user" && typeof e.message?.content === "string") return [`user:${e.message.content}`];
+    return [];
+  });
+}
+
+/** Records `queued` at each `running` of the task and resolves once `turns` turns have run and it is idle again. */
+function watchTurns(node: GitPoolNode | Awaited<ReturnType<typeof setupNode>>, taskId: string, turns: number) {
+  const queuedAtStart: string[][] = [];
+  const done = new Promise<void>((res) => {
+    let runs = 0;
+    const off = node.runner.onState((id, s) => {
+      if (id !== taskId) return;
+      if (s === "running") {
+        runs += 1;
+        const q = getTask(node.db, taskId)!.queued;
+        queuedAtStart.push(q === null ? [] : (JSON.parse(q) as string[]));
+      } else if (s === "idle" && runs === turns) {
+        off();
+        res();
+      }
+    });
+  });
+  return { queuedAtStart, done };
+}
+
+test("activation replays the follow-up and the queued prompts as one turn each, in order", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     const m = await turnedTask(A);
@@ -131,22 +163,44 @@ test("activation replays the follow-up and the queued prompts as one turn", asyn
       const { got } = await sendTask(A, B, m.id);
       expect(got).not.toBeNull();
       expect(JSON.parse(getTask(B.db, m.id)!.queued!)).toEqual(["first queued", "second queued"]);
+      const before = listEvents(B.db, m.id).length;
 
-      const idle = idleOn(B, m.id);
-      expect(await ref.activateTask({ taskId: m.id, followUp: "carry on after the move" })).toEqual({ ok: true });
-      await idle;
-      const events = listEvents(B.db, m.id).map((e) => e.message as { type?: string; subtype?: string; resume?: boolean; message?: { content?: unknown } });
-      const lastStart = events.findLastIndex((e) => e.subtype === "turn_started");
-      expect(events[lastStart]!.resume).toBe(true);
-      const prompts = events.slice(lastStart).filter((e) => e.type === "user" && typeof e.message?.content === "string").map((e) => e.message!.content);
-      expect(prompts).toEqual(["carry on after the move", "first queued", "second queued"]);
-      expect(events.filter((e) => e.subtype === "turn_started")).toHaveLength(2);
+      const texts = ["carry on after the move", "first queued", "second queued"];
+      const { queuedAtStart, done } = watchTurns(B, m.id, 3);
+      expect(await ref.activateTask({ taskId: m.id, followUp: texts[0]! })).toEqual({ ok: true });
+      await done;
+      const events = listEvents(B.db, m.id).slice(before);
+      expect(turnMarks(events)).toEqual(texts.flatMap((t) => ["start", `user:${t}`, "result"]));
+      expect(events.filter((e) => (e.message as { subtype?: string }).subtype === "turn_started").map((e) => (e.message as { resume: boolean }).resume))
+        .toEqual([true, true, true]);
+      // A text leaves the queue only once its own turn exists, never before: at the k-th turn's start the queue still
+      // holds every later text, and the k-th text at most.
+      expect(queuedAtStart).toHaveLength(3);
+      queuedAtStart.forEach((q, k) => expect([texts.slice(k), texts.slice(k + 1)]).toContainEqual(q));
       expect(getTask(B.db, m.id)!.queued).toBeNull();
+      expect(getTask(B.db, m.id)!.turns).toBe(4);
     } finally {
       ref.release();
     }
   } finally {
     await close();
+  }
+}, 15_000);
+
+test("a prompt to an idle task with queued prompts runs after them", async () => {
+  const node = await setupNode();
+  try {
+    const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
+    node.db.query("UPDATE tasks SET queued = ? WHERE id = ?").run(JSON.stringify(["queued first"]), m.id);
+    const { done } = watchTurns(node, m.id, 2);
+    await node.runner.prompt(m.id, "sent later");
+    await done;
+    expect(turnMarks(listEvents(node.db, m.id))).toEqual(["start", "user:queued first", "result", "start", "user:sent later", "result"]);
+    expect(getTask(node.db, m.id)!.queued).toBeNull();
+  } finally {
+    await node.harness.close();
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
   }
 }, 15_000);
 
@@ -235,7 +289,16 @@ async function copyTask(from: GitPoolNode, to: GitPoolNode, taskId: string): Pro
   }
 }
 
-test("a receive is refused for another Claude Code version, an unknown one, an unsafe id, or a node that hosts no tasks", async () => {
+/** Polls `get` until it returns `want`; fails with the last value after 5 s. */
+async function until<T>(what: string, get: () => T, want: T): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (get() !== want) {
+    if (Date.now() > deadline) throw new Error(`${what} is still ${String(get())}`);
+    await Bun.sleep(20);
+  }
+}
+
+test("a receive is refused for another Claude Code version, an unknown one, an unsafe id, or a node that hosts no tasks; hostsTasks follows the task root", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     const ours = claudeCodeVersion();
@@ -250,10 +313,21 @@ test("a receive is refused for another Claude Code version, an unknown one, an u
       expect(await ref.receiveTask({ manifest: { ...manifest, id: "../x" }, claudeCodeVersion: ours })).toEqual({ ok: false, reason: "invalid task id: ../x" });
       await rm(B.cfg.taskRoot, { recursive: true, force: true });
       expect(await ref.receiveTask({ manifest, claudeCodeVersion: ours })).toEqual({ ok: false, reason: "this node does not host tasks" });
-      const deadline = Date.now() + 5000;
-      while (ref.hostsTasks.value) {
-        if (Date.now() > deadline) throw new Error(`hostsTasks still ${ref.hostsTasks.value}`);
-        await Bun.sleep(20);
+      await until("the peer's hostsTasks", () => ref.hostsTasks.value, false);
+      // Each metrics sample re-reads the task root, for peers and for the dashboard: it can go and come back.
+      const owner = linkClient(B.host);
+      try {
+        const node = await owner.client.get(NodeObject, {});
+        const sample = () => { B.metrics.stop(); B.metrics.start(); };
+        sample();
+        await until("the node's hostsTasks", () => node.hostsTasks.value, false);
+        await mkdir(B.cfg.taskRoot, { recursive: true });
+        sample();
+        await until("the node's hostsTasks", () => node.hostsTasks.value, true);
+        await until("the peer's hostsTasks", () => ref.hostsTasks.value, true);
+        node.release();
+      } finally {
+        await owner.close();
       }
       expect(getTask(B.db, manifest.id)).toBeNull();
     } finally {
