@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
+import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
 
 export function newId(): string {
   return randomBytes(6).toString("hex");
@@ -24,7 +25,12 @@ export type TaskRow = {
   turns: number;
   created_at: string;
   updated_at: string;
+  /** `TaskSettings` as JSON, or NULL for none. */
+  settings: string | null;
 };
+
+/** What the user chose for a task's later turns; an absent field takes the default. */
+export type TaskSettings = { model?: string; effort?: string; permissionMode?: PermissionMode };
 
 export function insertProject(db: Database, row: ProjectRow): void {
   db.query(
@@ -47,7 +53,7 @@ export function listProjectRows(db: Database): ProjectRow[] {
   return db.query<ProjectRow, []>("SELECT * FROM projects ORDER BY created_at, id").all();
 }
 
-export function insertTask(db: Database, row: Omit<TaskRow, "created_at" | "updated_at">): void {
+export function insertTask(db: Database, row: Omit<TaskRow, "created_at" | "updated_at" | "settings">): void {
   const now = new Date().toISOString();
   db.query(
     `INSERT INTO tasks (id, title, state, session_id, manifest, started, turns, created_at, updated_at)
@@ -89,4 +95,22 @@ export function updateTask(
 
 export function listTasks(db: Database): TaskRow[] {
   return db.query<TaskRow, []>("SELECT * FROM tasks ORDER BY created_at, id").all();
+}
+
+/** The task's settings; `{}` for a task with none, or an unknown task. */
+export function getTaskSettings(db: Database, id: string): TaskSettings {
+  const row = db.query<{ settings: string | null }, [string]>("SELECT settings FROM tasks WHERE id = ?").get(id);
+  return row?.settings ? (JSON.parse(row.settings) as TaskSettings) : {};
+}
+
+/** Sets the given fields of the task's settings; a field given as `undefined` goes back to the default. */
+export function updateTaskSettings(db: Database, id: string, patch: { [K in keyof TaskSettings]?: TaskSettings[K] | undefined }): void {
+  db.transaction(() => {
+    const settings: Record<string, unknown> = { ...getTaskSettings(db, id) };
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) delete settings[key];
+      else settings[key] = value;
+    }
+    db.query("UPDATE tasks SET settings = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(settings), new Date().toISOString(), id);
+  })();
 }

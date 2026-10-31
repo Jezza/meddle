@@ -6,7 +6,7 @@ import { openDb } from "../src/store/db";
 import { addProjectFromFolder } from "../src/projects/project";
 import { initColocated } from "../src/jj";
 import { openHarness } from "../src/tasks/harness";
-import { TaskRunner } from "../src/tasks/durable";
+import { CARRY_ON_PROMPT, TaskRunner } from "../src/tasks/durable";
 import { appendEvent, listEvents } from "../src/store/events";
 import { getTask, updateTask } from "../src/store/records";
 const replay = `${import.meta.dir}/fake-claude/replay.ts`;
@@ -52,12 +52,12 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   // 1. the first process stalls before the result; closing its Harness kills the turn mid-way
   const { h, runner } = await open({ MEDDLE_FIXTURE_STALL: "1" });
   const m = await runner.create({ title: "t", projectIds: [p.id] });
-  // Claude Code's init is the evidence that it created the session, so the rerun resumes it
+  // by its init, Claude Code has read the prompt and written the session's transcript, so the rerun resumes it
   const initialised = new Promise<void>(res => runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "system" && msg.subtype === "init") res(); }));
   await runner.prompt(m.id, "Reply with the single word ok.");
   await initialised;
   expect(runner.state(m.id)).toBe("running");
-  // a steer into the live turn is recorded and told to listeners before it is sent
+  // a steer into the live turn is sent, then recorded and told to listeners
   const steered: unknown[] = [];
   runner.onEvent((tid, seq, msg) => { if (tid === m.id && msg.type === "user") steered.push([seq, msg]); });
   await runner.prompt(m.id, "Also say why.");
@@ -76,6 +76,9 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   // 3. one fresh start, one resume, and the task is idle again
   expect(turnsStarted()).toEqual([false, true]);
   expect(again.runner.state(m.id)).toBe("idle");
+  // the rerun told Claude to carry on rather than sending the prompt again
+  const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  expect(prompts).toEqual(["Reply with the single word ok.", "Also say why.", CARRY_ON_PROMPT]);
   await again.h.close();
 });
 test("a pending approval makes the task waiting until it is answered", async () => {
@@ -171,5 +174,105 @@ test("a turn cut off after it ended finishes on reopen without running again", a
   expect(turnsStarted()).toEqual([false]);
   expect(listEvents(db, m.id).filter(e => (e.message as any).type === "result")).toHaveLength(1);
   expect(getTask(db, m.id)?.turns).toBe(1);
+  await again.h.close();
+});
+test("a task started before with no transcript on disk starts its session fresh, even after Claude Code said something", async () => {
+  const { db, h, runner, m, turnsStarted, settled } = await setup();
+  // the last turn died after Claude Code's init but before it wrote the transcript
+  updateTask(db, m.id, { started: 1 });
+  appendEvent(db, m.id, { type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: false });
+  appendEvent(db, m.id, { type: "system", subtype: "init", session_id: m.sessionId });
+  const done = settled(runner);
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await done;
+  expect(turnsStarted()).toEqual([false, false]);
+  await h.close();
+});
+test("a turn that fails before it runs logs turn_failed with the reason, and pi-durable's report reaches the log", async () => {
+  const { writeFile } = await import("node:fs/promises");
+  const { db, h, runner, m } = await setup();
+  await mkdir(`${m.projects[0]!.replica}/.meddle`, { recursive: true });
+  await writeFile(`${m.projects[0]!.replica}/.meddle/context.toml`, "[claude]\nallwo = []\n");
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const told: unknown[] = [];
+    runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.subtype === "turn_failed") told.push(msg); });
+    const idle = new Promise<void>(res => runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); }));
+    await runner.prompt(m.id, "hi");
+    await idle;
+    const failed = listEvents(db, m.id).map(e => e.message as any).filter(msg => msg.subtype === "turn_failed");
+    expect(failed).toMatchObject([{ type: "meddle", error: "Error: context.toml: unknown key claude.allwo" }]);
+    expect(told).toEqual(failed);
+    for (let i = 0; i < 100 && !logged.mock.calls.some(c => String(c[0]).includes("task_faulted")); i++) await Bun.sleep(10);
+    expect(logged.mock.calls.some(c => String(c[0]).startsWith("meddle: durable task_faulted (meddle.turn "))).toBe(true);
+  } finally {
+    logged.mockRestore();
+  }
+  await h.close();
+});
+test("a steer after the turn's result is refused and not logged", async () => {
+  const { db, h, runner, m, settled } = await setup();
+  const done = settled(runner);
+  let late: Promise<void> | undefined;
+  // a microtask after the result's listeners: the turn's input is closed, its child not gone yet
+  runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "result") queueMicrotask(() => { late = runner.prompt(m.id, "too late"); late.catch(() => {}); }); });
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await done;
+  await expect(late!).rejects.toThrow("the turn just ended; send it as a new prompt");
+  const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  expect(prompts).toEqual(["Reply with the single word ok."]);
+  await h.close();
+});
+test("a prompt to a task whose turn is parked retries the turn and asks for the message again", async () => {
+  const { insertTask } = await import("../src/store/records");
+  const home = await mkdtemp("/tmp/meddle-dur-");
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
+  const db = openDb(":memory:");
+  insertTask(db, { id: "t1", title: "t", state: "running", session_id: "s", manifest: "{}", started: 1, turns: 0 });
+  const retried: string[] = [];
+  const parked = { record: { id: "turn-1", kind: "meddle.turn", input: { taskId: "t1", prompt: "p" } }, state: { kind: "blocked", reason: "restart_limit" } };
+  const harness = {
+    inspect: async () => ({ tasks: [parked] }),
+    retryTask: async (id: string) => { retried.push(id); },
+  } as any;
+  const runner = new TaskRunner(cfg, db, harness, {});
+  await expect(runner.prompt("t1", "hello")).rejects.toThrow("the task's interrupted turn is being retried; send your message again once it is idle");
+  expect(retried).toEqual(["turn-1"]);
+  await runner.retry("t1");
+  expect(retried).toEqual(["turn-1", "turn-1"]);
+  expect(listEvents(db, "t1")).toEqual([]);
+});
+test("a task's model, effort and permission mode outlive the runner and start its next turn", async () => {
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { db, h, runner, m, open, settled } = await setup();
+  // no live turn: each is kept for later turns, none throws
+  await runner.setModel(m.id, "claude-test-model");
+  await runner.setEffort(m.id, "low");
+  await runner.setPermissionMode(m.id, "plan");
+  await runner.setModel(m.id, "claude-other-model");
+  await expect(runner.setPermissionMode("nope", "plan")).rejects.toThrow("unknown task: nope");
+  await h.close();
+  const mark = crypto.randomUUID();
+  const again = await open({ MEDDLE_TEST_MARK: mark });
+  expect(again.runner.settings(m.id)).toEqual({ model: "claude-other-model", effort: "low", permissionMode: "plan" });
+  expect(JSON.parse(getTask(db, m.id)!.settings!)).toEqual({ model: "claude-other-model", effort: "low", permissionMode: "plan" });
+  // the next turn's child is started with them
+  let argv: string[] = [];
+  again.runner.onEvent((tid, _s, msg: any) => {
+    if (tid !== m.id || msg.type !== "system" || msg.subtype !== "init") return;
+    for (const pid of readdirSync("/proc").filter(d => /^\d+$/.test(d))) {
+      try {
+        if (readFileSync(`/proc/${pid}/environ`, "latin1").includes(`MEDDLE_TEST_MARK=${mark}`)) argv = readFileSync(`/proc/${pid}/cmdline`, "latin1").split("\0");
+      } catch {}
+    }
+  });
+  const done = settled(again.runner);
+  await again.runner.prompt(m.id, "Reply with the single word ok.");
+  await done;
+  expect(argv).toContain("--model=claude-other-model");
+  expect(argv).toContain("--effort=low");
+  expect(argv).toContain("--permission-mode=plan");
+  await again.runner.setModel(m.id);
+  expect(again.runner.settings(m.id)).toEqual({ effort: "low", permissionMode: "plan" });
   await again.h.close();
 });

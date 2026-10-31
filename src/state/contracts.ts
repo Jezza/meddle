@@ -155,6 +155,8 @@ export const TaskObject = remote("meddle.task", {
       methods: {
         prompt: method(Type.Object({ text: Type.String() })),
         interrupt: method(Type.Object({})),
+        /** Runs the task's turn again after repeated crashes parked it; rejects when no turn is parked. */
+        retry: method(Type.Object({})),
         approve: method(Type.Object({ requestId: Type.String(), updatedInput: Type.Optional(Type.Record(Type.String(), Type.Unknown())) })),
         deny: method(Type.Object({ requestId: Type.String(), message: Type.String(), interrupt: Type.Optional(Type.Boolean()) })),
         answerQuestion: method(Type.Object({ requestId: Type.String(), answers: Type.Record(Type.String(), Type.String()) })),

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { PermissionMode, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -11,17 +12,18 @@ import { promptEvent, runTurn, type MeddleEvent } from "../engine/session";
 import { bookmarkSet, changeId } from "../jj";
 import { paths } from "../paths";
 import { loadContext, loadProjectSettings } from "../projects/context";
-import { appendEvent, hasSdkEvents } from "../store/events";
+import { appendEvent } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
-import { getTask, updateTask, type TaskRow } from "../store/records";
+import { getTask, getTaskSettings, updateTask, updateTaskSettings, type TaskRow, type TaskSettings } from "../store/records";
 import { getToken } from "../token";
-import { readManifest, type TaskManifest } from "./manifest";
+import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
 import { provisionTask } from "./provision";
 
 export type TaskState = "idle" | "running" | "waiting" | "archived";
 
 type TurnInput = { taskId: string; prompt: string };
-type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
+/** `attempt` counts the run phase's starts: 1 for the first, more for a rerun after the turn was cut off. */
+type TurnCheckpoint = { phase: "run"; attempt: number } | { phase: "finish" };
 /** Installed by `openHarness`: how a phase finds the Harness it runs in. */
 type MeddleHooks = { harness(): Harness };
 type TurnRuntime = TaskRuntime<TurnInput, TurnCheckpoint, null, MeddleHooks>;
@@ -48,18 +50,31 @@ async function runnerFor(runtime: TurnRuntime, context: Context): Promise<TaskRu
   return awaitWithContext(runnerSlot(harness).promise, context);
 }
 
+/** What a rerun of a cut-off turn sends into the resumed session instead of the turn's prompt. */
+export const CARRY_ON_PROMPT =
+  "The meddle service restarted while you were working on the previous message. Continue where you left off; do not redo work that is already done.";
+
 /**
  * One Claude Code turn of a task. `run` drives the turn; a rerun after a crash resumes the task's
- * session. `finish` does the bookkeeping once the turn is over, so a rerun from there skips the turn.
+ * session and tells Claude to carry on. `finish` does the bookkeeping once the turn is over, so a rerun
+ * from there skips the turn.
  */
 export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHooks>({
   name: "meddle.turn",
-  version: 1,
-  initial: () => ({ phase: "run" }),
+  version: 2,
+  initial: () => ({ phase: "run", attempt: 0 }),
+  // Version 1 had no attempt count: a v1 turn still in `run` is treated as not yet started.
+  migrate: (input, checkpoint) => ({
+    input: input as TurnInput,
+    checkpoint: (checkpoint as { phase: string }).phase === "run" ? { phase: "run", attempt: 0 } : { phase: "finish" },
+  }),
   phases: {
     run: async (task, runtime, context) => {
+      // Counted before anything else, so a rerun knows an earlier attempt was cut off.
+      const attempt = task.state.checkpoint.attempt + 1;
+      await runtime.commit(() => ({ status: "running", checkpoint: { phase: "run", attempt } }), context);
       const runner = await runnerFor(runtime, context);
-      await runner.runTurnPhase(task.input, context);
+      await runner.runTurnPhase(task.input, attempt, context);
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "finish" } }), context);
     },
     finish: async (task, runtime, context) => {
@@ -89,8 +104,6 @@ export class TaskRunner {
   #live = new Map<string, LiveTurn>();
   /** Tasks whose new `meddle.turn` is being created or has not started running yet. */
   #pending = new Set<string>();
-  #models = new Map<string, string | undefined>();
-  #efforts = new Map<string, string>();
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
   #stateListeners = new Set<(taskId: string, state: TaskState) => void>();
 
@@ -115,8 +128,9 @@ export class TaskRunner {
 
   /**
    * Steers the live turn, or starts a new durable turn when the task is idle. A task left `running`
-   * with no live turn here is reconciled against the Harness: a turn still pending or parked there
-   * refuses the prompt; with none, the task is idle again and the prompt starts a turn.
+   * with no live turn here is reconciled against the Harness: a turn still pending there refuses the
+   * prompt, a parked one is retried and refuses it too; with none, the task is idle again and the
+   * prompt starts a turn.
    */
   async prompt(taskId: string, text: string): Promise<void> {
     const row = this.#row(taskId);
@@ -125,14 +139,20 @@ export class TaskRunner {
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
       if (live !== undefined) {
+        // Sent first: after the turn's `result` its input is closed while the turn is still live, and a steer then
+        // is refused rather than logged as sent.
+        if (live.queue.ended) throw new Error("the turn just ended; send it as a new prompt");
+        live.queue.push(text, "now");
         const steer = promptEvent(text);
         const seq = appendEvent(this.#db, taskId, steer);
         notify(this.#eventListeners, (cb) => cb(taskId, seq, steer));
-        live.queue.push(text, "now");
         return;
       }
       const turn = await this.#durableTurn(taskId);
-      if (turn !== undefined && isParked(turn)) throw new Error("task has a parked turn: retry it");
+      if (turn !== undefined && isParked(turn)) {
+        await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+        throw new Error("the task's interrupted turn is being retried; send your message again once it is idle");
+      }
       if (turn !== undefined) throw new Error("task is resuming");
       stale = true;
     }
@@ -156,19 +176,30 @@ export class TaskRunner {
     await this.#liveQueryOrThrow(taskId).interrupt();
   }
 
+  /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
-    await this.#liveQueryOrThrow(taskId).setPermissionMode(mode);
+    this.#row(taskId);
+    await this.liveQuery(taskId)?.setPermissionMode(mode);
+    updateTaskSettings(this.#db, taskId, { permissionMode: mode });
   }
 
-  /** Switches the live turn's model, if any, and keeps it for the task's later turns. */
+  /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the default. */
   async setModel(taskId: string, model?: string): Promise<void> {
-    this.#models.set(taskId, model);
+    this.#row(taskId);
     await this.liveQuery(taskId)?.setModel(model);
+    updateTaskSettings(this.#db, taskId, { model });
   }
 
   /** Effort for the task's later turns; a live turn keeps its own. */
   async setEffort(taskId: string, effort: string): Promise<void> {
-    this.#efforts.set(taskId, effort);
+    this.#row(taskId);
+    updateTaskSettings(this.#db, taskId, { effort });
+  }
+
+  /** The model, effort and permission mode the task's next turn starts with, where the user chose one. */
+  settings(taskId: string): TaskSettings {
+    this.#row(taskId);
+    return getTaskSettings(this.#db, taskId);
   }
 
   /** Runs the task's turn again after pi-durable's restart limit parked it. */
@@ -196,24 +227,34 @@ export class TaskRunner {
     return this.#live.get(taskId)?.query ?? null;
   }
 
-  /** The `run` phase of `meddle.turn`: drives the turn to its end. Not for callers outside this module. */
-  async runTurnPhase(input: TurnInput, context: Context): Promise<void> {
+  /**
+   * The `run` phase of `meddle.turn`: drives the turn to its end. `attempt` counts this phase's starts; a later
+   * attempt that resumes the session sends `CARRY_ON_PROMPT` instead of the prompt. Not for callers outside this module.
+   */
+  async runTurnPhase(input: TurnInput, attempt: number, context: Context): Promise<void> {
     const { taskId } = input;
+    let failureLogged = false; // the turn's own turn_failed is in the log
     try {
-      // Resume only a session Claude Code has shown it created, not one a turn merely set out to create.
-      const resume = this.#row(taskId).started === 1 && hasSdkEvents(this.#db, taskId);
+      const started = this.#row(taskId).started === 1;
       this.#db.transaction(() => updateTask(this.#db, taskId, { started: 1, state: "running" }))();
       this.#pending.delete(taskId);
       this.#emitState(taskId, "running");
+      const manifest = await readManifest(this.#cfg, taskId);
+      // Resume only a session whose transcript Claude Code wrote, not one a turn merely set out to create.
+      const resume = started && existsSync(transcriptPath(this.#cfg, manifest));
       const queue = new InputQueue();
       const { query, done } = runTurn({
-        input: await this.#engineInput(taskId, resume),
-        prompt: input.prompt,
+        input: await this.#engineInput(taskId, manifest, resume),
+        // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
+        prompt: attempt > 1 && resume ? CARRY_ON_PROMPT : input.prompt,
         db: this.#db,
         approvals: this.approvals,
         queue,
         ...(context.abortSignal !== undefined ? { signal: context.abortSignal } : {}),
-        onMessage: (m, seq) => notify(this.#eventListeners, (cb) => cb(taskId, seq, m)),
+        onMessage: (m, seq) => {
+          if (m.type === "meddle" && m.subtype === "turn_failed") failureLogged = true;
+          notify(this.#eventListeners, (cb) => cb(taskId, seq, m));
+        },
       });
       this.#live.set(taskId, { query, queue, state: "running" });
       try {
@@ -222,6 +263,8 @@ export class TaskRunner {
         this.#live.delete(taskId);
       }
     } catch (err) {
+      // A turn that failed before it ran (no token, a bad context.toml, …) says why in the log like any other.
+      if (!context.abortSignal?.aborted && !failureLogged) this.#logFailure(taskId, err);
       this.#failTurn(taskId, context);
       throw err;
     }
@@ -253,6 +296,17 @@ export class TaskRunner {
     this.#setState(taskId, "idle");
   }
 
+  /** Appends a `turn_failed` for `err` and tells the listeners; a failure to do so never hides `err`. */
+  #logFailure(taskId: string, err: unknown): void {
+    const failed: MeddleEvent = { type: "meddle", subtype: "turn_failed", at: new Date().toISOString(), error: String(err) };
+    try {
+      const seq = appendEvent(this.#db, taskId, failed);
+      notify(this.#eventListeners, (cb) => cb(taskId, seq, failed));
+    } catch (logErr) {
+      console.error(`meddle: could not log the failure of task ${taskId}'s turn:`, logErr);
+    }
+  }
+
   /** A turn that failed of itself ends the task's turn; an aborted one (close, abortTask) stays running for its rerun or abort handler. */
   #failTurn(taskId: string, context: Context): void {
     this.#pending.delete(taskId);
@@ -265,8 +319,11 @@ export class TaskRunner {
     return tasks.find((t) => t.record.kind === MeddleTurn.definition.name && (t.record.input as TurnInput).taskId === taskId);
   }
 
-  async #engineInput(taskId: string, resume: boolean): Promise<Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">> {
-    const manifest = await readManifest(this.#cfg, taskId);
+  async #engineInput(
+    taskId: string,
+    manifest: TaskManifest,
+    resume: boolean,
+  ): Promise<Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">> {
     const token = await getToken(this.#cfg);
     if (token === null || token === "") throw new Error("no token set");
     const contexts = [];
@@ -284,10 +341,10 @@ export class TaskRunner {
       sessionStore: this.#sessionStore,
       resume,
     };
-    const model = this.#models.get(taskId);
-    const effort = this.#efforts.get(taskId);
+    const { model, effort, permissionMode } = getTaskSettings(this.#db, taskId);
     if (model !== undefined) input.model = model;
     if (effort !== undefined) input.effort = effort;
+    if (permissionMode !== undefined) input.permissionMode = permissionMode;
     if (this.#deps.claudePath !== undefined) input.claudePath = this.#deps.claudePath;
     if (this.#deps.claudeRuntime !== undefined) input.claudeRuntime = this.#deps.claudeRuntime;
     if (this.#deps.extraEnv !== undefined) input.extraEnv = this.#deps.extraEnv;

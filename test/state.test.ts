@@ -5,7 +5,7 @@ import { createNodeHost, NodeObject, TaskObject, SessionObject } from "../src/st
 import { findTaskPids, MetricsSampler } from "../src/metrics";
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent } from "../src/store/events";
-import { setupNode } from "./helpers";
+import { errorResultFixture, setupNode } from "./helpers";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -91,6 +91,8 @@ test("a client follows a task through a prompted turn over a link", async () => 
 
     await task.setEffort({ effort: "low" });
     await until(task.effort, (e) => e === "low");
+    // nothing is parked: retry says so
+    await expect(task.retry({})).rejects.toThrow(`no parked turn for task ${manifest.id}`);
     task.release();
     session.release();
     node.release();
@@ -148,6 +150,52 @@ test("a session keeps stream deltas out of its window and in live until the next
     expect(again.live.value).toBeNull();
     expect(await again.loadEarlier({ beforeSeq: 5, limit: 10 })).toEqual([again.window.value[0]!]);
     again.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("a turn whose result is an error is notified as failed", async () => {
+  const { client, project, close } = await connect(await errorResultFixture("error_max_turns"));
+  try {
+    const node = await client.get(NodeObject, {});
+    const manifest = await node.createTask({ title: "t", projectIds: [project.id] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await task.prompt({ text: "Reply with the single word ok." });
+    const notes = await until(node.notifications, (n) => n.some((x) => x.taskId === manifest.id && x.kind === "failed"));
+    expect(notes.filter((x) => x.taskId === manifest.id).map(({ kind, text }) => ({ kind, text }))).toEqual([{ kind: "failed", text: "Turn ended: error_max_turns" }]);
+    await until(task.state, (s) => s === "idle");
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("a task's activation reads its log summary from the newest events, and its session from the log's tail", async () => {
+  const { client, db, project, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { id } = await node.createTask({ title: "t", projectIds: [project.id] });
+    appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "default", model: "old" });
+    appendEvent(db, id, { type: "result", subtype: "success", usage: { input_tokens: 1 } });
+    appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "auto", model: "new" });
+    appendEvent(db, id, { type: "system", subtype: "status", permissionMode: "plan" });
+    for (let i = 0; i < 250; i++) appendEvent(db, id, { type: "assistant", n: i });
+    appendEvent(db, id, { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } } });
+    const task = await client.get(TaskObject, { id });
+    expect(task.lastSeq.value).toBe(255);
+    expect(task.model.value).toBe("new");
+    expect(task.permissionMode.value).toBe("plan");
+    expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 1 } });
+    const session = await client.get(SessionObject, { taskId: id });
+    expect(session.window.value).toHaveLength(200);
+    expect(session.window.value.at(-1)!.seq).toBe(254);
+    expect(session.live.value).toEqual({ text: "x", thinking: "" });
+    expect((await session.loadEarlier({ beforeSeq: session.fromSeq.value, limit: 3 })).map((e) => e.seq)).toEqual([52, 53, 54]);
+    task.release();
+    session.release();
     node.release();
   } finally {
     await close();

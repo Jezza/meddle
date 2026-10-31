@@ -1,5 +1,5 @@
 // test/helpers.ts — shared fixtures for tests that drive a whole node against the replayer.
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { ensureDataDirs, loadConfig, paths } from "../src/config";
 import { initColocated } from "../src/jj";
@@ -13,7 +13,8 @@ export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 
 /**
  * A node in a temp home: data dirs, task root, database, one colocated project added from a folder,
- * a token, and a Harness with a TaskRunner that runs Claude Code turns from the `fixture` recording.
+ * a token, and a Harness with a TaskRunner that runs Claude Code turns from the `fixture` recording
+ * (a name in `test/fixtures`, or an absolute path).
  */
 export async function setupNode(fixture = "hello.jsonl") {
   const home = await mkdtemp("/tmp/meddle-node-");
@@ -29,9 +30,26 @@ export async function setupNode(fixture = "hello.jsonl") {
   const runner = new TaskRunner(cfg, db, harness.harness, {
     claudePath: replay,
     claudeRuntime: "bun",
-    extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/${fixture}` },
+    extraEnv: { MEDDLE_FIXTURE: fixture.startsWith("/") ? fixture : `${import.meta.dir}/fixtures/${fixture}` },
   });
   return { home, cfg, db, project, harness, runner };
+}
+
+/**
+ * Writes a copy of `test/fixtures/hello.jsonl` whose `result` ended with `subtype` (an error, `is_error` set) to a temp
+ * file and returns its path.
+ */
+export async function errorResultFixture(subtype = "error_during_execution"): Promise<string> {
+  const lines = (await readFile(`${import.meta.dir}/fixtures/hello.jsonl`, "utf8")).split("\n").filter(Boolean).map((l) => {
+    const entry = JSON.parse(l) as { dir: string; line?: string };
+    if (entry.dir !== "out" || entry.line === undefined) return l;
+    const frame = JSON.parse(entry.line) as { type?: string };
+    if (frame.type !== "result") return l;
+    return JSON.stringify({ ...entry, line: JSON.stringify({ ...frame, subtype, is_error: true, errors: [] }) });
+  });
+  const file = `${await mkdtemp("/tmp/meddle-fixture-")}/error.jsonl`;
+  await writeFile(file, `${lines.join("\n")}\n`);
+  return file;
 }
 
 export const repoRoot = `${import.meta.dir}/..`;

@@ -1,6 +1,6 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { defineExtension, Harness, hook, type Registry } from "@earendil-works/pi-durable";
+import { defineExtension, Harness, hook, type Registry, type ReportInfo } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { NodeConfig } from "../config";
 import { paths } from "../paths";
@@ -23,10 +23,16 @@ export async function openHarness(
   }));
   const harness = await Harness.open(
     await openNodeSqliteStorage(paths(cfg).durableDb),
-    { models: createModels(), registry },
+    { models: createModels(), registry, onReport: report },
     BACKGROUND_CONTEXT,
   );
   opened = harness;
   harness.resume();
   return { harness, close: () => harness.close(BACKGROUND_CONTEXT) };
+}
+
+/** pi-durable's reports (a faulted or parked turn, a failed Session, a throwing listener) go to the service log. */
+function report(error: unknown, info: ReportInfo): void {
+  const task = "task" in info && info.task !== undefined ? ` (${info.task.kind} ${info.task.id})` : "";
+  console.error(`meddle: durable ${info.type}${task}:`, error);
 }

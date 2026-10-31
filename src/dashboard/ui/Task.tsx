@@ -260,6 +260,8 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 // ─── controls and composer ───
 
 function Controls({ node, task }: { node: NodeRef; task: TaskRef }) {
+  const state = useValue(task.state);
+  const pending = useValue(task.pending);
   const models = useValue(node.models);
   const permissionMode = useValue(task.permissionMode);
   const model = useValue(task.model);
@@ -272,6 +274,10 @@ function Controls({ node, task }: { node: NodeRef; task: TaskRef }) {
     <section class="controls">
       <div class="row">
         <button disabled={action.busy} onClick={() => action.run(() => task.interrupt({}))}>Interrupt</button>
+        {/* A turn that crashed the node too often is parked; retry says so when none is. */}
+        {(state === "running" || state === "waiting") && pending.length === 0 && (
+          <button disabled={action.busy} onClick={() => action.run(() => task.retry({}))}>Retry turn</button>
+        )}
         <label>Permission mode{" "}
           <select value={permissionMode ?? ""} onChange={(e) => {
             const mode = e.currentTarget.value as PermissionMode;

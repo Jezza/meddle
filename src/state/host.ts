@@ -7,12 +7,12 @@ import { createHost, type Ctx, type Host, type Subscribable } from "@earendil-wo
 import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { checkTaskRoot, type NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
-import type { MeddleEvent } from "../engine/session";
+import { resultError, type MeddleEvent } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { loadContext } from "../projects/context";
 import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects } from "../projects/project";
-import { listEvents, type EventRecord } from "../store/events";
-import { listTasks } from "../store/records";
+import { latestEventOfType, listEvents, listEventsTail, type EventRecord } from "../store/events";
+import { getTaskSettings, listTasks } from "../store/records";
 import type { TaskRunner, TaskState } from "../tasks/durable";
 import { readManifest } from "../tasks/manifest";
 import { tokenStatus } from "../token";
@@ -70,7 +70,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const hostsTasks = self.state("hostsTasks", NodeStore.def.members.hostsTasks, { init: async () => (await checkTaskRoot(cfg)).ok });
     const models = self.state("models", NodeStore.def.members.models, []);
     const notifications = self.state("notifications", NodeStore.def.members.notifications, []);
-    const efforts = self.state("efforts", NodeStore.def.members.efforts, {});
+    const efforts = self.state("efforts", NodeStore.def.members.efforts, { init: effortsNow });
     /** Pending request ids already notified, so each request is announced once. */
     const announced = self.state("announced", Type.Array(Type.String()), []);
 
@@ -82,7 +82,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("events", events, async ({ taskId, message }, ctx) => {
       const m = message as Message;
       if (m.type === "result") {
-        notify(ctx, { taskId, kind: "finished", text: m.subtype === "success" ? "Turn finished" : `Turn ended: ${String(m.subtype)}` });
+        const error = resultError(m);
+        notify(ctx, error === null ? { taskId, kind: "finished", text: "Turn finished" } : { taskId, kind: "failed", text: `Turn ended: ${error}` });
       } else if (m.type === "meddle" && m.subtype === "turn_failed") {
         notify(ctx, { taskId, kind: "failed", text: `Turn failed: ${String(m.error)}` });
       } else if (m.type === "system" && m.subtype === "init") {
@@ -202,7 +203,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const manifest = self.state("manifest", members.manifest, { init: () => readManifest(cfg, id) });
     const state = self.state("state", members.state, { init: () => runner.state(id) });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
-    const log = self.state("log", TaskLogSchema, { init: () => foldTaskLog(EMPTY_TASK_LOG, listEvents(db, id)) });
+    const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
 
     /** Brings the cells up to the runner, the approvals and the event log. */
     const catchUpLog = (ctx: Ctx) => {
@@ -237,6 +238,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       contextUsage: self.derive([log], (l) => l.contextUsage),
       prompt: ({ text }) => runner.prompt(id, text),
       interrupt: () => runner.interrupt(id),
+      retry: () => runner.retry(id),
       approve: async ({ requestId, updatedInput }) => {
         answer(requestId, (req) => ({ behavior: "allow", updatedInput: updatedInput ?? req.input }));
       },
@@ -256,7 +258,10 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const view = self.state("view", SessionViewSchema, {
       init: () => {
         runner.state(taskId); // an unknown task fails the activation
-        return foldSession(EMPTY_SESSION, listEvents(db, taskId));
+        // The window's events, then the stream deltas after the newest of them, which make up `live`.
+        const tail = listEventsTail(db, taskId, { limit: WINDOW_SIZE, excludeTypes: ["stream_event"] });
+        const streaming = listEvents(db, taskId, { fromSeq: (tail.at(-1)?.seq ?? 0) + 1 });
+        return foldSession(EMPTY_SESSION, [...tail, ...streaming]);
       },
     });
     const catchUp = (ctx: Ctx) => {
@@ -273,13 +278,34 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       live: self.derive([view], (v) => v.live),
       loadEarlier: async ({ beforeSeq, limit }) => {
         if (beforeSeq <= 1 || limit <= 0) return [];
-        return listEvents(db, taskId, { limit: beforeSeq - 1 }).filter((e) => !isStreamEvent(e)).slice(-limit);
+        return listEventsTail(db, taskId, { beforeSeq, limit, excludeTypes: ["stream_event"] });
       },
     };
   });
 
   function projectIdsNow(): string[] {
     return listProjects(db).map((p) => p.id);
+  }
+
+  /** Each task's chosen effort, from the tasks' stored settings. */
+  function effortsNow(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const t of listTasks(db)) {
+      const { effort } = getTaskSettings(db, t.id);
+      if (effort !== undefined) out[t.id] = effort;
+    }
+    return out;
+  }
+
+  /** A task's log summary from its newest `init`, `status` and `result` and its newest seq, not its whole log. */
+  function taskLogNow(taskId: string): TaskLog {
+    const latest = [
+      latestEventOfType(db, taskId, "system", "init"),
+      latestEventOfType(db, taskId, "system", "status"),
+      latestEventOfType(db, taskId, "result"),
+    ].filter((e) => e !== null).sort((a, b) => a.seq - b.seq);
+    const log = foldTaskLog(EMPTY_TASK_LOG, latest);
+    return { ...log, lastSeq: listEventsTail(db, taskId, { limit: 1 })[0]?.seq ?? 0 };
   }
 
   return host;

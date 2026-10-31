@@ -15,6 +15,11 @@ export class InputQueue implements AsyncIterable<SDKUserMessage> {
     this.#notify();
   }
 
+  /** Whether `end()` was called: a push now throws. */
+  get ended(): boolean {
+    return this.#ended;
+  }
+
   /** No more input; the iterator finishes once the queued messages are drained. Idempotent. */
   end(): void {
     this.#ended = true;

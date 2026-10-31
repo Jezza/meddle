@@ -28,6 +28,15 @@ export function promptEvent(text: string): SDKUserMessage {
   return { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
 }
 
+/**
+ * What went wrong in a turn's `result`, or null when it succeeded: its subtype (`error_max_turns`, …), or `error`
+ * for a `success` that Claude Code flagged `is_error`.
+ */
+export function resultError(m: { subtype?: unknown; is_error?: unknown }): string | null {
+  if (m.subtype !== "success") return String(m.subtype);
+  return m.is_error === true ? "error" : null;
+}
+
 /** How long the child may outlive its `result` (stdin closed) before it is closed for it. */
 const EXIT_GRACE_MS = 5_000;
 

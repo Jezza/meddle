@@ -9,6 +9,7 @@ import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } fro
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { findTaskPids, MetricsSampler } from "./metrics";
 import { ensurePlugins, seedProfile } from "./profile";
+import { resultError } from "./engine/session";
 import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
 import { listTasks } from "./store/records";
@@ -22,7 +23,7 @@ const USAGE = `usage: meddle --version
        meddle status
        meddle token set [--file <path>] | meddle token status
        meddle project add <path-or-url> [--name <n>] | meddle project list
-       meddle task new --title <t> --project <id>... | meddle task prompt <id> <text>
+       meddle task new --title <t> --project <id>... | meddle task prompt <id> <text> | meddle task retry <id>
        meddle service install [--dry-run]`;
 
 /** A client subcommand found no node listening on the configured port. */
@@ -203,9 +204,13 @@ function taskNew(title: string, projectIds: string[]): Promise<number> {
 
 type WindowEvent = { seq: number; message: unknown };
 
+/** How many of the newest events `task prompt` reads once the task is idle again; the turn's end is among them. */
+const SETTLE_EVENTS = 20;
+
 /**
- * Submits a turn and prints each new event's `type[/subtype]` to stderr until a `result` arrives. A `turn_failed`
- * event, or the task going idle again with no `result` (a turn that failed before it logged anything), fails it.
+ * Submits a turn and prints each new event's `type[/subtype]` to stderr until a `result` arrives. A `result` other
+ * than a success, a `turn_failed` event, or the task going idle again with no `result` (a turn that failed before it
+ * logged anything) fails it.
  */
 function taskPrompt(id: string, text: string): Promise<number> {
   return withNode(async (client, socket) => {
@@ -221,13 +226,18 @@ function taskPrompt(id: string, text: string): Promise<number> {
         printed = seq;
         const { type, subtype } = message as { type?: string; subtype?: string };
         console.error(subtype === undefined ? `${type}` : `${type}/${subtype}`);
-        if (type === "result") return finished.resolve();
-        if (type === "meddle" && subtype === "turn_failed") return finished.reject(new Error("the turn failed"));
+        if (type === "result") {
+          const error = resultError(message as { subtype?: unknown; is_error?: unknown });
+          return error === null ? finished.resolve() : finished.reject(new Error(`the turn ended with ${error}`));
+        }
+        if (type === "meddle" && subtype === "turn_failed") {
+          return finished.reject(new Error(`the turn failed: ${String((message as { error?: unknown }).error)}`));
+        }
       }
     };
-    /** Idle again: the database has every event the turn logged, so a `result` missing from it means failure. */
+    /** Idle again: the database has every event the turn logged, so a `result` missing from its newest means failure. */
     const settle = async () => {
-      follow(await session.loadEarlier({ beforeSeq: Number.MAX_SAFE_INTEGER, limit: 200 }));
+      follow(await session.loadEarlier({ beforeSeq: Number.MAX_SAFE_INTEGER, limit: SETTLE_EVENTS }));
       finished.reject(new Error("the turn failed"));
     };
     let busy = false;
@@ -244,6 +254,16 @@ function taskPrompt(id: string, text: string): Promise<number> {
     } finally {
       for (const stop of unsubscribe) stop();
     }
+    return 0;
+  });
+}
+
+/** Runs the task's turn again after repeated crashes parked it; fails when none is parked. */
+function taskRetry(id: string): Promise<number> {
+  return withNode(async (client) => {
+    const task = await client.get(TaskObject, { id });
+    await task.retry({});
+    console.log("retrying");
     return 0;
   });
 }
@@ -326,6 +346,7 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
     return parsed === null ? null : () => taskNew(parsed.title, parsed.projectIds);
   }
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
+  if (command === "task" && sub === "retry" && rest.length === 1) return () => taskRetry(rest[0]!);
   if (command === "service" && sub === "install" && rest.length === 0) return () => serviceInstall(false);
   if (command === "service" && sub === "install" && rest.length === 1 && rest[0] === "--dry-run") return () => serviceInstall(true);
   return null;

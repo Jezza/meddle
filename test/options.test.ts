@@ -21,6 +21,9 @@ test("options match the spec", () => {
   expect(o.pathToClaudeCodeExecutable).toBe("/x/replay.ts"); expect(o.executable).toBe("bun");
   const r: any = buildOptions({ ...common, contexts: [], resume: true });
   expect(r.resume).toBe(manifest.sessionId); expect(r.sessionId).toBeUndefined(); expect(r.pathToClaudeCodeExecutable).toBeUndefined();
+  expect(r.permissionMode).toBe("auto");
+  const planned: any = buildOptions({ ...common, contexts: [], resume: false, permissionMode: "plan" });
+  expect(planned.permissionMode).toBe("plan");
   const three: any = buildOptions({ ...common, contexts: [{ ...DEFAULT_CONTEXT, instructions: "A." }, { ...DEFAULT_CONTEXT, instructions: "" }, { ...DEFAULT_CONTEXT, instructions: "B." }], resume: false });
   expect(three.systemPrompt.append).toBe("A.\n\nB.");
   const none: any = buildOptions({ ...common, contexts: [DEFAULT_CONTEXT], resume: false });

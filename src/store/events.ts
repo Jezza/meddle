@@ -43,9 +43,40 @@ export function listEvents(
 }
 
 /**
- * Whether Claude Code has run for the task: its log holds a message other than meddle's own events and the `user`
- * prompts meddle records as it sends them (Claude Code's first message of a session is never a `user` one).
+ * The newest `limit` events of a task before `beforeSeq` (all of them without it), leaving out `excludeTypes`; oldest
+ * first. Reads only the rows it returns, newest first, so a long log costs no more than a short one.
  */
-export function hasSdkEvents(db: Database, taskId: string): boolean {
-  return db.query("SELECT 1 FROM events WHERE task_id = ? AND type NOT IN ('meddle', 'user') LIMIT 1").get(taskId) !== null;
+export function listEventsTail(
+  db: Database,
+  taskId: string,
+  opts: { beforeSeq?: number; limit: number; excludeTypes?: string[] },
+): EventRecord[] {
+  const where = ["task_id = ?"];
+  const params: Array<string | number> = [taskId];
+  if (opts.beforeSeq !== undefined) {
+    where.push("seq < ?");
+    params.push(opts.beforeSeq);
+  }
+  const excluded = opts.excludeTypes ?? [];
+  // `type IS NULL` keeps messages without a type, which `NOT IN` alone would drop.
+  if (excluded.length > 0) where.push(`(type IS NULL OR type NOT IN (${excluded.map(() => "?").join(", ")}))`);
+  params.push(...excluded, opts.limit);
+  const rows = db
+    .query<{ seq: number; json: string }, Array<string | number>>(
+      `SELECT seq, json FROM events WHERE ${where.join(" AND ")} ORDER BY seq DESC LIMIT ?`,
+    )
+    .all(...params);
+  return rows.reverse().map((row) => ({ seq: row.seq, message: JSON.parse(row.json) }));
+}
+
+/** The task's newest event of `type` (and `subtype`, when given), or null. */
+export function latestEventOfType(db: Database, taskId: string, type: string, subtype?: string): EventRecord | null {
+  const row = subtype === undefined
+    ? db.query<{ seq: number; json: string }, [string, string]>(
+      "SELECT seq, json FROM events WHERE task_id = ? AND type = ? ORDER BY seq DESC LIMIT 1",
+    ).get(taskId, type)
+    : db.query<{ seq: number; json: string }, [string, string, string]>(
+      "SELECT seq, json FROM events WHERE task_id = ? AND type = ? AND subtype = ? ORDER BY seq DESC LIMIT 1",
+    ).get(taskId, type, subtype);
+  return row === null ? null : { seq: row.seq, message: JSON.parse(row.json) };
 }

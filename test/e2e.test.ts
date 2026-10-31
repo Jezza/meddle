@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { initColocated } from "../src/jj";
-import { meddle, replay, startServe } from "./helpers";
+import { errorResultFixture, meddle, replay, startServe } from "./helpers";
 
 /** A temp home with a data dir, a created task root and a colocated jj repo, and the env a meddle child runs with. */
 async function home() {
@@ -51,6 +51,11 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     const types = prompted.stderr.trim().split("\n");
     expect(types).toContain("system/init");
     expect(types.at(-1)).toBe("result/success");
+
+    // nothing is parked, so there is nothing to retry (chord marks a method's own error `unavailable`)
+    const retried = await meddle(["task", "retry", taskId], client);
+    expect(retried.code).toBe(1);
+    expect(retried.stderr).toBe(`meddle: unavailable: no parked turn for task ${taskId}\n`);
 
     const page = await fetch(node.url);
     expect(page.status).toBe(200);
@@ -102,16 +107,33 @@ test("task prompt fails fast when the turn fails", async () => {
     const taskId = (await meddle(["task", "new", "--title", "t", "--project", projectId], client)).stdout.trim();
     expect(taskId).toMatch(/^\S+$/);
 
-    // the child never starts: the turn logs `turn_failed`
+    // the child never starts: the turn logs `turn_failed`, and its error is printed
     const prompted = await meddle(["task", "prompt", taskId, "hi"], client);
     expect(prompted.code).toBe(1);
-    expect(prompted.stderr).toEndWith("meddle/turn_failed\nmeddle: the turn failed\n");
+    expect(prompted.stderr).toMatch(/meddle\/turn_failed\nmeddle: the turn failed: ReferenceError: Claude Code native binary not found at \S+\/no-such-claude\. .*\n$/);
 
-    // no token: the turn fails before it logs anything, and the task goes idle again
+    // no token: the turn fails before Claude Code starts, and still logs why
     await rm(`${dir}/d/secrets/claude-token`);
     const tokenless = await meddle(["task", "prompt", taskId, "hi"], client);
     expect(tokenless.code).toBe(1);
-    expect(tokenless.stderr).toBe("meddle: the turn failed\n");
+    expect(tokenless.stderr).toBe("meddle/turn_failed\nmeddle: the turn failed: Error: no token set\n");
+  } finally {
+    await node.stop();
+  }
+}, 30_000);
+
+test("task prompt fails when the turn's result is an error", async () => {
+  const { dir, env } = await home();
+  await writeFile(`${dir}/token`, "tok\n");
+  expect((await meddle(["token", "set", "--file", `${dir}/token`], env)).code).toBe(0);
+  const node = await startServe({ ...env, MEDDLE_PORT: "0", MEDDLE_FIXTURE: await errorResultFixture("error_max_turns") });
+  const client = { ...env, MEDDLE_PORT: String(node.port) };
+  try {
+    const projectId = (await meddle(["project", "add", `${dir}/repo`], client)).stdout.trim();
+    const taskId = (await meddle(["task", "new", "--title", "t", "--project", projectId], client)).stdout.trim();
+    const prompted = await meddle(["task", "prompt", taskId, "hi"], client);
+    expect(prompted.code).toBe(1);
+    expect(prompted.stderr).toEndWith("result/error_max_turns\nmeddle: the turn ended with error_max_turns\n");
   } finally {
     await node.stop();
   }

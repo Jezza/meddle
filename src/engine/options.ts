@@ -3,6 +3,7 @@ import type {
   McpServerConfig,
   Options,
   PermissionDeniedHookInput,
+  PermissionMode,
   SDKUserMessage,
   SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -25,6 +26,8 @@ export type EngineInput = {
   /** This task has started a session before (the `tasks.started` flag), not crash recovery. */
   resume: boolean;
   model?: string;
+  /** The task's chosen mode; `auto` without one. */
+  permissionMode?: PermissionMode;
   tools?: string[];
   effort?: string;
   claudePath?: string;
@@ -59,7 +62,7 @@ export function buildOptions(i: EngineInput): Options {
   const options: Options = {
     cwd,
     settingSources,
-    permissionMode: "auto",
+    permissionMode: i.permissionMode ?? "auto",
     settings: composeSettings(i.contexts, i.projectSettings),
     systemPrompt: append === ""
       ? { type: "preset", preset: "claude_code" }

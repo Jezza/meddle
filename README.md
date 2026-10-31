@@ -58,6 +58,7 @@ bun run src/cli.ts project add ~/src/myproject [--name myproject]   # prints the
 bun run src/cli.ts project list
 bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id>   # prints the task id
 bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fix it"
+bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
 ```
 
 ## Dashboard

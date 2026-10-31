@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type { NodeConfig } from "../config";
 import { paths } from "../paths";
 
@@ -20,4 +20,12 @@ export async function writeManifest(cfg: NodeConfig, m: TaskManifest): Promise<v
   const file = paths(cfg).taskManifest(m.id);
   await mkdir(dirname(file), { recursive: true });
   await writeFile(file, `${JSON.stringify(m, null, 2)}\n`);
+}
+
+/**
+ * Where Claude Code keeps the task's session transcript: under the task's config dir, in the project dir it is told
+ * to use (`CLAUDE_CODE_PROJECT_DIR_NAME`, the primary project). It exists once Claude Code has read a first prompt.
+ */
+export function transcriptPath(cfg: NodeConfig, m: TaskManifest): string {
+  return join(paths(cfg).taskConfig(m.id), "projects", m.primaryProjectId, `${m.sessionId}.jsonl`);
 }

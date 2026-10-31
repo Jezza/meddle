@@ -1,7 +1,9 @@
 // Stands in for the `claude` binary: replays a recorded stream-json session (see record.ts).
 // Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause forever before `result`).
-// Any argv is accepted and ignored. Dependency-free so it starts fast.
-import { readFileSync } from "node:fs";
+// Any argv is accepted; only `--session-id` / `--resume` are read (see `transcribe`). Dependency-free so it
+// starts fast.
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t: number } | { dir: "exit"; t: number; code: number | null };
 type Frame = { type: string; subtype?: string; request_id?: string; request?: { subtype?: string }; response?: { request_id?: string } };
@@ -92,6 +94,36 @@ function matches(need: Need, f: Frame): boolean {
   }
 }
 
+/** The session id the SDK passed (`--session-id <id>` or `--resume <id>`, either also as `--flag=<id>`). */
+function sessionArg(): string | undefined {
+  const argv = process.argv;
+  for (const flag of ["--session-id", "--resume"]) {
+    const i = argv.indexOf(flag);
+    if (i !== -1 && i + 1 < argv.length) return argv[i + 1];
+    const joined = argv.find(a => a.startsWith(`${flag}=`));
+    if (joined !== undefined) return joined.slice(flag.length + 1);
+  }
+  return undefined;
+}
+
+let transcribed = false;
+/**
+ * Like the real CLI, writes the session's transcript once it reads the first user message: one line, that message,
+ * appended to `<CLAUDE_CONFIG_DIR>/projects/<CLAUDE_CODE_PROJECT_DIR_NAME>/<session id>.jsonl`. Without a session id
+ * or those variables it writes nothing.
+ */
+function transcribe(f: Frame) {
+  if (transcribed) return;
+  transcribed = true;
+  const id = sessionArg();
+  const configDir = process.env.CLAUDE_CONFIG_DIR;
+  const projectDir = process.env.CLAUDE_CODE_PROJECT_DIR_NAME;
+  if (!id || !configDir || !projectDir) return;
+  const dir = join(configDir, "projects", projectDir);
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(join(dir, `${id}.jsonl`), JSON.stringify(f) + "\n");
+}
+
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms).unref());
 /** Resolves on stdin EOF, or EOF_CAP_MS after the first wait began; one cap for the whole run. */
 let eofOrCap: Promise<void> | undefined;
@@ -104,7 +136,11 @@ function waitForEof(): Promise<void> {
 async function waitFor(need: Need) {
   for (;;) {
     const hit = arrived.find(a => !a.used && matches(need, a.frame));
-    if (hit) { hit.used = true; return; }
+    if (hit) {
+      hit.used = true;
+      if (need.kind === "user") transcribe(hit.frame);
+      return;
+    }
     if (eof) await finish();
     await new Promise<void>(r => { wake = r; });
   }

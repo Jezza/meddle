@@ -30,6 +30,7 @@ const MIGRATIONS = [
     json TEXT,
     PRIMARY KEY (task_id, seq)
   )`,
+  `CREATE INDEX IF NOT EXISTS events_type ON events (task_id, type, subtype, seq)`,
   `CREATE TABLE IF NOT EXISTS transcript (
     project_key TEXT,
     session_id TEXT,
@@ -44,10 +45,20 @@ const MIGRATIONS = [
     ON transcript (project_key, session_id, subpath, uuid) WHERE uuid IS NOT NULL`,
 ];
 
+/** Columns added to a table after its first release: each is added to a database that lacks it. */
+const ADDED_COLUMNS = [
+  // A task's model, effort and permission mode overrides, as JSON (`TaskSettings`); NULL for none.
+  { table: "tasks", column: "settings", type: "TEXT" },
+];
+
 export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
   if (path !== ":memory:") db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA busy_timeout = 5000");
   for (const sql of MIGRATIONS) db.exec(sql);
+  for (const { table, column, type } of ADDED_COLUMNS) {
+    const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
+    if (!columns.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
   return db;
 }
