@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
+    "typecheck": "tsc --noEmit -p .",
     "serve": "bun run src/cli.ts serve",
     "build": "bun run scripts/build.ts",
     "install:service": "bun run src/cli.ts service install"
@@ -18,6 +19,7 @@
     "typebox": "1.4.3"
   },
   "devDependencies": {
-    "@types/bun": "1.4.4"
+    "@types/bun": "1.4.4",
+    "typescript": "5.8.3"
   }
 }

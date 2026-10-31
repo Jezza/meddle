@@ -124,6 +124,8 @@ function listAt(obj: unknown, key: string): unknown[] {
 
 export function composeSettings(contexts: Context[], projectSettings: Json[] = []): Json {
   const settings = projectSettings.reduce<Json>((acc, s) => deepMerge(acc, s), {});
+  // Claude Code unions `autoMode` lists across setting scopes and expands `$defaults` in place, so these lists add to
+  // the defaults and to the user's own rules (verified with `claude auto-mode config`, Claude Code 2.1.314, 2026-10-31).
   const autoMode: Json = isPlainObject(settings.autoMode) ? settings.autoMode : {};
   for (const key of ["allow", "soft_deny", "hard_deny"] as const) {
     autoMode[key] = dedupe(["$defaults", ...listAt(autoMode, key), ...contexts.flatMap((c) => c.claude.autoMode[key])]);
