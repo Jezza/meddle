@@ -32,6 +32,19 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Settles as `promise` does, or rejects with the signal's reason once it aborts. */
+function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (err: unknown) => { signal.removeEventListener("abort", onAbort); reject(err); },
+    );
+  });
+}
+
 export class PoolSync {
   private readonly views = new Map<string, PeerView>();
   /** Client hosts being closed, so that `stop()` can wait for them. */
@@ -119,9 +132,11 @@ export class PoolSync {
       });
       pool.token.subscribe((meta) => {
         if (meta === null) return;
+        // A call in flight when the view is dropped is not settled by closing its client host: the drop's abort ends
+        // it, so that one gone peer cannot hold up the pull chain (and `stop()`).
         this.pulls = this.pulls
-          .then(() => this.pull(meta, () => pool.fetchToken({}), current))
-          .catch((err: unknown) => this.report(err));
+          .then(() => this.pull(meta, () => unlessAborted(pool.fetchToken({}), view.abort.signal), current))
+          .catch((err: unknown) => { if (current()) this.report(err); });
       });
     } catch (err) {
       if (!current()) return;
@@ -146,11 +161,12 @@ export class PoolSync {
     return !local.present || local.setAt === undefined || setAt > local.setAt;
   }
 
-  /** Forgets the peer's view at once and closes its client host, if it has one yet. */
+  /** Forgets the peer's view at once, ends its calls in flight and closes its client host, if it has one yet. */
   private async drop(id: string): Promise<void> {
     const view = this.views.get(id);
     if (!view) return;
     this.views.delete(id);
+    view.abort.abort(new Error(`stopped holding the pool of ${shortId(id)}`));
     if (view.host === null) return;
     const closed = view.host.close().catch((err: unknown) => this.report(err));
     this.closing.add(closed);

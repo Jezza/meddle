@@ -2,15 +2,21 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { SecretKey, type Connection, type Endpoint } from "@number0/iroh";
-import { createHost, type Host, type Subscribable } from "@earendil-works/chord";
-import { ensureDataDirs, loadConfig, paths, type NodeConfig } from "../src/config";
+import { createHost, memoryLinkPair, type Host, type Subscribable } from "@earendil-works/chord";
+import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "../src/config";
+import { MetricsSampler, findTaskPids } from "../src/metrics";
 import { hexOf, shortId, type Identity } from "../src/pool/identity";
 import type { LinkTap } from "../src/pool/link";
 import { PoolNet, fromEndpoint, openEndpoint, toEndpointAddr } from "../src/pool/net";
 import { servePool, type PoolObjectDeps } from "../src/pool/object";
 import { PoolStore, type NodeSummary } from "../src/pool/store";
+import { startPool } from "../src/pool/runtime";
 import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
+import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
+import { listTasks } from "../src/store/records";
+import { VERSION, claudeCodeVersion } from "../src/version";
+import { setupNode } from "./helpers";
 
 export type TestNode = { endpoint: Endpoint; identity: Identity };
 
@@ -170,4 +176,42 @@ export async function twoNodes(options: { start?: boolean; offerAddresses?: bool
       }
     },
   };
+}
+
+/** The environment a pool node in a test reads: loopback only, no relays, no lighthouse. */
+export const POOL_ENV = { MEDDLE_IROH_PRESET: "minimal", MEDDLE_IROH_BIND: "127.0.0.1:0", MEDDLE_LIGHTHOUSE_URL: "" };
+
+/**
+ * A whole node (see `setupNode`) with its pool runtime started and its chord host (`createNodeHost`) serving it; the
+ * metrics sampler is not started. `close()` stops the pool, the host and the harness.
+ */
+export async function startPoolNode(fixture?: string) {
+  const node = await setupNode(fixture, POOL_ENV);
+  const { cfg, db, runner } = node;
+  const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 60_000, dataDir: cfg.dataDir });
+  const pool = await startPool(cfg, db, {
+    version: VERSION,
+    claudeCodeVersion: claudeCodeVersion(),
+    hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
+    taskCount: () => listTasks(db).length,
+  });
+  const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool });
+  return {
+    ...node, metrics, pool, host,
+    id: pool.identity.id, identity: pool.identity, store: pool.store, net: pool.net,
+    async close() {
+      metrics.stop();
+      await pool.stop();
+      await host.close();
+      await node.harness.close();
+    },
+  };
+}
+
+/** A client host linked to `host` over a memory link, as principal `owner`. */
+export function linkClient(host: Host): { client: Host; close(): Promise<void> } {
+  const [down, up] = memoryLinkPair();
+  host.accept(down, { principal: "owner", kind: "client" });
+  const client = createHost({ name: "client", self: "client", kind: "client", upstream: { link: up, principal: "node" } });
+  return { client, close: () => client.close() };
 }

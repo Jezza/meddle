@@ -1,0 +1,152 @@
+// test/pool-state.test.ts — the pool runtime behind a node host: PoolObject, joining, the token and removal.
+import { test, expect } from "bun:test";
+import { hostname } from "node:os";
+import type { Host } from "@earendil-works/chord";
+import { NodeObject, PoolObject } from "../src/state/contracts";
+import { getToken, setToken } from "../src/token";
+import { VERSION } from "../src/version";
+import { linkClient, startPoolNode } from "./pool-helpers";
+
+type Node = Awaited<ReturnType<typeof startPoolNode>>;
+
+const WAIT_MS = 10_000;
+
+/** Resolves with the first value of `readable` (the current one included) that satisfies `pred`; rejects after 10 s. */
+function until<T>(readable: { readonly value: T; subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let stop: (() => void) | undefined;
+    const timer = setTimeout(() => {
+      done = true;
+      stop?.();
+      reject(new Error(`timed out waiting; last value ${JSON.stringify(readable.value)}`));
+    }, WAIT_MS);
+    stop = readable.subscribe((value) => {
+      if (done || !pred(value)) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+      stop?.();
+    });
+    if (done) stop();
+  });
+}
+
+async function eventually(cond: () => boolean, ms = WAIT_MS): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("timed out waiting");
+    await Bun.sleep(10);
+  }
+}
+
+/** The `default` variant of the node's PoolObject, as a dashboard holds it. */
+async function poolOf(client: Host) {
+  const pool = await client.get(PoolObject, {});
+  if (pool.variant !== "default") throw new Error("expected the default variant");
+  return pool;
+}
+
+type Viewed = { node: Node; client: Host; pool: Awaited<ReturnType<typeof poolOf>> };
+
+/** `count` pool nodes, each with a client holding its PoolObject; `run` gets them and everything is stopped after. */
+async function withNodes(count: number, run: (nodes: Viewed[]) => Promise<void>): Promise<void> {
+  const started: Node[] = [];
+  const clients: { close(): Promise<void> }[] = [];
+  try {
+    const viewed: Viewed[] = [];
+    for (let i = 0; i < count; i++) {
+      const node = await startPoolNode();
+      started.push(node);
+      const linked = linkClient(node.host);
+      clients.push(linked);
+      viewed.push({ node, client: linked.client, pool: await poolOf(linked.client) });
+    }
+    await run(viewed);
+  } finally {
+    for (const c of clients) await c.close();
+    for (const n of started) await n.close();
+  }
+}
+
+/** `joiner` joins the pool of `inviter` through their PoolObjects. */
+async function join(inviter: Viewed, joiner: Viewed): Promise<{ poolId: string; members: number }> {
+  const { ticket } = await inviter.pool.invite({});
+  return joiner.pool.join({ ticket });
+}
+
+function onlineOn(viewer: Viewed, other: Viewed): Promise<unknown> {
+  return until(viewer.pool.nodes, (rows) => rows.some((r) => r.nodeId === other.node.id && r.online));
+}
+
+test("PoolObject shows a pool of one, invites, and a joined node appears online on both", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    const B = b!.node;
+    const poolA = a!.pool;
+    expect(poolA.self.value).toBe(A.identity.id);
+    expect(poolA.nodes.value).toEqual([{
+      nodeId: A.id, hostname: hostname(), status: "member", online: true, version: VERSION, claudeCodeVersion: "2.1.314",
+      hostsTasks: true, taskCount: 0, lastSeenAt: expect.any(String),
+    }]);
+    const nodeA = await a!.client.get(NodeObject, {});
+    expect(nodeA.nodeId.value).toBe(A.identity.id);
+
+    expect(await join(a!, b!)).toEqual({ poolId: poolA.poolId.value, members: 2 });
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+    expect(A.store.pool().poolSecret).toBe(B.store.pool().poolSecret);
+    expect(b!.pool.poolId.value).toBe(poolA.poolId.value);
+    expect(poolA.mixedVersions.value).toBe(false);
+  });
+}, 15_000);
+
+test("tokenChanged replicates the token; remove propagates and the removed node is cut off", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    const B = b!.node;
+    const poolA = a!.pool;
+    const poolB = b!.pool;
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+
+    await setToken(A.cfg, "tok2", { setBy: A.id });
+    await poolA.tokenChanged({});
+    await until(poolA.token, (t) => t.setBy === A.id);
+    await until(poolB.token, (t) => t.setBy === A.id);
+    expect((await getToken(B.cfg)) === "tok2").toBe(true);
+    expect(poolB.token.value.setAt).toBe(poolA.token.value.setAt);
+    const nodeB = await b!.client.get(NodeObject, {});
+    await until(nodeB.token, (t) => t.expiresAt === poolB.token.value.expiresAt);
+
+    await poolA.remove({ nodeId: B.id });
+    expect(A.net.isOnline(B.id)).toBe(false);
+    await until(poolA.nodes, (rows) => rows.some((r) => r.nodeId === B.id && r.status === "removed" && !r.online));
+    await until(poolB.nodes, (rows) => rows.some((r) => r.nodeId === B.id && r.status === "removed"));
+    expect(B.net.online()).toEqual([]);
+    await expect(poolA.remove({ nodeId: A.id })).rejects.toThrow("a node cannot remove itself");
+  });
+}, 15_000);
+
+test("a member that did not do the removing also cuts the removed node off", async () => {
+  await withNodes(3, async ([a, b, c]) => {
+    const [A, B, C] = [a!.node, b!.node, c!.node];
+    await join(a!, b!);
+    expect(await join(a!, c!)).toEqual({ poolId: a!.pool.poolId.value, members: 3 });
+    const all = [A, B, C];
+    const fullyLinked = () => all.every((n) => all.every((m) => m === n || n.net.isOnline(m.id)));
+    await eventually(fullyLinked);
+
+    await a!.pool.remove({ nodeId: C.id });
+    await eventually(() => B.store.row(C.id)?.status === "removed" && !B.net.isOnline(C.id) && !C.net.isOnline(B.id));
+    await until(c!.pool.nodes, (rows) => rows.some((r) => r.nodeId === C.id && r.status === "removed"));
+    expect(C.net.online()).toEqual([]);
+    // B was not removed: it still counts itself a member and keeps its link with A.
+    expect(B.store.isMember(B.id)).toBe(true);
+    expect(B.net.isOnline(A.id)).toBe(true);
+
+    expect(await join(a!, c!)).toEqual({ poolId: a!.pool.poolId.value, members: 3 });
+    await eventually(() => B.store.isMember(C.id) && fullyLinked());
+  });
+}, 15_000);

@@ -1,11 +1,10 @@
 // test/state.test.ts
 import { test, expect } from "bun:test";
-import { memoryLinkPair, createHost, type Host } from "@earendil-works/chord";
-import { createNodeHost, NodeObject, TaskObject, SessionObject } from "../src/state/host";
-import { findTaskPids, MetricsSampler } from "../src/metrics";
+import { NodeObject, TaskObject, SessionObject } from "../src/state/host";
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent } from "../src/store/events";
-import { errorResultFixture, setupNode } from "./helpers";
+import { errorResultFixture } from "./helpers";
+import { linkClient, startPoolNode } from "./pool-helpers";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -22,20 +21,15 @@ function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, p
   });
 }
 
-/** A node host for `fixture`, and a client host connected to it over a memory link. */
+/** A node host (with its pool) for `fixture`, and a client host connected to it over a memory link. */
 async function connect(fixture?: string) {
-  const node = await setupNode(fixture);
-  const metrics = new MetricsSampler({ taskPids: () => findTaskPids(node.cfg.taskRoot), intervalMs: 60_000, dataDir: node.cfg.dataDir });
-  const host = createNodeHost({ cfg: node.cfg, db: node.db, runner: node.runner, metrics, claudeCodeVersion: claudeCodeVersion() });
-  const [down, up] = memoryLinkPair();
-  host.accept(down, { principal: "owner", kind: "client" });
-  const client: Host = createHost({ name: "client", self: "client", kind: "client", upstream: { link: up, principal: "node" } });
+  const node = await startPoolNode(fixture);
+  const { client, close: closeClient } = linkClient(node.host);
   const close = async () => {
-    await client.close();
-    await host.close();
-    await node.harness.close();
+    await closeClient();
+    await node.close();
   };
-  return { ...node, metrics, host, client, close };
+  return { ...node, client, close };
 }
 
 test("claudeCodeVersion reads the pinned SDK's manifest", () => {

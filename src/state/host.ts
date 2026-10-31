@@ -9,6 +9,9 @@ import { checkTaskRoot, type NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
 import { resultError, type MeddleEvent } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
+import { servePool } from "../pool/object";
+import type { PoolRuntime } from "../pool/runtime";
+import { acceptPeerLinks } from "../pool/sync";
 import { loadContext } from "../projects/context";
 import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects } from "../projects/project";
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
@@ -39,6 +42,8 @@ export type NodeHostDeps = {
   runner: TaskRunner;
   metrics: MetricsSampler;
   claudeCodeVersion: string;
+  /** The node's pool: served as `PoolObject`, and its members' chord links are accepted on this host. */
+  pool: PoolRuntime;
 };
 
 type TaskEvent = { taskId: string; seq: number; message: SDKMessage | MeddleEvent };
@@ -47,9 +52,9 @@ type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
 const NOTIFICATIONS_KEPT = 50;
 const WINDOW_SIZE = 200;
 
-/** A host named `node` serving `NodeObject`, `ProjectObject`, `TaskObject` and `SessionObject`. */
+/** A host named `node` serving `NodeObject`, `ProjectObject`, `TaskObject`, `SessionObject` and `PoolObject`. */
 export function createNodeHost(deps: NodeHostDeps): Host {
-  const { cfg, db, runner, metrics } = deps;
+  const { cfg, db, runner, metrics, pool } = deps;
   const approvals = runner.approvals;
   const events: Subscribable<TaskEvent> = {
     subscribe: (cb) => runner.onEvent((taskId, seq, message) => cb({ taskId, seq, message })),
@@ -59,8 +64,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   };
   const approvalChanges: Subscribable<null> = { subscribe: (cb) => approvals.onChange(() => cb(null)) };
   const samples: Subscribable<NodeMetrics> = { subscribe: (cb) => metrics.onSample(cb) };
+  const poolChanges: Subscribable<null> = { subscribe: (cb) => pool.onChange(() => cb(null)) };
 
   const host = createHost({ name: "node", self: "node" });
+  servePool(host, pool.objectDeps);
+  acceptPeerLinks(pool.net, host, (id) => pool.store.isMember(id));
 
   host.serve(NodeStore, (_input, _principal, self) => {
     const taskIds = self.state("taskIds", NodeStore.def.members.taskIds, { init: () => listTasks(db).map((t) => t.id) });
@@ -112,8 +120,15 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       metricsNow.replace(ctx, sample);
       token.replace(ctx, await tokenNow(cfg));
     });
+    // A token pulled from a peer changes the file without a metrics sample.
+    self.on("pool", poolChanges, async (_event, ctx) => {
+      const next = await tokenNow(cfg);
+      // The host may have closed while the file was read (a change as the node shuts down).
+      if (!ctx.signal.aborted) token.replace(ctx, next);
+    });
 
     return {
+      nodeId: self.state("nodeId", NodeStore.def.members.nodeId, pool.identity.id),
       hostname: self.state("hostname", NodeStore.def.members.hostname, hostname()),
       version: self.state("version", NodeStore.def.members.version, VERSION),
       claudeCodeVersion: self.state("claudeCodeVersion", NodeStore.def.members.claudeCodeVersion, deps.claudeCodeVersion),
@@ -155,6 +170,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const store = self.get(NodeStore, {});
     return {
       variant: "default",
+      nodeId: store.nodeId,
       hostname: store.hostname,
       version: store.version,
       claudeCodeVersion: store.claudeCodeVersion,

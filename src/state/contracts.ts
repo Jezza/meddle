@@ -81,6 +81,8 @@ export const PermissionModeSchema = Type.Union([
 ]);
 
 const nodeState = {
+  /** This node's id in the pool. */
+  nodeId: Type.String(),
   hostname: Type.String(),
   version: Type.String(),
   claudeCodeVersion: Type.String(),

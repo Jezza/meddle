@@ -2,15 +2,13 @@
 import { test, expect } from "bun:test";
 import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
 import { startDashboard } from "../src/dashboard/server";
-import { createNodeHost, NodeObject } from "../src/state/host";
-import { MetricsSampler } from "../src/metrics";
+import { NodeObject } from "../src/state/host";
 import { VERSION } from "../src/version";
-import { setupNode } from "./helpers";
+import { startPoolNode } from "./pool-helpers";
 
 test("the dashboard serves the UI and a chord link on /ws", async () => {
-  const node = await setupNode();
-  const metrics = new MetricsSampler({ taskPids: () => ({}), intervalMs: 60_000, dataDir: node.cfg.dataDir });
-  const host = createNodeHost({ cfg: node.cfg, db: node.db, runner: node.runner, metrics, claudeCodeVersion: "0.0.0" });
+  const node = await startPoolNode();
+  const { host } = node;
   let dashboard: Awaited<ReturnType<typeof startDashboard>> | undefined;
   let client: Host | undefined;
   try {
@@ -50,8 +48,7 @@ test("the dashboard serves the UI and a chord link on /ws", async () => {
   } finally {
     await client?.close();
     await dashboard?.stop();
-    await host.close();
-    await node.harness.close();
+    await node.close();
   }
 });
 

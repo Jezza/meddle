@@ -225,3 +225,20 @@ test("a node already in a pool with others refuses to join", async () => {
     await a.close();
   }
 }, 15_000);
+
+test("a node removed from its pool may join another", async () => {
+  const a = await inviter();
+  const b = await joiner();
+  try {
+    const ticket = decodeTicket(createInvite(a.store, a.node.endpoint));
+    const self = b.store.row(b.identity.id)!;
+    b.store.upsert({ ...self, nodeId: "c".repeat(64), hostname: "gamma" });
+    b.store.remove(b.identity.id);
+    expect(await joinPool(ticket, b.deps)).toMatchObject({ poolId: a.store.pool().poolId, members: 2 });
+    expect(b.store.isMember(b.identity.id)).toBe(true);
+    expect(b.store.row("c".repeat(64))).toBeNull();
+  } finally {
+    await closeAll([b]);
+    await a.close();
+  }
+}, 15_000);

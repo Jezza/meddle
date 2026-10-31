@@ -80,12 +80,12 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     // only when the node refreshed it (a fresh `lastSeenAt` on every refresh would bounce between nodes forever).
     const roster = self.state("roster", Type.Array(RosterRowSchema), { init: () => store.roster() });
     const token = self.state("token", defaultState.token, { init: () => tokenNow(cfg) });
-    /** Token reads in flight: only the newest one's result is kept. */
+    /** Token reads in flight: only the newest one's result is kept, and none once the host closed meanwhile. */
     let tokenReads = 0;
     const refreshToken = async (ctx: Ctx) => {
       const n = ++tokenReads;
       const next = await tokenNow(cfg);
-      if (n === tokenReads) token.replace(ctx, next);
+      if (n === tokenReads && !ctx.signal.aborted) token.replace(ctx, next);
     };
 
     if (peer !== null) {
@@ -115,7 +115,7 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       roster.replace(ctx, store.roster());
       online.replace(ctx, onlineNow());
       poolId.replace(ctx, store.pool().poolId);
-      await Promise.all([refreshToken(ctx), liveNow().then((l) => live.replace(ctx, l))]);
+      await Promise.all([refreshToken(ctx), liveNow().then((l) => { if (!ctx.signal.aborted) live.replace(ctx, l); })]);
     });
     return {
       variant: "default",

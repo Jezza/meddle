@@ -8,6 +8,7 @@ import { createRegistry } from "@earendil-works/pi-durable";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "./config";
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { findTaskPids, MetricsSampler } from "./metrics";
+import { startPool, type PoolRuntime } from "./pool/runtime";
 import { ensurePlugins, seedProfile } from "./profile";
 import { resultError } from "./engine/session";
 import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
@@ -34,11 +35,14 @@ class NoNode extends Error {
 }
 
 /** What `serve` has opened so far, closed by `shutdown`. */
-type OpenNode = { db?: Database; harness?: { close(): Promise<void> }; metrics?: MetricsSampler; host?: Host; dashboard?: Dashboard };
+type OpenNode = {
+  db?: Database; harness?: { close(): Promise<void> }; metrics?: MetricsSampler; pool?: PoolRuntime; host?: Host; dashboard?: Dashboard;
+};
 
-/** Closes whatever of the node is open: the dashboard, metrics, the harness, the host, then the database. */
+/** Closes whatever of the node is open: the dashboard, the pool, metrics, the harness, the host, then the database. */
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
+  await node.pool?.stop();
   node.metrics?.stop();
   await node.harness?.close();
   await node.host?.close();
@@ -70,7 +74,13 @@ async function serve(): Promise<number> {
       dataDir: cfg.dataDir,
     }));
     metrics.start();
-    const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion() }));
+    const pool = (node.pool = await startPool(cfg, db, {
+      version: VERSION,
+      claudeCodeVersion: claudeCodeVersion(),
+      hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
+      taskCount: () => listTasks(db).length,
+    }));
+    const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();
     node.dashboard = await startDashboard(cfg, host);

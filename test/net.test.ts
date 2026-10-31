@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { randomBytes } from "node:crypto";
 import type { Connection } from "@number0/iroh";
 import { ALPN_POOL, writeLine } from "../src/pool/frames";
-import { PoolNet, fromEndpoint, toEndpointAddr, type NetDeps, type PeerStream } from "../src/pool/net";
+import { PeerClosed, PoolNet, fromEndpoint, toEndpointAddr, type NetDeps, type PeerStream } from "../src/pool/net";
 import { endpointPair, type TestNode } from "./pool-helpers";
 
 const fast = { initialMs: 50, maxMs: 200 };
@@ -20,13 +20,14 @@ function netOf(node: TestNode, deps: Partial<NetDeps> = {}) {
   const peers: [string, boolean][] = [];
   const streams: PeerStream[] = [];
   const errors: string[] = [];
+  const raw: unknown[] = [];
   const net = new PoolNet({
     endpoint: node.endpoint, selfId: node.identity.id, isMember: () => true, onJoin: async () => {},
-    onError: (err) => errors.push(String(err)), backoff: fast, ...deps,
+    onError: (err) => { raw.push(err); errors.push(String(err)); }, backoff: fast, ...deps,
   });
   net.onPeer((id, online) => peers.push([id, online]));
   net.onStream((s) => streams.push(s));
-  return { net, peers, streams, errors, id: node.identity.id };
+  return { net, peers, streams, errors, raw, id: node.identity.id };
 }
 
 /** Both ends of a pair as PoolNets, `lo` the one with the smaller id (the dialer). */
@@ -130,6 +131,24 @@ test("unwatch closes the connection with the reason and the other side sees it",
     expect(hi.peers).toEqual([[lo.id, true], [lo.id, false]]);
     expect(lo.net.isOnline(hi.id)).toBe(false);
     expect(lo.errors.filter((e) => e.includes("not a member")).length).toBeGreaterThan(0);
+  } finally {
+    await stop();
+  }
+});
+
+test("unwatch with bye closes with code 0 and reports nothing; a code-1 refusal is reported naming the peer", async () => {
+  let hiAdmitsLo = true;
+  const { lo, hi, stop } = await poolPair({ hi: () => hiAdmitsLo });
+  try {
+    const s = await lo.net.openStream(hi.id, { stream: "x" });
+    hiAdmitsLo = false;
+    hi.net.unwatch(lo.id, "bye");
+    expect(await s.closed).toBe("closed by peer: bye (code 0)");
+    await until(() => lo.raw.some((e) => e instanceof PeerClosed));
+    expect(lo.errors.some((e) => e.includes("bye"))).toBe(false);
+    const refusal = lo.raw.find((e) => e instanceof PeerClosed) as PeerClosed;
+    expect(refusal.peerId).toBe(hi.id);
+    expect(refusal.reason).toBe("closed by peer: not a member (code 1)");
   } finally {
     await stop();
   }

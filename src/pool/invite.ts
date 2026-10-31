@@ -216,11 +216,14 @@ function welcomeOf(line: string | null, selfId: string): Extract<JoinReply, { t:
   return { ...value, roster };
 }
 
-/** Joins the pool a ticket names. Rejects when this node already has other members, or the inviter refuses. */
+/**
+ * Joins the pool a ticket names. Rejects when this node is a member of a pool with other members, or the inviter
+ * refuses; a node removed from its pool is in no pool with anyone and may join.
+ */
 export async function joinPool(ticket: Ticket, deps: JoinDeps): Promise<{ poolId: string; members: number; addrs: WireAddr[] }> {
   const selfId = deps.identity.id;
   if (ticket.inviter.id === selfId) throw new Error("this is this node's own invite");
-  const others = deps.store.members().filter((row) => row.nodeId !== selfId).length;
+  const others = deps.store.isMember(selfId) ? deps.store.members().filter((row) => row.nodeId !== selfId).length : 0;
   if (others > 0) throw alreadyPooled(others);
   const summary = await deps.summary();
   const request: JoinRequest = {

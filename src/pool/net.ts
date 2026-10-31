@@ -80,6 +80,13 @@ const JOIN = decoder.decode(Uint8Array.from(ALPN_JOIN));
 /** What `closed()` resolves to when the peer closed with code 1: it refused or removed this node. */
 const REFUSED = /^closed by peer: .* \(code 1\)$/;
 
+/** Reported when a peer closed a connection, or refused a dial: `reason` is what `closed()` resolved to. */
+export class PeerClosed extends Error {
+  constructor(readonly peerId: string, readonly reason: string, message: string) {
+    super(message);
+  }
+}
+
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -141,19 +148,23 @@ export class PoolNet {
     this.dial(peerId, 0);
   }
 
-  /** Closes any connection with the peer (inbound or outbound) with code 1 and `reason`, and stops dialing it. */
-  unwatch(peerId: string, reason: "removed" | "not a member"): void {
+  /**
+   * Closes any connection with the peer (inbound or outbound) with `reason`, and stops dialing it: code 1 for
+   * `removed` and `not a member`, code 0 for `bye` (this node is leaving, not refusing the peer).
+   */
+  unwatch(peerId: string, reason: "removed" | "not a member" | "bye"): void {
+    const code = reason === "bye" ? 0n : 1n;
     this.watched.delete(peerId);
     const d = this.dials.get(peerId);
     if (d) {
       this.dials.delete(peerId);
-      d.cancel = { code: 1n, reason };
+      d.cancel = { code, reason };
       d.wake();
     }
     const link = this.links.get(peerId);
     if (link) {
       this.links.delete(peerId);
-      link.conn.close(1n, bytes(reason));
+      link.conn.close(code, bytes(reason));
       this.emitPeer(peerId, false);
     }
   }
@@ -297,7 +308,7 @@ export class PoolNet {
 
   private async untilClosed(id: string, link: Link): Promise<void> {
     const reason = await link.closed.catch(messageOf);
-    if (REFUSED.test(reason)) this.report(new Error(`${shortId(id)} closed the connection: ${reason}`));
+    if (REFUSED.test(reason)) this.report(new PeerClosed(id, reason, `${shortId(id)} closed the connection: ${reason}`));
     if (this.links.get(id) !== link) return;
     this.links.delete(id);
     this.emitPeer(id, false);
@@ -412,7 +423,7 @@ export class PoolNet {
       return null;
     }
     const reason = await conn.closed().catch(messageOf);
-    this.report(new Error(`${shortId(id)} refused the connection: ${reason}`));
+    this.report(new PeerClosed(id, reason, `${shortId(id)} refused the connection: ${reason}`));
     return null;
   }
 }

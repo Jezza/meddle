@@ -3,6 +3,7 @@ import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { initColocated } from "../src/jj";
 import { errorResultFixture, meddle, replay, startServe } from "./helpers";
+import { POOL_ENV } from "./pool-helpers";
 
 /** A temp home with a data dir, a created task root and a colocated jj repo, and the env a meddle child runs with. */
 async function home() {
@@ -16,6 +17,7 @@ async function home() {
     MEDDLE_CLAUDE_PATH: replay,
     MEDDLE_CLAUDE_RUNTIME: "bun",
     MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl`,
+    ...POOL_ENV,
   };
   return { dir, env };
 }

@@ -14,11 +14,11 @@ export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 /**
  * A node in a temp home: data dirs, task root, database, one colocated project added from a folder,
  * a token, and a Harness with a TaskRunner that runs Claude Code turns from the `fixture` recording
- * (a name in `test/fixtures`, or an absolute path).
+ * (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the environment the config is read from.
  */
-export async function setupNode(fixture = "hello.jsonl") {
+export async function setupNode(fixture = "hello.jsonl", extraEnv: Record<string, string> = {}) {
   const home = await mkdtemp("/tmp/meddle-node-");
-  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t`, ...extraEnv });
   await ensureDataDirs(cfg);
   await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(paths(cfg).db);
