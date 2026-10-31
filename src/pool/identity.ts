@@ -1,21 +1,15 @@
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { EndpointId, SecretKey } from "@number0/iroh";
 import { paths, type NodeConfig } from "../config";
+import { isNodeId } from "./ids";
+
+export { isNodeId, shortId } from "./ids";
 
 /** This node's iroh identity: `id` is the lowercase hex of its public key, `secret` its 32-byte secret key. */
 export type Identity = { id: string; secret: Uint8Array };
 
 /** 32 bytes as lowercase hex: the form of both a node id and the secret key file. */
 const HEX_32 = /^[0-9a-f]{64}$/;
-
-export function isNodeId(text: string): boolean {
-  return HEX_32.test(text);
-}
-
-/** The prefix of a node id that the CLI and the UI print. */
-export function shortId(id: string): string {
-  return id.slice(0, 10);
-}
 
 export function hexOf(id: EndpointId): string {
   return Buffer.from(id.toBytes()).toString("hex");

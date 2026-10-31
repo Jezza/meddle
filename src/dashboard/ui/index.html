@@ -31,6 +31,14 @@
   dd { margin: 0; }
   fieldset { border: 1px solid var(--line); border-radius: 4px; margin: 8px 0; }
   .card { border: 1px solid var(--line); border-radius: 6px; padding: 8px 16px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 12px; }
+  .cards .card { margin: 0; min-width: 0; overflow-x: auto; }
+  .card.removed, tr.removed { opacity: 0.5; }
+  .id { font: 12px ui-monospace, monospace; }
+  .badge { font-size: 12px; font-weight: normal; padding: 1px 6px; border-radius: 8px; background: var(--soft); }
+  .badge.online { color: var(--accent); }
+  .badge.offline, .badge.removed { color: var(--muted); }
+  .flag { color: var(--warn); }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .option { display: block; margin: 2px 0; }
   .muted { color: var(--muted); }
