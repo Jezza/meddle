@@ -259,7 +259,7 @@ export async function twoPoolNodes(): Promise<{ A: GitPoolNode; B: GitPoolNode; 
       await socket.start();
       stops.push(() => socket.stop());
       const stopAccepting = acceptGitStreams(node.net, {
-        db: node.db, cfg: node.cfg, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
+        db: node.db, cfg: node.cfg, selfId: node.id, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
       });
       stops.push(async () => stopAccepting());
     }

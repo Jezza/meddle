@@ -31,18 +31,27 @@ async function descends(cfg: NodeConfig, repo: string, rev: string, base: string
 }
 
 /**
- * Settles the local `memory` bookmark: when it is conflicted (this node's unpushed commits against the home's newer
- * ones) and `remote` has a `memory`, it takes the remote's; the commits it pointed at stay under `@`, which the
- * caller rebases. Returns whether `memory` exists (and is not conflicted).
+ * Settles the local `memory` bookmark. When it is conflicted and `remote` has a clean `memory` (this node's unpushed
+ * commits against the home's newer ones), it takes the remote's. When there is no clean remote one (on the home, or
+ * the remote's is conflicted too), it takes one of its own targets, preferring one `@` does not descend from, and
+ * `note`s the change. Either way the commits it pointed at stay under `@` or on the chosen side, and the caller's
+ * rebase of `@` onto `memory` carries the rest across. Returns whether `memory` exists.
  */
-async function settleMemory(cfg: NodeConfig, repo: string, remote: string | null): Promise<boolean> {
+async function settleMemory(cfg: NodeConfig, repo: string, remote: string | null, note: (change: string) => void): Promise<boolean> {
   const list = await bookmarkList(repo, cfg);
   const local = list.find((b) => b.name === MEMORY_BOOKMARK && b.remote === null);
   const upstream = remote === null ? undefined : list.find((b) => b.name === MEMORY_BOOKMARK && b.remote === remote);
   if (local === undefined) return false;
   if (!local.conflicted) return true;
-  if (upstream === undefined || upstream.conflicted) throw new Error("the memory bookmark is conflicted");
-  await bookmarkSet(repo, MEMORY_BOOKMARK, upstream.changeId, cfg);
+  if (upstream !== undefined && !upstream.conflicted) {
+    await bookmarkSet(repo, MEMORY_BOOKMARK, upstream.changeId, cfg);
+    return true;
+  }
+  const targets = `bookmarks(exact:"${MEMORY_BOOKMARK}")`;
+  const [change] = [...(await changes(cfg, repo, `${targets} ~ ::@`)), ...(await changes(cfg, repo, targets))];
+  if (change === undefined) throw new Error("the memory bookmark is conflicted and has no target");
+  await bookmarkSet(repo, MEMORY_BOOKMARK, change, cfg);
+  note(change);
   return true;
 }
 
@@ -55,6 +64,11 @@ async function followMemory(cfg: NodeConfig, repo: string): Promise<void> {
 async function fetchMemory(cfg: NodeConfig, repo: string, remote: string): Promise<void> {
   await fetch(repo, remote, [`exact:${MEMORY_BOOKMARK}`], cfg);
   await track(repo, MEMORY_BOOKMARK, remote, cfg);
+}
+
+/** Logs that a conflicted `memory` of `projectId` was resolved to `change`. */
+function resolved(projectId: string, log: Log): (change: string) => void {
+  return (change) => log(`meddle: git: memory of ${shortId(projectId)} had a conflicted bookmark; resolved to ${change}`);
 }
 
 /** The project's home and memory repo; throws when this node does not hold both. */
@@ -82,7 +96,7 @@ export async function syncMemoryBefore(deps: ReplicaDeps, projectId: string, liv
       if (!pool.net.isOnline(home)) throw new Error(`home ${remote} is offline`);
       await fetchMemory(cfg, repo, remote);
     }
-    if (await settleMemory(cfg, repo, remote)) await followMemory(cfg, repo);
+    if (await settleMemory(cfg, repo, remote, resolved(projectId, log))) await followMemory(cfg, repo);
   } catch (err) {
     log(`meddle: git: memory of ${shortId(projectId)} was not synced before the turn: ${oneLine(err)}`);
   }
@@ -105,7 +119,7 @@ export async function syncMemoryAfter(deps: ReplicaDeps, projectId: string, log:
     const remote = home === self ? null : shortId(home);
     const online = remote !== null && pool.net.isOnline(home);
     if (online) await fetchMemory(cfg, repo, remote);
-    const exists = await settleMemory(cfg, repo, remote);
+    const exists = await settleMemory(cfg, repo, remote, resolved(projectId, log));
     if (exists && !(await descends(cfg, repo, "@-", MEMORY_BOOKMARK))) {
       await jj(["rebase", "-b", "@", "-d", MEMORY_BOOKMARK], repo, cfg);
     }

@@ -7,12 +7,16 @@ import type { NodeConfig } from "../config";
 import { jj } from "../jj";
 import { paths } from "../paths";
 import type { PeerStream, PoolNet } from "../pool/net";
+import { shortId } from "../pool/ids";
 import { getProject } from "../projects/project";
+import { refreshTrunk } from "../projects/replicas";
 import { parseGitHeader, repoName, type GitService, type Repo } from "./wire";
 
 export type GitServeDeps = {
   db: Database;
   cfg: NodeConfig;
+  /** This node's id: a fetch of a project homed here refreshes its `trunk` first. */
+  selfId: string;
   isMember(id: string): boolean;
   /** Where a refused stream is logged (`meddle: git: …`); the runtime passes a deduplicating sink. */
   log?(line: string): void;
@@ -67,6 +71,14 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
   if (repo === null || gitDir === null) {
     deps.log?.(`meddle: git: unknown repo ${repoName(request.repo)}`);
     return refuse(s);
+  }
+
+  // A peer fetching a project homed here gets the `trunk` the home itself would start a task from.
+  if (request.service === "upload-pack" && request.repo.kind === "project" && getProject(deps.db, request.repo.id)?.home === deps.selfId) {
+    await refreshTrunk(deps.cfg, repo).catch((err: unknown) => {
+      const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+      deps.log?.(`meddle: git: trunk of ${shortId(request.repo.id)} was not refreshed: ${message}`);
+    });
   }
 
   const proc = Bun.spawn(command(deps.cfg, request.service, gitDir), {

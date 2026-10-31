@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
 import { ensureReplica, type ReplicaDeps } from "../src/projects/replicas";
 import { setupNode } from "./helpers";
-import { peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+import { peerReady, startPoolNode, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 const depsOf = (n: GitPoolNode): ReplicaDeps => ({ cfg: n.cfg, db: n.db, pool: n.pool });
 
@@ -131,5 +131,48 @@ test("with MEDDLE_FIXTURE_MEMORY=1 the stand-in appends the first prompt to the 
     expect(await read(`${paths(cfg).memory(project.id)}/MEMORY.md`)).toBe("Remember the tide tables.\n");
   } finally {
     await harness.close();
+  }
+}, 15_000);
+
+test("a conflicted memory bookmark on the home is resolved, and the next turn end moves memory as usual", async () => {
+  const A = await startPoolNode();
+  try {
+    const deps: ReplicaDeps = { cfg: A.cfg, db: A.db, pool: A.pool };
+    const id = A.project.id;
+    const mem = paths(A.cfg).memory(id);
+    const logs: string[] = [];
+    const log = (line: string) => { logs.push(line); };
+    const change = async (rev: string) => (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], mem, A.cfg)).trim();
+    await writeFile(`${mem}/MEMORY.md`, "- base\n");
+    await syncMemoryAfter(deps, id, log);
+    // A local commit `@` descends from, and a sibling it does not; two divergent operations point `memory` at each.
+    await writeFile(`${mem}/LOCAL.md`, "- local\n");
+    await jj(["commit", "-m", "local"], mem, A.cfg);
+    const local = await change("@-");
+    await jj(["new", "memory", "--no-edit", "-m", "sibling"], mem, A.cfg);
+    const sibling = await change(`children(memory) ~ ${local}`);
+    const op = (await jj(["op", "log", "-n", "1", "--no-graph", "-T", "id"], mem, A.cfg)).trim();
+    await jj(["--at-op", op, "bookmark", "set", "memory", "-r", local], mem, A.cfg);
+    await jj(["--at-op", op, "bookmark", "set", "memory", "-r", sibling], mem, A.cfg);
+    expect((await bookmarkList(mem, A.cfg)).find((b) => b.name === "memory" && b.remote === null)?.conflicted).toBe(true);
+
+    await syncMemoryBefore(deps, id, false, log);
+    expect(logs).toEqual([`meddle: git: memory of ${shortId(id)} had a conflicted bookmark; resolved to ${sibling}`]);
+    expect((await bookmarkList(mem, A.cfg)).find((b) => b.name === "memory" && b.remote === null)).toMatchObject({ changeId: sibling, conflicted: false });
+    // The local side was carried across onto the chosen one.
+    expect(await change(`::@ & ${sibling}`)).toBe(sibling);
+    expect(await read(`${mem}/LOCAL.md`)).toBe("- local\n");
+
+    await writeFile(`${mem}/AFTER.md`, "- after\n");
+    await syncMemoryAfter(deps, id, log);
+    expect(await change("memory")).toBe(await change("@-"));
+    expect(await jj(["log", "-r", "@-", "--no-graph", "-T", "description"], mem, A.cfg)).toBe(`memory from ${shortId(A.id)}\n`);
+    expect(await change(`::memory & ${sibling}`)).toBe(sibling);
+    expect(await change(`::memory & ${local}`)).toBe(local);
+    expect(logs).toHaveLength(1);
+  } finally {
+    await A.close();
+    A.db.close();
+    await rm(A.home, { recursive: true, force: true });
   }
 }, 15_000);

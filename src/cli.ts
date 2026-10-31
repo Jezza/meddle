@@ -111,7 +111,7 @@ async function serve(): Promise<number> {
     const gitSocket = (node.gitSocket = new GitSocket(cfg, pool.net));
     await gitSocket.start();
     const logGit = dedupe((line) => console.error(line));
-    node.stopGit = acceptGitStreams(pool.net, { db, cfg, isMember: (id) => pool.store.isMember(id), log: logGit });
+    node.stopGit = acceptGitStreams(pool.net, { db, cfg, selfId: pool.identity.id, isMember: (id) => pool.store.isMember(id), log: logGit });
     const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();

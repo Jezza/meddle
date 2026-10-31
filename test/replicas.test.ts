@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
 import { rm, writeFile } from "node:fs/promises";
 import { paths } from "../src/config";
-import { bookmarkList, fetch, isJjRepo, jj, remoteList } from "../src/jj";
+import { bookmarkList, fetch, initColocated, isJjRepo, jj, remoteList } from "../src/jj";
 import { shortId } from "../src/pool/identity";
-import { getProject, listProjects, type Project } from "../src/projects/project";
+import { addProjectFromFolder, getProject, listProjects, type Project } from "../src/projects/project";
 import { ensureRemote, ensureReplica, fetchBookmarks, pushBookmark, remoteHeads, trunkFor, type ReplicaDeps } from "../src/projects/replicas";
-import { peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+import { peerReady, startPoolNode, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 const depsOf = (n: GitPoolNode): ReplicaDeps => ({ cfg: n.cfg, db: n.db, pool: n.pool });
 
@@ -13,13 +13,18 @@ async function changeOf(node: GitPoolNode, repo: string, rev: string): Promise<s
   return (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], repo, node.cfg)).trim();
 }
 
-/** Gives A's project a commit with a file and points `trunk` at it; returns its change id. */
-async function makeTrunk(A: GitPoolNode): Promise<string> {
+/** Gives A's project a commit with a file and points `main` (not `trunk`) at it; returns its change id. */
+async function makeMain(A: GitPoolNode): Promise<string> {
   const repo = A.project.replica;
   await writeFile(`${repo}/README`, "hello\n");
   await jj(["commit", "-m", "init"], repo, A.cfg);
-  await jj(["bookmark", "set", "trunk", "-r", "@-"], repo, A.cfg);
-  return changeOf(A, repo, "trunk");
+  await jj(["bookmark", "set", "main", "-r", "@-"], repo, A.cfg);
+  return changeOf(A, repo, "main");
+}
+
+/** The change A's local bookmark `name` points at, or undefined. */
+async function localOn(node: GitPoolNode, repo: string, name: string): Promise<string | undefined> {
+  return (await bookmarkList(repo, node.cfg)).find((b) => b.name === name && b.remote === null)?.changeId;
 }
 
 /** A commit with `file` on top of `parent` in B's `repo`; returns its change id. */
@@ -33,7 +38,9 @@ async function commitOn(node: GitPoolNode, repo: string, parent: string, file: s
 test("ensureReplica clones a project and its memory from home, and trunkFor follows the home's trunk", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
-    const trunk = await makeTrunk(A);
+    const trunk = await makeMain(A);
+    // A's project has `main` and no `trunk`: a peer's fetch makes the home point `trunk` at it first.
+    expect(await localOn(A, A.project.replica, "trunk")).toBeUndefined();
     const id = A.project.id;
     const shortA = shortId(A.id);
     const memoryA = paths(A.cfg).memory(id);
@@ -57,10 +64,15 @@ test("ensureReplica clones a project and its memory from home, and trunkFor foll
     const onB = await trunkFor(depsOf(B), project);
     expect(onB).toBe(`trunk@${shortA}`);
     expect(await changeOf(B, project.replica, onB)).toBe(trunk);
+    expect(await localOn(A, A.project.replica, "trunk")).toBe(trunk);
     expect(await trunkFor(depsOf(A), A.project)).toBe(trunk);
+    // A moves `main` on; B's next trunkFor sees it.
+    const next = await commitOn(A, A.project.replica, "main", "next");
+    await jj(["bookmark", "set", "main", "-r", next], A.project.replica, A.cfg);
+    expect(await changeOf(B, project.replica, await trunkFor(depsOf(B), project))).toBe(next);
     // A folder project with no commits starts at root.
     expect(await trunkFor(depsOf(B), B.project)).toBe("root()");
-    expect(await remoteHeads(B.cfg, project.replica)).toContainEqual({ name: "trunk", remote: shortA, changeId: trunk, conflicted: false });
+    expect(await remoteHeads(B.cfg, project.replica)).toContainEqual({ name: "trunk", remote: shortA, changeId: next, conflicted: false });
 
     // A second call is a no-op.
     expect(await ensureReplica(depsOf(B), id)).toEqual(project);
@@ -89,7 +101,7 @@ test("ensureReplica clones a project and its memory from home, and trunkFor foll
 test("pushBookmark reaches the home fresh, over an untracked remote bookmark, and after the home's copy moved", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
-    const trunk = await makeTrunk(A);
+    const trunk = await makeMain(A);
     const shortA = shortId(A.id);
     await peerReady(B, A);
     const project = await ensureReplica(depsOf(B), A.project.id);
@@ -102,7 +114,7 @@ test("pushBookmark reaches the home fresh, over an untracked remote bookmark, an
     expect(await onA("meddle/task/t1/a")).toEqual({ name: "meddle/task/t1/a", remote: null, changeId: first, conflicted: false });
 
     // 2. A fetch left an untracked `meddle/task/t2/a@<shortA>`.
-    await jj(["bookmark", "set", "meddle/task/t2/a", "-r", "trunk"], A.project.replica, A.cfg);
+    await jj(["bookmark", "set", "meddle/task/t2/a", "-r", "main"], A.project.replica, A.cfg);
     await fetch(repo, shortA, ["glob:meddle/task/*"], B.cfg);
     expect(await bookmarkList(repo, B.cfg)).toContainEqual({ name: "meddle/task/t2/a", remote: shortA, changeId: trunk, conflicted: false });
     const second = await commitOn(B, repo, trunk, "two");
@@ -118,5 +130,44 @@ test("pushBookmark reaches the home fresh, over an untracked remote bookmark, an
     expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
   } finally {
     await close();
+  }
+}, 15_000);
+
+test("on the home, trunk follows the newest of trunk and main, and a project added on main gets a trunk", async () => {
+  const A = await startPoolNode();
+  try {
+    const deps: ReplicaDeps = { cfg: A.cfg, db: A.db, pool: A.pool };
+    const folder = `${A.home}/onmain`;
+    await initColocated(folder, A.cfg);
+    await writeFile(`${folder}/README`, "hello\n");
+    await jj(["commit", "-m", "init"], folder, A.cfg);
+    await jj(["bookmark", "set", "main", "-r", "@-"], folder, A.cfg);
+    const main = (await jj(["log", "-r", "main", "--no-graph", "-T", "change_id"], folder, A.cfg)).trim();
+    const project = await addProjectFromFolder(A.cfg, A.db, folder, A.id, "onmain");
+    const local = async (name: string) => (await bookmarkList(folder, A.cfg)).find((b) => b.name === name && b.remote === null)?.changeId;
+    expect(await local("trunk")).toBe(main);
+    expect(await trunkFor(deps, project)).toBe(main);
+
+    const commit = async (parent: string, file: string) => {
+      await jj(["new", parent], folder, A.cfg);
+      await writeFile(`${folder}/${file}`, `${file}\n`);
+      await jj(["commit", "-m", file], folder, A.cfg);
+      return (await jj(["log", "-r", "@-", "--no-graph", "-T", "change_id"], folder, A.cfg)).trim();
+    };
+    // `trunk` ahead of `main`: trunk stays.
+    const ahead = await commit(main, "ahead");
+    await jj(["bookmark", "set", "trunk", "-r", ahead], folder, A.cfg);
+    expect(await trunkFor(deps, project)).toBe(ahead);
+    expect(await local("trunk")).toBe(ahead);
+    expect(await local("main")).toBe(main);
+    // `main` ahead of `trunk`: trunk follows main.
+    const newer = await commit(ahead, "newer");
+    await jj(["bookmark", "set", "main", "-r", newer], folder, A.cfg);
+    expect(await trunkFor(deps, project)).toBe(newer);
+    expect(await local("trunk")).toBe(newer);
+  } finally {
+    await A.close();
+    A.db.close();
+    await rm(A.home, { recursive: true, force: true });
   }
 }, 15_000);

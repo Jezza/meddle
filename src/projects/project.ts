@@ -5,6 +5,7 @@ import type { Subscribable } from "@earendil-works/chord";
 import { paths, type NodeConfig } from "../config";
 import { cloneColocated, initColocated, isJjRepo } from "../jj";
 import { ensureMemoryReplica, importMemory } from "../memory";
+import { refreshTrunk } from "./replicas";
 import { getProjectRow, insertProject, listProjectRows, newId, type ProjectRow } from "../store/records";
 
 export type Project = {
@@ -65,12 +66,16 @@ async function isDirectory(path: string): Promise<boolean> {
   }
 }
 
-/** Adds the project in `folder` (made a colocated jj repo when it is not one), with its home `home` (this node). */
+/**
+ * Adds the project in `folder` (made a colocated jj repo when it is not one), with its home `home` (this node); its
+ * `trunk` bookmark follows its latest trunk-like revision (`refreshTrunk`).
+ */
 export async function addProjectFromFolder(cfg: NodeConfig, db: Database, folder: string, home: string, name?: string): Promise<Project> {
   const path = resolve(folder);
   if (!(await isDirectory(path))) throw new Error(`not a directory: ${folder}`);
   const id = newId();
   if (!(await isJjRepo(path))) await initColocated(path, cfg);
+  await refreshTrunk(cfg, path);
   await ensureMemoryReplica(cfg, id);
   await importMemory(cfg, id, path);
   return save(db, { id, name: name ?? basename(path), source: { kind: "folder", path }, replica: path, home });
@@ -81,11 +86,15 @@ function upstreamName(url: string): string {
   return last.replace(/\.git$/, "");
 }
 
-/** Adds a project cloned from `url` into the replicas directory, with its home `home` (this node). */
+/**
+ * Adds a project cloned from `url` into the replicas directory, with its home `home` (this node); its `trunk`
+ * bookmark follows the upstream's trunk (`refreshTrunk`).
+ */
 export async function addProjectFromUpstream(cfg: NodeConfig, db: Database, url: string, home: string, name?: string): Promise<Project> {
   const id = newId();
   const replica = paths(cfg).replica(id);
   await cloneColocated(url, replica, cfg);
+  await refreshTrunk(cfg, replica);
   await ensureMemoryReplica(cfg, id);
   return save(db, { id, name: name ?? upstreamName(url), source: { kind: "upstream", url }, replica, home });
 }

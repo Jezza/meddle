@@ -132,16 +132,25 @@ export async function remoteHeads(cfg: NodeConfig, replica: string): Promise<Arr
 const HOME_TRUNK = 'latest(trunk() ~ root() | bookmarks(exact:"trunk") | bookmarks(exact:"main") | bookmarks(exact:"master"))';
 
 /**
- * The revision a new task of `project` starts from: on the home, the change `HOME_TRUNK` resolves to (`root()` when
+ * On a project's home: points the local `trunk` bookmark at the latest trunk-like revision (`HOME_TRUNK`), so that
+ * other nodes, which fetch only `trunk`, start tasks where the home would. Returns that change id, or null (and
+ * leaves the bookmarks alone) when nothing resolves.
+ */
+export async function refreshTrunk(cfg: NodeConfig, replica: string): Promise<string | null> {
+  const [change] = (await jj(["log", "-r", HOME_TRUNK, "--no-graph", "-T", 'change_id ++ "\\n"'], replica, cfg)).split("\n");
+  if (change === undefined || change === "") return null;
+  await bookmarkSet(replica, "trunk", change, cfg);
+  return change;
+}
+
+/**
+ * The revision a new task of `project` starts from: on the home, the change `refreshTrunk` resolves (`root()` when
  * nothing does); elsewhere `trunk@<shortId(home)>` after fetching it (`root()` when the home has no `trunk`).
  * Rejects `home <shortId> is offline` on another node while the home cannot be reached.
  */
 export async function trunkFor(deps: ReplicaDeps, project: Project): Promise<string> {
   const { cfg, pool } = deps;
-  if (project.home === pool.identity.id) {
-    const change = (await jj(["log", "-r", HOME_TRUNK, "--no-graph", "-T", "change_id"], project.replica, cfg)).trim();
-    return change === "" ? "root()" : change;
-  }
+  if (project.home === pool.identity.id) return (await refreshTrunk(cfg, project.replica)) ?? "root()";
   const remote = shortId(project.home);
   if (!pool.net.isOnline(project.home)) throw new Error(`home ${remote} is offline`);
   try {
