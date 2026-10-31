@@ -34,7 +34,14 @@ export class IrohLink implements Link {
 
   constructor(private readonly peer: PeerStream, options: { tap?: LinkTap } = {}) {
     this.tap = options.tap;
-    void this.run();
+    // Nothing in `run` is expected to reject; should a close handler throw, the link still ends and the process lives.
+    void this.run().catch((err: unknown) => {
+      try {
+        this.end(`link failed: ${messageOf(err)}`);
+      } catch {
+        // A close handler threw again: the link is marked done either way.
+      }
+    });
   }
 
   get closed(): boolean {
