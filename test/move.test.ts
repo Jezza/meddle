@@ -614,6 +614,48 @@ test("a source that stops after the receipt finishes the move when it starts aga
   }
 }, 15_000);
 
+test("a target that stops answering after the receipt is asked again until it answers; the move never rolls back meanwhile", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    let calls = 0;
+    const cut = Promise.withResolvers<void>();
+    B.hooks.beforeActivate = async () => {
+      calls += 1;
+      if (calls > 1) return;
+      // The link goes while B handles the first activation: whatever B answers, A hears nothing.
+      A.net.unwatch(B.id, "bye");
+      B.net.unwatch(A.id, "bye");
+      while (A.net.isOnline(B.id) || B.net.isOnline(A.id)) await Bun.sleep(10);
+      cut.resolve();
+      throw new Error("not activated this time");
+    };
+    await A.runner.moveTo(m.id, B.id, false);
+    await cut.promise;
+    await Bun.sleep(3000);
+    expect(getTask(A.db, m.id)!.state).toBe("moving");
+    expect(A.runner.moveState(m.id)).toEqual({ to: B.id, phase: "commit", error: null });
+    expect(existsSync(paths(A.cfg).taskManifest(m.id))).toBe(true);
+    expect(A.logs.filter((l) => l.includes(" failed at "))).toEqual([]);
+    expect(A.logs.some((l) => l.startsWith(`meddle: move: ${m.id} waits for ${shortId(B.id)} to activate it: `))).toBe(true);
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "receiving", receiving_from: A.id });
+
+    // B is back: the next attempt activates the task, and the move completes.
+    A.net.watch(B.id);
+    B.net.watch(A.id);
+    B.net.offerAddress(B.pool.store.row(A.id)!.lastAddr!);
+    A.net.offerAddress(A.pool.store.row(B.id)!.lastAddr!);
+    await moveSettled(A.harness.harness);
+    expect(calls).toBe(2);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
+  } finally {
+    await close();
+  }
+}, 15_000);
+
 test("a move is refused for this node, an offline target, one that hosts no tasks, or another or unknown Claude Code version", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {

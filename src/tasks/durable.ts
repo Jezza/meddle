@@ -3,7 +3,7 @@ import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { PermissionMode, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { forbidden } from "@earendil-works/chord";
+import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
@@ -565,16 +565,28 @@ export class TaskRunner {
   /**
    * Makes a task received from `from` live here (`idle`); a follow-up joins the front of its queued prompts, which
    * then run one turn each, in order (`startQueued`). A task already activated is a no-op: the sender's commit ran
-   * again. Refused `forbidden` unless the task is being received from `from`.
+   * again. Refused `forbidden` unless the task is being received from `from`. Every answer is definite, so the sender
+   * can tell it from a lost one: `ok: true` when the task is live here, `ok: false` when activating it failed and it
+   * is not (its received copy stays, for the sender to abandon).
    */
-  async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: true }> {
+  async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: boolean }> {
     return serialised(taskKey(taskId), async () => {
-      await this.#deps.hooks?.beforeActivate?.(taskId);
-      const current = getTask(this.#db, taskId);
-      if (current !== null && current.receiving_from === null && ACTIVE_STATES.has(current.state)) return { ok: true as const };
-      const row = this.#receivingFrom(taskId, from);
-      const queued = [...(followUp === null ? [] : [followUp]), ...queuedOf(row)];
-      updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: queued.length === 0 ? null : JSON.stringify(queued) });
+      const live = () => {
+        const current = getTask(this.#db, taskId);
+        return current !== null && current.receiving_from === null && ACTIVE_STATES.has(current.state);
+      };
+      try {
+        await this.#deps.hooks?.beforeActivate?.(taskId);
+        if (live()) return { ok: true };
+        const row = this.#receivingFrom(taskId, from);
+        const queued = [...(followUp === null ? [] : [followUp]), ...queuedOf(row)];
+        updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: queued.length === 0 ? null : JSON.stringify(queued) });
+      } catch (err) {
+        if (isChordError(err, "forbidden")) throw err;
+        if (live()) return { ok: true };
+        this.#log(`meddle: move: could not activate ${taskId} from ${shortId(from)}: ${messageOf(err)}`);
+        return { ok: false };
+      }
       this.#emitState(taskId, "idle");
       try {
         // However the sender's last turn ended, this one starts the task's stay here: it is never a rerun of that.
@@ -583,7 +595,7 @@ export class TaskRunner {
         // The task is here now; its prompts stay queued, and the next prompt starts them.
         this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
       }
-      return { ok: true as const };
+      return { ok: true };
     });
   }
 
