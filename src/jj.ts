@@ -124,12 +124,22 @@ export type Bookmark = { name: string; remote: string | null; changeId: string; 
 const BOOKMARK_TEMPLATE = 'if(present, name ++ "\\t" ++ remote ++ "\\t" ++ if(normal_target, normal_target.change_id(), "") ++ "\\t" ++ conflict ++ "\\n")';
 
 /**
+ * Brings a colocated repo's git refs into jj without snapshotting the working copy: what peers pushed into its `.git`
+ * and what the user did with git. jj imports them by itself only in a command that snapshots; a read run with
+ * `--ignore-working-copy` runs this first. Adds no operation when nothing changed.
+ */
+export async function gitImport(repo: string, cfg?: NodeConfig): Promise<void> {
+  await jj(["--ignore-working-copy", "git", "import"], repo, cfg);
+}
+
+/**
  * Every local and remote bookmark (not the colocated `git` remote, not a local bookmark that was deleted) with the
- * change it points at; a conflicted bookmark has `changeId` "" and `conflicted` true. A read that never snapshots the
- * working copy (`--ignore-working-copy`): a folder project's replica is the user's own checkout, and a snapshot moves
- * no bookmark to another change.
+ * change it points at; a conflicted bookmark has `changeId` "" and `conflicted` true. The git refs are imported first
+ * (`gitImport`), then read without snapshotting the working copy: a folder project's replica is the user's own
+ * checkout, and a snapshot moves no bookmark to another change.
  */
 export async function bookmarkList(repo: string, cfg?: NodeConfig): Promise<Bookmark[]> {
+  await gitImport(repo, cfg);
   const out = await jj(["bookmark", "list", "--ignore-working-copy", "--all-remotes", "-T", BOOKMARK_TEMPLATE], repo, cfg);
   const list: Bookmark[] = [];
   for (const line of out.split("\n")) {

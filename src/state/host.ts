@@ -360,7 +360,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("taskStates", states, ({ taskId }, ctx) => {
       if (taskHasProject(taskId, id)) return refreshHeads(ctx);
     });
-    // Bookmarks a peer pushes here, or a fetch elsewhere, tell nothing: a slow re-read catches them.
+    // Bookmarks a peer pushes into the replica's `.git`, or the user's git, tell nothing: a slow re-read (which imports
+    // the git refs first) catches them.
     self.on("ticks", headTicks, (_event, ctx) => refreshHeads(ctx));
     return {
       variant: "default",

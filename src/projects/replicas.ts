@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { paths, type NodeConfig } from "../config";
 import { repoName, type Repo } from "../git/wire";
-import { bookmarkList, bookmarkSet, cloneColocated, fetch, isJjRepo, jj, push, remoteAdd, remoteList, track } from "../jj";
+import { bookmarkList, bookmarkSet, cloneColocated, fetch, gitImport, isJjRepo, jj, push, remoteAdd, remoteList, track } from "../jj";
 import { cloneMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
 import { repoKey, serialised } from "../serial";
@@ -140,7 +140,9 @@ const HOME_TRUNK = 'latest(trunk() ~ root() | bookmarks(exact:"trunk") | bookmar
  * leaves the bookmarks alone) when nothing resolves.
  */
 export async function refreshTrunk(cfg: NodeConfig, replica: string): Promise<string | null> {
-  // A read that never snapshots the working copy: a folder project's replica is the user's own checkout.
+  // What git moved (a pull or commit in the checkout, a push from a peer) first, then a read that never snapshots the
+  // working copy: a folder project's replica is the user's own checkout.
+  await gitImport(replica, cfg);
   const [change] = (await jj(["log", "--ignore-working-copy", "-r", HOME_TRUNK, "--no-graph", "-T", 'change_id ++ "\\n"'], replica, cfg)).split("\n");
   if (change === undefined || change === "") return null;
   await bookmarkSet(replica, "trunk", change, cfg);
