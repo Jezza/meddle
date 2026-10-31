@@ -1,6 +1,6 @@
 // src/metrics.ts — the service's own footprint and each task's process tree, from /proc (Linux).
 // On other platforms the /proc readers return empty/zero values instead of throwing.
-import { readdirSync, readFileSync, readlinkSync, statfsSync } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync, realpathSync, statfsSync } from "node:fs";
 import { cpus } from "node:os";
 
 const linux = process.platform === "linux";
@@ -69,10 +69,15 @@ function walkTree(pid: number): Array<StatEntry & { depth: number }> {
   }
   const out: Array<StatEntry & { depth: number }> = [];
   const queue = [{ ...root, depth: 0 }];
+  const seen = new Set([pid]); // a ppid cycle from pid reuse mid-scan must not loop forever
   for (let i = 0; i < queue.length; i++) {
     const cur = queue[i]!;
     out.push(cur);
-    for (const c of children.get(cur.pid) ?? []) queue.push({ ...c, depth: cur.depth + 1 });
+    for (const c of children.get(cur.pid) ?? []) {
+      if (seen.has(c.pid)) continue;
+      seen.add(c.pid);
+      queue.push({ ...c, depth: cur.depth + 1 });
+    }
   }
   return out;
 }
@@ -101,14 +106,17 @@ export function serviceRssKb(): number {
 /**
  * Task id → pid for this process's descendants whose cwd is `<taskRoot>/<taskId>` or below it.
  * The shallowest match per task wins (the `claude` child, not its tool subprocesses).
+ * The root is resolved first, since `/proc/<pid>/cwd` reports the real path.
  */
 export function findTaskPids(taskRoot: string): Record<string, number> {
-  const prefix = taskRoot.replace(/\/+$/, "") + "/";
+  let root = taskRoot;
+  try { root = realpathSync(taskRoot); } catch {}
+  const prefix = root.replace(/\/+$/, "") + "/";
   const out: Record<string, number> = {};
   for (const p of walkTree(process.pid).slice(1)) {
     let cwd: string;
     try { cwd = readlinkSync(`/proc/${p.pid}/cwd`); } catch { continue; }
-    if (!cwd.startsWith(prefix)) continue;
+    if (cwd.endsWith(" (deleted)") || !cwd.startsWith(prefix)) continue;
     const taskId = cwd.slice(prefix.length).split("/")[0]!;
     if (taskId && !(taskId in out)) out[taskId] = p.pid;
   }

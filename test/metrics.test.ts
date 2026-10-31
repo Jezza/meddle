@@ -1,6 +1,6 @@
 // test/metrics.test.ts
 import { test, expect } from "bun:test";
-import { mkdtemp, mkdir, realpath } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink } from "node:fs/promises";
 import { processTree, sampleTask, serviceRssKb, findTaskPids, MetricsSampler, type NodeMetrics } from "../src/metrics";
 
 function killTree(pid: number) {
@@ -30,15 +30,17 @@ test("processTree of a vanished pid is empty", () => {
 });
 
 test("findTaskPids maps a task's cwd to its shallowest descendant", async () => {
-  const root = await realpath(await mkdtemp("/tmp/meddle-metrics-"));
+  const base = await mkdtemp("/tmp/meddle-metrics-");
+  const root = `${base}/real`;
   await mkdir(`${root}/task1/sub`, { recursive: true });
   await mkdir(`${root}/task10`, { recursive: true });
+  await symlink(root, `${base}/link`); // /proc/<pid>/cwd reports the resolved path
   const inTask = Bun.spawn(["sh", "-c", "cd sub && sleep 5 & sleep 5"], { cwd: `${root}/task1` });
   const lookalike = Bun.spawn(["sleep", "5"], { cwd: `${root}/task10` });
   const elsewhere = Bun.spawn(["sleep", "5"], { cwd: root });
   try {
     await Bun.sleep(100);
-    const found = findTaskPids(root);
+    const found = findTaskPids(`${base}/link`);
     expect(found.task1).toBe(inTask.pid);
     expect(found.task10).toBe(lookalike.pid);
     expect(Object.values(found)).not.toContain(elsewhere.pid);
@@ -52,7 +54,7 @@ test("findTaskPids maps a task's cwd to its shallowest descendant", async () => 
 test("MetricsSampler samples the node and each task, and stops cleanly", async () => {
   const dataDir = await mkdtemp("/tmp/meddle-metrics-");
   const p = Bun.spawn(["sleep", "5"], {});
-  const s = new MetricsSampler({ taskPids: () => ({ a: p.pid, b: process.pid }), intervalMs: 60_000, dataDir });
+  const s = new MetricsSampler({ taskPids: () => ({ a: p.pid, b: process.pid }), intervalMs: 20, dataDir });
   try {
     expect(s.latest()).toBeNull();
     s.onSample(() => { throw new Error("a broken listener must not break sampling"); });
@@ -70,6 +72,12 @@ test("MetricsSampler samples the node and each task, and stops cleanly", async (
     expect(m.eventLoopLagMs).toBeGreaterThanOrEqual(0);
     expect(m.load1).toBeGreaterThanOrEqual(0);
     expect(Number.isNaN(Date.parse(m.at))).toBe(false);
+
+    let after = 0;
+    s.stop();
+    s.onSample(() => { after++; });
+    await Bun.sleep(60); // three intervals
+    expect(after).toBe(0);
   } finally {
     s.stop();
     p.kill();
