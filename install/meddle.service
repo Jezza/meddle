@@ -6,6 +6,8 @@ ExecStart={{bun}} run src/cli.ts serve
 WorkingDirectory={{checkout}}
 Restart=on-failure
 RestartSec=2
+# The pool's iroh endpoint binds a UDP socket on iroh's default address; to pin it (for a firewall rule), add
+# Environment=MEDDLE_IROH_BIND=<ip>:<port>
 
 [Install]
 WantedBy=default.target
