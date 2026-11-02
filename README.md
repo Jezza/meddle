@@ -84,6 +84,24 @@ fails with `no usable token`, and `task new` is refused the same way. `token lis
 status with its time and reason, expiry) and then `active: <id>`, the token a turn starting now would use, or
 `active: none`.
 
+During a turn, a `rate_limit_event` whose status is `rejected`, or an assistant message whose error is `rate_limit`,
+marks the turn's token `exhausted` until the limit's reset time (one hour from now when the event gives none), with
+the limit's type as its reason. The errors `billing_error`, `account_on_hold`, `authentication_failed`,
+`oauth_org_not_allowed` and `verification_required` mark it `disabled` until `token enable`. The mark replicates, so
+every node of the pool stops using that token. If another token is usable, the turn then runs once more with it, in
+the same session, sending this instead of the original message:
+
+> The previous attempt at this message failed because the login it used hit a usage limit; meddle switched to another
+> login. If you had not started on it, start now; otherwise continue where you left off and do not redo finished work.
+
+(The original message is sent again when the session has no transcript yet to resume.) The failed attempt stays in
+the task's log, followed by a status line `Token <label> exhausted until <time>; switching login`. A turn reruns for
+its token at most once. When no other token is usable, or the rerun's token fails too, the turn ends there and the
+node raises a notification of kind `token` (`token <label> exhausted until <time>; no other token`, `token <label>
+disabled: <reason>; no other token`), instead of a `failed` one. A turn that finds no usable token at all fails with
+`no usable token` and raises a `token` notification saying so. A service restart between the fault and the rerun
+reruns the turn once with the next token when it starts again.
+
 The token commands work on the node's database and secrets directory directly, with or without a running node, so a
 value never goes over the node's socket; when a node runs, they tell it and it tells the pool. `token list` reads the
 database read-only and, before the node's first start, prints only `active: none`.

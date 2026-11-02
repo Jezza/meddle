@@ -2,7 +2,9 @@
 // Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause before `result` until stdin ends or,
 // as Claude Code ends an interrupted turn, an `interrupt` arrives: then the `result` comes as `error_during_execution`
 // and the stand-in exits),
-// MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`).
+// MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`),
+// MEDDLE_FIXTURE_BY_TOKEN=<token>=<path>,<token>=<path> (the recording of the entry whose token is the
+// CLAUDE_CODE_OAUTH_TOKEN this run got; MEDDLE_FIXTURE when none is).
 // Any argv is accepted; only `--session-id` / `--resume` are read (see `transcribe`). Dependency-free so it
 // starts fast.
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
@@ -13,7 +15,16 @@ type Frame = { type: string; subtype?: string; message?: { content?: unknown }; 
 type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
 type Step = { need: Need } | { emit: string; frame: Frame };
 
-const fixture = process.env.MEDDLE_FIXTURE;
+/** The recording for the token this run got, from MEDDLE_FIXTURE_BY_TOKEN, if it lists that token. */
+function fixtureForToken(): string | undefined {
+  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  for (const entry of (process.env.MEDDLE_FIXTURE_BY_TOKEN ?? "").split(",")) {
+    const at = entry.indexOf("=");
+    if (at > 0 && entry.slice(0, at) === token) return entry.slice(at + 1);
+  }
+  return undefined;
+}
+const fixture = fixtureForToken() ?? process.env.MEDDLE_FIXTURE;
 if (!fixture) { process.stderr.write("replay.ts: MEDDLE_FIXTURE is not set\n"); process.exit(2); }
 const stall = process.env.MEDDLE_FIXTURE_STALL === "1";
 const memory = process.env.MEDDLE_FIXTURE_MEMORY === "1";

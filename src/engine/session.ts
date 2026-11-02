@@ -18,7 +18,67 @@ export type MeddleEvent =
   | { type: "meddle"; subtype: "turn_started"; at: string; resume: boolean }
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
   | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
-  | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput };
+  | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput }
+  /**
+   * The turn's login failed it (`fault`), or no token was usable (`kind: "none"`, no token named): appended once the
+   * turn has settled. `rerun` says whether the turn runs again with the next token.
+   */
+  | {
+    type: "meddle";
+    subtype: "token_fault";
+    at: string;
+    tokenId: string | null;
+    label: string | null;
+    fault: TokenFault | { kind: "none" };
+    rerun: boolean;
+  };
+
+/**
+ * What a turn's messages say about the login it ran with: it hit a usage limit (`exhausted`, usable again `until`, an
+ * ISO time when the SDK said, and the limit's `type`), or the login itself is refused (`disabled`, with the SDK's error).
+ */
+export type TokenFault =
+  | { kind: "exhausted"; until: string | null; type: string | null }
+  | { kind: "disabled"; reason: string };
+
+/** Assistant errors that say the login cannot be used at all, rather than that it is out of quota for now. */
+const DISABLING_ERRORS: readonly string[] = [
+  "billing_error", "account_on_hold", "authentication_failed", "oauth_org_not_allowed", "verification_required",
+];
+
+/**
+ * The token fault one SDK message reports, or null: a `rate_limit_event` whose `status` is `rejected` (its
+ * `overageStatus` says nothing about the login and is ignored), an assistant message whose `error` is `rate_limit`, or
+ * one whose `error` is a login-class error. `resetsAt` is unix seconds as recorded, milliseconds when it is that large.
+ */
+export function tokenFaultOf(m: SDKMessage): TokenFault | null {
+  if (m.type === "rate_limit_event") {
+    const info = m.rate_limit_info as { status?: unknown; resetsAt?: unknown; rateLimitType?: unknown } | undefined;
+    if (info?.status !== "rejected") return null;
+    const resets = typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt) && info.resetsAt > 0
+      ? (info.resetsAt < 1e12 ? info.resetsAt * 1000 : info.resetsAt)
+      : null;
+    const until = resets === null || Number.isNaN(new Date(resets).getTime()) ? null : new Date(resets).toISOString();
+    return { kind: "exhausted", until, type: typeof info.rateLimitType === "string" ? info.rateLimitType : null };
+  }
+  if (m.type === "assistant") {
+    const error = (m as { error?: unknown }).error;
+    if (error === "rate_limit") return { kind: "exhausted", until: null, type: null };
+    if (typeof error === "string" && DISABLING_ERRORS.includes(error)) return { kind: "disabled", reason: error };
+  }
+  return null;
+}
+
+/**
+ * Of two faults in one turn, the one that says more: `disabled` over `exhausted`, an `exhausted` with a time over one
+ * without; else the first.
+ */
+function moreTelling(a: TokenFault | null, b: TokenFault): TokenFault {
+  if (a === null) return b;
+  if (a.kind === "disabled") return a;
+  if (b.kind === "disabled") return b;
+  return a.until === null && b.until !== null ? b : a;
+}
 
 /**
  * The event meddle records for a prompt or steer it sends: Claude Code does not echo the user's text back, so the
@@ -49,6 +109,11 @@ export type RunTurnArgs = {
   signal?: AbortSignal;
   /** Called after each appended event, meddle's own included, in seq order. */
   onMessage?: (m: SDKMessage | MeddleEvent, seq: number) => void;
+  /**
+   * Called at most once per turn, before `done` settles, when the turn's messages reported a token fault (the most
+   * telling one, see `tokenFaultOf`); not for an aborted turn.
+   */
+  onTokenFault?: (fault: TokenFault) => void;
 };
 
 /**
@@ -84,7 +149,28 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
     bestEffort(() => record(turnFailed(String(err))));
     throw err;
   }
-  return { query: q, done: drive(q, queue, args.signal, record) };
+  let fault: TokenFault | null = null;
+  const watch = (m: SDKMessage) => {
+    const found = tokenFaultOf(m);
+    if (found !== null) fault = moreTelling(fault, found);
+  };
+  /** Tells `onTokenFault` of the turn's fault, once, as `done` settles; a throw there never fails the turn. */
+  const tell = () => {
+    if (fault === null || args.onTokenFault === undefined) return;
+    try {
+      args.onTokenFault(fault);
+    } catch (err) {
+      console.error(`meddle: the token fault of task ${taskId}'s turn could not be handled:`, err);
+    }
+  };
+  const done = drive(q, queue, args.signal, record, watch).then(
+    (result) => { tell(); return result; },
+    (err: unknown) => {
+      if (!(err instanceof DOMException && err.name === "AbortError")) tell();
+      throw err;
+    },
+  );
+  return { query: q, done };
 }
 
 /** Appends an event to the task's log, then tells `onMessage`. */
@@ -100,6 +186,7 @@ async function drive(
   queue: InputQueue,
   signal: AbortSignal | undefined,
   record: (m: SDKMessage | MeddleEvent) => void,
+  watch: (m: SDKMessage) => void,
 ): Promise<SDKResultMessage> {
   const it = q[Symbol.asyncIterator]();
 
@@ -138,6 +225,7 @@ async function drive(
       if (step.done) { ended = true; break; }
       const m = step.value;
       record(m);
+      watch(m);
       if (m.type === "result" && result === undefined) {
         result = m;
         queue.end();

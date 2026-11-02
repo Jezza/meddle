@@ -1,12 +1,11 @@
 // Pool sync: each node holds every online peer's PoolObject (peer variant) over a chord link on iroh, merges the
 // peer's roster, settings and token rows into its own, pulls the value of each token it lists but lacks, by id, and
 // deletes the value of each token the pool removed.
-import { existsSync } from "node:fs";
 import type { Database } from "bun:sqlite";
 import { createHost, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
 import { PoolObject } from "../state/contracts";
-import { deleteTokenValue, listTokens, mergeTokens, tokenFile, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
+import { deleteTokenValue, hasTokenValue, listTokens, mergeTokens, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
 import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
 import { fromEndpoint, type PoolNet } from "./net";
@@ -140,7 +139,13 @@ export class PoolSync {
 
   private refreshInBackground(): void {
     this.refreshSelf().catch((err: unknown) => this.report(err));
-    this.retryPulls();
+    try {
+      this.retryPulls();
+    } catch (err) {
+      // A database or file error here must not escape the timer; the next refresh tries again.
+      const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+      (this.deps.log ?? ((line: string) => console.error(line)))(`meddle: tokens: retrying value pulls failed: ${message}`);
+    }
   }
 
   /**
@@ -152,7 +157,7 @@ export class PoolSync {
     if (this.stopped) return;
     const round = this.retries++;
     for (const t of listTokens(this.deps.db)) {
-      if (this.retrying.has(t.id) || existsSync(tokenFile(this.deps.cfg, t.id))) continue;
+      if (this.retrying.has(t.id) || hasTokenValue(this.deps.cfg, t.id)) continue;
       const holders = [...this.views.entries()].filter(([, v]) => v.fetchToken !== null && v.tokenIds.has(t.id));
       if (holders.length === 0) continue;
       const [peerId, view] = holders[round % holders.length]!;

@@ -10,7 +10,7 @@ import type { NodeConfig } from "../config";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
-import { promptEvent, runTurn, type MeddleEvent } from "../engine/session";
+import { promptEvent, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
 import { bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceForget } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
@@ -35,7 +35,7 @@ import {
   type TaskRow,
   type TaskSettings,
 } from "../store/records";
-import { pickToken } from "../token";
+import { markToken, pickToken } from "../token";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
 import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
@@ -50,7 +50,11 @@ export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" 
  * events after this seq, so a turn the sender ended (by moving the task) is never taken for one this node must carry on.
  */
 type TurnInput = { taskId: string; prompt: string; freshAfter?: number };
-type TurnCheckpoint = { phase: "run" } | { phase: "finish" };
+/**
+ * Where a turn is. `tokenRetries`: how often `run` was entered again after the turn's token failed it (at most once). A
+ * checkpoint stored by an older meddle has none: read it as 0.
+ */
+type TurnCheckpoint = { phase: "run"; tokenRetries?: number } | { phase: "finish" };
 /** Installed by `openHarness`: how a phase finds the Harness it runs in. */
 export type MeddleHooks = { harness(): Harness };
 
@@ -64,6 +68,8 @@ export type RunnerHooks = {
   beforeReceive?(taskId: string): void | Promise<void>;
   /** Called as a failed move restores the task's state; a throw stands for a failure there. */
   beforeRestore?(taskId: string): void | Promise<void>;
+  /** Called once a turn's `token_fault` with `rerun: true` is in the log, before the `run` phase enters itself again. */
+  afterTokenFault?(taskId: string): void | Promise<void>;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
   callMs?: number;
 };
@@ -111,21 +117,36 @@ export async function runnerFor(runtime: { hooks: TaskRuntime<unknown, unknown, 
 export const CARRY_ON_PROMPT =
   "The meddle service restarted while you were working on the previous message. Continue where you left off; do not redo work that is already done.";
 
+/** What the rerun of a turn whose token failed it sends into the resumed session instead of the turn's prompt. */
+export const TOKEN_RETRY_PROMPT =
+  "The previous attempt at this message failed because the login it used hit a usage limit; meddle switched to another login. If you had not started on it, start now; otherwise continue where you left off and do not redo finished work.";
+
+/** How long a token that hit a limit the SDK gave no reset time for is left alone. */
+const EXHAUSTED_DEFAULT_MS = 3600_000;
+
 /**
  * One Claude Code turn of a task. `run` drives the turn; a rerun after a crash resumes the task's
- * session and tells Claude to carry on. `finish` does the bookkeeping once the turn is over, so a rerun
+ * session and tells Claude to carry on. A turn whose token failed it (a usage limit, a refused login) enters `run` once
+ * more, through a sleep until now, with the next token. `finish` does the bookkeeping once the turn is over, so a rerun
  * from there skips the turn.
  */
 export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHooks>({
   name: "meddle.turn",
   version: 1,
-  initial: () => ({ phase: "run" }),
+  initial: () => ({ phase: "run", tokenRetries: 0 }),
   phases: {
     // Commits nothing before the turn ends: a commit would be progress to pi-durable and start its restart count
     // over, so a turn that kept crashing the process would never park. Whether this is a rerun comes from the log.
+    // A token rerun is a sleep, which is progress too; it happens at most once per turn (`tokenRetries`).
     run: async (task, runtime, context) => {
       const runner = await runnerFor(runtime, context);
-      await runner.runTurnPhase(task.input, context);
+      const checkpoint = task.state.checkpoint;
+      const tokenRetries = checkpoint.phase === "run" ? checkpoint.tokenRetries ?? 0 : 0;
+      const outcome = await runner.runTurnPhase(task.input, tokenRetries, context);
+      if (outcome === "rerun") {
+        await runtime.sleepUntil(runtime.now(), { phase: "run", tokenRetries: 1 }, context);
+        return;
+      }
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "finish" } }), context);
     },
     finish: async (task, runtime, context) => {
@@ -326,9 +347,35 @@ export class TaskRunner {
   /** Sends `text` into a live turn's input and records it as a user event. */
   #send(taskId: string, queue: InputQueue, text: string, priority: "now" | "next"): void {
     queue.push(text, priority);
-    const event = promptEvent(text);
+    this.#record(taskId, promptEvent(text));
+  }
+
+  /** Appends an event to the task's log and tells the listeners. */
+  #record(taskId: string, event: SDKMessage | MeddleEvent): void {
     const seq = appendEvent(this.#db, taskId, event);
     notify(this.#eventListeners, (cb) => cb(taskId, seq, event));
+  }
+
+  /**
+   * Marks token `id` as its fault says, for the whole pool: `exhausted` until the SDK's reset time (an hour from now when
+   * it gave none) with the limit's type, or `disabled` with the error. A token no longer listed is left alone. Returns
+   * the fault as marked (its `until` the one stored).
+   */
+  async #markFault(id: string, fault: TokenFault): Promise<TokenFault> {
+    let marked: TokenFault;
+    if (fault.kind === "exhausted") {
+      marked = { ...fault, until: fault.until ?? new Date(Date.now() + EXHAUSTED_DEFAULT_MS).toISOString() };
+      markToken(this.#db, id, "exhausted", marked.until, markDetail(fault.type));
+    } else {
+      marked = fault;
+      markToken(this.#db, id, "disabled", null, markDetail(fault.reason));
+    }
+    try {
+      await this.#pool?.tokenChanged();
+    } catch (err) {
+      this.#log(`meddle: tokens: could not tell the pool of token ${id}'s mark: ${messageOf(err)}`);
+    }
+    return marked;
   }
 
   async interrupt(taskId: string): Promise<void> {
@@ -389,14 +436,17 @@ export class TaskRunner {
   }
 
   /**
-   * The `run` phase of `meddle.turn`: drives the turn to its end. A rerun of a cut-off turn that resumes the
-   * session sends `CARRY_ON_PROMPT` instead of the prompt. Not for callers outside this module.
+   * The `run` phase of `meddle.turn`: drives the turn to its end with the first usable token. A rerun that resumes the
+   * session sends `CARRY_ON_PROMPT` (the turn was cut off) or `TOKEN_RETRY_PROMPT` (its token failed it) instead of the
+   * prompt. When the turn's token hit a limit or was refused, the token is marked for the pool; `"rerun"` when this was
+   * the turn's first try (`tokenRetries` 0) and another token is usable now, so the phase enters itself again.
+   * Not for callers outside this module.
    */
-  async runTurnPhase(input: TurnInput, context: Context): Promise<void> {
+  async runTurnPhase(input: TurnInput, tokenRetries: number, context: Context): Promise<"done" | "rerun"> {
     const { taskId } = input;
     let failureLogged = false; // the turn's own turn_failed is in the log
     try {
-      const rerun = lastTurnCutOff(this.#db, taskId, input.freshAfter ?? 0);
+      const cutOff = lastTurnCutOff(this.#db, taskId, input.freshAfter ?? 0);
       const row = this.#row(taskId);
       const started = row.started === 1;
       const moving = this.#isMoving(row);
@@ -413,11 +463,17 @@ export class TaskRunner {
       }
       // Resume only a session whose transcript Claude Code wrote, not one a turn merely set out to create.
       const resume = started && existsSync(transcriptPath(this.#cfg, manifest));
+      const picked = await pickToken(this.#cfg, this.#db);
+      if (picked === null) {
+        this.#record(taskId, tokenFaultEvent(null, { kind: "none" }, false));
+        throw new Error("no usable token");
+      }
       const queue = new InputQueue();
+      let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
       const { query, done } = runTurn({
-        input: await this.#engineInput(taskId, manifest, resume),
+        input: await this.#engineInput(taskId, manifest, resume, picked.value),
         // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
-        prompt: rerun && resume ? CARRY_ON_PROMPT : input.prompt,
+        prompt: resume && cutOff === "token" ? TOKEN_RETRY_PROMPT : resume && cutOff === "restart" ? CARRY_ON_PROMPT : input.prompt,
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -426,14 +482,27 @@ export class TaskRunner {
           if (m.type === "meddle" && m.subtype === "turn_failed") failureLogged = true;
           notify(this.#eventListeners, (cb) => cb(taskId, seq, m));
         },
+        onTokenFault: (f) => { fault = f; },
       });
       this.#live.set(taskId, { query, queue, state: "running" });
       try {
         await done;
+      } catch (err) {
+        // A turn that ended without a result after its token failed it fails as before; the token is marked all the same.
+        if (fault !== null) await this.#markFault(picked.id, fault).catch(() => {});
+        throw err;
       } finally {
         // The task stays in `#primaries` until `finish` has synced its memory.
         this.#live.delete(taskId);
       }
+      if (fault === null) return "done";
+      const marked = await this.#markFault(picked.id, fault);
+      const next = await pickToken(this.#cfg, this.#db);
+      const rerun = tokenRetries === 0 && next !== null && next.id !== picked.id;
+      this.#record(taskId, tokenFaultEvent(picked, marked, rerun));
+      if (!rerun) return "done";
+      await this.#deps.hooks?.afterTokenFault?.(taskId);
+      return "rerun";
     } catch (err) {
       this.#primaries.delete(taskId);
       // A turn that failed before it ran (no token, a bad context.toml, …) says why in the log like any other.
@@ -1005,10 +1074,8 @@ export class TaskRunner {
     taskId: string,
     manifest: TaskManifest,
     resume: boolean,
+    token: string,
   ): Promise<Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">> {
-    const picked = await pickToken(this.#cfg, this.#db);
-    if (picked === null) throw new Error("no usable token");
-    const token = picked.value;
     const contexts = [];
     for (const p of manifest.projects) contexts.push(await loadContext(p.replica));
     const projectSettings = [];
@@ -1095,20 +1162,41 @@ function notify<T>(listeners: Set<T>, call: (cb: T) => void): void {
 }
 
 /**
- * Whether the task's last turn was cut off, so this run is its rerun: of the events that start or end a turn, the
- * newest is a `turn_started` (the process died mid-turn) or a `turn_aborted` (a close interrupted it). A `result` or
- * `turn_failed`, or none (after `afterSeq`), means a first attempt. A process that dies between a turn's `result` and the commit of its
- * `finish` checkpoint (milliseconds) has its rerun send the prompt again: the one replay this accepts.
+ * Why this run of the task's turn is a rerun, if it is: of the events that start or end a turn (after `afterSeq`), the
+ * newest is a `token_fault` with `rerun` set (`"token"`: the turn's token failed it, the next one takes over), or a
+ * `turn_started` (the process died mid-turn) or `turn_aborted` (a close interrupted it) (`"restart"`). A `result`, a
+ * `turn_failed`, a `token_fault` without `rerun`, or none means a first attempt (null). A process that dies between a
+ * turn's `result` and the commit of its `finish` checkpoint (milliseconds), or between its `result` and its
+ * `token_fault`, has its rerun send the prompt again: the one replay this accepts.
  */
-function lastTurnCutOff(db: Database, taskId: string, afterSeq: number): boolean {
+function lastTurnCutOff(db: Database, taskId: string, afterSeq: number): "token" | "restart" | null {
   const latest = [
     latestEventOfType(db, taskId, "meddle", "turn_started"),
     latestEventOfType(db, taskId, "meddle", "turn_aborted"),
     latestEventOfType(db, taskId, "meddle", "turn_failed"),
+    latestEventOfType(db, taskId, "meddle", "token_fault"),
     latestEventOfType(db, taskId, "result"),
   ].reduce<EventRecord | null>((a, b) => (b !== null && b.seq > afterSeq && (a === null || b.seq > a.seq) ? b : a), null);
-  const subtype = (latest?.message as { subtype?: unknown } | undefined)?.subtype;
-  return latest !== null && (latest.message as { type?: unknown }).type === "meddle" && (subtype === "turn_started" || subtype === "turn_aborted");
+  if (latest === null) return null;
+  const m = latest.message as { type?: unknown; subtype?: unknown; rerun?: unknown };
+  if (m.type !== "meddle") return null;
+  if (m.subtype === "token_fault") return m.rerun === true ? "token" : null;
+  return m.subtype === "turn_started" || m.subtype === "turn_aborted" ? "restart" : null;
+}
+
+/** The `token_fault` event for the token a turn ran with (null: none was usable). */
+function tokenFaultEvent(
+  token: { id: string; label: string } | null, fault: TokenFault | { kind: "none" }, rerun: boolean,
+): MeddleEvent {
+  return {
+    type: "meddle", subtype: "token_fault", at: new Date().toISOString(),
+    tokenId: token?.id ?? null, label: token?.label ?? null, fault, rerun,
+  };
+}
+
+/** A token mark's detail from what the SDK said: kept when a peer would accept it (short, no control characters). */
+function markDetail(s: string | null): string | null {
+  return s !== null && s.length <= 256 && !/[\x00-\x1f\x7f-\x9f]/.test(s) ? s : null;
 }
 
 function isParked(turn: TaskInspection): boolean {

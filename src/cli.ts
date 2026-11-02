@@ -162,7 +162,7 @@ function runnerDeps(env = process.env): RunnerDeps {
     deps.claudeRuntime = env.MEDDLE_CLAUDE_RUNTIME === "node" ? "node" : "bun";
   }
   const extraEnv: Record<string, string> = {};
-  for (const name of ["MEDDLE_FIXTURE", "MEDDLE_FIXTURE_STALL", "MEDDLE_FIXTURE_MEMORY"]) {
+  for (const name of ["MEDDLE_FIXTURE", "MEDDLE_FIXTURE_STALL", "MEDDLE_FIXTURE_MEMORY", "MEDDLE_FIXTURE_BY_TOKEN"]) {
     const value = env[name];
     if (value !== undefined) extraEnv[name] = value;
   }

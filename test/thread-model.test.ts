@@ -38,3 +38,22 @@ test("a prompt meddle recorded becomes a user item", () => {
   ]);
   expect(items[1]).toEqual({ kind: "user", text: "Run: echo hi" });
 });
+
+test("a token fault renders as a status line", () => {
+  const fault = (fault: unknown, rerun: boolean, label: string | null = "a") =>
+    ({ type: "meddle", subtype: "token_fault", at: "", tokenId: label === null ? null : "0123456789abcdef", label, fault, rerun });
+  const items = buildThread([
+    { seq: 1, message: fault({ kind: "exhausted", until: "2100-01-01T00:00:00.000Z", type: "five_hour" }, true) },
+    { seq: 2, message: fault({ kind: "exhausted", until: null, type: null }, false) },
+    { seq: 3, message: fault({ kind: "disabled", reason: "billing_error" }, true) },
+    { seq: 4, message: fault({ kind: "disabled", reason: "account_on_hold" }, false) },
+    { seq: 5, message: fault({ kind: "none" }, false, null) },
+  ]);
+  expect(items).toEqual([
+    { kind: "status", text: "Token a exhausted until 2100-01-01T00:00:00.000Z; switching login" },
+    { kind: "status", text: "Token a exhausted; no other token" },
+    { kind: "status", text: "Token a disabled: billing_error; switching login" },
+    { kind: "status", text: "Token a disabled: account_on_hold; no other token" },
+    { kind: "status", text: "No usable token" },
+  ]);
+});

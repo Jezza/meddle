@@ -58,7 +58,7 @@ export const NotificationSchema = Type.Object({
   id: Type.String(),
   at: Type.String(),
   taskId: Type.String(),
-  kind: Type.Union([Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed"), Type.Literal("move")]),
+  kind: Type.Union([Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed"), Type.Literal("move"), Type.Literal("token")]),
   text: Type.String(),
 });
 export type Notification = Type.Static<typeof NotificationSchema>;

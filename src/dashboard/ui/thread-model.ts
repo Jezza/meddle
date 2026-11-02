@@ -161,6 +161,9 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
       case "turn_failed":
         top.push({ kind: "status", text: `Turn failed: ${str(m.error)}` });
         return;
+      case "token_fault":
+        top.push({ kind: "status", text: tokenFaultText(m) });
+        return;
       case "permission_denied_hook": {
         const input = (m.input ?? {}) as { tool_use_id?: unknown; tool_name?: unknown; reason?: unknown };
         addDenied(input.tool_use_id, str(input.tool_name), input.reason, undefined, false);
@@ -191,6 +194,16 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
 function unknown(m: Message): ThreadItem {
   const type = typeof m.subtype === "string" ? `${String(m.type)}:${m.subtype}` : String(m.type);
   return { kind: "unknown", type, raw: m };
+}
+
+/** A `token_fault`: which token failed the turn and how, and whether the turn goes on with another login. */
+function tokenFaultText(m: Message): string {
+  const fault = (m.fault ?? {}) as { kind?: unknown; until?: unknown; reason?: unknown };
+  if (fault.kind === "none") return "No usable token";
+  const what = fault.kind === "disabled"
+    ? `disabled: ${str(fault.reason)}`
+    : `exhausted${typeof fault.until === "string" ? ` until ${fault.until}` : ""}`;
+  return `Token ${str(m.label) || str(m.tokenId)} ${what}; ${m.rerun === true ? "switching login" : "no other token"}`;
 }
 
 function resultText(m: Message): string {

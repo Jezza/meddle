@@ -17,8 +17,8 @@ export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
  * colocated project added from a folder with this node as its home,
  * a token (`options.token`, default `"tok"`; `null` adds none), and a Harness with a TaskRunner that runs Claude Code
  * turns from the `fixture` recording (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the
- * environment the config is read from; its `MEDDLE_FIXTURE_MEMORY` and `MEDDLE_FIXTURE_STALL` also reach the stand-in
- * Claude Code. `log` receives the runner's log lines (default `console.error`); `hooks` are the runner's test hooks.
+ * environment the config is read from; its `MEDDLE_FIXTURE_MEMORY`, `MEDDLE_FIXTURE_STALL` and `MEDDLE_FIXTURE_BY_TOKEN`
+ * also reach the stand-in Claude Code. `log` receives the runner's log lines (default `console.error`); `hooks` are the runner's test hooks.
  */
 export async function setupNode(
   fixture = "hello.jsonl",
@@ -44,6 +44,7 @@ export async function setupNode(
       MEDDLE_FIXTURE: fixture.startsWith("/") ? fixture : `${import.meta.dir}/fixtures/${fixture}`,
       ...(extraEnv.MEDDLE_FIXTURE_MEMORY === undefined ? {} : { MEDDLE_FIXTURE_MEMORY: extraEnv.MEDDLE_FIXTURE_MEMORY }),
       ...(extraEnv.MEDDLE_FIXTURE_STALL === undefined ? {} : { MEDDLE_FIXTURE_STALL: extraEnv.MEDDLE_FIXTURE_STALL }),
+      ...(extraEnv.MEDDLE_FIXTURE_BY_TOKEN === undefined ? {} : { MEDDLE_FIXTURE_BY_TOKEN: extraEnv.MEDDLE_FIXTURE_BY_TOKEN }),
     },
     ...(options.log === undefined ? {} : { log: options.log }),
     ...(options.hooks === undefined ? {} : { hooks: options.hooks }),

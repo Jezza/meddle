@@ -2,8 +2,8 @@
 // replicates per id, last writer wins on `updatedAt`; each value is a mode-600 file under `<data>/secrets/tokens`,
 // named by the token's id (the first 16 hex characters of the SHA-256 of the value) and pulled from a peer by id.
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { chmod, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { chmod, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { ensurePrivateDir, paths } from "./paths";
@@ -122,14 +122,43 @@ function resolve(db: Database, idOrLabel: string): TokenMeta {
   return byLabel[0]!;
 }
 
-/** Writes token `id`'s value file (mode 600, its directory 700), replacing it whole. */
+let tmpSeq = 0;
+
+/**
+ * Writes token `id`'s value file (mode 600, its directory 700), replacing it whole. The file and the rename are on disk
+ * when it returns, so a caller may delete another copy of the value (the legacy file, on migration) after it.
+ */
 export async function writeTokenValue(cfg: NodeConfig, id: string, value: string): Promise<void> {
   const file = tokenFile(cfg, id);
-  await ensurePrivateDir(paths(cfg).tokensDir);
-  const tmp = `${file}.${process.pid}.tmp`;
-  await writeFile(tmp, value, { mode: 0o600 });
+  const dir = paths(cfg).tokensDir;
+  await ensurePrivateDir(dir);
+  // Unique per call: a pull and a CLI-less add of the same value may write it at once in one process.
+  const tmp = `${file}.${process.pid}.${++tmpSeq}.tmp`;
+  const handle = await open(tmp, "w", 0o600);
+  try {
+    await handle.writeFile(value);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await chmod(tmp, 0o600);
   await rename(tmp, file);
+  const dirHandle = await open(dir, "r");
+  try {
+    await dirHandle.sync();
+  } finally {
+    await dirHandle.close();
+  }
+}
+
+/** Whether token `id`'s value is here: its file exists and holds more than blanks (what `tokenValue` would read). */
+export function hasTokenValue(cfg: NodeConfig, id: string): boolean {
+  try {
+    return readFileSync(tokenFile(cfg, id), "utf8").trim() !== "";
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
 }
 
 /** Deletes token `id`'s value file, if there is one. */
@@ -293,9 +322,9 @@ export function mergeTokens(
   const removedValues: string[] = [];
   for (const id of accepted) {
     const t = tokenRow(db, id)!;
-    const present = existsSync(tokenFile(cfg, id));
-    if (!t.removed && !present) missingValues.push(id);
-    if (t.removed && present) removedValues.push(id);
+    // An empty value file is no value: pull one over it. Any file of a removed token goes.
+    if (!t.removed && !hasTokenValue(cfg, id)) missingValues.push(id);
+    if (t.removed && existsSync(tokenFile(cfg, id))) removedValues.push(id);
   }
   return { changed, missingValues, removedValues, rejected };
 }

@@ -137,7 +137,7 @@ test("task prompt fails fast when the turn fails", async () => {
     await rm(`${dir}/d/secrets/tokens`, { recursive: true });
     const tokenless = await meddle(["task", "prompt", taskId, "hi"], client);
     expect(tokenless.code).toBe(1);
-    expect(tokenless.stderr).toBe("meddle/turn_failed\nmeddle: the turn failed: Error: no usable token\n");
+    expect(tokenless.stderr).toBe("meddle/token_fault\nmeddle/turn_failed\nmeddle: the turn failed: Error: no usable token\n");
   } finally {
     await node.stop();
   }

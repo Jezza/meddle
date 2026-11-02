@@ -7,7 +7,7 @@ import { listEvents } from "../src/store/events";
 import { SqliteSessionStore } from "../src/store/session-store";
 import { Approvals, } from "../src/engine/approvals";
 import { InputQueue } from "../src/engine/input";
-import { runTurn } from "../src/engine/session";
+import { runTurn, tokenFaultOf, type TokenFault } from "../src/engine/session";
 import { loadConfig, ensureDataDirs } from "../src/config";
 import { DEFAULT_CONTEXT } from "../src/projects/context";
 const replay = `${import.meta.dir}/fake-claude/replay.ts`;
@@ -91,6 +91,44 @@ test("onMessage streams every recorded event, meddle's own included, in seq orde
   expect(streamed).toHaveLength(2); // turn_started and the prompt, both before the child says anything
   await done;
   expect(streamed).toEqual(listEvents(db, "abc").map(e => [e.seq, e.message]));
+});
+/** The SDK message of line `n` (1-based) of a fixture. */
+function fixtureFrame(name: string, n: number): any {
+  const line = readFileSync(`${import.meta.dir}/fixtures/${name}.jsonl`, "utf8").split("\n").filter(Boolean)[n - 1]!;
+  return JSON.parse(JSON.parse(line).line);
+}
+test("tokenFaultOf reads a rejected rate limit and the login-class assistant errors, nothing else", () => {
+  // the recorded rejection: resetsAt in unix seconds
+  expect(tokenFaultOf(fixtureFrame("rate-limited", 6))).toEqual({ kind: "exhausted", until: new Date(4102444800 * 1000).toISOString(), type: "five_hour" });
+  // a resetsAt in milliseconds is taken as such; none gives a null until; no type gives a null type
+  const at = Date.parse("2030-01-02T03:04:05.000Z");
+  expect(tokenFaultOf({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: at } } as any)).toEqual({ kind: "exhausted", until: "2030-01-02T03:04:05.000Z", type: null });
+  expect(tokenFaultOf({ type: "rate_limit_event", rate_limit_info: { status: "rejected" } } as any)).toEqual({ kind: "exhausted", until: null, type: null });
+  // hello.jsonl line 6: status allowed, overageStatus rejected: the discriminator is status
+  const allowed = fixtureFrame("hello", 6);
+  expect(allowed.rate_limit_info).toMatchObject({ status: "allowed", overageStatus: "rejected" });
+  expect(tokenFaultOf(allowed)).toBeNull();
+  expect(tokenFaultOf({ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", resetsAt: 1 } } as any)).toBeNull();
+  const assistant = fixtureFrame("hello", 7);
+  expect(tokenFaultOf(assistant)).toBeNull();
+  expect(tokenFaultOf({ ...assistant, error: "rate_limit" })).toEqual({ kind: "exhausted", until: null, type: null });
+  for (const reason of ["billing_error", "account_on_hold", "authentication_failed", "oauth_org_not_allowed", "verification_required"]) {
+    expect(tokenFaultOf({ ...assistant, error: reason })).toEqual({ kind: "disabled", reason });
+  }
+  for (const other of ["max_output_tokens", "overloaded", "server_error", "unknown"]) expect(tokenFaultOf({ ...assistant, error: other })).toBeNull();
+  expect(tokenFaultOf(fixtureFrame("hello", 8))).toBeNull();
+});
+test("onTokenFault is called once, before done resolves, for a turn whose login hit a limit", async () => {
+  const { db, input, fixture } = await setup();
+  const faults: TokenFault[] = [];
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("rate-limited") }, prompt: "x", db, approvals: new Approvals(), onTokenFault: (f) => faults.push(f) });
+  const result = await done;
+  expect(result).toMatchObject({ subtype: "error_during_execution", is_error: true });
+  expect(faults).toEqual([{ kind: "exhausted", until: new Date(4102444800 * 1000).toISOString(), type: "five_hour" }]);
+  // a turn without one never calls it
+  const none: TokenFault[] = [];
+  await runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: "x", db, approvals: new Approvals(), onTokenFault: (f) => none.push(f) }).done;
+  expect(none).toEqual([]);
 });
 test("input queue: yields pushed items in order, waits while empty, finishes after end", async () => {
   const q = new InputQueue();

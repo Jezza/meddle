@@ -144,6 +144,19 @@ test("remove deletes the value file and keeps a removed row; add again revives i
   expect(listTokens(db).map((t) => t.id)).toEqual([a.id, b.id]);
 });
 
+test("an empty value file is no value: mergeTokens names it missing, and writeTokenValue replaces it", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T1 });
+  await writeFile(tokenFile(cfg, a.id), "  \n", { mode: 0o600 });
+  expect(await tokenValue(cfg, a.id)).toBeNull();
+  expect(mergeTokens(cfg, db, [row({ ...a, updatedAt: T1 })]).missingValues).toEqual([a.id]);
+  await writeTokenValue(cfg, a.id, "tok-a");
+  expect(await tokenValue(cfg, a.id)).toBe("tok-a");
+  expect((await stat(tokenFile(cfg, a.id))).mode & 0o777).toBe(0o600);
+  expect(mergeTokens(cfg, db, [row({ ...a, updatedAt: T1 })]).missingValues).toEqual([]);
+  expect((await readdir(paths(cfg).tokensDir)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+});
+
 test("mergeTokens is last writer wins per id, names missing values, and rejects path-like ids, long labels and unknown statuses", async () => {
   const { cfg, db } = await node();
   const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T1 });
