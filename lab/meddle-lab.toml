@@ -1,0 +1,21 @@
+# meddle under real network faults: one lighthouse and three meddle nodes, fully meshed, 10 ms each way.
+# Hermetic: no internet node; discovery goes through lh only. tpo runs the [run] commands with this
+# directory as the working directory. See README.md.
+name = "meddle-lab"
+mode = "direct"
+
+[defaults]
+delay = "10ms"
+
+[nodes]
+lh = {}
+a = {}
+b = {}
+c = {}
+
+[[link]]
+mesh = ["lh", "a", "b", "c"]
+
+[run]
+"lh" = "${LIGHTHOUSE_BIN:-$HOME/projects/iroh-lighthouse/target/release/lighthouse} --http-listen 0.0.0.0:8080 --no-iroh --no-snapshot"
+"*" = "./node.sh serve"

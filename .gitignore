@@ -2,3 +2,8 @@ node_modules
 dist
 *.sqlite
 .superpowers/
+lab/nodes/
+lab/logs/
+lab/scratch/
+lab/run-output.txt
+lab/ids.env
