@@ -36,6 +36,9 @@ const ENV_PREFIX = "env.";
 const NON_NEGATIVE_INTEGER = /^\d+$/;
 /** The longest value a setting may have: it goes into the environment of every jj and Claude Code. */
 export const MAX_SETTING_VALUE = 4096;
+/** The one form of `updatedAt` a replicated row may carry: what `new Date().toISOString()` prints. */
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
 /** The longest key a setting may have: an `env.*` name goes into the environment of every jj and Claude Code. */
 export const MAX_SETTING_KEY = 256;
 /** The most the settings add to an environment, counting each name's and value's length; later entries are left out. */
@@ -185,7 +188,9 @@ export class PoolSettings {
    * Folds a peer's rows into this node's: a row is taken when its `updatedAt` is later than the local one's (an ISO
    * string compare, as the roster's); on equal times the greater `setBy`, then the greater value wins, so that every
    * node ends on the same row. Rows with an invalid key, a reserved env name or a value no reader could use (too long,
-   * a control character, an empty jj identity) are dropped, and each such key is logged once
+   * a control character, an empty jj identity) or an `updatedAt` that is not a millisecond ISO time (a time that is
+   * not one would sort above every real one, or make the next local write throw) are dropped, and each such key is
+   * logged once
    * (`meddle: settings: ignored replicated key "<key>"`, the key JSON-escaped and cut to 80 characters).
    * True when any row changed.
    */
@@ -193,7 +198,10 @@ export class PoolSettings {
     return this.db.transaction(() => {
       let changed = false;
       for (const remote of rows) {
-        if (keyProblem(remote.key) !== null || !replicableValue(remote.key, remote.value)) {
+        if (
+          keyProblem(remote.key) !== null || !replicableValue(remote.key, remote.value) ||
+          !ISO_TIME.test(remote.updatedAt)
+        ) {
           this.ignore(remote.key);
           continue;
         }

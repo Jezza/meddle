@@ -530,6 +530,10 @@ meddle passes again from context.
 
 ## 11. Shared login
 
+(Revised by section 21.2, 2026-11-02: the pool holds an ordered list of
+tokens with automatic fallback; what follows is the single-token model it
+grew from.)
+
 The pool's credential is one token from `claude setup-token`, a one-year
 OAuth token that makes model requests only. It is pool state: `meddle token
 set` on any node stores it and replicates it; every node writes it to a

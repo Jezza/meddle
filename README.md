@@ -596,7 +596,8 @@ home until it is deleted.
 
 `task restore <task-id> [--node <id|prefix> | --here]` (or Restore, whose node select defaults to Automatic) brings
 the task back, on any node that can take it. Without `--node` or `--here` meddle places it as it places a new task of
-the task's projects (see [Where a new task runs](#where-a-new-task-runs)): the primary project's home first. The node
+the task's projects (see [Where a new task runs](#where-a-new-task-runs)): the primary project's home first, skipping
+nodes a move would refuse (another or an unknown Claude Code version, no task root, offline). The node
 holding the archive runs it: `task restore` on that node, or Restore in the dashboard of any node.
 
 On the node it was archived on (`--here`, or placement picks it), each project's workspace starts on the task's
@@ -617,7 +618,9 @@ sends, read from the archive, under the same receipt rule. Once the target has a
 resumes the session, with no follow-up prompt), the archive becomes the move's leftover in `<data dir>/moved/` (kept
 seven days, see [On the node a task left](#on-the-node-a-task-left)), the staged bookmarks are forgotten again off the
 home, the event and transcript rows go, and a `moved` row remains. A restore-move that fails (the target refuses, the
-home is offline, a restart parks it) leaves the task `archived` here again, its archive intact and nothing staged. The
+home is offline, a restart parks it before the receipt) leaves the task `archived` here again, its archive intact and
+nothing staged; one parked in `commit` stays `moving`, as [When a move fails](#when-a-move-fails) describes, because the
+target may already hold the task. The
 command prints `restoring to <short id>` once the move has started and returns; the move goes on in the background,
 and the task's view in the dashboard shows how it goes (`status` does not).
 

@@ -232,8 +232,9 @@ export const TaskObject = remote("meddle.task", {
          */
         archive: method(Type.Object({})),
         /**
-         * Restores an archived task on the node `node` names: null or `"here"` (or this node's id), the node it was
-         * archived on; another node is not available yet. Answers the node it is on.
+         * Restores an archived task: `node` null places it over the roster like a new task of its projects (nodes a
+         * move would refuse left out); `"here"` or this node's id restores it on the node holding the archive; another
+         * member's id moves it there from the archive. Answers the node it is on, or is on its way to.
          */
         restore: method(Type.Object({ node: Nullable(Type.String()) }), Type.Object({ nodeId: Type.String() })),
         /** Deletes an archived or moved task's rows and archive from its node; refused for any other. */

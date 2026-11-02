@@ -81,11 +81,15 @@ test("invalid keys and reserved names are refused at set and dropped at merge", 
   expect(settings.merge([row("env.PATH", "/evil", "2026-01-01T00:00:00.000Z")])).toBe(false);
   expect(settings.merge([row("env.PATH", "/evil", "2026-01-02T00:00:00.000Z")])).toBe(false);
   expect(settings.merge([row("nonsense", "x", "2026-01-01T00:00:00.000Z")])).toBe(false);
+  // A time that is not a millisecond ISO time would sort above every real one or break the next local write.
+  expect(settings.merge([row("env.FOO", "x", "9")])).toBe(false);
+  expect(settings.merge([row("env.FOO", "x", "+275760-09-13T00:00:00.000Z")])).toBe(false);
+  expect(settings.get("env.FOO")).toBeNull();
   expect(settings.env().PATH).toBeUndefined();
   expect(settings.rows()).toEqual([]);
   expect(lines.filter((l) => l === 'meddle: settings: ignored replicated key "env.PATH"')).toHaveLength(1);
   expect(lines).toContain('meddle: settings: ignored replicated key "nonsense"');
-  expect(settings.ignored).toBe(3);
+  expect(settings.ignored).toBe(5);
 });
 
 test("env maps jj identity and env.* and apply updates cfg.poolEnv", () => {
