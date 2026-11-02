@@ -117,6 +117,11 @@ export function listLiveTasks(db: Database): TaskRow[] {
   return db.query<TaskRow, []>("SELECT * FROM tasks WHERE state NOT IN ('moved', 'receiving') ORDER BY created_at, id").all();
 }
 
+/** How many of this node's tasks are in state `running` or `waiting`. */
+export function countRunningTasks(db: Database): number {
+  return db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM tasks WHERE state IN ('running', 'waiting')").get()!.n;
+}
+
 /** The task's settings; `{}` for a task with none, or an unknown task. */
 export function getTaskSettings(db: Database, id: string): TaskSettings {
   const row = db.query<{ settings: string | null }, [string]>("SELECT settings FROM tasks WHERE id = ?").get(id);

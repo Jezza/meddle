@@ -1,7 +1,7 @@
 // test/ui.test.ts
 import { test, expect } from "bun:test";
 import { joinStateOf } from "../src/dashboard/ui/join-state";
-import { headText, mergeProjects, moveTargets } from "../src/dashboard/ui/pool-model";
+import { headText, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 
 test("the dashboard bundle builds", async () => {
@@ -65,4 +65,19 @@ test("the projects view merges each project's holders by id, home's name first, 
   ]);
   expect(headText(heads[0]!)).toBe("trunk kkkkkkkk");
   expect(headText({ name: "meddle/task/t1/one", remote: "0123456789", changeId: "", conflicted: true })).toBe("meddle/task/t1/one@0123456789 (conflicted)");
+});
+
+test("projectChoices: every project an online member lists, once, named as its home lists it", () => {
+  const a = "a".repeat(64);
+  const b = "b".repeat(64);
+  const c = "c".repeat(64);
+  const nodes = [
+    { nodeId: a, status: "member" as const, online: true, projects: [{ id: "p", name: "old-name", home: b }, { id: "q", name: "zeta", home: a }] },
+    { nodeId: b, status: "member" as const, online: true, projects: [{ id: "p", name: "alpha", home: b }] },
+    { nodeId: c, status: "member" as const, online: false, projects: [{ id: "r", name: "offline", home: c }] },
+    { nodeId: "d".repeat(64), status: "removed" as const, online: true, projects: [{ id: "s", name: "gone", home: c }] },
+  ];
+  expect(projectChoices(nodes)).toEqual([{ id: "p", name: "alpha", home: b }, { id: "q", name: "zeta", home: a }]);
+  // With the home not listing it, another holder's entry stands.
+  expect(projectChoices([nodes[0]!])).toEqual([{ id: "p", name: "old-name", home: b }, { id: "q", name: "zeta", home: a }]);
 });

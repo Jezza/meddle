@@ -12,7 +12,7 @@ import { DialFailed, PeerClosed, PoolNet, fromEndpoint, openEndpoint, type Refus
 import type { PoolObjectDeps } from "./object";
 import { dedupe } from "./report";
 import { PoolSettings, discoveryLighthouseUrl } from "./settings";
-import { PoolStore, type NodeSummary, type WireAddr } from "./store";
+import { PoolStore, type NodeProject, type NodeSummary, type WireAddr } from "./store";
 import { HoldFailed, PoolSync } from "./sync";
 
 export type PoolRuntime = {
@@ -36,7 +36,8 @@ export type PoolRuntime = {
   /** Unsets a pool setting here, applies it and tells the pool. */
   unsetSetting(key: string): Promise<void>;
   /**
-   * This node's summary changed (a task was created): tell the pool now rather than at the next periodic refresh.
+   * This node's summary changed (a task was created, started or ended, a project added): tell the pool now rather than
+   * at the next periodic refresh.
    * Never rejects.
    */
   refresh(): Promise<void>;
@@ -53,8 +54,14 @@ export type PoolRuntime = {
   stop(): Promise<void>;
 };
 
-/** What this node reports about itself, apart from its hostname. */
-export type PoolSummaryDeps = { version: string; claudeCodeVersion: string; hostsTasks(): Promise<boolean>; taskCount(): number };
+/**
+ * What this node reports about itself, apart from its hostname and its running limit (the pool settings'): `running`
+ * counts its tasks in state `running` or `waiting`, `projects` lists every project it holds.
+ */
+export type PoolSummaryDeps = {
+  version: string; claudeCodeVersion: string; hostsTasks(): Promise<boolean>; taskCount(): number;
+  running(): number; projects(): NodeProject[];
+};
 
 /**
  * Optional (tests): `onError` sees every error the net and the sync report, after the runtime acted on it; `log` gets
@@ -83,12 +90,19 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   const selfId = identity.id;
   const endpoint = await openEndpoint(cfg, identity);
   const store = new PoolStore(db);
+  let stopped = false;
+  const log = hooks.log ?? ((line: string) => console.error(line));
+  const settings = new PoolSettings(db, cfg, selfId, log);
+  settings.apply();
   const liveSummary = async (): Promise<NodeSummary> => ({
     hostname: hostname(),
     version: summary.version,
     claudeCodeVersion: summary.claudeCodeVersion,
     hostsTasks: await summary.hostsTasks(),
     taskCount: summary.taskCount(),
+    running: summary.running(),
+    limit: settings.runningLimit(),
+    projects: summary.projects(),
   });
   try {
     store.ensurePool({ nodeId: selfId, hostname: hostname() });
@@ -98,10 +112,6 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     throw err;
   }
 
-  let stopped = false;
-  const log = hooks.log ?? ((line: string) => console.error(line));
-  const settings = new PoolSettings(db, cfg, selfId, log);
-  settings.apply();
   /** A connection diagnostic, each distinct message at most once a minute. */
   const diagnose = dedupe((message) => { if (!stopped) log(`meddle: pool: ${message}`); });
   /** Consecutive code-1 closes and refusals from each member since it was last online (or a dial to it failed). */

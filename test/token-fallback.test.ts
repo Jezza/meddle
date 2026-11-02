@@ -5,12 +5,12 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { NodeObject } from "../src/state/host";
 import { PoolObject, type Notification } from "../src/state/contracts";
-import { listEvents } from "../src/store/events";
+import { appendEvent, listEvents } from "../src/store/events";
 import { getTask } from "../src/store/records";
 import { TaskRunner, TOKEN_RETRY_PROMPT } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
 import { addToken, listTokens, removeToken } from "../src/token";
-import { replay } from "./helpers";
+import { replay, setupNode } from "./helpers";
 import { linkClient, startPoolNode, twoPoolNodes } from "./pool-helpers";
 
 const fixture = (name: string) => `${import.meta.dir}/fixtures/${name}`;
@@ -127,7 +127,7 @@ test("a rate-limited token is marked exhausted and the turn reruns once with the
     const a = await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
     const b = await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
     await until(node.poolObject.activeTokenId, (id) => id === a.id);
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     const over = turnOver(node.runner, m.id);
     await node.runner.prompt(m.id, "Reply with the single word ok.");
     await over;
@@ -165,7 +165,7 @@ test("with no other token the turn fails once and raises a token notification", 
   const node = await tokenNode({ "tok-a": fixture("rate-limited.jsonl") });
   try {
     const a = await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     const over = turnOver(node.runner, m.id);
     await node.runner.prompt(m.id, "Reply with the single word ok.");
     await over;
@@ -193,7 +193,7 @@ test("a disabled-class error disables the token with until null", async () => {
   const node = await tokenNode({ "tok-a": await assistantErrorFixture("billing_error") });
   try {
     const a = await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     const over = turnOver(node.runner, m.id);
     await node.runner.prompt(m.id, "Reply with the single word ok.");
     await over;
@@ -216,7 +216,7 @@ test("with no usable token the only notification is of kind token", async () => 
   const node = await tokenNode({});
   try {
     await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     await removeToken(node.cfg, node.db, "a");
     const over = turnOver(node.runner, m.id);
     await node.runner.prompt(m.id, "Reply with the single word ok.");
@@ -264,7 +264,7 @@ test("a service restart after the fault reruns once with TOKEN_RETRY_PROMPT", as
   try {
     await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
     await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     // The sleep before the rerun is `now()`: this hook is the only window for the process to stop in.
     let closing: Promise<void> | undefined;
     node.hooks.afterTokenFault = () => { closing ??= node.harness.close(); };
@@ -301,7 +301,7 @@ test("a fault in a turn that succeeds marks the token but does not rerun the tur
   try {
     const a = await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
     const b = await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     const over = turnOver(node.runner, m.id);
     await node.runner.prompt(m.id, "Reply with the single word ok.");
     await over;
@@ -328,7 +328,7 @@ test("a turn reruns for its token at most once: a second fault stops it and says
     const a = await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
     const b = await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
     const c = await node.add("tok-c", "c", "2026-01-01T00:00:02.000Z");
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     const over = turnOver(node.runner, m.id);
     await node.runner.prompt(m.id, "Reply with the single word ok.");
     await over;
@@ -360,7 +360,7 @@ test("a restart before the rerun's sleep is stored still reruns at most once", a
     await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
     await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
     await node.add("tok-c", "c", "2026-01-01T00:00:02.000Z");
-    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const m = (await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] })).manifest;
     let closing: Promise<void> | undefined;
     node.hooks.afterTokenFault = () => { closing ??= node.harness.close(); };
     await node.runner.prompt(m.id, "Reply with the single word ok.");
@@ -390,3 +390,30 @@ test("a restart before the rerun's sleep is stored still reruns at most once", a
     await node.close();
   }
 }, 40_000);
+
+test("a turn aborted between its token rerun and the rerun's start logs turn_aborted, so the next turn is not a token rerun", async () => {
+  const node = await setupNode();
+  try {
+    const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
+    const told: string[] = [];
+    node.runner.onEvent((tid, _seq, msg: any) => { if (tid === m.id) told.push(msg.subtype ?? msg.type); });
+    appendEvent(node.db, m.id, { type: "meddle", subtype: "turn_started", at: new Date().toISOString() } as any);
+    appendEvent(node.db, m.id, { type: "meddle", subtype: "token_fault", at: new Date().toISOString(), rerun: true } as any);
+    node.runner.abortTurnPhase(m.id);
+    expect(messages(node.db, m.id).map((x) => x.subtype)).toEqual(["turn_started", "token_fault", "turn_aborted"]);
+    expect(told).toEqual(["turn_aborted"]);
+
+    // The rerun had started (its own turn_started is the newest): runTurn logs its abort, not this.
+    appendEvent(node.db, m.id, { type: "meddle", subtype: "token_fault", at: new Date().toISOString(), rerun: true } as any);
+    appendEvent(node.db, m.id, { type: "meddle", subtype: "turn_started", at: new Date().toISOString() } as any);
+    node.runner.abortTurnPhase(m.id);
+    // A token fault that does not rerun is a turn's end: nothing to add either.
+    appendEvent(node.db, m.id, { type: "meddle", subtype: "token_fault", at: new Date().toISOString(), rerun: false } as any);
+    node.runner.abortTurnPhase(m.id);
+    expect(messages(node.db, m.id).map((x) => x.subtype)).toEqual([
+      "turn_started", "token_fault", "turn_aborted", "token_fault", "turn_started", "token_fault",
+    ]);
+  } finally {
+    await node.harness.close();
+  }
+});

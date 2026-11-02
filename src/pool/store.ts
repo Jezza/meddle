@@ -1,8 +1,26 @@
 import type { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
 
-/** What a node reports about itself to the rest of the pool. */
-export type NodeSummary = { hostname: string; version: string; claudeCodeVersion: string; hostsTasks: boolean; taskCount: number };
+/** A project a node holds (its own or a replica), as the rest of the pool sees it. */
+export type NodeProject = { id: string; name: string; home: string };
+
+/**
+ * What a node reports about itself to the rest of the pool. `running`: its tasks in state `running` or `waiting`;
+ * `limit`: how many may run at once (0 is no limit); `projects`: every project it holds. A node of an older meddle
+ * reports none of the three: they read as 0, 0 and [] (`withSummaryDefaults`).
+ */
+export type NodeSummary = {
+  hostname: string; version: string; claudeCodeVersion: string; hostsTasks: boolean; taskCount: number;
+  running: number; limit: number; projects: NodeProject[];
+};
+
+/** A summary as a peer may send it: an older meddle's has no `running`, `limit` or `projects`. */
+export type WireSummary = Omit<NodeSummary, "running" | "limit" | "projects"> & Partial<Pick<NodeSummary, "running" | "limit" | "projects">>;
+
+/** A summary with what an older peer left out filled in: nothing running, no limit, no projects. */
+export function withSummaryDefaults(s: WireSummary): NodeSummary {
+  return { ...s, running: s.running ?? 0, limit: s.limit ?? 0, projects: s.projects ?? [] };
+}
 
 /** An iroh endpoint address in JSON form: `id` is the node id. */
 export type WireAddr = { id: string; relay: string | null; direct: string[] };
@@ -15,6 +33,9 @@ export type RosterRow = {
   nodeId: string; hostname: string; status: "member" | "removed"; updatedAt: string; addedBy: string;
   summary: NodeSummary | null; lastSeenAt: string | null; lastAddr: WireAddr | null;
 };
+
+/** A roster row as a peer may send it (its summary perhaps an older meddle's). */
+export type WireRosterRow = Omit<RosterRow, "summary"> & { summary: WireSummary | null };
 
 export type PoolIdentity = { poolId: string; poolSecret: string; createdAt: string };
 
@@ -34,7 +55,7 @@ function toRow(r: RosterRecord): RosterRow {
     status: r.status,
     updatedAt: r.updated_at,
     addedBy: r.added_by,
-    summary: r.summary === null ? null : (JSON.parse(r.summary) as NodeSummary),
+    summary: r.summary === null ? null : withSummaryDefaults(JSON.parse(r.summary) as WireSummary),
     lastSeenAt: r.last_seen_at,
     lastAddr: r.last_addr === null ? null : (JSON.parse(r.last_addr) as WireAddr),
   };
@@ -88,7 +109,7 @@ export class PoolStore {
     return this.row(nodeId)?.status === "member";
   }
 
-  upsert(row: RosterRow): void {
+  upsert(row: WireRosterRow): void {
     this.db.query(
       `INSERT OR REPLACE INTO roster (node_id, hostname, status, updated_at, added_by, summary, last_seen_at, last_addr)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -103,7 +124,7 @@ export class PoolStore {
    * Folds a peer's roster into this one: membership fields when the remote `updatedAt` is newer,
    * presence fields when the remote `lastSeenAt` is newer. Returns true when any row changed.
    */
-  merge(rows: RosterRow[]): boolean {
+  merge(rows: WireRosterRow[]): boolean {
     return this.db.transaction(() => {
       let changed = false;
       for (const remote of rows) {
@@ -113,7 +134,7 @@ export class PoolStore {
           changed = true;
           continue;
         }
-        const next = { ...local };
+        const next: WireRosterRow = { ...local };
         let rowChanged = false;
         if (remote.updatedAt > local.updatedAt) {
           next.hostname = remote.hostname;
@@ -162,7 +183,7 @@ export class PoolStore {
    * Replaces this node's pool and roster with another pool's, as when it joins that pool; drops outstanding invites and
    * the old pool's settings (the new pool's arrive by sync).
    */
-  replacePool(pool: PoolIdentity, roster: RosterRow[]): void {
+  replacePool(pool: PoolIdentity, roster: WireRosterRow[]): void {
     this.db.transaction(() => {
       this.db.exec("DELETE FROM pool");
       this.db.exec("DELETE FROM roster");

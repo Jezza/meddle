@@ -29,6 +29,13 @@ async function home() {
   return { dir, env };
 }
 
+/** The task id `task new` printed (`task <id> on <node>`). */
+function taskIdOf(out: { stdout: string }): string {
+  const id = /^task (\S+) on \S+\n$/.exec(out.stdout)?.[1];
+  if (id === undefined) throw new Error(`task new printed ${JSON.stringify(out.stdout)}`);
+  return id;
+}
+
 test("serve, add a project, run a task's turn, and report status", async () => {
   const { dir, env } = await home();
   await writeFile(`${dir}/token`, "tok\n");
@@ -52,8 +59,9 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], client);
     expect(created.stderr).toBe("");
     expect(created.code).toBe(0);
-    const taskId = created.stdout.trim();
+    const [, taskId, on] = /^task (\S+) on (\S+)\n$/.exec(created.stdout) ?? [];
     expect(taskId).toMatch(/^\S+$/);
+    expect(on).toBe(shortId(node.id));
 
     const prompted = await meddle(["task", "prompt", taskId, "Reply", "with", "the", "single", "word", "ok."], client);
     expect(prompted.code).toBe(0);
@@ -129,7 +137,7 @@ test("task prompt follows a turn its token reruns to the rerun's success, and fa
   const client = { ...env, MEDDLE_PORT: String(node.port) };
   try {
     const projectId = (await meddle(["project", "add", `${dir}/repo`], client)).stdout.trim();
-    const taskId = (await meddle(["task", "new", "--title", "t", "--project", projectId], client)).stdout.trim();
+    const taskId = taskIdOf(await meddle(["task", "new", "--title", "t", "--project", projectId], client));
 
     const prompted = await meddle(["task", "prompt", taskId, "Reply with the single word ok."], client);
     expect(prompted.stderr).not.toContain("meddle: ");
@@ -165,7 +173,7 @@ test("task prompt fails fast when the turn fails", async () => {
   const client = { ...env, MEDDLE_PORT: String(node.port) };
   try {
     const projectId = (await meddle(["project", "add", `${dir}/repo`], client)).stdout.trim();
-    const taskId = (await meddle(["task", "new", "--title", "t", "--project", projectId], client)).stdout.trim();
+    const taskId = taskIdOf(await meddle(["task", "new", "--title", "t", "--project", projectId], client));
     expect(taskId).toMatch(/^\S+$/);
 
     // the child never starts: the turn logs `turn_failed`, and its error is printed
@@ -191,7 +199,7 @@ test("task prompt fails when the turn's result is an error", async () => {
   const client = { ...env, MEDDLE_PORT: String(node.port) };
   try {
     const projectId = (await meddle(["project", "add", `${dir}/repo`], client)).stdout.trim();
-    const taskId = (await meddle(["task", "new", "--title", "t", "--project", projectId], client)).stdout.trim();
+    const taskId = taskIdOf(await meddle(["task", "new", "--title", "t", "--project", projectId], client));
     const prompted = await meddle(["task", "prompt", taskId, "hi"], client);
     expect(prompted.code).toBe(1);
     expect(prompted.stderr).toEndWith("result/error_max_turns\nmeddle: the turn ended with error_max_turns\n");

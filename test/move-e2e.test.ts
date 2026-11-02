@@ -95,7 +95,8 @@ test("a task moves from one node to another through the CLI and resumes there", 
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], atA);
     expect(created.stderr).toBe("");
     expect(created.code).toBe(0);
-    const taskId = created.stdout.trim();
+    const [, taskId = "", on] = /^task (\S+) on (\S+)\n$/.exec(created.stdout) ?? [];
+    expect(on).toBe(shortId(A.id));
     const first = await meddle(["task", "prompt", taskId, "Reply", "with", "ok."], atA);
     expect(first.code).toBe(0);
     expect(first.stderr.trim().split("\n").at(-1)).toBe("result/success");

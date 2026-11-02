@@ -20,7 +20,8 @@ import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
 import { PeerObject } from "../src/state/contracts";
 import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
-import { listLiveTasks } from "../src/store/records";
+import { listProjects } from "../src/projects/project";
+import { countRunningTasks, listLiveTasks } from "../src/store/records";
 import type { RunnerHooks } from "../src/tasks/durable";
 import { VERSION, claudeCodeVersion } from "../src/version";
 import { setupNode } from "./helpers";
@@ -101,7 +102,7 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
   const store = new PoolStore(db);
   const identity = freshIdentity();
   const id = identity.id;
-  const summary: NodeSummary = { hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 0 };
+  const summary: NodeSummary = { hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [] };
   store.ensurePool({ nodeId: id, hostname: summary.hostname });
   const endpoint = await openEndpoint(cfg, identity);
   const errors: unknown[] = [];
@@ -205,13 +206,18 @@ export async function twoNodes(options: { start?: boolean; offerAddresses?: bool
 /** The environment a pool node in a test reads: loopback only, no relays, no lighthouse. */
 export const POOL_ENV = { MEDDLE_IROH_PRESET: "minimal", MEDDLE_IROH_BIND: "127.0.0.1:0", MEDDLE_LIGHTHOUSE_URL: "" };
 
-/** What a test node reports to its pool, as `serve` does: this meddle, the pinned Claude Code, its task root and tasks. */
+/**
+ * What a test node reports to its pool, as `serve` does: this meddle, the pinned Claude Code, its task root, tasks, running
+ * tasks and projects.
+ */
 export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
   return {
     version: VERSION,
     claudeCodeVersion: claudeCodeVersion(),
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
     taskCount: () => listLiveTasks(db).length,
+    running: () => countRunningTasks(db),
+    projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home })),
   };
 }
 

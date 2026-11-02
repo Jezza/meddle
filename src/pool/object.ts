@@ -8,7 +8,7 @@ import { NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema, Token
 import { listTokens, pickToken, tokenRow, tokenValue } from "../token";
 import { isNodeId } from "./identity";
 import type { PoolSettings } from "./settings";
-import type { NodeSummary, PoolStore, RosterRow } from "./store";
+import type { NodeSummary, PoolStore, WireRosterRow } from "./store";
 
 export type PoolObjectDeps = {
   store: PoolStore;
@@ -44,11 +44,14 @@ export function peerOf(principal: unknown): string | null {
 
 const defaultState = PoolObject.def.variants.default.state;
 const LiveSchema = Type.Object({ summary: NodeSummarySchema, at: Type.String() });
-type Live = Type.Static<typeof LiveSchema>;
+export type Live = Type.Static<typeof LiveSchema>;
 type PoolNode = Type.Static<typeof defaultState.nodes>[number];
 
-/** One roster row as a dashboard sees it; this node's own row shows its live summary. */
-function nodeOf(row: RosterRow, selfId: string, live: Live, online: readonly string[]): PoolNode {
+/**
+ * One roster row as a dashboard sees it; this node's own row shows its live summary. A summary from an older meddle
+ * (no `running`, `limit` or `projects`) shows 0, 0 and [], as placement reads it.
+ */
+export function nodeOf(row: WireRosterRow, selfId: string, live: Live, online: readonly string[]): PoolNode {
   const self = row.nodeId === selfId;
   const summary = self ? live.summary : row.summary;
   return {
@@ -60,16 +63,19 @@ function nodeOf(row: RosterRow, selfId: string, live: Live, online: readonly str
     claudeCodeVersion: summary?.claudeCodeVersion ?? "",
     hostsTasks: summary?.hostsTasks ?? false,
     taskCount: summary?.taskCount ?? 0,
+    running: summary?.running ?? 0,
+    limit: summary?.limit ?? 0,
+    projects: summary?.projects ?? [],
     lastSeenAt: self ? live.at : row.lastSeenAt,
   };
 }
 
 /** Members (with a known summary) report more than one meddle or Claude Code version. */
-function mixed(rows: readonly RosterRow[], selfId: string, live: Live): boolean {
+function mixed(rows: readonly WireRosterRow[], selfId: string, live: Live): boolean {
   const summaries = rows
     .filter((r) => r.status === "member")
     .map((r) => (r.nodeId === selfId ? live.summary : r.summary))
-    .filter((s): s is NodeSummary => s !== null);
+    .filter((s) => s !== null);
   return new Set(summaries.map((s) => s.version)).size > 1 || new Set(summaries.map((s) => s.claudeCodeVersion)).size > 1;
 }
 

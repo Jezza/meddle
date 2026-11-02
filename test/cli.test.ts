@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { startDashboard } from "../src/dashboard/server";
-import { resolveNodeId } from "../src/pool/ids";
+import { resolveNodeId, shortId } from "../src/pool/ids";
 import { PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
 import { getTask } from "../src/store/records";
@@ -186,4 +186,35 @@ test("the usage text lists the token subcommands", async () => {
   expect(out.code).toBe(2);
   expect(out.stderr).toContain("meddle token add [--file <path>] [--label <l>] | meddle token set [--file <path>] [--label <l>]");
   expect(out.stderr).toContain("meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>");
+});
+
+test("task new --here creates the task on this node and says so; an unknown --node is refused", async () => {
+  const { A, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    const port = new URL(dashboard.url).port;
+    const run = (args: string[]) => meddle(["task", "new", "--title", "t", "--project", A.project.id, ...args], { HOME: A.home, MEDDLE_PORT: port });
+    const here = await run(["--here"]);
+    expect(here.stderr).toBe("");
+    expect(here.code).toBe(0);
+    const match = /^task (\S+) on (\S+)\n$/.exec(here.stdout);
+    expect(match?.[2]).toBe(shortId(A.id));
+    expect(getTask(A.db, match![1]!)?.title).toBe("t");
+
+    const unknown = await run(["--node", "zzz"]);
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain("no such node: zzz");
+    expect(unknown.stdout).toBe("");
+
+    const both = await run(["--here", "--node", A.id]);
+    expect(both.code).toBe(2);
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 30_000);
+
+test("the usage text lists task new's node choice", async () => {
+  const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
+  expect(out.stderr).toContain("meddle task new --title <t> --project <id>... [--node <id|prefix> | --here]");
 });

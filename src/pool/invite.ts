@@ -166,7 +166,7 @@ export async function handleJoin(conn: Connection, deps: JoinHostDeps): Promise<
         const { hostname, version, claudeCodeVersion } = request;
         deps.store.upsert({
           nodeId, hostname, status: "member", updatedAt: now, addedBy: deps.selfId,
-          summary: { hostname, version, claudeCodeVersion, hostsTasks: false, taskCount: 0 },
+          summary: { hostname, version, claudeCodeVersion, hostsTasks: false, taskCount: 0, running: 0, limit: 0, projects: [] },
           lastSeenAt: now, lastAddr: admitted,
         });
         const selfAddr = fromEndpoint(deps.endpoint);

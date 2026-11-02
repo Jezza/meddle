@@ -10,6 +10,7 @@ import type { PendingApproval } from "../engine/approvals";
 import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { peerOf, servePool } from "../pool/object";
+import { place, placementCandidates } from "../pool/placement";
 import type { PoolRuntime } from "../pool/runtime";
 import { acceptPeerLinks } from "../pool/sync";
 import { bookmarkList } from "../jj";
@@ -66,8 +67,10 @@ export type PeerObjectDeps = {
   changes: Subscribable<null>;
   /** Fires when this node's own state may have changed (each metrics sample, each pool change): `hostsTasks` is re-read. */
   recheck?: Subscribable<null>;
-  /** Receives tasks other nodes move here; each call names the calling node. */
-  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask">;
+  /** Whether a node is a member of this node's pool: only a member may create a task here. */
+  isMember(nodeId: string): boolean;
+  /** Receives tasks other nodes move here (each call names the calling node), and creates tasks members place here. */
+  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt">;
 };
 
 /** A project as another node sees it. */
@@ -112,6 +115,13 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
       },
       activateTask: ({ taskId, followUp }) => deps.runner.activateTask(taskId, from, followUp),
       abandonTask: ({ taskId }) => deps.runner.abandonTask(taskId, from),
+      // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
+      createTask: async ({ title, projectIds, prompt }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        const manifest = await deps.runner.create({ title, projectIds });
+        if (prompt !== null) await deps.runner.prompt(manifest.id, prompt);
+        return { manifest };
+      },
     };
   });
 }
@@ -153,6 +163,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     claudeCodeVersion: deps.claudeCodeVersion,
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
     changes: projectChanges,
+    isMember: (id) => pool.store.isMember(id),
     recheck: {
       subscribe: (cb) => {
         const offSamples = metrics.onSample(() => cb(null));
@@ -240,16 +251,26 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("moves", moves, ({ taskId, move }, ctx) => {
       if (move?.error) notify(ctx, { taskId, kind: "move", text: `Move to ${shortId(move.to)} failed at ${move.phase}: ${move.error}` });
     });
-    // A task received from another node turns live through the runner, not through createTask; a moved one leaves.
+    /** The running count the pool last heard from here (placement reads it from the roster). */
+    let reportedRunning = runner.running();
+    // A task received from another node, or created for one, turns live through the runner; a moved one leaves. The
+    // pool hears of a new or gone task, and of one that started or stopped running, now.
     self.on("taskStates", states, (_event, ctx) => {
       const ids = listLiveTasks(db).map((t) => t.id);
-      if (ids.join() !== taskIds.value.join()) {
-        taskIds.replace(ctx, ids);
+      const running = runner.running();
+      const changed = ids.join() !== taskIds.value.join();
+      if (changed) taskIds.replace(ctx, ids);
+      if (changed || running !== reportedRunning) {
+        reportedRunning = running;
         void pool.refresh();
       }
     });
-    // A project added or registered elsewhere than through this object (a replica a task needed).
-    self.on("projects", projectChanges, (_event, ctx) => projectIds.replace(ctx, projectIdsNow()));
+    // A project added or registered elsewhere than through this object (a replica a task needed); the pool hears of it
+    // now, as placement reads where projects are from the roster.
+    self.on("projects", projectChanges, (_event, ctx) => {
+      projectIds.replace(ctx, projectIdsNow());
+      void pool.refresh();
+    });
     // A token pulled from a peer, marked or removed changes what is usable without a metrics sample.
     self.on("pool", poolChanges, async (_event, ctx) => {
       const next = await tokenNow(cfg, db);
@@ -272,12 +293,26 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       models,
       notifications,
       efforts,
-      createTask: async (input, ctx) => {
-        const manifest = await runner.create(input);
-        if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
-        // The pool sees the new task count now, not at the next periodic refresh.
-        void pool.refresh();
-        return manifest;
+      createTask: async ({ title, projectIds: ids, prompt, node }, ctx) => {
+        const selfId = pool.identity.id;
+        const target = node === "here" ? selfId : node ?? await placeTask(ids);
+        if (target === selfId) {
+          const manifest = await runner.create({ title, projectIds: ids });
+          if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
+          // The pool sees the new task count now, not at the next periodic refresh.
+          void pool.refresh();
+          if (prompt !== undefined && prompt !== null) await runner.prompt(manifest.id, prompt);
+          return { manifest, nodeId: selfId };
+        }
+        if (!pool.store.isMember(target)) throw new Error(`no such node: ${target}`);
+        const peer = await pool.peerRef(target, PeerObject);
+        try {
+          if (peer.variant !== "peer") throw new Error(`${shortId(target)} did not serve the peer variant of PeerObject`);
+          const { manifest } = await peer.createTask({ title, projectIds: ids, prompt: prompt ?? null });
+          return { manifest, nodeId: target };
+        } finally {
+          peer.release();
+        }
       },
       addProjectFromFolder: async ({ path, name }, ctx) => {
         const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name);
@@ -501,6 +536,21 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const row = getTask(db, taskId);
     if (row === null) return false;
     return (JSON.parse(row.manifest) as TaskManifest).projects.some((p) => p.id === projectId);
+  }
+
+  /** The node `place` picks for a new task of `projectIds`, from the roster and this node's live numbers. */
+  async function placeTask(projectIds: string[]): Promise<string> {
+    const self = {
+      nodeId: pool.identity.id,
+      hostsTasks: (await checkTaskRoot(cfg)).ok,
+      running: runner.running(),
+      taskCount: listLiveTasks(db).length,
+      projects: listProjects(db).map((p) => ({ id: p.id, home: p.home })),
+      limit: pool.settings.runningLimit(),
+    };
+    const choice = place({ projectIds, nodes: placementCandidates(pool.store.roster(), (id) => pool.net.isOnline(id), self) });
+    if ("error" in choice) throw new Error(choice.error);
+    return choice.nodeId;
   }
 
   function projectIdsNow(): string[] {

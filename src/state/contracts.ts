@@ -110,7 +110,20 @@ const nodeState = {
 };
 
 const nodeMethods = {
-  createTask: method(Type.Object({ title: Type.String(), projectIds: Type.Array(Type.String()) }), TaskManifestSchema),
+  /**
+   * Creates a task on the node `node` names: absent or null, the one placement picks (`place`); `"here"`, this node;
+   * else that node id, a member of the pool. `prompt`, when given, starts its first turn there. Answers the manifest
+   * and the node the task is on.
+   */
+  createTask: method(
+    Type.Object({
+      title: Type.String(),
+      projectIds: Type.Array(Type.String()),
+      prompt: Type.Optional(Nullable(Type.String())),
+      node: Type.Optional(Nullable(Type.String())),
+    }),
+    Type.Object({ manifest: TaskManifestSchema, nodeId: Type.String() }),
+  ),
   addProjectFromFolder: method(Type.Object({ path: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
   addProjectFromUpstream: method(Type.Object({ url: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
   dismiss: method(Type.Object({ id: Type.String() })),
@@ -251,13 +264,22 @@ export type SessionView = Type.Static<typeof SessionViewSchema>;
 /** An iroh endpoint address in JSON form (`WireAddr`): `id` is the node id. */
 export const WireAddrSchema = Type.Object({ id: Type.String(), relay: Nullable(Type.String()), direct: Type.Array(Type.String()) });
 
-/** What a node reports about itself to the rest of the pool (`NodeSummary`). */
+/**
+ * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit` and `projects` are
+ * optional: an older meddle sends none of them, and they read as 0, 0 and [] (`withSummaryDefaults`).
+ */
 export const NodeSummarySchema = Type.Object({
   hostname: Type.String(),
   version: Type.String(),
   claudeCodeVersion: Type.String(),
   hostsTasks: Type.Boolean(),
   taskCount: Type.Number(),
+  /** Tasks in state `running` or `waiting`. */
+  running: Type.Optional(Type.Number()),
+  /** How many tasks may run at once; 0 is no limit. */
+  limit: Type.Optional(Type.Number()),
+  /** Every project the node holds, its own and its replicas of others'. */
+  projects: Type.Optional(Type.Array(ProjectInfoSchema)),
 });
 
 /** One node of the pool's roster (`RosterRow`). */
@@ -307,6 +329,12 @@ export const PoolNodeSchema = Type.Object({
   claudeCodeVersion: Type.String(),
   hostsTasks: Type.Boolean(),
   taskCount: Type.Number(),
+  /** Tasks in state `running` or `waiting` (0 for a node of an older meddle). */
+  running: Type.Number(),
+  /** How many tasks may run at once; 0 is no limit (and what a node of an older meddle shows). */
+  limit: Type.Number(),
+  /** Every project the node holds ([] for a node of an older meddle). */
+  projects: Type.Array(ProjectInfoSchema),
   lastSeenAt: Nullable(Type.String()),
 });
 
@@ -338,6 +366,14 @@ export const PeerObject = remote("meddle.peer", {
         activateTask: method(Type.Object({ taskId: Type.String(), followUp: Nullable(Type.String()) }), Type.Object({ ok: Type.Boolean() })),
         /** Removes a task still being received from the caller. */
         abandonTask: method(Type.Object({ taskId: Type.String() })),
+        /**
+         * Creates a task here for the caller (a member; anyone else is refused `forbidden`), then starts its first
+         * turn with `prompt` when one is given. Refused like a local create: no task root, no usable token, ….
+         */
+        createTask: method(
+          Type.Object({ title: Type.String(), projectIds: Type.Array(Type.String()), prompt: Nullable(Type.String()) }),
+          Type.Object({ manifest: TaskManifestSchema }),
+        ),
       },
     },
   },

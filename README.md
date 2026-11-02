@@ -271,7 +271,7 @@ create a task on it and send it a prompt:
 ```sh
 bun run src/cli.ts project add ~/src/myproject [--name myproject]   # prints the project id
 bun run src/cli.ts project list
-bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id>   # prints the task id
+bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id>   # prints: task <id> on <node>
 bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fix it"
 bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
 bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to another node
@@ -281,6 +281,28 @@ bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to anot
 `idle`, `running` or `waiting` (for an approval) while it lives on a node; a task moving away is `moving` on the node
 it leaves and `receiving` on the node it goes to until it arrives, and the node it left keeps it as `moved`.
 
+### Where a new task runs
+
+`task new` creates the task on the node meddle picks for it, and prints `task <id> on <short id>`; `--here` creates
+it on this node and `--node <id|prefix>` on that member (an id or a unique prefix of one; `no such node: <x>`
+otherwise). The dashboard's new-task form has the same choice: `Automatic` (the default) or one of the online nodes
+that host tasks.
+
+meddle picks among the online members that host tasks (have a task root) and run fewer tasks (`running` or `waiting`)
+than their limit, `limits.running` (see [Pool settings](#pool-settings); `MEDDLE_MAX_RUNNING` on a node overrides it,
+and `0` is no limit). Of those it prefers the home of the task's first project; else the nodes holding a copy of every
+project of the task; else any of them. Ties go to the fewest running tasks, then the fewest tasks, then the lower
+node id. With no node to pick, creation fails with `no online node hosts tasks` or `every node is at its running
+limit`. A pick or a named node never skips the task's own checks there: that node refuses a create without a task
+root or a usable token as it would locally.
+
+meddle picks from what the roster says of each node: every node reports its running count, its limit and the
+projects it holds with its summary, at once when a task starts or ends, a task is created or a project is added, and
+every 15 s. The node that took the request asks the chosen node to create the task (and to run its first prompt, when
+one is given); the task is born there, no move involved. Only a member may ask. A node of an older meddle reports none
+of this: it counts as idle, with no limit and no projects, and it cannot create a task for another node, so a task
+placed on it fails; name a node with `--node` or `--here` while the pool upgrades.
+
 ## Projects across the pool
 
 ### Homes and replicas
@@ -289,8 +311,8 @@ The node a project is added on is its home, and the project keeps the id its hom
 same folder or URL on two nodes makes two projects. A task can be created on any node that hosts tasks. On a node
 that has never seen the project, `task new --project <id>` (the id from the home's `project list` or the dashboard's
 Projects view) asks the online members which of them holds it, then clones the project from its home into
-`<data dir>/replicas/<id>` and its memory into `<data dir>/memory/<id>`. The dashboard's new-task form offers the
-projects the chosen node already holds.
+`<data dir>/replicas/<id>` and its memory into `<data dir>/memory/<id>`. The dashboard's new-task form offers every
+project the online members hold.
 
 A new task starts from the home's `trunk`. On the home, meddle keeps a local `trunk` bookmark in the project's repo
 (your own folder, for a folder project) at the newest of jj's `trunk()` (the upstream's main, master or trunk) and
@@ -510,7 +532,8 @@ bun run src/cli.ts serve
 Then open <http://127.0.0.1:7777/> (`MEDDLE_PORT` changes the port). The dashboard binds to localhost only.
 
 The dashboard of any node shows the whole pool: a card per node with its state (online, offline or removed); the
-notifications of every online node; and a form for a new task on any online node that hosts tasks. An online node's
+notifications of every online node; and a form for a new task, placed by meddle or on a chosen online node that
+hosts tasks (see [Where a new task runs](#where-a-new-task-runs)). An online node's
 card shows its meddle and Claude Code versions, token, task root, resources and tasks. An offline member's card shows
 what the roster last recorded of it (its versions, whether it hosts tasks and how many tasks it has) and when it was
 last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle

@@ -25,7 +25,8 @@ import { resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
 import { PoolObject } from "./state/contracts";
 import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
-import { listLiveTasks } from "./store/records";
+import { listProjects } from "./projects/project";
+import { countRunningTasks, listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
 import {
@@ -43,7 +44,8 @@ const USAGE = `usage: meddle --version
        meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
        meddle project add <path-or-url> [--name <n>] | meddle project list
-       meddle task new --title <t> --project <id>... | meddle task prompt <id> <text> | meddle task retry <id>
+       meddle task new --title <t> --project <id>... [--node <id|prefix> | --here]
+       meddle task prompt <id> <text> | meddle task retry <id>
        meddle task move <id> <node> [--now]
        meddle service install [--dry-run]
        meddle git-remote <name> <url>   (git's remote helper for meddle:// remotes)`;
@@ -118,6 +120,8 @@ async function serve(): Promise<number> {
       claudeCodeVersion: claudeCodeVersion(),
       hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
       taskCount: () => listLiveTasks(db).length,
+      running: () => countRunningTasks(db),
+      projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home })),
     }));
     const gitSocket = (node.gitSocket = new GitSocket(cfg, pool.net));
     await gitSocket.start();
@@ -423,10 +427,28 @@ function projectList(): Promise<number> {
   });
 }
 
-function taskNew(title: string, projectIds: string[]): Promise<number> {
+/**
+ * Creates a task on the node `where` names: `auto` (placement picks it), `here` (this node), or a node's id or a
+ * unique prefix of one in the pool's roster. Prints `task <id> on <node>`.
+ */
+function taskNew(title: string, projectIds: string[], where: { node: string } | "here" | "auto"): Promise<number> {
   return withNode(async (client) => {
-    const node = await client.get(NodeObject, {});
-    console.log((await node.createTask({ title, projectIds })).id);
+    let node: string | null = where === "here" ? "here" : null;
+    if (typeof where === "object") {
+      const pool = await poolView(client);
+      try {
+        node = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), where.node);
+      } finally {
+        pool.release();
+      }
+    }
+    const ref = await client.get(NodeObject, {});
+    try {
+      const { manifest, nodeId } = await ref.createTask({ title, projectIds, node });
+      console.log(`task ${manifest.id} on ${shortId(nodeId)}`);
+    } finally {
+      ref.release();
+    }
     return 0;
   });
 }
@@ -444,8 +466,9 @@ const QUEUED_FOR_MOVE = "queued; it runs once the task has arrived";
  * than a success, a `turn_failed` event, or the task going idle again with no `result` (a turn that failed before it
  * logged anything) fails it. An error `result` of an attempt whose messages reported a token fault is provisional: a
  * `token_fault` that reruns the turn drops it and the rerun is followed; one that does not fails it with the token's
- * notice; the task going idle, or a meddle event other than a `token_fault`, fails it with the result's error. A text the node queued for a task it is moving away (or one that has moved before a
- * `result` came) runs on the other node: that is printed (`QUEUED_FOR_MOVE`) and the command succeeds.
+ * notice; the task going idle, or a meddle event other than a `token_fault`, fails it with the result's error. A text
+ * the node queued for a task it is moving away (or one that has moved before a `result` came) runs on the other node:
+ * that is printed (`QUEUED_FOR_MOVE`) and the command succeeds.
  */
 function taskPrompt(id: string, text: string): Promise<number> {
   return withNode(async (client, socket) => {
@@ -607,16 +630,22 @@ function tokenAddArgs(args: string[]): { file?: string; label?: string } | null 
   return out;
 }
 
-/** `--title <t>` and `--project <id>...` (one or more ids, the flag repeatable). */
-function taskNewArgs(args: string[]): { title: string; projectIds: string[] } | null {
+/**
+ * `--title <t>`, `--project <id>...` (one or more ids, the flag repeatable) and at most one of `--node <id|prefix>` and
+ * `--here` (neither: `auto`).
+ */
+function taskNewArgs(args: string[]): { title: string; projectIds: string[]; where: { node: string } | "here" | "auto" } | null {
   let title: string | undefined;
   const projectIds: string[] = [];
+  let where: { node: string } | "here" | "auto" = "auto";
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--title" && i + 1 < args.length) title = args[++i];
     else if (args[i] === "--project") while (i + 1 < args.length && !args[i + 1]!.startsWith("--")) projectIds.push(args[++i]!);
+    else if (args[i] === "--node" && i + 1 < args.length && where === "auto") where = { node: args[++i]! };
+    else if (args[i] === "--here" && where === "auto") where = "here";
     else return null;
   }
-  return title === undefined || projectIds.length === 0 ? null : { title, projectIds };
+  return title === undefined || projectIds.length === 0 ? null : { title, projectIds, where };
 }
 
 /**
@@ -666,7 +695,7 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "project" && sub === "list" && rest.length === 0) return projectList;
   if (command === "task" && sub === "new") {
     const parsed = taskNewArgs(rest);
-    return parsed === null ? null : () => taskNew(parsed.title, parsed.projectIds);
+    return parsed === null ? null : () => taskNew(parsed.title, parsed.projectIds, parsed.where);
   }
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
   if (command === "task" && sub === "retry" && rest.length === 1) return () => taskRetry(rest[0]!);

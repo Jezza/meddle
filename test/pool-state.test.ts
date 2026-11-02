@@ -109,7 +109,8 @@ test("PoolObject shows a pool of one, invites, and a joined node appears online 
     expect(poolA.self.value).toBe(A.identity.id);
     expect(poolA.nodes.value).toEqual([{
       nodeId: A.id, hostname: hostname(), status: "member", online: true, version: VERSION, claudeCodeVersion: "2.1.314",
-      hostsTasks: true, taskCount: 0, lastSeenAt: expect.any(String),
+      hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [{ id: A.project.id, name: "a", home: A.id }],
+      lastSeenAt: expect.any(String),
     }]);
     const nodeA = await a!.client.get(NodeObject, {});
     expect(nodeA.nodeId.value).toBe(A.identity.id);
@@ -249,7 +250,7 @@ test("a member that did not do the removing closes the removed node's live conne
       const { ticket } = await a!.pool.invite({});
       const joined = await joinPool(decodeTicket(ticket), {
         endpoint: c.endpoint, store, identity: c.identity,
-        summary: () => ({ hostname: "bare-c", version: VERSION, claudeCodeVersion: "2.1.314", hostsTasks: false, taskCount: 0 }),
+        summary: () => ({ hostname: "bare-c", version: VERSION, claudeCodeVersion: "2.1.314", hostsTasks: false, taskCount: 0, running: 0, limit: 0, projects: [] }),
       });
       net.start();
       for (const addr of joined.addrs) net.offerAddress(addr);
@@ -477,7 +478,9 @@ test("a task created for a project a node has never seen clones it from home, st
     expect(getProject(B.db, id)).toBeNull();
 
     const nodeB = await linked.client.get(NodeObject, {});
-    const manifest = await nodeB.createTask({ title: "t", projectIds: [id] });
+    // Here, on B: placement would pick the project's home.
+    const { manifest, nodeId } = await nodeB.createTask({ title: "t", projectIds: [id], node: "here" });
+    expect(nodeId).toBe(B.id);
     expect(getProject(B.db, id)?.home).toBe(A.id);
     const workspace = joinPath(paths(B.cfg).task(manifest.id), "a");
     expect(await changeOf(B.cfg, workspace, "@-")).toBe(main);

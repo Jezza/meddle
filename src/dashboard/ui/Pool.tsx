@@ -1,10 +1,11 @@
 // The pool: a card per node with its tasks, the notifications strip merged from every online node, and a form for a
-// new task on any online node that hosts tasks.
+// new task, placed automatically or on a chosen online node that hosts tasks.
 import type { Host, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
-import { NodeObject, PoolObject, ProjectObject, TaskObject, type Notification } from "../../state/contracts";
+import { NodeObject, PoolObject, TaskObject, type Notification } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, type HostStatus, useAction, useObject, useValue } from "./hooks";
+import { projectChoices } from "./pool-model";
 import type { Open } from "./routes";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -26,7 +27,7 @@ export function Pool({ hosts, pool, open }: { hosts: Hosts; pool: PoolRef; open:
       <section class="cards">
         {ordered.map((row) => <NodeCard key={row.nodeId} hosts={hosts} row={row} selfRow={selfRow} open={open} />)}
       </section>
-      <NewTask hosts={hosts} canHost={canHost} selfId={selfId} open={open} />
+      <NewTask hosts={hosts} nodes={nodes} canHost={canHost} selfId={selfId} open={open} />
     </>
   );
 }
@@ -223,59 +224,68 @@ function NoteSourceLoaded({ node, nodeId, report }: { node: NodeRef; nodeId: str
 
 // ─── a new task ───
 
-function NewTask({ hosts, canHost, selfId, open }: { hosts: Hosts; canHost: readonly PoolNode[]; selfId: string; open: Open }) {
-  const [picked, setPicked] = useState<string | null>(null);
-  const target = canHost.find((n) => n.nodeId === picked) ?? canHost.find((n) => n.nodeId === selfId) ?? canHost[0];
+/**
+ * A new task, created through this node: on the node chosen, or (`Automatic`) the one placement picks. The projects
+ * offered are those the online members list; the task opens on the node it was created on.
+ */
+function NewTask({ hosts, nodes, canHost, selfId, open }: {
+  hosts: Hosts; nodes: readonly PoolNode[]; canHost: readonly PoolNode[]; selfId: string; open: Open;
+}) {
+  const host = hosts.for(selfId);
   return (
     <section>
       <h2>New task</h2>
-      {target === undefined ? <p class="muted">No online node hosts tasks.</p> : (
-        <>
-          <label>Node{" "}
-            <select value={target.nodeId} onChange={(e) => setPicked(e.currentTarget.value)}>
-              {canHost.map((n) => <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)})</option>)}
-            </select>
-          </label>
-          <NewTaskOn key={target.nodeId} host={hosts.for(target.nodeId)} status={hosts.status(target.nodeId)} open={(taskId) => open(target.nodeId, taskId)} />
-        </>
-      )}
+      {canHost.length === 0 ? <p class="muted">No online node hosts tasks.</p>
+        : host === undefined ? <Unavailable status={hosts.status(selfId)} />
+        : <NewTaskOnHost host={host} nodes={nodes} canHost={canHost} open={open} />}
     </section>
   );
 }
 
-function NewTaskOn({ host, status, open }: { host: Host | undefined; status: HostStatus; open: (taskId: string) => void }) {
-  return host === undefined ? <Unavailable status={status} /> : <NewTaskOnHost host={host} open={open} />;
-}
-
-function NewTaskOnHost({ host, open }: { host: Host; open: (taskId: string) => void }) {
+function NewTaskOnHost({ host, nodes, canHost, open }: { host: Host; nodes: readonly PoolNode[]; canHost: readonly PoolNode[]; open: Open }) {
   const node = useObject(host, NodeObject, {});
   if (node.error !== undefined) return <p class="error">{node.error}</p>;
   if (node.ref === undefined) return <p class="muted">Connecting…</p>;
-  return <NewTaskForm host={host} node={node.ref} open={open} />;
+  return <NewTaskForm node={node.ref} nodes={nodes} canHost={canHost} open={open} />;
 }
 
-function NewTaskForm({ host, node, open }: { host: Host; node: NodeRef; open: (taskId: string) => void }) {
-  const projectIds = useValue(node.projectIds);
+/** The node select's value for `Automatic`. */
+const AUTOMATIC = "";
+
+function NewTaskForm({ node, nodes, canHost, open }: { node: NodeRef; nodes: readonly PoolNode[]; canHost: readonly PoolNode[]; open: Open }) {
+  const projects = projectChoices(nodes);
   const [title, setTitle] = useState("");
   const [chosen, setChosen] = useState<string[]>([]);
+  const [picked, setPicked] = useState(AUTOMATIC);
+  // A node that went offline (or stopped hosting tasks) since it was picked falls back to Automatic.
+  const where = canHost.some((n) => n.nodeId === picked) ? picked : AUTOMATIC;
   const action = useAction();
   const toggle = (id: string) => setChosen(chosen.includes(id) ? chosen.filter((c) => c !== id) : [...chosen, id]);
   const submit = async (e: Event) => {
     e.preventDefault();
-    let created: string | undefined;
-    const ok = await action.run(async () => { created = (await node.createTask({ title, projectIds: chosen })).id; });
-    if (ok && created !== undefined) open(created);
+    let created: { taskId: string; nodeId: string } | undefined;
+    const ok = await action.run(async () => {
+      const { manifest, nodeId } = await node.createTask({ title, projectIds: chosen, node: where === AUTOMATIC ? null : where });
+      created = { taskId: manifest.id, nodeId };
+    });
+    if (ok && created !== undefined) open(created.nodeId, created.taskId);
   };
   return (
     <form onSubmit={submit}>
       <label>Title <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} required /></label>
+      <label>Node{" "}
+        <select value={where} onChange={(e) => setPicked(e.currentTarget.value)}>
+          <option value={AUTOMATIC}>Automatic</option>
+          {canHost.map((n) => <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)})</option>)}
+        </select>
+      </label>
       <fieldset>
         <legend>Projects (the first chosen is the primary)</legend>
-        {projectIds.length === 0 && <p class="muted">Add a project first.</p>}
-        {projectIds.map((id) => (
-          <label key={id} class="option">
-            <input type="checkbox" checked={chosen.includes(id)} onChange={() => toggle(id)} />{" "}
-            <ProjectName host={host} id={id} />
+        {projects.length === 0 && <p class="muted">Add a project first.</p>}
+        {projects.map((p) => (
+          <label key={p.id} class="option" title={p.id}>
+            <input type="checkbox" checked={chosen.includes(p.id)} onChange={() => toggle(p.id)} />{" "}
+            <span>{p.name}</span>
           </label>
         ))}
       </fieldset>
@@ -283,15 +293,6 @@ function NewTaskForm({ host, node, open }: { host: Host; node: NodeRef; open: (t
       {action.error !== null && <p class="error">{action.error}</p>}
     </form>
   );
-}
-
-function ProjectName({ host, id }: { host: Host; id: string }) {
-  const project = useObject(host, ProjectObject, { id });
-  return project.ref === undefined ? <span class="muted">{id}</span> : <ProjectNameLoaded project={project.ref} />;
-}
-
-function ProjectNameLoaded({ project }: { project: Ref<typeof ProjectObject> }) {
-  return <span>{useValue(project.name)}</span>;
 }
 
 export function tokenText(token: { present: boolean; expiresAt: string | null }): string {

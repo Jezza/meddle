@@ -26,7 +26,10 @@ async function until(cond: () => boolean, ms = 2000): Promise<void> {
 }
 
 function summaryOf(id: string): NodeSummary {
-  return { hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 3 };
+  return {
+    hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 3,
+    running: 1, limit: 2, projects: [{ id: "p", name: "p", home: id }],
+  };
 }
 
 /** The inviting node: a temp home, a store with a pool of one, and a PoolNet that serves ALPN_JOIN with handleJoin. */
@@ -135,7 +138,7 @@ test("a node joins with a ticket and both rosters agree", async () => {
       expect(b.store.roster()).toHaveLength(a.store.roster().length);
       const bRow = a.store.row(bId)!;
       expect(bRow).toMatchObject({ status: "member", addedBy: a.id, lastAddr: fromEndpoint(b.endpoint) });
-      expect(bRow.summary).toEqual({ ...summaryOf(bId), hostsTasks: false, taskCount: 0 });
+      expect(bRow.summary).toEqual({ ...summaryOf(bId), hostsTasks: false, taskCount: 0, running: 0, limit: 0, projects: [] });
       expect(b.store.row(bId)).toEqual(bRow);
       expect(b.store.row(a.id)!.lastAddr).toEqual(fromEndpoint(a.node.endpoint));
       // The inviter reports the admission once its reply is finished, which may be after the joiner has read it.

@@ -23,6 +23,30 @@ export function moveTargets<N extends MoveCandidate>(nodes: readonly N[], from: 
   return nodes.filter((n) => n.nodeId !== from && n.status === "member" && n.online && n.hostsTasks && n.claudeCodeVersion === version);
 }
 
+/** A project as a node's summary lists it (`PoolObject.nodes[].projects`). */
+export type ListedProject = { id: string; name: string; home: string };
+
+/** What the projects a new task can work in are read from: a row of `PoolObject.nodes`. */
+export type ProjectLister = { nodeId: string; status: "member" | "removed"; online: boolean; projects: readonly ListedProject[] };
+
+/**
+ * The projects a new task can work in: every project an online member lists, one per id, named as its home lists it
+ * (another holder's entry when the home lists nothing), by name then id.
+ */
+export function projectChoices(nodes: readonly ProjectLister[]): ListedProject[] {
+  /** Each id's entry, and whether it is the home's own. */
+  const byId = new Map<string, { project: ListedProject; fromHome: boolean }>();
+  for (const n of nodes) {
+    if (n.status !== "member" || !n.online) continue;
+    for (const p of n.projects) {
+      const fromHome = p.home === n.nodeId;
+      const known = byId.get(p.id);
+      if (known === undefined || (fromHome && !known.fromHome)) byId.set(p.id, { project: { id: p.id, name: p.name, home: p.home }, fromHome });
+    }
+  }
+  return [...byId.values()].map((e) => e.project).sort((x, y) => x.name.localeCompare(y.name) || x.id.localeCompare(y.id));
+}
+
 /** A bookmark of a project's replica, as `ProjectObject.heads` carries it. */
 export type Head = { name: string; remote: string | null; changeId: string; conflicted: boolean };
 

@@ -110,7 +110,8 @@ test("a browser reaches a remote node's objects through the tunnel", async () =>
       const pool = await first.client.get(PoolObject, {});
       if (pool.variant !== "default") throw new Error("expected the default variant");
       expect(pool.self.value).toBe(B!.id);
-      const manifest = await node.createTask({ title: "t", projectIds: [B!.project.id] });
+      const { manifest, nodeId } = await node.createTask({ title: "t", projectIds: [B!.project.id] });
+      expect(nodeId).toBe(B!.id);
       expect(B!.runner.state(manifest.id)).toBe("idle");
       node.release();
       pool.release();

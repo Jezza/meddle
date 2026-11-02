@@ -25,6 +25,7 @@ import { appendEvent, latestEventOfType, listEventsTail, type EventRecord } from
 import { SqliteSessionStore } from "../store/session-store";
 import {
   clearTaskLog,
+  countRunningTasks,
   deleteTask,
   getTask,
   getTaskSettings,
@@ -158,7 +159,7 @@ export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHook
   },
   abort: async (task, runtime, context) => {
     const runner = await runnerFor(runtime, context);
-    runner.abortTurnPhase(task.input.taskId);
+    runner.abortTurnPhase(task.input.taskId, task.input.freshAfter ?? 0);
     await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context);
   },
 });
@@ -241,13 +242,24 @@ export class TaskRunner {
   async create(input: { title: string; projectIds: string[] }): Promise<TaskManifest> {
     if ((await pickToken(this.#cfg, this.#db)) === null) throw new Error("no usable token");
     const deps = this.#replicaDeps();
-    if (deps === null) return provisionTask(this.#cfg, this.#db, input);
-    const parents: Record<string, string> = {};
-    for (const id of input.projectIds) {
-      if (id in parents) continue; // provisionTask refuses the duplicate
-      parents[id] = await trunkFor(deps, await ensureReplica(deps, id));
+    let manifest: TaskManifest;
+    if (deps === null) manifest = await provisionTask(this.#cfg, this.#db, input);
+    else {
+      const parents: Record<string, string> = {};
+      for (const id of input.projectIds) {
+        if (id in parents) continue; // provisionTask refuses the duplicate
+        parents[id] = await trunkFor(deps, await ensureReplica(deps, id));
+      }
+      manifest = await provisionTask(this.#cfg, this.#db, { ...input, parents });
     }
-    return provisionTask(this.#cfg, this.#db, { ...input, parents });
+    // The new task is live here: whoever lists this node's tasks hears of it, whichever node asked for it.
+    this.#emitState(manifest.id, "idle");
+    return manifest;
+  }
+
+  /** How many of this node's tasks are in state `running` or `waiting`. */
+  running(): number {
+    return countRunningTasks(this.#db);
   }
 
   /**
@@ -1031,8 +1043,19 @@ export class TaskRunner {
     });
   }
 
-  /** The `abort` phase of `meddle.turn`; not for callers outside this module. */
-  abortTurnPhase(taskId: string): void {
+  /**
+   * The `abort` phase of `meddle.turn`; not for callers outside this module. An abort between a `token_fault` that
+   * reruns the turn and the rerun's `turn_started` leaves no `turn_aborted` from `runTurn`: one is logged here, so the
+   * task's next new turn is not taken for that rerun (and sent `TOKEN_RETRY_PROMPT` in place of its own prompt).
+   */
+  abortTurnPhase(taskId: string, freshAfter = 0): void {
+    if (lastTurnCutOff(this.#db, taskId, freshAfter) === "token") {
+      try {
+        this.#record(taskId, { type: "meddle", subtype: "turn_aborted", at: new Date().toISOString() });
+      } catch (err) {
+        this.#log(`meddle: could not log the abort of task ${taskId}'s turn: ${messageOf(err)}`);
+      }
+    }
     this.#primaries.delete(taskId);
     this.#live.get(taskId)?.query.close();
     this.#turnState(taskId, "idle");
