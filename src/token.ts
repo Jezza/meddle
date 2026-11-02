@@ -3,7 +3,7 @@
 // named by the token's id (the first 16 hex characters of the SHA-256 of the value) and pulled from a peer by id.
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { ensurePrivateDir, paths } from "./paths";
@@ -102,6 +102,11 @@ function after(now: string, previous: string): string {
   return Date.parse(now) >= next ? now : new Date(next).toISOString();
 }
 
+/** Null, or at most 256 characters with no control characters. */
+function detailOk(detail: unknown): boolean {
+  return detail === null || (typeof detail === "string" && detail.length <= MAX_DETAIL && !CONTROL.test(detail));
+}
+
 function labelOk(label: unknown): label is string {
   return typeof label === "string" && label.length > 0 && label.length <= MAX_TOKEN_LABEL && !CONTROL.test(label);
 }
@@ -173,7 +178,7 @@ export async function addToken(
       write(db, { ...local, label, removed: false, updatedAt: after(now, local.updatedAt) });
     }
     return tokenRow(db, id)!;
-  })();
+  }).immediate();
 }
 
 /**
@@ -186,7 +191,7 @@ export async function removeToken(cfg: NodeConfig, db: Database, idOrLabel: stri
     const local = resolve(db, idOrLabel);
     write(db, { ...local, removed: true, updatedAt: after(at, local.updatedAt) });
     return tokenRow(db, local.id)!;
-  })();
+  }).immediate();
   await deleteTokenValue(cfg, removed.id);
   return removed;
 }
@@ -199,20 +204,27 @@ export function enableToken(db: Database, idOrLabel: string, now?: string): Toke
     if (local.status === "ok" && local.until === null && local.detail === null) return local;
     write(db, { ...local, status: "ok", until: null, detail: null, updatedAt: after(at, local.updatedAt) });
     return tokenRow(db, local.id)!;
-  })();
+  }).immediate();
 }
 
-/** Sets token `id`'s status (`exhausted` until a time, `disabled`, or `ok`); null when there is no such row. */
+/**
+ * Sets token `id`'s status (`exhausted` until a time, `disabled`, or `ok`); null when there is no such row. Throws
+ * `invalid token mark` for anything a peer would drop: a status other than the three, an `until` that is not an ISO
+ * time (`Date.toISOString`) or null, a `detail` over 256 characters or with control characters.
+ */
 export function markToken(
   db: Database, id: string, status: TokenStatus, until: string | null, detail: string | null, now?: string,
 ): TokenMeta | null {
+  if (!STATUSES.includes(status) || !(until === null || ISO_TIME.test(until)) || !detailOk(detail)) {
+    throw new Error("invalid token mark: a status of ok, exhausted or disabled, an ISO time or null, a short detail");
+  }
   const at = now ?? new Date().toISOString();
   return db.transaction(() => {
     const local = tokenRow(db, id);
     if (local === null) return null;
     write(db, { ...local, status, until, detail, updatedAt: after(at, local.updatedAt) });
     return tokenRow(db, id);
-  })();
+  }).immediate();
 }
 
 /** Usable at `at` (ms): `ok`, or `exhausted` until a time that has passed. */
@@ -237,13 +249,12 @@ export async function pickToken(
 /** A replicated row this node can store: an id that names a file safely, and nothing no node would write. */
 function acceptable(r: TokenRowIn): r is TokenMeta {
   const time = (s: unknown) => typeof s === "string" && ISO_TIME.test(s);
-  const text = (s: unknown) => s === null || (typeof s === "string" && s.length <= MAX_DETAIL && !CONTROL.test(s));
   return typeof r.id === "string" && TOKEN_ID.test(r.id)
     && labelOk(r.label)
     && STATUSES.includes(r.status)
     && time(r.setAt) && time(r.updatedAt) && (r.until === null || time(r.until))
     && (r.setBy === null || (typeof r.setBy === "string" && isNodeId(r.setBy)))
-    && text(r.detail)
+    && detailOk(r.detail)
     && typeof r.removed === "boolean";
 }
 
@@ -277,7 +288,7 @@ export function mergeTokens(
       write(db, r);
       changed = true;
     }
-  })();
+  }).immediate();
   const missingValues: string[] = [];
   const removedValues: string[] = [];
   for (const id of accepted) {
@@ -291,8 +302,9 @@ export function mergeTokens(
 
 /**
  * Imports the single token of meddle before token lists (`<data>/secrets/claude-token` and its `.meta.json`) as a token
- * labelled `default`, set when and by whom its meta says (else when the file was written, by `selfId`), then renames
- * both files to `*.migrated`. False when there is nothing to import.
+ * labelled `default`, set when and by whom its meta says (else when the file was written, by `selfId`). Once the value
+ * is in `tokens/<id>`, the meta file is renamed to `*.migrated` and the old value file deleted, so that no copy of the
+ * value outlives the token's removal. False when there is nothing to import.
  */
 export async function migrateLegacyToken(cfg: NodeConfig, db: Database, selfId: string): Promise<boolean> {
   const file = join(paths(cfg).secrets, "claude-token");
@@ -316,9 +328,31 @@ export async function migrateLegacyToken(cfg: NodeConfig, db: Database, selfId: 
   }
   const imported = value.trim() !== "";
   if (imported) await addToken(cfg, db, value, { label: "default", setBy, now: setAt });
-  await rename(file, `${file}.migrated`);
   await rename(metaFile, `${metaFile}.migrated`).catch((err: NodeJS.ErrnoException) => {
     if (err.code !== "ENOENT") throw err;
   });
+  await rm(file, { force: true });
   return imported;
+}
+
+/**
+ * Removes what a crash can leave in the tokens directory: a half-written `*.tmp` (never read as a value: only a file
+ * named by a token id is) and the value of a token that is removed. Run at `serve` start. Returns how many it removed.
+ */
+export async function sweepTokenValues(cfg: NodeConfig, db: Database): Promise<number> {
+  let names: string[];
+  try {
+    names = await readdir(paths(cfg).tokensDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw err;
+  }
+  let removed = 0;
+  for (const name of names) {
+    const stray = name.endsWith(".tmp") || (TOKEN_ID.test(name) && tokenRow(db, name)?.removed === true);
+    if (!stray) continue;
+    await rm(join(paths(cfg).tokensDir, name), { force: true });
+    removed += 1;
+  }
+  return removed;
 }

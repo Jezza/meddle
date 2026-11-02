@@ -1,11 +1,12 @@
 // Pool sync: each node holds every online peer's PoolObject (peer variant) over a chord link on iroh, merges the
 // peer's roster, settings and token rows into its own, pulls the value of each token it lists but lacks, by id, and
 // deletes the value of each token the pool removed.
+import { existsSync } from "node:fs";
 import type { Database } from "bun:sqlite";
 import { createHost, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
 import { PoolObject } from "../state/contracts";
-import { deleteTokenValue, mergeTokens, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
+import { deleteTokenValue, listTokens, mergeTokens, tokenFile, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
 import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
 import { fromEndpoint, type PoolNet } from "./net";
@@ -35,7 +36,14 @@ export type SyncDeps = {
 };
 
 /** The peer's PoolObject as held over its link; `host` is this node's client host for that link. */
-type PeerView = { host: Host | null; abort: AbortController };
+type PeerView = {
+  host: Host | null;
+  abort: AbortController;
+  /** The ids of the tokens the peer's rows list as not removed, from its latest `tokens` state. */
+  tokenIds: Set<string>;
+  /** Asks the peer for a token's value (aborted with the view); set once its PoolObject is held. */
+  fetchToken: ((id: string) => Promise<{ value: string }>) | null;
+};
 
 /** Reported when this node could not hold a peer's PoolObject (it is tried again when the peer is next online). */
 export class HoldFailed extends Error {
@@ -73,6 +81,10 @@ export class PoolSync {
    * interleave between a check of the row and the write.
    */
   private pulls: Promise<void> = Promise.resolve();
+  /** Token ids a periodic retry queued and that have not run yet, so retries cannot pile up behind a slow pull. */
+  private readonly retrying = new Set<string>();
+  /** Periodic retries so far: which holder of an id is asked turns with it. */
+  private retries = 0;
   /** Token ids already logged as dropped (at most `MAX_LOGGED_REJECTIONS`), so each is logged once. */
   private readonly rejectedLogged = new Set<string>();
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -128,6 +140,30 @@ export class PoolSync {
 
   private refreshInBackground(): void {
     this.refreshSelf().catch((err: unknown) => this.report(err));
+    this.retryPulls();
+  }
+
+  /**
+   * Asks again for every token value this node lists (not removed) and lacks, once per id per refresh, from one online
+   * peer whose rows list it (each refresh the next such peer): a pull that failed, or found its holder unreachable,
+   * is not left waiting for a row to change.
+   */
+  private retryPulls(): void {
+    if (this.stopped) return;
+    const round = this.retries++;
+    for (const t of listTokens(this.deps.db)) {
+      if (this.retrying.has(t.id) || existsSync(tokenFile(this.deps.cfg, t.id))) continue;
+      const holders = [...this.views.entries()].filter(([, v]) => v.fetchToken !== null && v.tokenIds.has(t.id));
+      if (holders.length === 0) continue;
+      const [peerId, view] = holders[round % holders.length]!;
+      const fetch = view.fetchToken!;
+      const current = () => !this.stopped && this.views.get(peerId) === view;
+      this.retrying.add(t.id);
+      this.serially(async () => {
+        this.retrying.delete(t.id);
+        await this.pull(t.id, () => fetch(t.id), current);
+      }, current);
+    }
   }
 
   private report(err: unknown): void {
@@ -138,7 +174,7 @@ export class PoolSync {
   private hold(id: string): void {
     if (this.stopped) return;
     void this.drop(id);
-    const view: PeerView = { host: null, abort: new AbortController() };
+    const view: PeerView = { host: null, abort: new AbortController(), tokenIds: new Set(), fetchToken: null };
     this.views.set(id, view);
     void this.attach(id, view);
   }
@@ -173,16 +209,16 @@ export class PoolSync {
         this.deps.settings.apply();
         this.deps.onChange();
       });
+      // A call in flight when the view is dropped is not settled by closing its client host: the drop's abort ends it,
+      // so that one gone peer cannot hold up the chain (and `stop()`).
+      view.fetchToken = (tokenId) => unlessAborted(pool.fetchToken({ id: tokenId }), view.abort.signal);
       pool.tokens.subscribe((rows) => {
         if (!current()) return;
+        view.tokenIds = new Set(rows.filter((r) => !r.removed).map((r) => r.id));
         const merged = mergeTokens(this.deps.cfg, this.deps.db, rows);
         for (const id of merged.rejected) this.logRejected(id);
         for (const id of merged.removedValues) this.serially(() => this.dropValue(id), current);
-        for (const id of merged.missingValues) {
-          // A call in flight when the view is dropped is not settled by closing its client host: the drop's abort
-          // ends it, so that one gone peer cannot hold up the chain (and `stop()`).
-          this.serially(() => this.pull(id, () => unlessAborted(pool.fetchToken({ id }), view.abort.signal), current), current);
-        }
+        for (const id of merged.missingValues) this.serially(() => this.pull(id, () => view.fetchToken!(id), current), current);
         if (merged.changed) this.deps.onChange();
       });
     } catch (err) {
@@ -213,6 +249,8 @@ export class PoolSync {
     if (!current() || !(await this.wanted(id))) return;
     if (tokenId(value) !== id) throw new Error(`a peer answered token ${id} with a value of another id`);
     await writeTokenValue(this.deps.cfg, id, value.trim());
+    // Removed here (by the CLI) while the value was being written: it does not stay.
+    if (tokenRow(this.deps.db, id)?.removed !== false) await deleteTokenValue(this.deps.cfg, id);
     this.deps.onChange();
   }
 

@@ -4,7 +4,7 @@ meddle is a service you run on each of your machines to drive Claude Code sessio
 task is created in one place and worked on wherever you assign it. Each task is a folder of jj workspaces with one
 Claude Code session running in auto mode, which you watch, approve, interrupt and steer from a browser dashboard with
 the fidelity of sitting at that machine's terminal. The services find each other and form one pool, sharing one
-Claude login and each project's memory, and a task can move between machines without losing its conversation.
+set of Claude logins and each project's memory, and a task can move between machines without losing its conversation.
 
 Status: Plan 3, repos across the pool and task moves. Nodes form a pool over iroh: they find each other through a
 lighthouse, share their login tokens, and the dashboard of any node shows every node and opens its tasks. A project's
@@ -89,7 +89,9 @@ value never goes over the node's socket; when a node runs, they tell it and it t
 database read-only and, before the node's first start, prints only `active: none`.
 
 A node that ran an older meddle with a single token (`secrets/claude-token`) imports it at its next `serve` as the
-token labelled `default`, keeping when and by whom it was set, and renames the old files to `*.migrated`.
+token labelled `default`, keeping when and by whom it was set; the old value file is deleted and its meta file renamed
+to `*.migrated`. Until that `serve`, `token list` and `status` show no token. `serve` also removes what a crash can
+leave in `secrets/tokens`: a half-written `*.tmp` and the value of a removed token.
 
 ## Pool
 
@@ -163,7 +165,8 @@ bring it back, remove the other nodes from its own Settings view, then join it w
 Every member lists every token. A token's metadata replicates per id, last writer wins on the time it last changed
 (on equal times every node settles on the same row), and a removal replicates as a removed row. A node pulls the value
 of each token it lists but lacks, by id, from the member that listed it, and deletes the value of a token the pool
-removed. A value crosses the network only as the answer to a request from a current member for a token the answering
+removed. A pull that fails (that member has not pulled the value yet, or is unreachable) is tried again at the node's
+next self refresh, every 15 seconds, from an online member that lists the token. A value crosses the network only as the answer to a request from a current member for a token the answering
 node lists, over the encrypted iroh connection. It never goes over the node's localhost socket (the CLI's and the
 dashboard's), and never into a ticket, the roster, the pool's replicated state or a log. A node drops a replicated row
 whose id is not 16 hex characters, whose label is empty, longer than 64 characters or holds control characters, or

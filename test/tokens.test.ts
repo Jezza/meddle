@@ -10,7 +10,7 @@ import { NodeObject, PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
 import {
   TOKEN_ID, addToken, enableToken, listTokens, markToken, mergeTokens, migrateLegacyToken, pickToken, removeToken,
-  tokenFile, tokenId, tokenValue, type TokenMeta,
+  sweepTokenValues, tokenFile, tokenId, tokenValue, writeTokenValue, type TokenMeta,
 } from "../src/token";
 import { linkClient, twoNodes, twoPoolNodes } from "./pool-helpers";
 
@@ -206,7 +206,7 @@ test("tokenFile refuses an invalid id", async () => {
   await expect(tokenValue(cfg, "../iroh.key")).rejects.toThrow("invalid token id");
 });
 
-test("migrateLegacyToken imports the single token once as default", async () => {
+test("migrateLegacyToken imports the single token once as default, and no copy of the value stays behind", async () => {
   const { cfg, db } = await node();
   const legacy = join(paths(cfg).secrets, "claude-token");
   await writeFile(legacy, "tok-legacy\n", { mode: 0o600 });
@@ -220,9 +220,10 @@ test("migrateLegacyToken imports the single token once as default", async () => 
   }]);
   expect(await tokenValue(cfg, id)).toBe("tok-legacy");
   expect(existsSync(legacy)).toBe(false);
+  expect(existsSync(`${legacy}.migrated`)).toBe(false);
   expect(existsSync(`${legacy}.meta.json`)).toBe(false);
-  expect(existsSync(`${legacy}.migrated`)).toBe(true);
   expect(existsSync(`${legacy}.meta.json.migrated`)).toBe(true);
+  expect((await readdir(paths(cfg).secrets)).sort()).toEqual(["claude-token.meta.json.migrated", "tokens"]);
 
   expect(await migrateLegacyToken(cfg, db, B)).toBe(false);
   expect(listTokens(db)).toHaveLength(1);
@@ -234,7 +235,69 @@ test("migrateLegacyToken imports the single token once as default", async () => 
   const mtime = (await stat(file)).mtime.toISOString();
   expect(await migrateLegacyToken(bare.cfg, bare.db, B)).toBe(true);
   expect(listTokens(bare.db)).toEqual([expect.objectContaining({ id: tokenId("tok-bare"), label: "default", setAt: mtime, setBy: B })]);
+  expect(existsSync(file)).toBe(false);
 });
+
+test("markToken refuses a mark a peer would drop", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: null, now: T0 });
+  const bad: Array<[string, string | null, string | null]> = [
+    ["weird", null, null],
+    ["exhausted", "tomorrow", null],
+    ["exhausted", "2026-11-02T13:00:00Z", null],
+    ["disabled", null, "x".repeat(257)],
+    ["disabled", null, "bad\u001b[2J"],
+  ];
+  for (const [status, until, detail] of bad) {
+    expect(() => markToken(db, a.id, status as TokenMeta["status"], until, detail)).toThrow("invalid token mark");
+  }
+  expect(listTokens(db)[0]).toMatchObject({ status: "ok", until: null, detail: null, updatedAt: T0 });
+  expect(markToken(db, a.id, "exhausted", "2026-11-02T13:00:00.000Z", "five_hour")).toMatchObject({ status: "exhausted" });
+  expect(markToken(db, tokenId("tok-none"), "disabled", null, null)).toBeNull();
+});
+
+test("a crash-orphaned .tmp and a removed token's value are swept, and a .tmp is never read as a value", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: null, now: T0 });
+  const b = await addToken(cfg, db, "tok-b", { label: "b", setBy: null, now: T1 });
+  const c = await addToken(cfg, db, "tok-c", { label: "c", setBy: null, now: T2 });
+  await removeToken(cfg, db, "b");
+  // A crash left a's value half-written (the file itself gone), and b's value after its removal committed.
+  await rm(tokenFile(cfg, a.id));
+  await writeFile(`${tokenFile(cfg, a.id)}.4242.tmp`, "tok-a", { mode: 0o600 });
+  await writeFile(tokenFile(cfg, b.id), "tok-b", { mode: 0o600 });
+  expect(await tokenValue(cfg, a.id)).toBeNull();
+  expect(await pickToken(cfg, db)).toMatchObject({ id: c.id });
+
+  expect(await sweepTokenValues(cfg, db)).toBe(2);
+  expect(await readdir(paths(cfg).tokensDir)).toEqual([c.id]);
+  expect(await sweepTokenValues(cfg, db)).toBe(0);
+  const empty = await node();
+  expect(await sweepTokenValues(empty.cfg, empty.db)).toBe(0);
+});
+
+test("a value pull that failed is retried at the next refresh, with no token row changing", async () => {
+  const { a, b, start, close } = await twoNodes({ start: false });
+  try {
+    // A lists the token but holds no value yet (as a member that merged the row before pulling it would).
+    const added = await addToken(a.cfg, a.db, "tok-a", { label: "a", setBy: a.id });
+    await rm(tokenFile(a.cfg, added.id));
+    const rowsOfA = JSON.stringify(listTokens(a.db, { includeRemoved: true }));
+    start();
+    await eventually(() => b.errors.some((e) => String(e).includes("the token's value is not on this node")));
+    expect(await tokenValue(b.cfg, added.id)).toBeNull();
+
+    // The value arrives on A without its row changing: B asks again on its own.
+    await writeTokenValue(a.cfg, added.id, "tok-a");
+    const since = Date.now();
+    await eventually(async () => (await tokenValue(b.cfg, added.id)) === "tok-a", 20_000);
+    expect(Date.now() - since).toBeLessThan(20_000);
+    expect(JSON.stringify(listTokens(a.db, { includeRemoved: true }))).toBe(rowsOfA);
+    expect(JSON.stringify(listTokens(b.db, { includeRemoved: true }))).toBe(rowsOfA);
+  } finally {
+    await close();
+  }
+}, 40_000);
 
 test("two nodes adding the same token value end with one token", async () => {
   const { A: na, B: nb, close } = await twoPoolNodes({ nodes: [{ token: null }, { token: null }] });
@@ -281,6 +344,7 @@ test("a token added on A is pulled by B and B's pickToken returns its value; a r
     expect(listTokens(nb.db, { includeRemoved: true })).toEqual([expect.objectContaining({ id: added.id, removed: true })]);
     expect(await pickToken(nb.cfg, nb.db)).toBeNull();
     await eventually(() => pool.activeTokenId.value === null && pool.tokens.value.length === 0);
+    await eventually(() => !nodeB.token.value.present && nodeB.token.value.expiresAt === null);
     expect([...na.errors, ...nb.errors].map(String)).toEqual([]);
     pool.release();
     nodeB.release();

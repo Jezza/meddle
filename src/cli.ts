@@ -28,7 +28,9 @@ import { openDb } from "./store/db";
 import { listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
-import { addToken, enableToken, listTokens, migrateLegacyToken, pickToken, removeToken, type TokenMeta } from "./token";
+import {
+  addToken, enableToken, listTokens, migrateLegacyToken, pickToken, removeToken, sweepTokenValues, type TokenMeta,
+} from "./token";
 import { claudeCodeVersion, VERSION } from "./version";
 
 const USAGE = `usage: meddle --version
@@ -108,6 +110,8 @@ async function serve(): Promise<number> {
     const db = (node.db = openDb(paths(cfg).db));
     // The single token of an older meddle becomes the first of the list, once.
     await migrateLegacyToken(cfg, db, (await loadOrCreateIdentity(cfg)).id);
+    // What a crash left in the tokens directory: a half-written value, the value of a removed token.
+    await sweepTokenValues(cfg, db);
     // The pool and git first: the Harness reruns unfinished turns as it opens, and their turn ends push to homes.
     const pool = (node.pool = await startPool(cfg, db, {
       version: VERSION,

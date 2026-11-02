@@ -132,7 +132,7 @@ test("token add, set, list, enable, remove and status work on the database, with
   expect(lines[1]).toMatch(new RegExp(`^${b}  ${b.slice(0, 8)}  ok  expires \\S+$`));
   expect(lines[2]).toBe(`active: ${a}`);
   expect(await meddle(["token", "status"], env)).toEqual(listed);
-  for (const out of [listed.stdout]) expect(out).not.toMatch(/tok-[ab]/);
+  expect(listed.stdout).not.toMatch(/tok-[ab]/);
 
   // A token marked exhausted shows its time, and is skipped; enable clears it.
   const db = openDb(`${dir}/d/meddle.sqlite`);

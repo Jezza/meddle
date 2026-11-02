@@ -184,7 +184,8 @@ test("serve imports the single token of an older meddle as the token labelled de
     const listed = await meddle(["token", "list"], env);
     expect(listed).toEqual({ stdout: `${id}  default  ok  expires 2027-10-31T10:00:00.000Z\nactive: ${id}\n`, stderr: "", code: 0 });
     expect(existsSync(`${dir}/d/secrets/claude-token`)).toBe(false);
-    expect(existsSync(`${dir}/d/secrets/claude-token.migrated`)).toBe(true);
+    expect(existsSync(`${dir}/d/secrets/claude-token.migrated`)).toBe(false);
+    expect(existsSync(`${dir}/d/secrets/claude-token.meta.json.migrated`)).toBe(true);
   } finally {
     expect(await node.stop()).toBe(0);
   }
