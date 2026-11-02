@@ -158,13 +158,18 @@ export class PoolStore {
     );
   }
 
-  /** Replaces this node's pool and roster with another pool's, as when it joins that pool; drops outstanding invites. */
+  /**
+   * Replaces this node's pool and roster with another pool's, as when it joins that pool; drops outstanding invites and
+   * the old pool's settings (the new pool's arrive by sync).
+   */
   replacePool(pool: PoolIdentity, roster: RosterRow[]): void {
     this.db.transaction(() => {
       this.db.exec("DELETE FROM pool");
       this.db.exec("DELETE FROM roster");
       // An invite issued for the old pool must not admit anyone into the new one.
       this.db.exec("DELETE FROM invites");
+      // The old pool's settings, newer than the new pool's, would otherwise win its merge and spread through it.
+      this.db.exec("DELETE FROM settings");
       this.db.query("INSERT INTO pool (pool_id, pool_secret, created_at) VALUES (?, ?, ?)")
         .run(pool.poolId, pool.poolSecret, pool.createdAt);
       for (const row of roster) this.upsert(row);

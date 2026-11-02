@@ -60,6 +60,13 @@ const MIGRATIONS = [
     last_seen_at TEXT,
     last_addr TEXT
   )`,
+  // The pool's settings (`PoolSettings`), last writer wins per key on updated_at; a NULL value is an unset (tombstone).
+  `CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NULL,
+    updated_at TEXT NOT NULL,
+    set_by TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS invites (
     code TEXT PRIMARY KEY,
     created_at TEXT,

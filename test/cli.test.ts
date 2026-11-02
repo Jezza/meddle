@@ -62,3 +62,41 @@ test("task prompt to a task being moved queues the text, says so and exits 0 rat
     await close();
   }
 }, 15_000);
+
+test("config set, list and refusals go through the running node", async () => {
+  const { A, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    const port = new URL(dashboard.url).port;
+    const run = (args: string[]) => meddle(["config", ...args], { HOME: A.home, MEDDLE_PORT: port });
+    expect(await run(["set", "jj.user", "Lab"])).toEqual({ stdout: "", stderr: "", code: 0 });
+    expect(await run(["set", "env.FOO", "bar"])).toEqual({ stdout: "", stderr: "", code: 0 });
+    expect(A.pool.settings.get("jj.user")).toBe("Lab");
+    expect(A.cfg.poolEnv).toEqual({ JJ_USER: "Lab", FOO: "bar" });
+    expect(await run(["list"])).toEqual({ stdout: "env.FOO = bar\njj.user = Lab\n", stderr: "", code: 0 });
+    expect(await run(["unset", "env.FOO"])).toEqual({ stdout: "", stderr: "", code: 0 });
+    expect(await run(["list"])).toEqual({ stdout: "jj.user = Lab\n", stderr: "", code: 0 });
+    const bad = await run(["set", "bad", "x"]);
+    expect(bad.code).toBe(1);
+    expect(bad.stderr).toContain("invalid setting key: bad");
+    const reserved = await run(["set", "env.PATH", "/x"]);
+    expect(reserved.code).toBe(1);
+    expect(reserved.stderr).toContain("reserved environment name: PATH");
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 30_000);
+
+test("config without a running node says to start one", async () => {
+  for (const args of [["list"], ["set", "jj.user", "Lab"], ["unset", "jj.user"]]) {
+    const out = await meddle(["config", ...args], { MEDDLE_PORT: String(await closedPort()) });
+    expect(out).toEqual({ stdout: "", stderr: 'meddle: start "meddle serve" first\n', code: 1 });
+  }
+});
+
+test("the usage text lists the config subcommands", async () => {
+  const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
+  expect(out.code).toBe(2);
+  expect(out.stderr).toContain("meddle config set <key> <value> | meddle config unset <key> | meddle config list");
+});

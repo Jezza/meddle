@@ -11,6 +11,7 @@ import { createInvite, decodeTicket, handleJoin, joinPool } from "./invite";
 import { DialFailed, PeerClosed, PoolNet, fromEndpoint, openEndpoint, type RefusalReason } from "./net";
 import type { PoolObjectDeps } from "./object";
 import { dedupe } from "./report";
+import { PoolSettings, discoveryLighthouseUrl } from "./settings";
 import { PoolStore, type NodeSummary, type WireAddr } from "./store";
 import { HoldFailed, PoolSync } from "./sync";
 
@@ -19,6 +20,8 @@ export type PoolRuntime = {
   readonly store: PoolStore;
   readonly net: PoolNet;
   readonly endpoint: Endpoint;
+  /** The pool's settings, applied to `cfg.poolEnv` at start and after every change. */
+  readonly settings: PoolSettings;
   /** What `servePool` needs; `createNodeHost` passes it on. */
   readonly objectDeps: PoolObjectDeps;
   /** A new invite ticket; throws "this node is not a member of a pool" once this node was removed. */
@@ -28,12 +31,16 @@ export type PoolRuntime = {
   remove(nodeId: string): Promise<void>;
   /** The token file changed on this node: tell the pool. */
   tokenChanged(): Promise<void>;
+  /** Sets a pool setting here (rejects what `PoolSettings.set` refuses), applies it and tells the pool. */
+  setSetting(key: string, value: string): Promise<void>;
+  /** Unsets a pool setting here, applies it and tells the pool. */
+  unsetSetting(key: string): Promise<void>;
   /**
    * This node's summary changed (a task was created): tell the pool now rather than at the next periodic refresh.
    * Never rejects.
    */
   refresh(): Promise<void>;
-  /** Fires whenever the roster, a peer's online state or the token changed. Returns the unsubscribe. */
+  /** Fires whenever the roster, a peer's online state, the token or the settings changed. Returns the unsubscribe. */
   onChange(cb: () => void): () => void;
   /**
    * A reference to `contract` (input `{}`) on the peer, over this node's client host for it; rejects
@@ -61,8 +68,9 @@ const REMOVAL_GRACE_MS = 1000;
 const REMOVED_AT = /^closed by peer: removed (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) \(code 1\)$/;
 
 /**
- * Starts this node's part in its pool (a pool of one on first start): identity, endpoint, roster, the connection
- * to every member, sync, and lighthouse discovery unless `cfg.lighthouseUrl` is empty. Logs (`meddle: discovery: …`
+ * Starts this node's part in its pool (a pool of one on first start): identity, endpoint, roster, settings (applied to
+ * `cfg.poolEnv` before anything runs), the connection to every member, sync, and lighthouse discovery unless
+ * `cfg.lighthouseUrl` is empty (the pool's `lighthouse.url` applies live unless `MEDDLE_LIGHTHOUSE_URL` is set). Logs (`meddle: discovery: …`
  * and `meddle: pool: …`, each distinct message at most once a minute) discovery errors and why a member cannot be
  * reached: dial failures, admission timeouts, refusals that persist, a removal learned from a refusal, and a peer's
  * PoolObject that could not be held. A healthy pool logs nothing.
@@ -89,6 +97,8 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   let stopped = false;
   const log = hooks.log ?? ((line: string) => console.error(line));
+  const settings = new PoolSettings(db, cfg, selfId, log);
+  settings.apply();
   /** A connection diagnostic, each distinct message at most once a minute. */
   const diagnose = dedupe((message) => { if (!stopped) log(`meddle: pool: ${message}`); });
   /** Consecutive code-1 closes and refusals from each member since it was last online (or a dial to it failed). */
@@ -179,7 +189,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   }
 
   const sync = new PoolSync({
-    cfg, store, net, selfId, summary: liveSummary,
+    cfg, store, net, selfId, settings, summary: liveSummary,
     onChange: () => {
       enforce();
       notify();
@@ -222,7 +232,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   if (cfg.lighthouseUrl !== "") {
     discovery = new Discovery({
       endpoint, identity, pool: store.pool(),
-      lighthouseUrl: () => cfg.lighthouseUrl,
+      lighthouseUrl: () => discoveryLighthouseUrl(cfg, settings),
       pollMs: cfg.discoveryPollMs,
       onPeers: (peers: WireAddr[]) => {
         if (!store.isMember(selfId)) return;
@@ -259,6 +269,8 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   async function join(ticket: string): Promise<{ poolId: string; members: number }> {
     const joined = await joinPool(decodeTicket(ticket), { endpoint, store, identity, summary: liveSummary });
+    // Joining dropped the old pool's settings; the new pool's arrive by sync.
+    settings.apply();
     leftPool = false;
     if (discovery !== null) await discovery.restart(store.pool());
     // The addresses first (offering one does not dial a node not yet watched), so the first dials have them.
@@ -288,6 +300,23 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     notify();
   }
 
+  /** A local change to the settings: applied here, then the `settings` cells re-read them and peers merge them. */
+  async function settingsChanged(): Promise<void> {
+    settings.apply();
+    await sync.refreshSelf();
+    notify();
+  }
+
+  async function setSetting(key: string, value: string): Promise<void> {
+    settings.set(key, value);
+    await settingsChanged();
+  }
+
+  async function unsetSetting(key: string): Promise<void> {
+    settings.unset(key);
+    await settingsChanged();
+  }
+
   async function refresh(): Promise<void> {
     if (stopped) return;
     await sync.refreshSelf().catch((err: unknown) => { if (!stopped) hooks.onError?.(err); });
@@ -303,21 +332,25 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   }
 
   return {
-    identity, store, net, endpoint,
+    identity, store, net, endpoint, settings,
     objectDeps: {
-      store, cfg, selfId,
+      store, cfg, selfId, settings,
       isOnline: (id) => net.isOnline(id),
       liveSummary,
       invite,
       join,
       remove,
       tokenChanged,
+      setSetting,
+      unsetSetting,
       changes,
     },
     invite,
     join,
     remove,
     tokenChanged,
+    setSetting,
+    unsetSetting,
     refresh,
     onChange,
     peerRef,

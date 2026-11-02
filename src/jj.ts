@@ -16,7 +16,8 @@ export class JjError extends Error {
 
 /**
  * The environment meddle runs jj (and Claude Code) with: this process's, with `<data>/bin` (the git remote helper)
- * first on `PATH` and `MEDDLE_GIT_SOCKET` naming this node's git socket.
+ * first on `PATH`, `MEDDLE_GIT_SOCKET` naming this node's git socket, and the pool's settings (`cfg.poolEnv`: the
+ * jj identity and `env.*`, never a reserved name) on top.
  */
 export function jjEnv(cfg: NodeConfig): Record<string, string> {
   const env: Record<string, string> = {};
@@ -24,6 +25,7 @@ export function jjEnv(cfg: NodeConfig): Record<string, string> {
   const p = paths(cfg);
   env.PATH = env.PATH ? `${p.bin}${delimiter}${env.PATH}` : p.bin;
   env.MEDDLE_GIT_SOCKET = p.gitSocket;
+  Object.assign(env, cfg.poolEnv);
   return env;
 }
 

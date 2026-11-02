@@ -271,6 +271,14 @@ export const RosterRowSchema = Type.Object({
   lastAddr: Nullable(WireAddrSchema),
 });
 
+/** One pool setting as replicated (`SettingRow`); `value: null` is an unset. */
+export const SettingRowSchema = Type.Object({
+  key: Type.String(),
+  value: Nullable(Type.String()),
+  updatedAt: Type.String(),
+  setBy: Type.String(),
+});
+
 /** When the token was set and the node it came from (null: set on that node by hand). Never the value. */
 export const TokenMetaSchema = Type.Object({ setAt: Type.String(), setBy: Nullable(Type.String()) });
 export type TokenMeta = Type.Static<typeof TokenMetaSchema>;
@@ -339,6 +347,8 @@ export const PoolObject = remote("meddle.pool", {
         }),
         /** Members report more than one meddle or Claude Code version. */
         mixedVersions: Type.Boolean(),
+        /** The pool's settings with a value, by key. */
+        settings: Type.Array(Type.Object({ key: Type.String(), value: Type.String() })),
       },
       methods: {
         invite: method(Type.Object({}), Type.Object({ ticket: Type.String() })),
@@ -346,11 +356,15 @@ export const PoolObject = remote("meddle.pool", {
         remove: method(Type.Object({ nodeId: Type.String() })),
         /** The token file changed on this node (written by the CLI); re-read it and tell the pool. */
         tokenChanged: method(Type.Object({})),
+        /** Sets a pool setting; refuses an invalid key, a reserved env name or an invalid value. */
+        setSetting: method(Type.Object({ key: Type.String(), value: Type.String() })),
+        /** Unsets a pool setting. */
+        unsetSetting: method(Type.Object({ key: Type.String() })),
       },
     },
     /** Other nodes (principal `peer:<nodeId>`). */
     peer: {
-      state: { roster: Type.Array(RosterRowSchema), token: Nullable(TokenMetaSchema) },
+      state: { roster: Type.Array(RosterRowSchema), token: Nullable(TokenMetaSchema), settings: Type.Array(SettingRowSchema) },
       methods: {
         fetchToken: method(Type.Object({}), Type.Object({ value: Type.String(), setAt: Type.String(), setBy: Nullable(Type.String()) })),
       },

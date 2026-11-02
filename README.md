@@ -23,16 +23,17 @@ bun install
 bun test
 ```
 
-Every node needs your jj identity: the commits meddle makes in your repos carry it, and meddle does not invent one.
-Set it once per node, as the user that runs meddle:
+The commits meddle makes in your repos carry a jj identity, and meddle does not invent one. Set it once for the
+whole pool, with a node running (see [Pool settings](#pool-settings)):
 
 ```sh
-jj config set --user user.name "Your Name"
-jj config set --user user.email you@example.com
+bun run src/cli.ts config set jj.user "Your Name"
+bun run src/cli.ts config set jj.email you@example.com
 ```
 
-Without it jj refuses to push the commits, so every push to a project's home fails and each turn end logs a
-`meddle: git: …` line saying so (see [Projects across the pool](#projects-across-the-pool)).
+Every node of the pool then runs jj and every task with that identity. Without one (neither the pool setting nor a
+jj user config on the node) jj refuses to push the commits, so every push to a project's home fails and each turn end
+logs a `meddle: git: …` line saying so (see [Projects across the pool](#projects-across-the-pool)).
 
 The commands below run from the checkout as `bun run src/cli.ts <command>`. `bun run build` also produces a compiled
 `dist/meddle` for `status` and `token set`; the service itself runs from the checkout. The compiled binary embeds
@@ -145,6 +146,36 @@ connection. It never goes over the node's localhost socket (the CLI's and the da
 the roster or a log. Each node sees when the others' tokens were set, and pulls the token from a member whose token
 was set later than its own. A token set while no node is running reaches the pool once that node serves.
 
+### Pool settings
+
+A few settings hold for the whole pool. Set, unset and list them from any node with that node running:
+
+```sh
+bun run src/cli.ts config set <key> <value>
+bun run src/cli.ts config unset <key>
+bun run src/cli.ts config list
+```
+
+`config list` prints one `<key> = <value>` line per setting, by key. Without a running node they fail with
+`start "meddle serve" first`.
+
+| Key | Applied as |
+| --- | --- |
+| `jj.user`, `jj.email` | `JJ_USER` and `JJ_EMAIL` for every jj command meddle runs and for every task's Claude Code, so commits carry one identity on every node. |
+| `env.<NAME>` | `<NAME>` (upper case, digits and `_`) in every task's Claude Code environment and in meddle's own jj and git calls. A project's context `env` wins over it for that project's tasks. |
+| `lighthouse.url` | The discovery lighthouse, applied live; it cannot be set empty. A node that sets `MEDDLE_LIGHTHOUSE_URL` (even empty, which turns discovery off there) uses its own instead. |
+| `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
+
+Each key replicates on its own, last writer wins on the time it was set, the roster's rule; an unset replicates too.
+Values are plain pool state: every member sees and stores them, so they are not for secrets (the token has its own
+path). Some names cannot be set through `env.*`, because meddle sets them itself or because they would let a member
+take over another node's processes: `PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`CLAUDE_CODE_PROJECT_DIR_NAME`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `JJ_USER`,
+`JJ_EMAIL`, `JJ_CONFIG`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_PARAMETERS`, `GIT_DIR`, `LD_PRELOAD`, `LD_LIBRARY_PATH` and
+every name starting `MEDDLE_`. `config set` refuses them, and a node ignores such a setting from a peer (logging
+`meddle: settings: ignored replicated key <key>` once). A node that joins another pool drops its old pool's settings
+and takes the new pool's.
+
 ### `meddle pool`
 
 ```sh
@@ -163,7 +194,13 @@ with `(this node)` after this node's line.
 
 | Variable | Default | |
 | --- | --- | --- |
-| `MEDDLE_LIGHTHOUSE_URL` | `https://iroh.ichor.io` | The lighthouse for discovery; empty turns discovery off. |
+| `MEDDLE_PORT` | `7777` | The localhost port of the dashboard and of the socket the CLI talks to the node on. |
+| `MEDDLE_DATA_DIR` | `~/.local/share/meddle` | The node's data: database, secrets, replicas, memory, archives. |
+| `MEDDLE_TASK_ROOT` | `/opt/meddle/tasks` | Where tasks' folders are made (see [Task root](#task-root)). |
+| `MEDDLE_GIT_SOCKET` | `<data dir>/git.sock` | The unix socket the git remote helper reaches the node at (see [`meddle://` remotes](#meddle-remotes)). |
+| `MEDDLE_ENV_PASSTHROUGH` | `TERM LANG LC_ALL SHELL TMPDIR XDG_RUNTIME_DIR SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy` | The space-separated names of this node's environment passed on to every task's Claude Code (besides `PATH` and `HOME`). |
+| `MEDDLE_MAX_RUNNING` | the pool's `limits.running` | How many turns this node runs at once before placement treats it as full, overriding the pool setting here; a non-negative integer, `0` unlimited. |
+| `MEDDLE_LIGHTHOUSE_URL` | the pool's `lighthouse.url`, else `https://iroh.ichor.io` | The lighthouse for discovery, overriding the pool setting here; empty turns discovery off. |
 | `MEDDLE_DISCOVERY_POLL_MS` | `10000` | How often a node looks its pool's topic up; at least `500`. |
 | `MEDDLE_IROH_PRESET` | `n0` | iroh's `n0` preset (number 0's public relays and address lookup), or `minimal`: no relays and no address lookup, so nodes reach each other only at direct addresses (loopback setups and tests). |
 | `MEDDLE_IROH_BIND` | iroh's default | The address iroh's UDP socket binds, as `<ip>:<port>`. |
@@ -207,7 +244,7 @@ otherwise). A project with nothing trunk-like starts its tasks at the root.
 
 At the end of every completed turn meddle points each of the task's bookmarks, `meddle/task/<task id>/<project name>`, at its
 workspace's working copy, and a node that is not the project's home pushes the bookmark to the home, so the home
-holds every task's latest work. A push that fails (the home offline, no jj identity) does not fail the turn: it is
+holds every task's latest work. A push that fails (the home offline, no jj identity: see [Install](#install)) does not fail the turn: it is
 logged as `meddle: git: push of <bookmark> to <short id> failed: …` (each distinct line at most once a minute, so a
 missing identity does not fill the log), and the next turn end pushes again. A turn that fails pushes nothing; the
 next completed turn pushes its work too.

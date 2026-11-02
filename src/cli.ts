@@ -38,6 +38,7 @@ const USAGE = `usage: meddle --version
        meddle join <ticket>
        meddle pool
        meddle token set [--file <path>] | meddle token status
+       meddle config set <key> <value> | meddle config unset <key> | meddle config list
        meddle project add <path-or-url> [--name <n>] | meddle project list
        meddle task new --title <t> --project <id>... | meddle task prompt <id> <text> | meddle task retry <id>
        meddle task move <id> <node> [--now]
@@ -305,6 +306,31 @@ function poolList(): Promise<number> {
   });
 }
 
+/** Sets a pool setting on the running node, which tells the pool. */
+function configSet(key: string, value: string): Promise<number> {
+  return withPool(async (pool) => {
+    await pool.setSetting({ key, value });
+    return 0;
+  });
+}
+
+/** Unsets a pool setting on the running node, which tells the pool. */
+function configUnset(key: string): Promise<number> {
+  return withPool(async (pool) => {
+    await pool.unsetSetting({ key });
+    return 0;
+  });
+}
+
+/** One `key = value` line per pool setting, by key. */
+function configList(): Promise<number> {
+  return withPool(async (pool) => {
+    const settings = [...pool.settings.value].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    for (const { key, value } of settings) console.log(`${key} = ${value}`);
+    return 0;
+  });
+}
+
 /** Adds an existing directory as a folder project, anything else as an upstream URL; prints the project id. */
 function projectAdd(source: string, name: string | undefined): Promise<number> {
   return withNode(async (client) => {
@@ -529,6 +555,9 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "token" && sub === "set" && rest.length === 0) return () => tokenSet(undefined);
   if (command === "token" && sub === "set" && rest.length === 2 && rest[0] === "--file") return () => tokenSet(rest[1]);
   if (command === "token" && sub === "status" && rest.length === 0) return tokenShow;
+  if (command === "config" && sub === "set" && rest.length === 2) return () => configSet(rest[0]!, rest[1]!);
+  if (command === "config" && sub === "unset" && rest.length === 1) return () => configUnset(rest[0]!);
+  if (command === "config" && sub === "list" && rest.length === 0) return configList;
   if (command === "project" && sub === "add" && rest.length === 1) return () => projectAdd(rest[0]!, undefined);
   if (command === "project" && sub === "add" && rest.length === 3 && rest[1] === "--name") return () => projectAdd(rest[0]!, rest[2]);
   if (command === "project" && sub === "list" && rest.length === 0) return projectList;

@@ -15,6 +15,7 @@ import { PoolNet, fromEndpoint, openEndpoint, toEndpointAddr } from "../src/pool
 import { servePool, type PoolObjectDeps } from "../src/pool/object";
 import { PoolStore, type NodeSummary } from "../src/pool/store";
 import { startPool, type PoolSummaryDeps } from "../src/pool/runtime";
+import { PoolSettings } from "../src/pool/settings";
 import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
 import { PeerObject } from "../src/state/contracts";
 import { createNodeHost } from "../src/state/host";
@@ -71,6 +72,8 @@ export type TappedFrame = { direction: "in" | "out"; text: string };
 /** One pool node of `twoNodes`: its store, net, chord host (serving PoolObject) and sync. */
 export type PoolNode = {
   id: string; identity: Identity; home: string; cfg: NodeConfig; db: Database; store: PoolStore; net: PoolNet; host: Host; sync: PoolSync;
+  /** The node's pool settings, applied to `cfg.poolEnv`. */
+  settings: PoolSettings;
   /** What this node reports about itself. */
   summary: NodeSummary;
   /** What `servePool` was given; `tokenChanged` refreshes the self row and tells the pool. */
@@ -120,7 +123,13 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
     onJoin: async (conn) => conn.close(0n, []),
   });
   net.onPeer(() => changed());
-  const sync = new PoolSync({ cfg, store, net, selfId: id, summary: () => summary, onChange: changed, onError, tap });
+  const settings = new PoolSettings(db, cfg, id, () => {});
+  settings.apply();
+  const sync = new PoolSync({ cfg, store, net, selfId: id, settings, summary: () => summary, onChange: changed, onError, tap });
+  const settingsChanged = async () => {
+    settings.apply();
+    await sync.refreshSelf();
+  };
   const deps: PoolObjectDeps = {
     store, cfg, selfId: id,
     isOnline: (peer) => net.isOnline(peer),
@@ -129,12 +138,21 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
     join: async () => notInThisTest(),
     remove: async () => notInThisTest(),
     tokenChanged: () => sync.refreshSelf(),
+    settings,
+    setSetting: async (key, value) => {
+      settings.set(key, value);
+      await settingsChanged();
+    },
+    unsetSetting: async (key) => {
+      settings.unset(key);
+      await settingsChanged();
+    },
     changes,
   };
   const host = createHost({ name: "node", self: "node", onError });
   servePool(host, deps);
   const stopAccepting = acceptPeerLinks(net, host, (peer) => store.isMember(peer));
-  return { node: { id, identity, home, cfg, db, store, net, host, sync, summary, deps, changed, errors }, frames, stopAccepting };
+  return { node: { id, identity, home, cfg, db, store, net, host, sync, settings, summary, deps, changed, errors }, frames, stopAccepting };
 }
 
 /**

@@ -36,7 +36,12 @@ export type EngineInput = {
   extraEnv?: Record<string, string>;
 };
 
-function buildEnv(i: EngineInput): Record<string, string> {
+/**
+ * The environment of a task's Claude Code: `PATH`, `HOME` and the passthrough names from `jjEnv`, the pool's settings
+ * (`cfg.poolEnv`), then the names meddle sets itself (which a pool setting can never replace), the projects' context
+ * env and `extraEnv`.
+ */
+export function buildEnv(i: EngineInput): Record<string, string> {
   const env: Record<string, string> = {};
   // PATH with `<data>/bin` first: jj and git inside a task find the remote helper for meddle:// remotes.
   const meddle = jjEnv(i.cfg);
@@ -46,6 +51,7 @@ function buildEnv(i: EngineInput): Record<string, string> {
   }
   return {
     ...env,
+    ...i.cfg.poolEnv,
     MEDDLE_GIT_SOCKET: meddle.MEDDLE_GIT_SOCKET!,
     CLAUDE_CONFIG_DIR: paths(i.cfg).taskConfig(i.manifest.id),
     CLAUDE_CODE_PROJECT_DIR_NAME: i.manifest.primaryProjectId,

@@ -1,10 +1,12 @@
-// Serves PoolObject: the pool as dashboards and the CLI see it (`default`), and as other nodes sync it (`peer`).
+// Serves PoolObject: the pool as dashboards and the CLI see it (`default`), and as other nodes sync it (`peer`): the
+// roster, the token's metadata and the settings.
 import Type from "typebox";
 import { forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
-import { NodeSummarySchema, PoolObject, RosterRowSchema } from "../state/contracts";
+import { NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema } from "../state/contracts";
 import { getToken, tokenStatus } from "../token";
 import { isNodeId } from "./identity";
+import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore, RosterRow } from "./store";
 
 export type PoolObjectDeps = {
@@ -18,7 +20,13 @@ export type PoolObjectDeps = {
   join(ticket: string): Promise<{ poolId: string; members: number }>;
   remove(nodeId: string): Promise<void>;
   tokenChanged(): Promise<void>;
-  /** Fires whenever the roster, a peer's online state or the token changed. */
+  /** The pool's settings, read by both variants. */
+  settings: PoolSettings;
+  /** Sets a setting here and tells the pool (rejects what `PoolSettings.set` refuses). */
+  setSetting(key: string, value: string): Promise<void>;
+  /** Unsets a setting here and tells the pool. */
+  unsetSetting(key: string): Promise<void>;
+  /** Fires whenever the roster, a peer's online state, the token or the settings changed. */
   changes: Subscribable<null>;
 };
 
@@ -70,7 +78,7 @@ function mixed(rows: readonly RosterRow[], selfId: string, live: Live): boolean 
 
 /** Serves PoolObject on `host`: the `peer` variant to `peer:` principals, `default` to everyone else. */
 export function servePool(host: Host, deps: PoolObjectDeps): void {
-  const { store, cfg, selfId } = deps;
+  const { store, cfg, selfId, settings } = deps;
   host.serve(PoolObject, (_input, principal, self) => {
     const peer = peerOf(principal);
     if (peer === null && typeof principal === "string" && principal.startsWith(PEER_PRINCIPAL_PREFIX)) {
@@ -89,13 +97,16 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     };
 
     if (peer !== null) {
+      const rows = self.state("settings", Type.Array(SettingRowSchema), { init: () => settings.rows() });
       self.on("changes", deps.changes, async (_event, ctx) => {
         roster.replace(ctx, store.roster());
+        rows.replace(ctx, settings.rows());
         await refreshToken(ctx);
       });
       return {
         variant: "peer",
         roster,
+        settings: rows,
         token: self.derive([token], (t) => (t.setAt === null ? null : { setAt: t.setAt, setBy: t.setBy })),
         fetchToken: async () => {
           if (!store.isMember(peer)) throw forbidden("not a member");
@@ -111,8 +122,10 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     const live = self.state("live", LiveSchema, { init: liveNow });
     const online = self.state("online", Type.Array(Type.String()), { init: onlineNow });
     const poolId = self.state("poolId", defaultState.poolId, { init: () => store.pool().poolId });
+    const listed = self.state("settings", defaultState.settings, { init: () => settings.list() });
     self.on("changes", deps.changes, async (_event, ctx) => {
       roster.replace(ctx, store.roster());
+      listed.replace(ctx, settings.list());
       online.replace(ctx, onlineNow());
       poolId.replace(ctx, store.pool().poolId);
       await Promise.all([refreshToken(ctx), liveNow().then((l) => { if (!ctx.signal.aborted) live.replace(ctx, l); })]);
@@ -124,10 +137,13 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       nodes: self.derive([roster, live, online], (rows, l, on) => rows.map((r) => nodeOf(r, selfId, l, on))),
       token,
       mixedVersions: self.derive([roster, live], (rows, l) => mixed(rows, selfId, l)),
+      settings: listed,
       invite: async () => ({ ticket: deps.invite() }),
       join: ({ ticket }) => deps.join(ticket),
       remove: ({ nodeId }) => deps.remove(nodeId),
       tokenChanged: () => deps.tokenChanged(),
+      setSetting: ({ key, value }) => deps.setSetting(key, value),
+      unsetSetting: ({ key }) => deps.unsetSetting(key),
     };
   });
 }

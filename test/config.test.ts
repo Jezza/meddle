@@ -60,3 +60,16 @@ test("pool settings default and parse", () => {
   expect(() => loadConfig({ HOME: "/h", MEDDLE_IROH_PRESET: "fast" })).toThrow("MEDDLE_IROH_PRESET must be n0 or minimal");
   expect(() => loadConfig({ HOME: "/h", MEDDLE_DISCOVERY_POLL_MS: "100" })).toThrow("MEDDLE_DISCOVERY_POLL_MS must be an integer of at least 500");
 });
+test("MEDDLE_MAX_RUNNING, the explicit lighthouse and the pool env", () => {
+  const cfg = loadConfig({ HOME: "/h" });
+  expect(cfg.maxRunning).toBeNull();
+  expect(cfg.lighthouseUrlExplicit).toBe(false);
+  expect(cfg.poolEnv).toEqual({});
+  expect(loadConfig({ HOME: "/h", MEDDLE_MAX_RUNNING: "2" }).maxRunning).toBe(2);
+  expect(loadConfig({ HOME: "/h", MEDDLE_MAX_RUNNING: "0" }).maxRunning).toBe(0);
+  for (const bad of ["-1", "", "1.5", "two"]) {
+    expect(() => loadConfig({ HOME: "/h", MEDDLE_MAX_RUNNING: bad })).toThrow("MEDDLE_MAX_RUNNING must be a non-negative integer");
+  }
+  expect(loadConfig({ HOME: "/h", MEDDLE_LIGHTHOUSE_URL: "" }).lighthouseUrlExplicit).toBe(true);
+  expect(loadConfig({ HOME: "/h", MEDDLE_LIGHTHOUSE_URL: "https://l.example.invalid" }).lighthouseUrlExplicit).toBe(true);
+});

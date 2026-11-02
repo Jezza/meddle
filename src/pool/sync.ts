@@ -1,5 +1,5 @@
 // Pool sync: each node holds every online peer's PoolObject (peer variant) over a chord link on iroh, merges the
-// peer's roster into its own and pulls the token when the peer's is newer.
+// peer's roster and settings into its own and pulls the token when the peer's is newer.
 import { createHost, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
 import { PoolObject, type TokenMeta } from "../state/contracts";
@@ -8,6 +8,7 @@ import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
 import { fromEndpoint, type PoolNet } from "./net";
 import { PEER_PRINCIPAL_PREFIX } from "./object";
+import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore } from "./store";
 
 export type SyncDeps = {
@@ -15,8 +16,10 @@ export type SyncDeps = {
   store: PoolStore;
   net: PoolNet;
   selfId: string;
+  /** The pool's settings: a peer's are merged in, then applied. */
+  settings: PoolSettings;
   summary(): NodeSummary | Promise<NodeSummary>;
-  /** The roster or the token changed because of a peer, or the self row was refreshed. */
+  /** The roster, the token or the settings changed because of a peer, or the self row was refreshed. */
   onChange(): void;
   onError?(err: unknown): void;
   /** Tests: every frame sent or received on every peer link. */
@@ -150,6 +153,11 @@ export class PoolSync {
       if (pool.variant !== "peer") throw new Error(`${shortId(id)} did not serve the peer variant of PoolObject`);
       pool.roster.subscribe((rows) => {
         if (current() && this.deps.store.merge([...rows])) this.deps.onChange();
+      });
+      pool.settings.subscribe((rows) => {
+        if (!current() || !this.deps.settings.merge([...rows])) return;
+        this.deps.settings.apply();
+        this.deps.onChange();
       });
       pool.token.subscribe((meta) => {
         if (meta === null) return;

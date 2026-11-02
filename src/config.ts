@@ -12,6 +12,8 @@ export type NodeConfig = {
   envPassthrough: string[];
   /** The iroh-lighthouse used to find the pool's members; "" disables discovery. */
   lighthouseUrl: string;
+  /** `MEDDLE_LIGHTHOUSE_URL` is set (even empty): it wins over the pool's `lighthouse.url` setting. */
+  lighthouseUrlExplicit: boolean;
   irohPreset: "n0" | "minimal";
   /** The iroh endpoint's bind address; null (unset or empty) for iroh's default. */
   irohBind: string | null;
@@ -20,6 +22,13 @@ export type NodeConfig = {
   gitSocket: string | null;
   /** How long a jj command that talks to a peer (fetch, push, clone, the import after a push) may run; default 120 s. */
   jjNetworkTimeoutMs: number;
+  /** How many turns may run at once on this node, `MEDDLE_MAX_RUNNING`; null (unset) for the pool's `limits.running`. */
+  maxRunning: number | null;
+  /**
+   * What the pool's settings add to the environment of jj and of Claude Code (`JJ_USER`, `JJ_EMAIL`, `env.*`).
+   * `{}` from `loadConfig`; owned by `PoolSettings.apply`, which replaces the object on every change.
+   */
+  poolEnv: Record<string, string>;
 };
 
 export const DEFAULT_ENV_PASSTHROUGH = [
@@ -57,6 +66,12 @@ function parseJjNetworkTimeoutMs(raw: string | undefined): number {
   return n;
 }
 
+function parseMaxRunning(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("MEDDLE_MAX_RUNNING must be a non-negative integer");
+  return Number(raw);
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): NodeConfig {
   const home = env.HOME ?? homedir();
   return {
@@ -69,11 +84,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       ? [...DEFAULT_ENV_PASSTHROUGH]
       : env.MEDDLE_ENV_PASSTHROUGH.split(" ").filter((name) => name !== ""),
     lighthouseUrl: env.MEDDLE_LIGHTHOUSE_URL ?? "https://iroh.ichor.io",
+    lighthouseUrlExplicit: env.MEDDLE_LIGHTHOUSE_URL !== undefined,
     irohPreset: parseIrohPreset(env.MEDDLE_IROH_PRESET),
     // Empty is unset, as for the lighthouse: iroh's default bind address.
     irohBind: env.MEDDLE_IROH_BIND === undefined || env.MEDDLE_IROH_BIND === "" ? null : env.MEDDLE_IROH_BIND,
     discoveryPollMs: parseDiscoveryPollMs(env.MEDDLE_DISCOVERY_POLL_MS),
     gitSocket: env.MEDDLE_GIT_SOCKET === undefined || env.MEDDLE_GIT_SOCKET === "" ? null : resolve(env.MEDDLE_GIT_SOCKET),
     jjNetworkTimeoutMs: parseJjNetworkTimeoutMs(env.MEDDLE_JJ_NETWORK_TIMEOUT_MS),
+    maxRunning: parseMaxRunning(env.MEDDLE_MAX_RUNNING),
+    poolEnv: {},
   };
 }
