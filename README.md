@@ -167,6 +167,7 @@ with `(this node)` after this node's line.
 | `MEDDLE_DISCOVERY_POLL_MS` | `10000` | How often a node looks its pool's topic up; at least `500`. |
 | `MEDDLE_IROH_PRESET` | `n0` | iroh's `n0` preset (number 0's public relays and address lookup), or `minimal`: no relays and no address lookup, so nodes reach each other only at direct addresses (loopback setups and tests). |
 | `MEDDLE_IROH_BIND` | iroh's default | The address iroh's UDP socket binds, as `<ip>:<port>`. |
+| `MEDDLE_JJ_NETWORK_TIMEOUT_MS` | `120000` | How long a jj fetch, push or clone with another node may take before meddle kills it (with its git processes) and fails it as `jj <args> timed out after <ms> ms`. |
 
 ## Projects and tasks
 
@@ -204,17 +205,19 @@ the home, and before another node fetches the project. Another node fetches `tru
 task, so creating a task of a project homed elsewhere needs the home online (`home <short id> is offline`
 otherwise). A project with nothing trunk-like starts its tasks at the root.
 
-At the end of every turn meddle points each of the task's bookmarks, `meddle/task/<task id>/<project name>`, at its
+At the end of every completed turn meddle points each of the task's bookmarks, `meddle/task/<task id>/<project name>`, at its
 workspace's working copy, and a node that is not the project's home pushes the bookmark to the home, so the home
 holds every task's latest work. A push that fails (the home offline, no jj identity) does not fail the turn: it is
-logged as `meddle: git: push of <bookmark> to <short id> failed: …`, and the next turn end pushes again.
+logged as `meddle: git: push of <bookmark> to <short id> failed: …` (each distinct line at most once a minute, so a
+missing identity does not fill the log), and the next turn end pushes again. A turn that fails pushes nothing; the
+next completed turn pushes its work too.
 
 A replica names its remote for another node after that node's short id, the first 10 characters of its node id, so
 on a node that is not the home `trunk@<short id>` is the home's trunk.
 
 The dashboard's Projects view lists every project of the pool once, merged across the online nodes that hold a copy:
-its home, the nodes holding it, and each node's bookmarks (`name` or `name@<short id>` with its change id, flagged
-when conflicted). It also adds a project on this node.
+its home, the nodes holding it, and each node's bookmarks (`name`, `name@<short id>`, or `name@origin` for a project
+added from an upstream URL, with its change id, flagged when conflicted). It also adds a project on this node.
 
 ### Memory
 
@@ -222,15 +225,21 @@ Each project has a memory repo on every node that holds it, `<data dir>/memory/<
 `memory` bookmark. It is the memory directory of every task whose primary project it is (linked into the task's
 Claude Code config). A folder project's starts from the memory Claude Code already keeps for that folder, if any.
 
-The memory of a task's primary project is synced around each of its turns, on every node:
+The memory of a task's primary project is synced around each of its turns, on every node, except while another task
+whose primary project is the same has a turn running on this node (a task that only uses the project as a second
+project does not count): its session is reading and writing the same files, so the sync waits for the last of them
+to end.
 
-- Before a turn, unless another task of the same project has a turn running on this node: a node that is not the
-  home fetches `memory` from the home, and the memory repo's working copy is rebased onto `memory` when it is not
-  already on it.
-- After every turn: what the turn wrote is committed as `memory from <short id>`, `memory` moves onto it (rebased
-  first when `memory` has moved meanwhile), and a node that is not the home pushes it to the home.
+- Before a turn: a node that is not the home fetches `memory` from the home, and the memory repo's working copy is
+  rebased onto `memory` when it is not already on it.
+- After every completed turn: what the turn wrote is committed as `memory from <short id>`, `memory` moves onto it
+  (rebased first when `memory` has moved meanwhile), and a node that is not the home pushes it to the home. A turn
+  that ends while another such task is still running leaves this to that task's turn end, which commits what both
+  wrote.
 
-A conflict between two nodes' edits stays in the files as jj's conflict markers, for a later session to tidy. A
+A conflict between two nodes' edits stays in the files as jj's conflict markers, for a later session to tidy. jj
+will not push a commit with conflicts, so until then this node's memory does not reach the home (each turn end logs
+why); the turn end after the tidy-up folds it into the conflicted commit, which then pushes as usual. A
 `memory` bookmark that is itself conflicted takes the home's when the home's is clean, and otherwise one of its own
 targets, logged as `meddle: git: memory of <short id> had a conflicted bookmark; resolved to <change>`. A sync that
 fails is logged as `meddle: git: memory of <short id> was not synced before the turn: …` (or `after`) and the turn
@@ -268,7 +277,18 @@ A node serves only members of its pool, only the repos it holds, and only fetche
 under the `update` hook, which accepts task bookmarks (`refs/heads/meddle/task/*`) into a project repo and the
 `memory` bookmark into a memory repo, and refuses deletions (`meddle: deleting <ref> is not accepted here`) and every
 other ref (`meddle: ref <ref> is not accepted here`). So `trunk` and your own bookmarks change only on the home,
-whatever another node, or a model pushing from inside a task, sends it.
+whatever another node, or a model pushing from inside a task, sends it. While the hook is missing or cannot run, the
+node refuses every push, logging `meddle: git: update hook missing; refusing receive-pack` (`serve` writes it again
+at start). A push it took is imported into jj without snapshotting the repo's working copy, and a fetch of a project
+homed here moves `trunk` the same way: your edits in a folder project are never recorded by another node's fetch or
+push.
+
+What a member can push: the whole `refs/heads/meddle/task/*` namespace of every project repo and `refs/heads/memory`
+of every memory repo, on any node that holds them. So a model inside any task on any node can push over another
+task's bookmark on the home (its backup) or move `memory` there. The task's owner sets and pushes its bookmark again
+at its next turn end, the next memory sync builds on whatever `memory` then is, and jj's operation log on the home
+keeps every earlier target (`jj op log`), so nothing is lost; but within the pool, task bookmarks and memory are not
+protected from each other.
 
 ## Moving a task
 
@@ -332,7 +352,8 @@ on the target starts with:
 ### Prompts during a move
 
 While the move waits for the turn to end (`prepare`), a prompt sent to the task (with `task prompt`; the dashboard's
-composer is disabled) is queued and travels with it. Later in the move a prompt is refused with
+composer is disabled) is queued and travels with it; `task prompt` then prints
+`queued; it runs once the task has arrived` and exits rather than waiting for a turn that runs on the other node. Later in the move a prompt is refused with
 `task is moving; send it again once it has arrived`; interrupting, retrying and changing settings are refused with
 `task is moving` throughout. On the target the queued prompts, after the "move now" text if there is one, run one
 turn each, in order, each recorded as your prompt.
@@ -351,7 +372,12 @@ stays `moving` here and this node asks again, after 2 seconds doubling up to 30,
 
 A node restarted in the middle of a move resumes it from its last step. A node restarted while it was receiving a
 task drops the partial copy. A task left `moving` with no move behind it is made live again at start, logged as
-`meddle: move: <task id> was left moving with no move in progress; it is live here again`.
+`meddle: move: <task id> was left moving with no move in progress; it is live here again`; one whose move kept
+crashing the node in `prepare` or `handoff` until it was parked is made live again too and its move given up, logged
+as `meddle: move: <task id> to <short id> at <step> parked; released` (a move parked in `commit` is left, as the
+target may have the task). A task that is live again keeps a turn that is being rerun (`running`), never `idle`
+under it. A step of a move that was already rolled back here goes no further: the move ends
+`failed at <step>: task is no longer moving`.
 
 ### On the node a task left
 
