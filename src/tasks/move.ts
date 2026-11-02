@@ -1,4 +1,5 @@
 // The sending side of moving a task to another node: the durable `meddle.move` (decisions 10, 11, 16, 18, 19).
+import { existsSync } from "node:fs";
 import { rename, rm, utimes } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { isChordError, type Ref } from "@earendil-works/chord";
@@ -367,10 +368,13 @@ async function removeArchivedCopy(cfg: NodeConfig, db: Database, self: string, t
   const moved = p.movedFile(taskId);
   try {
     await rename(p.archiveFile(taskId), moved);
-    const now = new Date();
-    await utimes(moved, now, now);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  // Also on a rerun after the rename: the janitor keeps the leftover seven days from the restore.
+  if (existsSync(moved)) {
+    const now = new Date();
+    await utimes(moved, now, now);
   }
   await releaseFolder(cfg, db, self, taskId);
   clearTaskLog(db, taskId, row.session_id);

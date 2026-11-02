@@ -14,6 +14,9 @@ import { getTask, listArchivedTasks, listLiveTasks, updateTask } from "../src/st
 import { readArchive, sweepArchiveTemps, writeArchive } from "../src/tasks/archive";
 import { ALPN_POOL, StreamReader } from "../src/pool/frames";
 import { exportArchive, exportTask, importTask, type Receipt } from "../src/tasks/transfer";
+import { taskKey } from "../src/tasks/durable";
+import { serialised } from "../src/serial";
+import { claudeCodeVersion } from "../src/version";
 import { transcriptPath, type TaskManifest } from "../src/tasks/manifest";
 import { setupNode } from "./helpers";
 import { endpointPair, linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
@@ -391,6 +394,8 @@ test("restore with no node named lands a task archived off its project's home on
     await A.runner.archive(m.id);
     expect(await namespace(A, replicaA, m.id)).toEqual({ local: [], remote: 0 });
     await peerReady(A, B);
+    // What an unstage that failed would leave: forgotten before the staging, so it never travels.
+    await jj(["bookmark", "create", `meddle/task/${m.id}/a.stale`, "-r", "@"], replicaA, A.cfg);
 
     let staged: { local: string[]; remote: number } | null = null;
     B.hooks.beforeReceive = async () => { staged = await namespace(A, replicaA, m.id); };
@@ -418,6 +423,7 @@ test("restore with no node named lands a task archived off its project's home on
     expect(A.logs.filter((l) => l.startsWith("meddle: move:"))).toEqual([]);
 
     expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", archived_on: null, receiving_from: null, turns: 1 });
+    expect((await namespace(B, B.project.replica, m.id)).local).toEqual([`meddle/task/${m.id}/a ${change}`]);
     expect(await changeAt(B, join(paths(B.cfg).task(m.id), "a"), "@-")).toBe(change);
     await promptAndWait(B, m.id, "Carry on.");
     expect(resumes(B, m.id)).toEqual([false, true]);
@@ -506,3 +512,48 @@ test("a restore-move the target refuses leaves the task archived on the source w
     await close();
   }
 }, 45_000);
+
+test("while a task is being restored here, a restore elsewhere is refused; the task ends idle here with no move", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    await A.runner.archive(m.id);
+    await peerReady(A, B);
+    // The restore here is reserved at once and then waits for the task's key, held here.
+    const gate = Promise.withResolvers<void>();
+    const held = serialised(taskKey(m.id), () => gate.promise);
+    const here = A.runner.restoreHere(m.id);
+    await expect(A.runner.restore(m.id, B.id)).rejects.toThrow("task is being restored");
+    await expect(A.runner.restore(m.id, null)).rejects.toThrow("task is being restored");
+    await expect(A.runner.moveTo(m.id, B.id, false, true)).rejects.toThrow("task is being restored");
+    await expect(A.runner.restoreHere(m.id)).rejects.toThrow("task is being restored");
+    gate.resolve();
+    await held;
+    await here;
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", archived_on: null, moved_to: null });
+    const { tasks } = await A.harness.harness.inspect(BACKGROUND_CONTEXT);
+    expect(tasks.filter((t) => t.record.kind === "meddle.move")).toEqual([]);
+    expect(getTask(B.db, m.id)).toBeNull();
+    expect(A.runner.moveState(m.id)).toBeNull();
+  } finally {
+    await close();
+  }
+}, 30_000);
+
+test("automatic placement for a restore leaves out a node running another Claude Code version: the task restores here, not on its project's home", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    // B is the project's home, which placement would pick; A's roster says B runs another Claude Code.
+    const m = await A.runner.create({ title: "t", projectIds: [B.project.id] });
+    await A.runner.archive(m.id);
+    const summary = A.store.row(B.id)!.summary!;
+    A.db.query("UPDATE roster SET summary = ? WHERE node_id = ?").run(JSON.stringify({ ...summary, claudeCodeVersion: "0.0.1-other" }), B.id);
+    await expect(A.runner.restore(m.id, B.id)).rejects.toThrow(`claude code ${claudeCodeVersion()} here, 0.0.1-other there`);
+    expect(await A.runner.restore(m.id, null)).toEqual({ nodeId: A.id });
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", archived_on: null });
+    expect(existsSync(join(paths(A.cfg).task(m.id), "a"))).toBe(true);
+    expect(getTask(B.db, m.id)).toBeNull();
+  } finally {
+    await close();
+  }
+}, 30_000);
