@@ -57,15 +57,20 @@ Three things must therefore be true:
 - One Claude login for the whole pool, rotated from any node.
 - Project memory shared by every task of a project, on every node.
 - Visible resource use per node and per task, with budgets you set.
+- A spot for every new task, chosen by meddle unless you choose; tasks
+  visible where they run, movable, and archived without a running process
+  (section 21).
 
 **Non-goals**
 
 - Multiple users or tenants. The pool is one person's.
-- Automatic placement or scheduling. You assign; the dashboard helps you see
-  where there is room.
 - Engines other than Claude Code. Keep the seam, don't build the second one.
 - Windows. Linux and macOS.
-- Replacing faff on a single machine.
+
+(Revision 2026-11-02, section 21: "Automatic placement or scheduling" and
+"Replacing faff on a single machine" were non-goals and no longer are.
+meddle makes the first placement choice when you do not, and faff is meant
+to become a single-project view of meddle.)
 
 **Anti-goals** (a build that does these has failed even if it works)
 
@@ -751,3 +756,129 @@ as calls in section 17. The two put to the author were answered:
   authentication, headless
 - Zed Delta: https://zed.dev/blog/introducing-delta
 - JetBrains Air: https://blog.jetbrains.com/air/
+
+## 21. Revision 2026-11-02: settings, tokens, placement, archive, bookmarks, spawn
+
+What changed in intent, in the author's words: moving agents around should
+be easy, that was the main point. meddle should find a spot for a task and
+run it there; the dashboard shows where the agents are running; "I don't
+want them there" is a move, and the agents migrate. Because the storage is
+durable, threads can be archived and revisited without keeping instances
+running, which is what several terminal instances cost today. The same jj
+name and email should apply everywhere. When a login token runs out, the
+next one should be used. A task has an optional set of projects, and an
+agent that wants a side branch kept pins it with a bookmark.
+
+### 21.1 Pool settings
+
+A replicated key/value map next to the token, last writer wins per key on
+its `updatedAt`, the roster's rule. Set, unset and list from any node
+(`meddle config set <key> <value>`, `unset`, `list`) and in the Settings
+view. Keys:
+
+| Key | Applied as |
+|---|---|
+| `jj.user`, `jj.email` | `JJ_USER` and `JJ_EMAIL` for every jj command meddle runs and for every task's child, so commits carry one identity on every node. Removes the "configure a jj identity on each node" prerequisite. |
+| `env.<NAME>` | `<NAME>` in every task's child environment and in meddle's own jj and git calls. |
+| `lighthouse.url` | The discovery lighthouse, applied live; an explicit `MEDDLE_LIGHTHOUSE_URL` on a node overrides it there. |
+| `limits.running` | How many turns a node runs at once before placement treats it as full; `0` is unlimited; `MEDDLE_MAX_RUNNING` overrides per node. |
+
+Values are plain pool state: every member sees them and stores them. The
+Settings view says so; secrets take the token path, not this one.
+
+### 21.2 Tokens
+
+The pool holds an ordered list of tokens instead of one. Each has an id, a
+label, who set it and when, its expiry, and a status: `ok`,
+`exhausted` until a time and with the limit type, or `disabled` with a
+reason. `token add`, `remove`, `list` and `enable` work from any node;
+metadata replicates per token id last writer wins; values are pulled by id
+the way the single token is today.
+
+A turn starts with the first token in order whose status is `ok` (an
+`exhausted` whose time has passed counts as `ok`). During a turn, a
+`rate_limit_event` with status `rejected`, or an assistant message whose
+error is `rate_limit`, marks that token `exhausted` until the event's
+`resetsAt`, or one hour from now when it carries none. The errors
+`billing_error`, `account_on_hold`, `authentication_failed`,
+`oauth_org_not_allowed` and `verification_required` mark it `disabled`
+until someone runs `token enable`. The mark replicates, so every node
+switches. The turn that failed reruns once with the next token in the same
+session; the failed message stays in the log as what happened. With no
+usable token the turn fails with a message that says so and a notification
+of kind `token` is raised. Switching early on warnings is not in this
+revision.
+
+### 21.3 Placement
+
+"Placement is a choice, not an accident" stands. meddle makes the first
+choice when you do not, and the Pool view shows the result. A task is
+created with a placement: a node id, or `auto`, the default in the
+dashboard and the CLI (`--here` forces the local node).
+
+Candidates are online members that host tasks and run fewer turns than
+`limits.running` allows. Preference: the home of the task's first project
+when it is a candidate; else candidates holding replicas of every project
+of the task; else any candidate. Ties: fewest running turns, then fewest
+tasks, then the lower node id. No candidate: creation fails with the
+reason. The node that took the request asks the chosen node to create the
+task; the task is born there, no move involved. Each node's summary gains
+its running-turn count for this.
+
+### 21.4 Archive and restore
+
+Archiving an idle task on the node that holds it: write the task's files
+(the manifest, the transcript tree, the config directory minus symlinks)
+to `<data>/archives/<taskId>.json.gz`, forget the workspaces, remove the
+folder, keep the event and transcript rows, set the row `archived` with
+`archivedOn` = this node. Task bookmarks stay as a move's cleanup leaves
+them: the backup on the home, forgotten elsewhere after the final push.
+
+An archived task renders read-only from its rows in the Task view, with
+Restore and Delete as the only controls. Restore takes a placement. On the
+archiving node it re-provisions the folder from the manifest and unpacks
+the files. On another node the archiving node runs the move procedure with
+the archive as its source: the same frames, from the file and the rows,
+the same receipt rule, and afterwards the archive is deleted and a `moved`
+row remains. Archived tasks appear in a pool-wide Archived list. Delete
+removes the archive and the rows. Archives are kept until deleted; the
+seven-day janitor applies only to move leftovers, which move to
+`<data>/moved/` so the two never mix.
+
+### 21.5 The task's bookmark namespace
+
+Everything under `meddle/task/<id>/` belongs to the task. meddle still
+moves `meddle/task/<id>/<project>` to the working copy at every turn end;
+the push to home (which is the backup; the home never fetches) and the
+fetch on a move both use `glob:meddle/task/<id>/*`, so any bookmark an
+agent creates in the namespace is backed up and travels. The Task view
+lists them with their change ids. An agent pins a side branch with
+`jj bookmark create meddle/task/<id>/<project>.<label>`; the generated
+CLAUDE.md tells it so. The name is `<project>.<label>`, not
+`<project>/<label>`: git refs are files, so a ref cannot be both a file
+and a directory, and `…/<project>/<label>` beside `…/<project>` is refused
+(verified with jj 0.45.1). A bookmark named outside the namespace stays in
+the replica, untracked and refused by the home's hook.
+
+### 21.6 Optional projects, first prompt, spawn
+
+`createTask` takes zero or more projects and an optional first prompt.
+With no project, Claude Code starts in the task folder with the user layer
+only, `CLAUDE_CODE_PROJECT_DIR_NAME` unset, so its memory keys on the task
+folder inside the task's config directory: it travels with the task and
+ends with it, and nothing syncs it. A task with a project keeps per-project
+memory as before.
+
+`meddle spawn "<prompt>" [--project <id|name>]… [--node <id> | --here]
+[--title <t>]` creates the task (the title defaults to the prompt's first
+sixty characters), places it, sends the prompt, and prints the task id and
+the node. `meddle project list` lists the pool's projects, with home and
+holders, not only this node's; `--project` accepts a name when it is unique
+in the pool.
+
+### 21.7 Deferred, by name
+
+So the plan does not drift: a `meddle` CLI inside tasks for attaching
+projects; parent and child tasks; approval policies per task; the JSON
+attach stream for faff and a terminal `attach`; revision ownership
+tracking; engines other than Claude Code.
