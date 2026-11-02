@@ -136,16 +136,21 @@ const HOME_TRUNK = 'latest(trunk() ~ root() | bookmarks(exact:"trunk") | bookmar
 
 /**
  * On a project's home: points the local `trunk` bookmark at the latest trunk-like revision (`HOME_TRUNK`), so that
- * other nodes, which fetch only `trunk`, start tasks where the home would. Returns that change id, or null (and
- * leaves the bookmarks alone) when nothing resolves.
+ * other nodes, which fetch only `trunk`, start tasks where the home would. Never snapshots the working copy, and adds
+ * no operation when `trunk` is already there. Returns that change id, or null (and leaves the bookmarks alone) when
+ * nothing resolves.
  */
 export async function refreshTrunk(cfg: NodeConfig, replica: string): Promise<string | null> {
   // What git moved (a pull or commit in the checkout, a push from a peer) first, then a read that never snapshots the
   // working copy: a folder project's replica is the user's own checkout.
   await gitImport(replica, cfg);
-  const [change] = (await jj(["log", "--ignore-working-copy", "-r", HOME_TRUNK, "--no-graph", "-T", 'change_id ++ "\\n"'], replica, cfg)).split("\n");
-  if (change === undefined || change === "") return null;
-  await bookmarkSet(replica, "trunk", change, cfg);
+  const resolve = async (revset: string) =>
+    (await jj(["log", "--ignore-working-copy", "-r", revset, "--no-graph", "-T", 'change_id ++ "\\n"'], replica, cfg)).split("\n").filter(Boolean);
+  const [change] = await resolve(HOME_TRUNK);
+  if (change === undefined) return null;
+  // Set only when it moves, and then without a snapshot either: a peer's every fetch runs this.
+  const current = await resolve('bookmarks(exact:"trunk")');
+  if (current.length !== 1 || current[0] !== change) await bookmarkSet(replica, "trunk", change, cfg, { ignoreWorkingCopy: true });
   return change;
 }
 

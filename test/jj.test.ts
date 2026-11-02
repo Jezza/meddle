@@ -2,8 +2,10 @@
 import { test, expect } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { loadConfig } from "../src/config";
-import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkList, bookmarkSet, jj } from "../src/jj";
+import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkList, bookmarkSet, fetch, jj, push, remoteAdd, track } from "../src/jj";
+import { shortId } from "../src/pool/identity";
 import { refreshTrunk } from "../src/projects/replicas";
+import { twoPoolNodes } from "./pool-helpers";
 test("init, workspace add, change id, bookmark, forget", async () => {
   const repo = await mkdtemp("/tmp/meddle-jj-");
   await initColocated(repo);
@@ -72,11 +74,57 @@ test("listing bookmarks and resolving the home's trunk import git's refs and nev
   expect(await ops()).toBeLessThanOrEqual(before + 1);
   expect(await recorded()).not.toContain("edited.txt");
 
-  // the resolution sees git's newest main (moved again, behind jj's back); only its `bookmark set` snapshots
+  // the resolution sees git's newest main (moved again, behind jj's back) and sets `trunk` there, never snapshotting
   const three = git("commit-tree", `${one}^{tree}`, "-p", two, "-m", "three");
   git("update-ref", "refs/heads/main", three);
   const home = await mkdtemp("/tmp/meddle-jj-home-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
   const threeChange = await refreshTrunk(cfg, repo);
   expect(threeChange).toBe((await jj(["log", "--ignore-working-copy", "-r", three, "--no-graph", "-T", "change_id"], repo)).trim());
+  expect(await recorded()).not.toContain("edited.txt");
+  // exported to git, for peers that fetch it
+  expect(git("rev-parse", "refs/heads/trunk")).toBe(three);
+  // and once `trunk` is there, a refresh adds no operation
+  before = await ops();
+  expect(await refreshTrunk(cfg, repo)).toBe(threeChange);
+  expect(await ops()).toBe(before);
 });
+
+test("a peer's fetch and push against a home with an edit in its checkout never snapshot that checkout", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const home = A.project.replica;
+    await Bun.write(`${home}/README`, "hello\n");
+    await jj(["commit", "-m", "init"], home, A.cfg);
+    // `main`, not `trunk`: the fetch below has the home set `trunk` itself.
+    await bookmarkSet(home, "main", "@-", A.cfg);
+    await Bun.write(`${home}/edited.txt`, "x\n");
+    const opIds = async () => (await jj(["op", "log", "--ignore-working-copy", "--no-graph", "-T", 'id ++ "\\n"'], home, A.cfg)).split("\n").filter(Boolean);
+    const known = new Set(await opIds());
+
+    const shortA = shortId(A.id);
+    const repo = `${B.home}/r`;
+    await initColocated(repo, B.cfg);
+    await remoteAdd(repo, shortA, `meddle://${A.id}/project/${A.project.id}`, B.cfg);
+    await fetch(repo, shortA, ["trunk"], B.cfg);
+    await jj(["new", `trunk@${shortA}`], repo, B.cfg);
+    await Bun.write(`${repo}/work`, "from b\n");
+    await jj(["commit", "-m", "work"], repo, B.cfg);
+    await track(repo, "meddle/task/t1/p", shortA, B.cfg);
+    await bookmarkSet(repo, "meddle/task/t1/p", "@-", B.cfg);
+    await push(repo, shortA, "meddle/task/t1/p", B.cfg);
+    // a second fetch finds `trunk` in place
+    await fetch(repo, shortA, ["trunk"], B.cfg);
+
+    const fresh = (await opIds()).filter((id) => !known.has(id));
+    const described = await Promise.all(fresh.map(async (id) => (await jj(["op", "show", "--ignore-working-copy", id, "--no-graph", "-T", "description", "--no-op-diff"], home, A.cfg)).trim()));
+    expect(described.filter((d) => d.startsWith("snapshot"))).toEqual([]);
+    // the trunk set and the pushed bookmark's import, nothing else
+    expect(fresh.length).toBeLessThanOrEqual(2);
+    expect((await jj(["diff", "--ignore-working-copy", "-r", "@", "--name-only"], home, A.cfg)).split("\n")).not.toContain("edited.txt");
+    expect((await bookmarkList(home, A.cfg)).map((b) => b.name).sort()).toEqual(["main", "meddle/task/t1/p", "trunk"]);
+    expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);

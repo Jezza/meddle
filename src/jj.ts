@@ -27,20 +27,61 @@ export function jjEnv(cfg: NodeConfig): Record<string, string> {
   return env;
 }
 
+/** What a jj command that talks to a peer may take when no config says otherwise. */
+const NETWORK_TIMEOUT_MS = 120_000;
+
+/** The time limit of a jj command that talks to a peer: the config's, or the default. */
+function networkMs(cfg?: NodeConfig): number {
+  return cfg?.jjNetworkTimeoutMs ?? NETWORK_TIMEOUT_MS;
+}
+
+export type JjOptions = {
+  /**
+   * Kills the command (with the git and remote-helper processes it started) and rejects
+   * `jj <args> timed out after <ms> ms` when it has not exited by then: a peer that never answers must not hold a
+   * repo's lock for good.
+   */
+  timeoutMs?: number;
+};
+
 /** Runs jj in `cwd`; with `cfg`, in `jjEnv(cfg)` so that `meddle://` remotes work. Rejects a `JjError` on failure. */
-export async function jj(args: string[], cwd: string, cfg?: NodeConfig): Promise<string> {
+export async function jj(args: string[], cwd: string, cfg?: NodeConfig, options: JjOptions = {}): Promise<string> {
+  const { timeoutMs } = options;
   const proc = Bun.spawn(["jj", "--no-pager", "--color", "never", ...args], {
     cwd,
     env: cfg === undefined ? process.env : jjEnv(cfg),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    // Its own process group, so a timeout kills git and the remote helper with it.
+    detached: timeoutMs !== undefined,
   });
-  const [stdout, stderr, code] = await Promise.all([
+  const finished = Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = timeoutMs === undefined
+    ? null
+    : new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          process.kill(-proc.pid, "SIGKILL");
+        } catch {
+          proc.kill("SIGKILL");
+        }
+        reject(new Error(`jj ${args.join(" ")} timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+    });
+  // Once timed out, the outputs end whenever the killed processes' pipes close; nobody waits for them.
+  finished.catch(() => {});
+  let stdout: string, stderr: string, code: number;
+  try {
+    [stdout, stderr, code] = await (limit === null ? finished : Promise.race([finished, limit]));
+  } finally {
+    clearTimeout(timer);
+  }
   if (code !== 0) throw new JjError(args, code, stderr);
   return stdout;
 }
@@ -58,11 +99,11 @@ export async function initColocated(dir: string, cfg?: NodeConfig): Promise<void
   await jj(["git", "init", "--colocate"], dir, cfg);
 }
 
-/** Clones `url` into `dir` as a colocated repo whose remote is named `remote`. */
+/** Clones `url` into `dir` as a colocated repo whose remote is named `remote`; limited to `cfg.jjNetworkTimeoutMs`. */
 export async function cloneColocated(url: string, dir: string, cfg?: NodeConfig, remote = "origin"): Promise<void> {
   const parent = dirname(dir);
   await mkdir(parent, { recursive: true });
-  await jj(["git", "clone", "--colocate", "--remote", remote, url, dir], parent, cfg);
+  await jj(["git", "clone", "--colocate", "--remote", remote, url, dir], parent, cfg, { timeoutMs: networkMs(cfg) });
 }
 
 export async function workspaceAdd(repo: string, name: string, path: string, revision: string, cfg?: NodeConfig): Promise<void> {
@@ -73,8 +114,15 @@ export async function workspaceForget(repo: string, name: string, cfg?: NodeConf
   await jj(["workspace", "forget", name], repo, cfg);
 }
 
-export async function bookmarkSet(repo: string, name: string, revision: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["bookmark", "set", name, "-r", revision, "--allow-backwards"], repo, cfg);
+/**
+ * Points bookmark `name` at `revision` (backwards or sideways too). With `ignoreWorkingCopy`, without snapshotting the
+ * working copy first (the ref is still exported to git): for a repo that is the user's own checkout.
+ */
+export async function bookmarkSet(
+  repo: string, name: string, revision: string, cfg?: NodeConfig, options: { ignoreWorkingCopy?: boolean } = {},
+): Promise<void> {
+  const args = ["bookmark", "set", name, "-r", revision, "--allow-backwards"];
+  await jj(options.ignoreWorkingCopy === true ? ["--ignore-working-copy", ...args] : args, repo, cfg);
 }
 
 export async function bookmarkDelete(repo: string, name: string, cfg?: NodeConfig): Promise<void> {
@@ -103,14 +151,15 @@ export async function remoteList(repo: string, cfg?: NodeConfig): Promise<Array<
   });
 }
 
-/** Fetches `bookmarks` (jj string patterns; every bookmark when empty) from `remote`. */
+/** Fetches `bookmarks` (jj string patterns; every bookmark when empty) from `remote`; limited to `cfg.jjNetworkTimeoutMs`. */
 export async function fetch(repo: string, remote: string, bookmarks: string[], cfg?: NodeConfig): Promise<void> {
-  await jj(["git", "fetch", "--remote", remote, ...bookmarks.flatMap((b) => ["--branch", b])], repo, cfg);
+  await jj(["git", "fetch", "--remote", remote, ...bookmarks.flatMap((b) => ["--branch", b])], repo, cfg, { timeoutMs: networkMs(cfg) });
 }
 
+/** Pushes `bookmark` to `remote`; limited to `cfg.jjNetworkTimeoutMs`. */
 export async function push(repo: string, remote: string, bookmark: string, cfg?: NodeConfig): Promise<void> {
   // A task bookmark points at its workspace's working copy, which is usually not described yet.
-  await jj(["git", "push", "--remote", remote, "--bookmark", `exact:${bookmark}`, "--allow-empty-description"], repo, cfg);
+  await jj(["git", "push", "--remote", remote, "--bookmark", `exact:${bookmark}`, "--allow-empty-description"], repo, cfg, { timeoutMs: networkMs(cfg) });
 }
 
 /** Tracks `bookmark@remote` (idempotent), so that a push may create or move it there. */
@@ -129,7 +178,8 @@ const BOOKMARK_TEMPLATE = 'if(present, name ++ "\\t" ++ remote ++ "\\t" ++ if(no
  * `--ignore-working-copy` runs this first. Adds no operation when nothing changed.
  */
 export async function gitImport(repo: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["--ignore-working-copy", "git", "import"], repo, cfg);
+  // Run after a peer's push, as that push's last step: limited like the push itself.
+  await jj(["--ignore-working-copy", "git", "import"], repo, cfg, { timeoutMs: networkMs(cfg) });
 }
 
 /**

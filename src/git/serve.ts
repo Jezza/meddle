@@ -1,10 +1,11 @@
 // The serving side of git over iroh: a peer's `git` stream runs `git upload-pack` or `git receive-pack` on a repo
 // this node holds, the stream's bytes piped to the process and its output piped back.
 import { existsSync, readFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
-import { jj } from "../jj";
+import { gitImport } from "../jj";
 import { paths } from "../paths";
 import type { PeerStream, PoolNet } from "../pool/net";
 import { shortId } from "../pool/ids";
@@ -50,6 +51,27 @@ async function refuse(s: PeerStream): Promise<void> {
   await s.stream.recv.stop(0n).catch(() => {});
 }
 
+/** Resets a stream refused after its header was taken: the opener's next read fails. */
+async function reset(s: PeerStream): Promise<void> {
+  await s.stream.send.reset(0n).catch(() => {});
+  await s.stream.recv.stop(0n).catch(() => {});
+}
+
+/** Whether meddle's `update` hook is in place: a file that can run. Without it, `receive-pack` would take any ref. */
+async function hookReady(cfg: NodeConfig): Promise<boolean> {
+  try {
+    const st = await stat(paths(cfg).hookUpdate);
+    return st.isFile() && (st.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+/** `err` as one line. */
+function oneLine(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+}
+
 /** The git command serving `service` on `gitDir`; a push goes through meddle's `update` hook. */
 function command(cfg: NodeConfig, service: GitService, gitDir: string): string[] {
   return service === "upload-pack"
@@ -76,9 +98,14 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
   // A peer fetching a project homed here gets the `trunk` the home itself would start a task from.
   if (request.service === "upload-pack" && request.repo.kind === "project" && getProject(deps.db, request.repo.id)?.home === deps.selfId) {
     await refreshTrunk(deps.cfg, repo).catch((err: unknown) => {
-      const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
-      deps.log?.(`meddle: git: trunk of ${shortId(request.repo.id)} was not refreshed: ${message}`);
+      deps.log?.(`meddle: git: trunk of ${shortId(request.repo.id)} was not refreshed: ${oneLine(err)}`);
     });
+  }
+
+  // A push goes through the hook or not at all: a missing hook would let a peer move `trunk` or delete bookmarks.
+  if (request.service === "receive-pack" && !(await hookReady(deps.cfg))) {
+    deps.log?.("meddle: git: update hook missing; refusing receive-pack");
+    return reset(s);
   }
 
   const proc = Bun.spawn(command(deps.cfg, request.service, gitDir), {
@@ -112,8 +139,13 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
     proc.kill();
   }
   const code = await proc.exited;
-  // A push landed in the git repo: jj imports it now, so the bookmarks are there when the pusher's push returns.
-  if (code === 0 && request.service === "receive-pack") await jj(["git", "import"], repo, deps.cfg).catch(() => {});
+  // A push landed in the git repo: jj imports it now, so the bookmarks are there when the pusher's push returns. Without
+  // a snapshot: a folder project's replica is the user's own checkout.
+  if (code === 0 && request.service === "receive-pack") {
+    await gitImport(repo, deps.cfg).catch((err: unknown) => {
+      deps.log?.(`meddle: git: what ${shortId(s.peerId)} pushed to ${repoName(request.repo)} was not imported: ${oneLine(err)}`);
+    });
+  }
   if (delivered) await s.stream.send.finish().catch(() => {});
   else await s.stream.send.reset(0n).catch(() => {});
   // The process is gone: nothing more the peer sends has anywhere to go.
@@ -124,7 +156,8 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
 /**
  * Serves the `git` streams members open to this node: only repos it holds (`repoPath`) and only `upload-pack` and
  * `receive-pack`, refused (logged, the stream ended with no data) before anything is spawned. A push runs under
- * `core.hooksPath=<data>/git-hooks` with `MEDDLE_REPO_KIND`, so the `update` hook decides which refs it may change.
+ * `core.hooksPath=<data>/git-hooks` with `MEDDLE_REPO_KIND`, so the `update` hook decides which refs it may change;
+ * while that hook is missing or cannot run, every push is refused (logged, the stream reset).
  * Returns the unsubscribe.
  */
 export function acceptGitStreams(net: PoolNet, deps: GitServeDeps): () => void {

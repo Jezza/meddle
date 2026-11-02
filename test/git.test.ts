@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { loadConfig, paths } from "../src/config";
 import { runRemoteHelper } from "../src/git/helper";
 import { writeHelperWrapper, writeUpdateHook } from "../src/git/scripts";
@@ -7,7 +7,9 @@ import { GitSocket } from "../src/git/socket";
 import { parseGitHeader, parseMeddleUrl, parseRepo, repoName } from "../src/git/wire";
 import { bookmarkList, cloneColocated, fetch, initColocated, jj, JjError, push, remoteAdd, remoteList, track } from "../src/jj";
 import { shortId } from "../src/pool/identity";
-import type { PoolNet } from "../src/pool/net";
+import type { PeerStream, PoolNet } from "../src/pool/net";
+import { pushBookmark } from "../src/projects/replicas";
+import { repoKey, serialised } from "../src/serial";
 import { twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 const NODE = "0123456789abcdef".repeat(4);
@@ -221,6 +223,73 @@ test("the update hook refuses a push to trunk and a deletion, and A's bookmarks 
   }
 }, 15_000);
 
+test("the update hook admits memory into a memory repo and refuses it into a project repo", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    await makeTrunk(A);
+    const shortA = shortId(A.id);
+    const memA = paths(A.cfg).memory(A.project.id);
+    // B's own repo with A's memory replica as its remote: a commit pushed as `memory`.
+    const mem = `${B.home}/m`;
+    await initColocated(mem, B.cfg);
+    await remoteAdd(mem, shortA, `meddle://${A.id}/memory/${A.project.id}`, B.cfg);
+    await writeFile(`${mem}/MEMORY.md`, "- from b\n");
+    await jj(["commit", "-m", "memory from b"], mem, B.cfg);
+    const change = await changeOf(B, mem, "@-");
+    await track(mem, "memory", shortA, B.cfg);
+    await jj(["bookmark", "set", "memory", "-r", "@-"], mem, B.cfg);
+    await push(mem, shortA, "memory", B.cfg);
+    expect((await bookmarkList(memA, A.cfg)).find((b) => b.name === "memory" && b.remote === null)?.changeId).toBe(change);
+
+    // The same ref into A's project repo is refused.
+    const { repo } = await pushTask(A, B);
+    const before = await bookmarkList(A.project.replica, A.cfg);
+    await track(repo, "memory", shortA, B.cfg);
+    await jj(["bookmark", "set", "memory", "-r", "@-"], repo, B.cfg);
+    const refused = await push(repo, shortA, "memory", B.cfg).catch((err: unknown) => err);
+    expect(refused).toBeInstanceOf(JjError);
+    expect((refused as JjError).stderr).toContain("meddle: ref refs/heads/memory is not accepted here");
+    expect(await bookmarkList(A.project.replica, A.cfg)).toEqual(before);
+    expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("without its update hook, the acceptor refuses every push and spawns nothing", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const trunk = await makeTrunk(A);
+    const shortA = shortId(A.id);
+    const repo = `${B.home}/r`;
+    await initColocated(repo, B.cfg);
+    await remoteAdd(repo, shortA, urlOf(A), B.cfg);
+    await fetch(repo, shortA, ["trunk"], B.cfg);
+    await jj(["new", `trunk@${shortA}`], repo, B.cfg);
+    await writeFile(`${repo}/work`, "from b\n");
+    await jj(["commit", "-m", "work"], repo, B.cfg);
+    const before = await bookmarkList(A.project.replica, A.cfg);
+
+    for (const broken of ["not executable", "missing"]) {
+      if (broken === "missing") await rm(paths(A.cfg).hookUpdate);
+      else await chmod(paths(A.cfg).hookUpdate, 0o644);
+      // Even a push the hook would admit, and one it would not.
+      for (const bookmark of ["meddle/task/t1/p", "trunk"]) {
+        await track(repo, bookmark, shortA, B.cfg);
+        await jj(["bookmark", "set", bookmark, "-r", "@-", "--allow-backwards"], repo, B.cfg);
+        await expect(push(repo, shortA, bookmark, B.cfg)).rejects.toBeInstanceOf(JjError);
+      }
+    }
+    expect(await bookmarkList(A.project.replica, A.cfg)).toEqual(before);
+    expect(before).toContainEqual({ name: "trunk", remote: null, changeId: trunk, conflicted: false });
+    expect([...new Set(A.logs)]).toEqual(["meddle: git: update hook missing; refusing receive-pack"]);
+    // A fetch needs no hook.
+    await fetch(repo, shortA, ["trunk"], B.cfg);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
 test("a clone over the helper names its remote after the home, and trunk@<home> and trunk() resolve", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
@@ -234,6 +303,48 @@ test("a clone over the helper names its remote after the home, and trunk@<home> 
     // The clone's `trunk()` alias names the home's remote.
     expect(await changeOf(B, dir, "trunk()")).toBe(trunk);
   } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a fetch or push whose peer never answers times out, takes its git processes with it and frees the repo's lock", async () => {
+  // A claims B's git streams and never serves them.
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ serveGit: false }, {}] });
+  const claimed: PeerStream[] = [];
+  const off = A.net.onStream((s) => {
+    if (s.header.stream !== "git") return false;
+    claimed.push(s);
+    return true;
+  });
+  try {
+    const shortA = shortId(A.id);
+    const repo = `${B.home}/r`;
+    await initColocated(repo, B.cfg);
+    await remoteAdd(repo, shortA, urlOf(A), B.cfg);
+    const cfg = { ...B.cfg, jjNetworkTimeoutMs: 1000 };
+    const bookmark = "meddle/task/t1/p";
+
+    let started = Date.now();
+    await expect(pushBookmark(cfg, repo, A.id, bookmark, "@"))
+      .rejects.toThrow(`jj git fetch --remote ${shortA} --branch exact:${bookmark} timed out after 1000 ms`);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    // The lock pushBookmark held is free again.
+    expect(await serialised(repoKey(repo), async () => "free")).toBe("free");
+    // The remote helper went with jj: its stream to A ends.
+    const ended = await Promise.race([
+      claimed[0]!.reader.readChunk().then(() => "ended", () => "ended"),
+      Bun.sleep(5_000).then(() => "still open"),
+    ]);
+    expect(ended).toBe("ended");
+
+    await track(repo, bookmark, shortA, B.cfg);
+    await jj(["bookmark", "set", bookmark, "-r", "@"], repo, B.cfg);
+    started = Date.now();
+    await expect(push(repo, shortA, bookmark, cfg)).rejects.toThrow("timed out after 1000 ms");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(claimed).toHaveLength(2);
+  } finally {
+    off();
     await close();
   }
 }, 15_000);

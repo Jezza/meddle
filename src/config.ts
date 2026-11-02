@@ -18,6 +18,8 @@ export type NodeConfig = {
   discoveryPollMs: number;
   /** The unix socket the git remote helper reaches this node at; null (unset or empty) for `<data>/git.sock`. */
   gitSocket: string | null;
+  /** How long a jj command that talks to a peer (fetch, push, clone, the import after a push) may run; default 120 s. */
+  jjNetworkTimeoutMs: number;
 };
 
 export const DEFAULT_ENV_PASSTHROUGH = [
@@ -48,6 +50,13 @@ function parseDiscoveryPollMs(raw: string | undefined): number {
   return n;
 }
 
+function parseJjNetworkTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined) return 120_000;
+  const n = Number(raw);
+  if (raw.trim() === "" || !Number.isInteger(n) || n < 1) throw new Error("MEDDLE_JJ_NETWORK_TIMEOUT_MS must be a positive integer");
+  return n;
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): NodeConfig {
   const home = env.HOME ?? homedir();
   return {
@@ -65,5 +74,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     irohBind: env.MEDDLE_IROH_BIND === undefined || env.MEDDLE_IROH_BIND === "" ? null : env.MEDDLE_IROH_BIND,
     discoveryPollMs: parseDiscoveryPollMs(env.MEDDLE_DISCOVERY_POLL_MS),
     gitSocket: env.MEDDLE_GIT_SOCKET === undefined || env.MEDDLE_GIT_SOCKET === "" ? null : resolve(env.MEDDLE_GIT_SOCKET),
+    jjNetworkTimeoutMs: parseJjNetworkTimeoutMs(env.MEDDLE_JJ_NETWORK_TIMEOUT_MS),
   };
 }

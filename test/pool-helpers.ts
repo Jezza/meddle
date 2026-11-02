@@ -237,8 +237,11 @@ export function linkClient(host: Host): { client: Host; close(): Promise<void> }
 /** A pool node of `twoPoolNodes`: `startPoolNode` serving git and moved tasks, its `git` refusals logged to `logs`. */
 export type GitPoolNode = Awaited<ReturnType<typeof startPoolNode>>;
 
-/** What one node of `poolNodes` runs its turns with, on top of the options for all. */
-export type NodeOptions = { fixture?: string; extraEnv?: Record<string, string> };
+/**
+ * What one node of `poolNodes` runs its turns with, on top of the options for all; `serveGit: false` leaves its `git`
+ * streams to the test (no `acceptGitStreams`).
+ */
+export type NodeOptions = { fixture?: string; extraEnv?: Record<string, string>; serveGit?: boolean };
 
 /**
  * `count` whole nodes (`startPoolNode`, with `extraEnv` and the node's own `nodes[i]`), each after the first joined to the first's pool and all
@@ -270,10 +273,12 @@ export async function poolNodes(
       const socket = new GitSocket(node.cfg, node.net);
       await socket.start();
       stops.push(() => socket.stop());
-      const stopAccepting = acceptGitStreams(node.net, {
-        db: node.db, cfg: node.cfg, selfId: node.id, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
-      });
-      stops.push(async () => stopAccepting());
+      if (own.serveGit !== false) {
+        const stopAccepting = acceptGitStreams(node.net, {
+          db: node.db, cfg: node.cfg, selfId: node.id, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
+        });
+        stops.push(async () => stopAccepting());
+      }
       const stopBlobs = acceptBlobStreams(node.net, node.runner);
       stops.push(async () => stopBlobs());
     }
