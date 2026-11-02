@@ -114,12 +114,15 @@ async function before(deps: ReplicaDeps, projectId: string, log: Log): Promise<v
 }
 
 /**
- * After a turn of `projectId` on this node: commits what the turn wrote (`memory from <shortId(self)>`), moves
+ * After a turn of `projectId` on this node (skipped while another task of the project is `live` here: the next idle
+ * turn end commits what both wrote): commits what the turn wrote (`memory from <shortId(self)>`; into `@-` when
+ * that has conflicts, so a tidy-up resolves it), moves
  * `memory` onto it (rebasing first when it does not descend from `memory`), and from a node that is not the home
  * pushes `memory` to the home. Never rejects: a failure is logged (`meddle: git: memory of <shortId> …`) and the
  * next turn end tries again.
  */
-export async function syncMemoryAfter(deps: ReplicaDeps, projectId: string, log: Log = defaultLog): Promise<void> {
+export async function syncMemoryAfter(deps: ReplicaDeps, projectId: string, live: boolean, log: Log = defaultLog): Promise<void> {
+  if (live) return;
   await oneAtATime(deps, projectId, () => after(deps, projectId, log));
 }
 
@@ -129,7 +132,10 @@ async function after(deps: ReplicaDeps, projectId: string, log: Log): Promise<vo
     const self = pool.identity.id;
     const { home, repo } = await memoryOf(deps, projectId);
     if ((await jj(["log", "-r", "@", "--no-graph", "-T", "empty"], repo, cfg)).trim() !== "true") {
-      await jj(["commit", "-m", `memory from ${shortId(self)}`], repo, cfg);
+      // A commit with conflicts is never pushed: what a session wrote on top of one (tidying the markers up) goes into
+      // it instead of above it, so the tidied commit replaces the conflicted one and pushes again.
+      if ((await changes(cfg, repo, "@- & conflicts()")).length > 0) await jj(["squash", "--use-destination-message"], repo, cfg);
+      else await jj(["commit", "-m", `memory from ${shortId(self)}`], repo, cfg);
     }
     const remote = home === self ? null : shortId(home);
     const online = remote !== null && pool.net.isOnline(home);

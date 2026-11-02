@@ -39,7 +39,7 @@ test("memory travels from the home to a peer and back around turns", async () =>
     const shortA = shortId(A.id);
     const shortB = shortId(B.id);
     await writeFile(`${memA}/MEMORY.md`, "- from a\n");
-    await syncMemoryAfter(depsOf(A), id, log);
+    await syncMemoryAfter(depsOf(A), id, false, log);
     expect(await changeOf(A, memA, "memory")).toBe(await changeOf(A, memA, "@-"));
     expect(await jj(["log", "-r", "@-", "--no-graph", "-T", "description"], memA, A.cfg)).toBe(`memory from ${shortA}\n`);
 
@@ -47,7 +47,7 @@ test("memory travels from the home to a peer and back around turns", async () =>
     expect(await read(`${memB}/MEMORY.md`)).toBe("- from a\n");
 
     await writeFile(`${memB}/NOTES.md`, "- from b\n");
-    await syncMemoryAfter(depsOf(B), id, log);
+    await syncMemoryAfter(depsOf(B), id, false, log);
     const fromB = await changeOf(B, memB, "@-");
     expect(await jj(["log", "-r", "@-", "--no-graph", "-T", "description"], memB, B.cfg)).toBe(`memory from ${shortB}\n`);
     expect(await changeOf(A, memA, "memory")).toBe(fromB);
@@ -60,7 +60,7 @@ test("memory travels from the home to a peer and back around turns", async () =>
 
     // A node live for the project leaves its memory alone.
     await writeFile(`${memA}/MEMORY.md`, "- from a\n- again\n");
-    await syncMemoryAfter(depsOf(A), id, log);
+    await syncMemoryAfter(depsOf(A), id, false, log);
     const again = await changeOf(A, memA, "memory");
     await syncMemoryBefore(depsOf(B), id, true, log);
     expect(await read(`${memB}/MEMORY.md`)).toBe("- from a\n");
@@ -74,23 +74,38 @@ test("memory travels from the home to a peer and back around turns", async () =>
   }
 }, 15_000);
 
-test("conflicting memory edits leave conflict markers on the puller and nothing throws", async () => {
-  const { A, B, id, memA, memB, log, close } = await replicated();
+test("conflicting memory edits leave conflict markers on the puller, and once tidied up they reach the home", async () => {
+  const { A, B, id, memA, memB, logs, log, close } = await replicated();
   try {
     await writeFile(`${memA}/MEMORY.md`, "- base\n");
-    await syncMemoryAfter(depsOf(A), id, log);
+    await syncMemoryAfter(depsOf(A), id, false, log);
     await syncMemoryBefore(depsOf(B), id, false, log);
     expect(await read(`${memB}/MEMORY.md`)).toBe("- base\n");
 
     await writeFile(`${memA}/MEMORY.md`, "- from a\n");
-    await syncMemoryAfter(depsOf(A), id, log);
+    await syncMemoryAfter(depsOf(A), id, false, log);
     await writeFile(`${memB}/MEMORY.md`, "- from b\n");
     await syncMemoryBefore(depsOf(B), id, false, log);
     const text = (await read(`${memB}/MEMORY.md`)) ?? "";
     expect(text).toContain("<<<<<<<");
     expect(text).toContain(">>>>>>>");
-    // B's turn-end sync of a conflicted commit does not throw either.
-    await syncMemoryAfter(depsOf(B), id, log);
+    // B's turn-end sync of a conflicted commit does not throw either; jj will not push it.
+    await syncMemoryAfter(depsOf(B), id, false, log);
+    expect(await jj(["log", "-r", "@- & conflicts()", "--no-graph", "-T", "change_id"], memB, B.cfg)).not.toBe("");
+    expect(logs.filter((l) => l.includes("was not synced after the turn"))).toHaveLength(1);
+    const conflicted = await changeOf(B, memB, "@-");
+
+    // A later session tidies the markers up: the next turn end folds that into the conflicted commit, which pushes.
+    await writeFile(`${memB}/MEMORY.md`, "- from a\n- from b\n");
+    logs.length = 0;
+    await syncMemoryAfter(depsOf(B), id, false, log);
+    expect(logs).toEqual([]);
+    expect(await changeOf(B, memB, "@-")).toBe(conflicted);
+    expect(await jj(["log", "-r", "conflicts()", "--no-graph", "-T", "change_id"], memB, B.cfg)).toBe("");
+    expect(await changeOf(A, memA, "memory")).toBe(conflicted);
+    await syncMemoryBefore(depsOf(A), id, false, log);
+    expect(await read(`${memA}/MEMORY.md`)).toBe("- from a\n- from b\n");
+    expect(logs).toEqual([]);
   } finally {
     await close();
   }
@@ -100,17 +115,17 @@ test("the home's turn-end sync after a peer's push keeps the peer's commit under
   const { A, B, id, memA, memB, logs, log, close } = await replicated();
   try {
     await writeFile(`${memA}/MEMORY.md`, "- base\n");
-    await syncMemoryAfter(depsOf(A), id, log);
+    await syncMemoryAfter(depsOf(A), id, false, log);
     await syncMemoryBefore(depsOf(B), id, false, log);
 
     await writeFile(`${memB}/NOTES.md`, "- from b\n");
-    await syncMemoryAfter(depsOf(B), id, log);
+    await syncMemoryAfter(depsOf(B), id, false, log);
     const fromB = await changeOf(B, memB, "@-");
     expect(await changeOf(A, memA, "memory")).toBe(fromB);
 
     // A wrote during its own turn, on the base it had before B's push.
     await writeFile(`${memA}/OTHER.md`, "- from a\n");
-    await syncMemoryAfter(depsOf(A), id, log);
+    await syncMemoryAfter(depsOf(A), id, false, log);
     expect(await changeOf(A, memA, "memory")).toBe(await changeOf(A, memA, "@-"));
     expect((await jj(["log", "-r", `${fromB} & ::memory`, "--no-graph", "-T", "change_id"], memA, A.cfg)).trim()).toBe(fromB);
     expect(await read(`${memA}/NOTES.md`)).toBe("- from b\n");
@@ -144,7 +159,7 @@ test("a conflicted memory bookmark on the home is resolved, and the next turn en
     const log = (line: string) => { logs.push(line); };
     const change = async (rev: string) => (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], mem, A.cfg)).trim();
     await writeFile(`${mem}/MEMORY.md`, "- base\n");
-    await syncMemoryAfter(deps, id, log);
+    await syncMemoryAfter(deps, id, false, log);
     // A local commit `@` descends from, and a sibling it does not; two divergent operations point `memory` at each.
     await writeFile(`${mem}/LOCAL.md`, "- local\n");
     await jj(["commit", "-m", "local"], mem, A.cfg);
@@ -164,7 +179,7 @@ test("a conflicted memory bookmark on the home is resolved, and the next turn en
     expect(await read(`${mem}/LOCAL.md`)).toBe("- local\n");
 
     await writeFile(`${mem}/AFTER.md`, "- after\n");
-    await syncMemoryAfter(deps, id, log);
+    await syncMemoryAfter(deps, id, false, log);
     expect(await change("memory")).toBe(await change("@-"));
     expect(await jj(["log", "-r", "@-", "--no-graph", "-T", "description"], mem, A.cfg)).toBe(`memory from ${shortId(A.id)}\n`);
     expect(await change(`::memory & ${sibling}`)).toBe(sibling);
@@ -203,6 +218,59 @@ test("two tasks of one project whose turns start and end together sync memory on
   }
 }, 15_000);
 
+test("a turn that ends while another task of the project is live here leaves memory alone; the last to end commits both", async () => {
+  // Both turns stall before their result until interrupted, after the stand-in wrote the prompt to MEMORY.md.
+  const A = await startPoolNode(undefined, { MEDDLE_FIXTURE_MEMORY: "1", MEDDLE_FIXTURE_STALL: "1" });
+  try {
+    const id = A.project.id;
+    const mem = paths(A.cfg).memory(id);
+    const one = await A.runner.create({ title: "one", projectIds: [id] });
+    const two = await A.runner.create({ title: "two", projectIds: [id] });
+    const idleOf = (taskId: string) =>
+      new Promise<void>((res) => { const off = A.runner.onState((tid, s) => { if (tid === taskId && s === "idle") { off(); res(); } }); });
+    /** Waits until the task's turn is live and its prompt is in the memory working copy. */
+    const wrote = async (taskId: string, line: string) => {
+      const deadline = Date.now() + 10_000;
+      let text: string | null = null;
+      for (;;) {
+        text = await read(`${mem}/MEMORY.md`);
+        if (A.runner.liveQuery(taskId) !== null && text?.includes(line)) return;
+        if (Date.now() > deadline) throw new Error(`no live turn of ${taskId} that wrote ${line}; MEMORY.md: ${text}`);
+        await Bun.sleep(20);
+      }
+    };
+    /** The newest operation of the memory repo, read without snapshotting its working copy. */
+    const head = async () => (await jj(["op", "log", "--ignore-working-copy", "-n", "1", "--no-graph", "-T", "id"], mem, A.cfg)).trim();
+    const syncs = async () => (await jj(["log", "--ignore-working-copy", "-r", '::present(memory) & description(glob:"memory from*")', "--no-graph", "-T", 'change_id ++ "\\n"'], mem, A.cfg)).split("\n").filter(Boolean);
+
+    await A.runner.prompt(one.id, "line from one");
+    await wrote(one.id, "line from one");
+    const before = await head();
+    // The other runs a whole turn meanwhile: no snapshot, commit or rebase in the memory repo, before or after it.
+    let idle = idleOf(two.id);
+    await A.runner.prompt(two.id, "line from two");
+    await wrote(two.id, "line from two");
+    await A.runner.interrupt(two.id);
+    await idle;
+    expect(await head()).toBe(before);
+    expect(await syncs()).toEqual([]);
+
+    // The first one ends: one sync commits what both wrote.
+    idle = idleOf(one.id);
+    await A.runner.interrupt(one.id);
+    await idle;
+    expect(await syncs()).toHaveLength(1);
+    const atMemory = await jj(["file", "show", "-r", "memory", "MEMORY.md"], mem, A.cfg);
+    expect(atMemory).toContain("line from one");
+    expect(atMemory).toContain("line from two");
+    expect(A.logs.filter((l) => l.startsWith("meddle: git: memory of"))).toEqual([]);
+  } finally {
+    await A.close();
+    A.db.close();
+    await rm(A.home, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("overlapping memory syncs of one project run one at a time: one line of history, every write under memory", async () => {
   const A = await startPoolNode();
   try {
@@ -215,7 +283,7 @@ test("overlapping memory syncs of one project run one at a time: one line of his
     for (let round = 0; round < 4; round++) {
       await writeFile(`${mem}/R${round}.md`, `- round ${round}\n`);
       const calls: Promise<void>[] = [];
-      for (let k = 0; k < 4; k++) calls.push(syncMemoryAfter(deps, id, log), syncMemoryBefore(deps, id, false, log));
+      for (let k = 0; k < 4; k++) calls.push(syncMemoryAfter(deps, id, false, log), syncMemoryBefore(deps, id, false, log));
       await Promise.all(calls);
     }
     expect(logs).toEqual([]);

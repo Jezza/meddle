@@ -166,8 +166,8 @@ export class TaskRunner {
   #sessionStore: SqliteSessionStore;
   #live = new Map<string, LiveTurn>();
   /**
-   * The primary project of each task whose turn is live or syncing memory to start, so whether a project is live here
-   * needs no manifest.
+   * The primary project of each task whose turn is live, from its start (memory sync included) to the end of its
+   * `finish` (memory sync included), so whether a project is live here needs no manifest.
    */
   #primaries = new Map<string, string>();
   #pool: PoolRuntime | undefined;
@@ -408,7 +408,7 @@ export class TaskRunner {
       const primary = manifest.primaryProjectId;
       const deps = this.#replicaDeps();
       if (deps !== null) {
-        const live = [...this.#primaries].some(([id, p]) => id !== taskId && p === primary);
+        const live = this.#projectLiveElsewhere(taskId, primary);
         this.#primaries.set(taskId, primary);
         await syncMemoryBefore(deps, primary, live, this.#log);
       }
@@ -432,8 +432,8 @@ export class TaskRunner {
       try {
         await done;
       } finally {
+        // The task stays in `#primaries` until `finish` has synced its memory.
         this.#live.delete(taskId);
-        this.#primaries.delete(taskId);
       }
     } catch (err) {
       this.#primaries.delete(taskId);
@@ -446,23 +446,38 @@ export class TaskRunner {
 
   /**
    * The `finish` phase of `meddle.turn`: moves the task's bookmarks; with a pool, pushes each to its project's home
-   * when that is another node and syncs the primary project's memory. A failed push or sync is logged, never thrown:
-   * the turn completed, and the next turn end tries again. Not for callers outside this module.
+   * when that is another node and syncs the primary project's memory, unless another task of that project is live
+   * here (decision 15: the last of them to end commits for all). A failed push or sync is logged, never thrown: the
+   * turn completed, and the next turn end tries again. Not for callers outside this module.
    */
   async finishTurnPhase(taskId: string, context: Context): Promise<void> {
-    let manifest: TaskManifest;
-    let moved: TaskBookmark[];
     try {
-      manifest = await readManifest(this.#cfg, taskId);
-      moved = await this.setTaskBookmarks(manifest);
-    } catch (err) {
-      this.#failTurn(taskId, context);
-      throw err;
+      let manifest: TaskManifest;
+      let moved: TaskBookmark[];
+      try {
+        manifest = await readManifest(this.#cfg, taskId);
+        moved = await this.setTaskBookmarks(manifest);
+      } catch (err) {
+        this.#failTurn(taskId, context);
+        throw err;
+      }
+      const deps = this.#replicaDeps();
+      if (deps === null) return;
+      for (const m of moved) await this.#pushToHome(deps, m);
+      const primary = manifest.primaryProjectId;
+      const live = this.#projectLiveElsewhere(taskId, primary);
+      // Decided and dropped in one go: of two tasks ending together, the second then sees the first gone and syncs.
+      // A task that syncs stays live for others until its sync is done, so a turn starting meanwhile defers its own.
+      if (live) this.#primaries.delete(taskId);
+      await syncMemoryAfter(deps, primary, live, this.#log);
+    } finally {
+      this.#primaries.delete(taskId);
     }
-    const deps = this.#replicaDeps();
-    if (deps === null) return;
-    for (const m of moved) await this.#pushToHome(deps, m);
-    await syncMemoryAfter(deps, manifest.primaryProjectId, this.#log);
+  }
+
+  /** Whether a task other than `taskId` whose primary project is `projectId` has a turn live (or syncing) here. */
+  #projectLiveElsewhere(taskId: string, projectId: string): boolean {
+    return [...this.#primaries].some(([id, p]) => id !== taskId && p === projectId);
   }
 
   /** Points each of the task's bookmarks at its workspace's working-copy change; what it set. */
@@ -896,6 +911,7 @@ export class TaskRunner {
 
   /** The `abort` phase of `meddle.turn`; not for callers outside this module. */
   abortTurnPhase(taskId: string): void {
+    this.#primaries.delete(taskId);
     this.#live.get(taskId)?.query.close();
     this.#turnState(taskId, "idle");
   }
