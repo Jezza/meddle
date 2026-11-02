@@ -1,14 +1,15 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { loadConfig, paths } from "../src/config";
 import { runRemoteHelper } from "../src/git/helper";
 import { writeHelperWrapper, writeUpdateHook } from "../src/git/scripts";
 import { GitSocket } from "../src/git/socket";
 import { parseGitHeader, parseMeddleUrl, parseRepo, repoName } from "../src/git/wire";
-import { bookmarkList, CLONE_TIMEOUT_FACTOR, cloneColocated, fetch, initColocated, jj, JjError, push, remoteAdd, remoteList, track } from "../src/jj";
+import { bookmarkList, CLONE_TIMEOUT_FACTOR, cloneColocated, fetch, initColocated, jj, JjError, push, remoteAdd, remoteList, track, workspaceAdd } from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import type { PeerStream, PoolNet } from "../src/pool/net";
-import { pushBookmark } from "../src/projects/replicas";
+import { pushBookmark, pushNamespace } from "../src/projects/replicas";
+import { sideBookmark, taskGlob } from "../src/tasks/manifest";
 import { repoKey, serialised } from "../src/serial";
 import { twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -140,9 +141,9 @@ async function pushTask(A: GitPoolNode, B: GitPoolNode): Promise<{ repo: string;
   await jj(["new", `trunk@${shortA}`], repo, B.cfg);
   await writeFile(`${repo}/work`, "from b\n");
   await jj(["commit", "-m", "work"], repo, B.cfg);
-  await track(repo, "meddle/task/t1/p", shortA, B.cfg);
+  await track(repo, "exact:meddle/task/t1/p", shortA, B.cfg);
   await jj(["bookmark", "set", "meddle/task/t1/p", "-r", "@-"], repo, B.cfg);
-  await push(repo, shortA, "meddle/task/t1/p", B.cfg);
+  await push(repo, shortA, "exact:meddle/task/t1/p", B.cfg);
   return { repo, change: await changeOf(B, repo, "@-") };
 }
 
@@ -162,11 +163,56 @@ test("B fetches A's trunk through the helper and pushes a task bookmark back", a
     await writeFile(`${repo}/work`, "from b\n");
     await jj(["commit", "-m", "work"], repo, B.cfg);
     const change = await changeOf(B, repo, "@-");
-    await track(repo, "meddle/task/t1/p", shortA, B.cfg);
+    await track(repo, "exact:meddle/task/t1/p", shortA, B.cfg);
     await jj(["bookmark", "set", "meddle/task/t1/p", "-r", "@-"], repo, B.cfg);
-    await push(repo, shortA, "meddle/task/t1/p", B.cfg);
+    await push(repo, shortA, "exact:meddle/task/t1/p", B.cfg);
     expect(await bookmarkList(A.project.replica, A.cfg)).toContainEqual({ name: "meddle/task/t1/p", remote: null, changeId: change, conflicted: false });
     expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("pushNamespace pushes a side bookmark made in the task workspace to the home, never one outside the namespace", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    await makeTrunk(A);
+    const shortA = shortId(A.id);
+    const repo = `${B.home}/r`;
+    await initColocated(repo, B.cfg);
+    await remoteAdd(repo, shortA, urlOf(A), B.cfg);
+    await fetch(repo, shortA, ["exact:trunk"], B.cfg);
+    // The task's workspace on B, as provisioning makes it; the agent works and bookmarks there.
+    const workspace = `${B.home}/task/p`;
+    await mkdir(`${B.home}/task`, { recursive: true });
+    await workspaceAdd(repo, "meddle-t1", workspace, `trunk@${shortA}`, B.cfg);
+    await writeFile(`${workspace}/work`, "from b\n");
+    await jj(["commit", "-m", "work"], workspace, B.cfg);
+    const spike = await changeOf(B, workspace, "@-");
+    await jj(["bookmark", "create", sideBookmark("t1", "p", "spike"), "-r", "@-"], workspace, B.cfg);
+    await jj(["bookmark", "create", "spike", "-r", "@-"], workspace, B.cfg);
+    const primary = await changeOf(B, workspace, "@");
+
+    await pushNamespace(B.cfg, repo, A.id, "t1", { name: "meddle/task/t1/p", changeId: primary });
+    const onA = (await bookmarkList(A.project.replica, A.cfg)).filter((b) => b.remote === null).map((b) => [b.name, b.changeId]);
+    expect(onA).toContainEqual(["meddle/task/t1/p", primary]);
+    expect(onA).toContainEqual(["meddle/task/t1/p.spike", spike]);
+    expect(onA.map(([name]) => name)).not.toContain("spike");
+    expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+
+    // A name with a slash after the project name: git refuses it beside `…/p`. The push throws jj's error line,
+    // and what was accepted still landed.
+    await jj(["bookmark", "set", "meddle/task/t1/p.spike", "-r", "@"], workspace, B.cfg);
+    await jj(["bookmark", "create", "meddle/task/t1/p/bad", "-r", "@"], workspace, B.cfg);
+    const failed = await pushNamespace(B.cfg, repo, A.id, "t1", null).catch((err: unknown) => err);
+    expect(failed).toBeInstanceOf(Error);
+    expect((failed as Error).message).toStartWith("Failed to push some bookmarks");
+    expect((failed as Error).message).toContain("refs/heads/meddle/task/t1/p/bad");
+    expect((failed as Error).message).not.toContain("exited with code");
+    const after = (await bookmarkList(A.project.replica, A.cfg)).filter((b) => b.remote === null);
+    expect(after.find((b) => b.name === "meddle/task/t1/p.spike")?.changeId).toBe(primary);
+    expect(after.map((b) => b.name)).not.toContain("meddle/task/t1/p/bad");
+    await expect(fetch(repo, shortA, [taskGlob("t1")], B.cfg)).resolves.toBeUndefined();
   } finally {
     await close();
   }
@@ -206,9 +252,9 @@ test("the update hook refuses a push to trunk and a deletion, and A's bookmarks 
     expect(before).toContainEqual({ name: "trunk", remote: null, changeId: trunk, conflicted: false });
     expect(before).toContainEqual({ name: "meddle/task/t1/p", remote: null, changeId: change, conflicted: false });
 
-    await track(repo, "trunk", shortA, B.cfg);
+    await track(repo, "exact:trunk", shortA, B.cfg);
     await jj(["bookmark", "set", "trunk", "-r", "@-", "--allow-backwards"], repo, B.cfg);
-    const toTrunk = await push(repo, shortA, "trunk", B.cfg).catch((err: unknown) => err);
+    const toTrunk = await push(repo, shortA, "exact:trunk", B.cfg).catch((err: unknown) => err);
     expect(toTrunk).toBeInstanceOf(JjError);
     expect((toTrunk as JjError).stderr).toContain("meddle: ref refs/heads/trunk is not accepted here");
 
@@ -236,17 +282,17 @@ test("the update hook admits memory into a memory repo and refuses it into a pro
     await writeFile(`${mem}/MEMORY.md`, "- from b\n");
     await jj(["commit", "-m", "memory from b"], mem, B.cfg);
     const change = await changeOf(B, mem, "@-");
-    await track(mem, "memory", shortA, B.cfg);
+    await track(mem, "exact:memory", shortA, B.cfg);
     await jj(["bookmark", "set", "memory", "-r", "@-"], mem, B.cfg);
-    await push(mem, shortA, "memory", B.cfg);
+    await push(mem, shortA, "exact:memory", B.cfg);
     expect((await bookmarkList(memA, A.cfg)).find((b) => b.name === "memory" && b.remote === null)?.changeId).toBe(change);
 
     // The same ref into A's project repo is refused.
     const { repo } = await pushTask(A, B);
     const before = await bookmarkList(A.project.replica, A.cfg);
-    await track(repo, "memory", shortA, B.cfg);
+    await track(repo, "exact:memory", shortA, B.cfg);
     await jj(["bookmark", "set", "memory", "-r", "@-"], repo, B.cfg);
-    const refused = await push(repo, shortA, "memory", B.cfg).catch((err: unknown) => err);
+    const refused = await push(repo, shortA, "exact:memory", B.cfg).catch((err: unknown) => err);
     expect(refused).toBeInstanceOf(JjError);
     expect((refused as JjError).stderr).toContain("meddle: ref refs/heads/memory is not accepted here");
     expect(await bookmarkList(A.project.replica, A.cfg)).toEqual(before);
@@ -275,9 +321,9 @@ test("without its update hook, the acceptor refuses every push and spawns nothin
       else await chmod(paths(A.cfg).hookUpdate, 0o644);
       // Even a push the hook would admit, and one it would not.
       for (const bookmark of ["meddle/task/t1/p", "trunk"]) {
-        await track(repo, bookmark, shortA, B.cfg);
+        await track(repo, `exact:${bookmark}`, shortA, B.cfg);
         await jj(["bookmark", "set", bookmark, "-r", "@-", "--allow-backwards"], repo, B.cfg);
-        await expect(push(repo, shortA, bookmark, B.cfg)).rejects.toBeInstanceOf(JjError);
+        await expect(push(repo, shortA, `exact:${bookmark}`, B.cfg)).rejects.toBeInstanceOf(JjError);
       }
     }
     expect(await bookmarkList(A.project.replica, A.cfg)).toEqual(before);
@@ -337,10 +383,10 @@ test("a fetch or push whose peer never answers times out, takes its git processe
     ]);
     expect(ended).toBe("ended");
 
-    await track(repo, bookmark, shortA, B.cfg);
+    await track(repo, `exact:${bookmark}`, shortA, B.cfg);
     await jj(["bookmark", "set", bookmark, "-r", "@"], repo, B.cfg);
     started = Date.now();
-    await expect(push(repo, shortA, bookmark, cfg)).rejects.toThrow("timed out after 1000 ms");
+    await expect(push(repo, shortA, `exact:${bookmark}`, cfg)).rejects.toThrow("timed out after 1000 ms");
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(claimed).toHaveLength(2);
 

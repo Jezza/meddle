@@ -19,7 +19,8 @@ import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects,
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
 import { claimHomelessProjects, getTask, getTaskSettings, listLiveTasks, listTasks } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
-import type { TaskManifest } from "../tasks/manifest";
+import { taskNamespace, type TaskManifest } from "../tasks/manifest";
+import { repoKey, serialised } from "../serial";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
@@ -124,6 +125,33 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
       },
     };
   });
+}
+
+/**
+ * A refresh of `cell` from `read`, one read at a time: triggers that arrive while one reads make one more read after
+ * it (a turn's end follows its start closely, and what it changed must not wait for the slow timer). The cell is
+ * replaced only when the value changed.
+ */
+function latest<T>(read: () => Promise<T>, cell: { readonly value: T; replace(ctx: Ctx, value: T): void }): (ctx: Ctx) => Promise<void> {
+  let reading = false;
+  let again = false;
+  return async (ctx) => {
+    if (reading) {
+      again = true;
+      return;
+    }
+    reading = true;
+    try {
+      do {
+        again = false;
+        const next = await read();
+        if (ctx.signal.aborted) return;
+        if (JSON.stringify(next) !== JSON.stringify(cell.value)) cell.replace(ctx, next);
+      } while (again);
+    } finally {
+      reading = false;
+    }
+  };
 }
 
 /**
@@ -388,29 +416,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       }
     };
     const heads = self.state("heads", Type.Array(HeadSchema), { init: headsNow });
-    /**
-     * One listing at a time: triggers that arrive while jj lists make one more listing after it (a turn's end follows
-     * its start closely, and its bookmark must not wait for the slow timer).
-     */
-    let listing = false;
-    let again = false;
-    const refreshHeads = async (ctx: Ctx) => {
-      if (listing) {
-        again = true;
-        return;
-      }
-      listing = true;
-      try {
-        do {
-          again = false;
-          const next = await headsNow();
-          if (ctx.signal.aborted) return;
-          if (JSON.stringify(next) !== JSON.stringify(heads.value)) heads.replace(ctx, next);
-        } while (again);
-      } finally {
-        listing = false;
-      }
-    };
+    const refreshHeads = latest(headsNow, heads);
     self.on("projects", projectChanges, (_event, ctx) => refreshHeads(ctx));
     // A task of this project changed state: a turn's end moved (and pushed) its bookmark, or a move fetched or forgot one.
     self.on("taskStates", states, ({ taskId }, ctx) => {
@@ -441,6 +447,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const movedTo = self.state("movedTo", members.movedTo, { init: () => getTask(db, id)?.moved_to ?? null });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
+    const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
+    const refreshBookmarks = latest(() => taskBookmarksNow(id), bookmarks);
 
     /** Brings the cells up to the runner, the approvals and the event log. */
     const catchUpLog = (ctx: Ctx) => {
@@ -453,7 +461,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       state.replace(ctx, event.state);
       const to = getTask(db, id)?.moved_to ?? null;
       if (to !== movedTo.value) movedTo.replace(ctx, to);
+      // A turn's end set (and pushed) them; a move fetched or forgot them.
+      return refreshBookmarks(ctx);
     });
+    self.on("projects", projectChanges, (_event, ctx) => refreshBookmarks(ctx));
+    // What the agent bookmarks during a turn, or the user by hand, tells nothing: a slow re-read catches it.
+    self.on("ticks", headTicks, (_event, ctx) => refreshBookmarks(ctx));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
     // What changed between the cells' init and the listeners starting.
@@ -483,6 +496,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       contextUsage: self.derive([log], (l) => l.contextUsage),
       move,
       movedTo,
+      bookmarks,
       prompt: ({ text }) => runner.prompt(id, text),
       interrupt: () => runner.interrupt(id),
       retry: () => runner.retry(id),
@@ -530,6 +544,29 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       },
     };
   });
+
+  /**
+   * Every local bookmark under task `taskId`'s namespace in each of its projects' replicas (the manifest's order); a
+   * replica jj cannot list contributes none.
+   */
+  async function taskBookmarksNow(taskId: string): Promise<Array<{ project: string; name: string; changeId: string }>> {
+    const row = getTask(db, taskId);
+    if (row === null) return [];
+    const ns = taskNamespace(taskId);
+    const found: Array<{ project: string; name: string; changeId: string }> = [];
+    for (const p of (JSON.parse(row.manifest) as TaskManifest).projects) {
+      const replica = getProject(db, p.id)?.replica;
+      if (replica === undefined) continue;
+      try {
+        for (const b of await serialised(repoKey(replica), () => bookmarkList(replica, cfg))) {
+          if (b.remote === null && b.name.startsWith(ns)) found.push({ project: p.id, name: b.name, changeId: b.changeId });
+        }
+      } catch {
+        // listed again on the next trigger
+      }
+    }
+    return found;
+  }
 
   function manifestOf(taskId: string): TaskManifest {
     const row = getTask(db, taskId);

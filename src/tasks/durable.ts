@@ -20,7 +20,7 @@ import { loadContext, loadProjectSettings } from "../projects/context";
 import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
 import type { StreamReader } from "../pool/frames";
 import { getProject, type Project } from "../projects/project";
-import { ensureRemote, ensureReplica, fetchBookmarks, pushBookmark, trunkFor, type ReplicaDeps } from "../projects/replicas";
+import { ensureRemote, ensureReplica, fetchBookmarks, pushNamespace, trunkFor, type ReplicaDeps } from "../projects/replicas";
 import { appendEvent, latestEventOfType, listEventsTail, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
@@ -39,7 +39,7 @@ import {
 import { markToken, pickToken } from "../token";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
-import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
+import { readManifest, taskGlob, taskNamespace, transcriptPath, type TaskManifest } from "./manifest";
 import { MeddleMove, type MoveInput } from "./move";
 import { checkReceivedManifest, provisionFromManifest, provisionTask } from "./provision";
 import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
@@ -572,7 +572,7 @@ export class TaskRunner {
       }
       const deps = this.#replicaDeps();
       if (deps === null) return;
-      for (const m of moved) await this.#pushToHome(deps, m);
+      for (const m of moved) await this.#pushToHome(deps, manifest.id, m);
       const primary = manifest.primaryProjectId;
       if (primary === null) return; // no project: no bookmarks moved, no memory
       const live = this.#projectLiveElsewhere(taskId, primary);
@@ -595,25 +595,29 @@ export class TaskRunner {
     const set: TaskBookmark[] = [];
     for (const p of manifest.projects) {
       const workspace = join(paths(this.#cfg).task(manifest.id), p.workspace);
-      const bookmark = `meddle/task/${manifest.id}/${p.name}`;
+      const bookmark = `${taskNamespace(manifest.id)}${p.name}`;
       const change = await changeId(workspace, this.#cfg);
-      // Not under another task's push to the same replica (pushBookmark takes the same key).
+      // Not under another task's push to the same replica (pushNamespace takes the same key).
       await serialised(repoKey(p.replica), () => bookmarkSet(p.replica, bookmark, change, this.#cfg));
       set.push({ projectId: p.id, replica: p.replica, bookmark, change });
     }
     return set;
   }
 
-  /** Pushes a task bookmark to its project's home when that is another node; a failure is logged. */
-  async #pushToHome(deps: ReplicaDeps, m: TaskBookmark): Promise<void> {
+  /**
+   * Pushes every bookmark under the task's namespace in `m`'s project (the project bookmark at `m.change`) to the
+   * project's home when that is another node: the home never fetches, so this is its backup. A failure is logged as
+   * `meddle: push: …`; what the home accepted has landed, and the next turn end pushes again.
+   */
+  async #pushToHome(deps: ReplicaDeps, taskId: string, m: TaskBookmark): Promise<void> {
     const home = getProject(this.#db, m.projectId)?.home;
     if (home === undefined || home === "" || home === deps.pool.identity.id) return;
     try {
       if (!deps.pool.net.isOnline(home)) throw new Error(`home ${shortId(home)} is offline`);
-      await pushBookmark(this.#cfg, m.replica, home, m.bookmark, m.change);
+      await pushNamespace(this.#cfg, m.replica, home, taskId, { name: m.bookmark, changeId: m.change });
     } catch (err) {
       const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
-      this.#log(`meddle: git: push of ${m.bookmark} to ${shortId(home)} failed: ${message}`);
+      this.#log(`meddle: push: ${taskNamespace(taskId)}* to ${shortId(home)} failed: ${message}`);
     }
   }
 
@@ -648,29 +652,52 @@ export class TaskRunner {
       } else {
         await this.#clearLeftovers(manifest);
       }
+      /** Side bookmarks this receive created; forgotten again when it fails. */
+      const created: Array<{ replica: string; name: string }> = [];
       try {
         const parents: Record<string, string> = {};
         for (const p of manifest.projects) {
-          parents[p.id] = await this.#fetchTaskChange(await ensureReplica(deps, p.id), from, `meddle/task/${taskId}/${p.name}`);
+          const project = await ensureReplica(deps, p.id);
+          const fetched = await this.#fetchTaskChange(project, from, taskId, `${taskNamespace(taskId)}${p.name}`);
+          parents[p.id] = fetched.change;
+          created.push(...fetched.created.map((name) => ({ replica: project.replica, name })));
         }
         await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "receiving");
         updateTask(this.#db, taskId, { receiving_from: from });
         return { ok: true };
       } catch (err) {
+        for (const { replica, name } of created) {
+          await serialised(repoKey(replica), () => bookmarkForget(replica, `exact:${name}`, this.#cfg)).catch(() => {});
+        }
         return { ok: false, reason: messageOf(err) };
       }
     });
   }
 
-  /** Fetches `bookmark` from node `from` into the project's replica (never tracking it); the change it points at. */
-  async #fetchTaskChange(project: Project, from: string, bookmark: string): Promise<string> {
+  /**
+   * Fetches every bookmark under task `taskId`'s namespace from node `from` into the project's replica (never
+   * tracking them); `bookmark`, the task's project bookmark, must be there. Each side bookmark becomes a local one
+   * here at the sender's change (the project bookmark is set as the workspace is provisioned). The project bookmark's
+   * change, and the side bookmarks that did not exist here before.
+   */
+  async #fetchTaskChange(project: Project, from: string, taskId: string, bookmark: string): Promise<{ change: string; created: string[] }> {
     const remote = shortId(from);
+    const ns = taskNamespace(taskId);
     return serialised(repoKey(project.replica), async () => {
       await ensureRemote(this.#cfg, project.replica, from, { kind: "project", id: project.id });
-      await fetchBookmarks(this.#cfg, project.replica, from, [bookmark]);
-      const found = (await bookmarkList(project.replica, this.#cfg)).find((b) => b.name === bookmark && b.remote === remote);
+      await fetchBookmarks(this.#cfg, project.replica, from, [`exact:${bookmark}`, taskGlob(taskId)]);
+      const listed = await bookmarkList(project.replica, this.#cfg);
+      const found = listed.find((b) => b.name === bookmark && b.remote === remote);
       if (found === undefined || found.conflicted || found.changeId === "") throw new Error(`bookmark ${bookmark}@${remote} is conflicted`);
-      return found.changeId;
+      const created: string[] = [];
+      for (const b of listed) {
+        if (b.remote !== remote || !b.name.startsWith(ns) || b.name === bookmark || b.conflicted || b.changeId === "") continue;
+        const here = listed.find((l) => l.name === b.name && l.remote === null);
+        if (here !== undefined && !here.conflicted && here.changeId === b.changeId) continue;
+        await bookmarkSet(project.replica, b.name, b.changeId, this.#cfg);
+        if (here === undefined) created.push(b.name);
+      }
+      return { change: found.changeId, created };
     });
   }
 
@@ -835,15 +862,14 @@ export class TaskRunner {
     await rm(task, { recursive: true, force: true });
   }
 
-  /** Removes a received task's workspaces, task bookmarks (not on the home), folder and rows. */
+  /** Removes a received task's workspaces, every bookmark under its namespace (not on the home), folder and rows. */
   async #discard(row: TaskRow): Promise<void> {
     const manifest = JSON.parse(row.manifest) as TaskManifest;
     const self = this.#pool?.identity.id;
     for (const p of manifest.projects) {
       await workspaceForget(p.replica, `meddle-${row.id}`, this.#cfg).catch(() => {});
       if (self !== undefined && getProject(this.#db, p.id)?.home === self) continue;
-      const bookmark = `meddle/task/${row.id}/${p.name}`;
-      await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, bookmark, this.#cfg)).catch(() => {});
+      await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(row.id), this.#cfg)).catch(() => {});
     }
     await rm(paths(this.#cfg).task(row.id), { recursive: true, force: true });
     deleteTask(this.#db, row.id, row.session_id);

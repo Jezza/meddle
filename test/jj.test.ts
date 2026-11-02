@@ -110,9 +110,9 @@ test("a peer's fetch and push against a home with an edit in its checkout never 
     await jj(["new", `trunk@${shortA}`], repo, B.cfg);
     await Bun.write(`${repo}/work`, "from b\n");
     await jj(["commit", "-m", "work"], repo, B.cfg);
-    await track(repo, "meddle/task/t1/p", shortA, B.cfg);
+    await track(repo, "exact:meddle/task/t1/p", shortA, B.cfg);
     await bookmarkSet(repo, "meddle/task/t1/p", "@-", B.cfg);
-    await push(repo, shortA, "meddle/task/t1/p", B.cfg);
+    await push(repo, shortA, "exact:meddle/task/t1/p", B.cfg);
     // a second fetch finds `trunk` in place
     await fetch(repo, shortA, ["trunk"], B.cfg);
 
@@ -128,3 +128,41 @@ test("a peer's fetch and push against a home with an edit in its checkout never 
     await close();
   }
 }, 15_000);
+
+test("push, track and bookmarkForget take jj string patterns: a task's glob selects its side bookmarks, nothing outside", async () => {
+  const { bookmarkForget } = await import("../src/jj");
+  const { taskGlob } = await import("../src/tasks/manifest");
+  const dir = await mkdtemp("/tmp/meddle-jj-");
+  const remote = `${dir}/remote.git`;
+  Bun.spawnSync(["git", "init", "-q", "--bare", remote]);
+  const repo = `${dir}/repo`;
+  await initColocated(repo);
+  await remoteAdd(repo, "r", remote);
+  await Bun.write(`${repo}/a.txt`, "a\n");
+  await jj(["commit", "-m", "one"], repo);
+  for (const name of ["meddle/task/t1/p", "meddle/task/t1/p.spike", "meddle/task/t2/p", "spike"]) await bookmarkSet(repo, name, "@-");
+  const onRemote = () => Bun.spawnSync(["git", "--git-dir", remote, "for-each-ref", "--format=%(refname)"]).stdout.toString().trim().split("\n").filter(Boolean);
+
+  // A task with no bookmarks: nothing to track or push, no error.
+  await track(repo, taskGlob("t9"), "r");
+  await push(repo, "r", taskGlob("t9"));
+  await track(repo, taskGlob("t1"), "r");
+  await push(repo, "r", taskGlob("t1"));
+  expect(onRemote()).toEqual(["refs/heads/meddle/task/t1/p", "refs/heads/meddle/task/t1/p.spike"]);
+  // Pushed again: already there, no error.
+  await push(repo, "r", taskGlob("t1"));
+  await track(repo, "exact:meddle/task/t2/p", "r");
+  await push(repo, "r", "exact:meddle/task/t2/p");
+  expect(onRemote()).toEqual(["refs/heads/meddle/task/t1/p", "refs/heads/meddle/task/t1/p.spike", "refs/heads/meddle/task/t2/p"]);
+
+  await bookmarkForget(repo, taskGlob("t1"));
+  await bookmarkForget(repo, taskGlob("t9"));
+  expect((await bookmarkList(repo)).map((b) => `${b.name}@${b.remote ?? ""}`).sort()).toEqual(["meddle/task/t2/p@", "meddle/task/t2/p@r", "spike@"]);
+});
+
+test("a task's namespace, its glob and a side bookmark's name", async () => {
+  const { sideBookmark, taskGlob, taskNamespace } = await import("../src/tasks/manifest");
+  expect(taskNamespace("abc")).toBe("meddle/task/abc/");
+  expect(taskGlob("abc")).toBe("glob:meddle/task/abc/*");
+  expect(sideBookmark("abc", "proj", "spike")).toBe("meddle/task/abc/proj.spike");
+});

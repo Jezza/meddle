@@ -139,9 +139,12 @@ export async function bookmarkDelete(repo: string, name: string, cfg?: NodeConfi
   await jj(["bookmark", "delete", `exact:${name}`], repo, cfg);
 }
 
-/** Forgets `name` here and its remote entries, leaving nothing for a push to delete (decision 19). */
-export async function bookmarkForget(repo: string, name: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["bookmark", "forget", "--include-remotes", `exact:${name}`], repo, cfg);
+/**
+ * Forgets the bookmarks `pattern` (a jj string pattern, `exact:` or `glob:`) selects here and their remote entries,
+ * leaving nothing for a push to delete (decision 19). No match is no error.
+ */
+export async function bookmarkForget(repo: string, pattern: string, cfg?: NodeConfig): Promise<void> {
+  await jj(["bookmark", "forget", "--include-remotes", pattern], repo, cfg);
 }
 
 export async function changeId(workspace: string, cfg?: NodeConfig): Promise<string> {
@@ -166,15 +169,23 @@ export async function fetch(repo: string, remote: string, bookmarks: string[], c
   await jj(["git", "fetch", "--remote", remote, ...bookmarks.flatMap((b) => ["--branch", b])], repo, cfg, { timeoutMs: networkMs(cfg) });
 }
 
-/** Pushes `bookmark` to `remote`; limited to `cfg.jjNetworkTimeoutMs`. */
-export async function push(repo: string, remote: string, bookmark: string, cfg?: NodeConfig): Promise<void> {
+/**
+ * Pushes the tracked bookmarks `pattern` (a jj string pattern, `exact:` or `glob:`) selects to `remote`; limited to
+ * `cfg.jjNetworkTimeoutMs`. Nothing to push is no error; when the remote refuses one bookmark, the ones it accepted
+ * still land and this rejects.
+ */
+export async function push(repo: string, remote: string, pattern: string, cfg?: NodeConfig): Promise<void> {
   // A task bookmark points at its workspace's working copy, which is usually not described yet.
-  await jj(["git", "push", "--remote", remote, "--bookmark", `exact:${bookmark}`, "--allow-empty-description"], repo, cfg, { timeoutMs: networkMs(cfg) });
+  await jj(["git", "push", "--remote", remote, "--bookmark", pattern, "--allow-empty-description"], repo, cfg, { timeoutMs: networkMs(cfg) });
 }
 
-/** Tracks `bookmark@remote` (idempotent), so that a push may create or move it there. */
-export async function track(repo: string, bookmark: string, remote: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["bookmark", "track", `exact:${bookmark}`, "--remote", `exact:${remote}`], repo, cfg);
+/**
+ * Tracks `<b>@remote` for every bookmark `b` that `pattern` (a jj string pattern, `exact:` or `glob:`) selects
+ * (idempotent; no match is no error), so that a push may create or move it there.
+ */
+export async function track(repo: string, pattern: string, remote: string, cfg?: NodeConfig): Promise<void> {
+  // `<glob>@<remote>` does not parse: the remote goes in its own option.
+  await jj(["bookmark", "track", pattern, "--remote", `exact:${remote}`], repo, cfg);
 }
 
 export type Bookmark = { name: string; remote: string | null; changeId: string; conflicted: boolean };

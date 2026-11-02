@@ -174,6 +174,9 @@ export const ProjectObject = remote("meddle.project", {
   },
 });
 
+/** A local bookmark under a task's namespace (`meddle/task/<id>/`) in one project's replica; "" when conflicted. */
+export const TaskBookmarkSchema = Type.Object({ project: Type.String(), name: Type.String(), changeId: Type.String() });
+
 export const TaskObject = remote("meddle.task", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
@@ -194,6 +197,12 @@ export const TaskObject = remote("meddle.task", {
         move: Nullable(Type.Object({ to: Type.String(), phase: Type.String(), error: Nullable(Type.String()) })),
         /** The node a `moved` task went to. */
         movedTo: Nullable(Type.String()),
+        /**
+         * Every local bookmark under the task's namespace, per project (its id) in the manifest's order: the project's
+         * own and the side bookmarks. Re-read like `ProjectObject.heads`: when projects change, when the task changes
+         * state, and every 60 s.
+         */
+        bookmarks: Type.Array(TaskBookmarkSchema),
       },
       methods: {
         prompt: method(Type.Object({ text: Type.String() })),

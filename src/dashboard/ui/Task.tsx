@@ -36,6 +36,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const pending = useValue(task.pending);
   const move = useValue(task.move);
   const movedTo = useValue(task.movedTo);
+  const bookmarks = useValue(task.bookmarks);
   const nodes = useValue(pool.nodes);
   const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
   const head = (
@@ -44,6 +45,16 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
       <p class="muted">
         {manifest.projects.length === 0 ? "no project" : manifest.projects.map((p) => `${p.name} (${p.workspace})`).join(", ")} · session {manifest.sessionId}
       </p>
+      {bookmarks.length > 0 && (
+        <p class="muted">
+          bookmarks:{" "}
+          {bookmarks.map((b, i) => (
+            <span key={`${b.project} ${b.name}`} class={b.changeId === "" ? "flag" : ""} title={b.name}>
+              {i > 0 && ", "}{bookmarkText(manifest.id, b)}
+            </span>
+          ))}
+        </p>
+      )}
     </header>
   );
   // Nothing of a moved task is left here but its row: no thread, no controls, a link to it where it went.
@@ -73,6 +84,13 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
       <Composer task={task} running={state === "running" || state === "waiting"} disabled={moving} />
     </>
   );
+}
+
+/** A task bookmark as the header lists it: its name after `meddle/task/<id>/`, then its change (or "conflicted"). */
+function bookmarkText(taskId: string, b: { name: string; changeId: string }): string {
+  const prefix = `meddle/task/${taskId}/`;
+  const name = b.name.startsWith(prefix) ? b.name.slice(prefix.length) : b.name;
+  return b.changeId === "" ? `${name} (conflicted)` : `${name} ${b.changeId.slice(0, 8)}`;
 }
 
 // ─── the thread ───

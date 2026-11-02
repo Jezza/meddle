@@ -38,3 +38,11 @@ test("--project takes an id, or a name exactly one project in the pool has", () 
   expect(() => resolveProject(rows, "a")).toThrow("ambiguous project name: a");
   expect(() => resolveProject(rows, "nope")).toThrow("unknown project: nope");
 });
+
+test("--project with an id the roster does not list yet passes it through for the node to ask the members", () => {
+  const rows = poolProjects([node(A, [{ id: "p1", name: "a", home: A }])]);
+  expect(resolveProject(rows, "0123456789ab")).toBe("0123456789ab");
+  // Not id-shaped: unknown.
+  expect(() => resolveProject(rows, "0123456789AB")).toThrow("unknown project: 0123456789AB");
+  expect(() => resolveProject(rows, "0123456789a")).toThrow("unknown project: 0123456789a");
+});

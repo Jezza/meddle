@@ -65,7 +65,7 @@ async function followMemory(cfg: NodeConfig, repo: string): Promise<void> {
 /** Fetches `memory` from the home and tracks it there, so the local bookmark follows the home's. */
 async function fetchMemory(cfg: NodeConfig, repo: string, remote: string): Promise<void> {
   await fetch(repo, remote, [`exact:${MEMORY_BOOKMARK}`], cfg);
-  await track(repo, MEMORY_BOOKMARK, remote, cfg);
+  await track(repo, `exact:${MEMORY_BOOKMARK}`, remote, cfg);
 }
 
 /** Logs that a conflicted `memory` of `projectId` was resolved to `change`. */

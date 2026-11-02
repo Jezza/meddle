@@ -15,6 +15,28 @@ export type TaskManifest = {
   createdAt: string;
 };
 
+/**
+ * Every bookmark of task `taskId` is under `meddle/task/<taskId>/`: its project's bookmark `<project name>` and the
+ * side bookmarks the agent names `<project name>.<label>`. All of them are pushed to the home, travel on a move and
+ * are forgotten together.
+ */
+export function taskNamespace(taskId: string): string {
+  return `meddle/task/${taskId}/`;
+}
+
+/** The jj string pattern for every bookmark under the task's namespace (jj's glob `*` crosses `/`). */
+export function taskGlob(taskId: string): string {
+  return `glob:${taskNamespace(taskId)}*`;
+}
+
+/**
+ * A side bookmark's name: `<project>.<label>`, not `<project>/<label>`, since git cannot hold `…/p` and `…/p/x`
+ * side by side (its refs are files).
+ */
+export function sideBookmark(taskId: string, projectName: string, label: string): string {
+  return `${taskNamespace(taskId)}${projectName}.${label}`;
+}
+
 export async function readManifest(cfg: NodeConfig, taskId: string): Promise<TaskManifest> {
   return JSON.parse(await readFile(paths(cfg).taskManifest(taskId), "utf8")) as TaskManifest;
 }

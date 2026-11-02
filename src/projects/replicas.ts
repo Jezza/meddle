@@ -4,12 +4,13 @@ import { rm } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { paths, type NodeConfig } from "../config";
 import { repoName, type Repo } from "../git/wire";
-import { bookmarkList, bookmarkSet, cloneColocated, fetch, gitImport, isJjRepo, jj, push, remoteAdd, remoteList, track } from "../jj";
+import { bookmarkList, bookmarkSet, cloneColocated, fetch, gitImport, isJjRepo, jj, JjError, push, remoteAdd, remoteList, track } from "../jj";
 import { cloneMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
 import { repoKey, serialised } from "../serial";
 import type { PoolRuntime } from "../pool/runtime";
 import { PeerObject } from "../state/contracts";
+import { taskGlob, taskNamespace } from "../tasks/manifest";
 import { getProject, registerReplica, type Project } from "./project";
 
 export type ReplicaDeps = { cfg: NodeConfig; db: Database; pool: PoolRuntime };
@@ -93,14 +94,39 @@ export async function ensureRemote(cfg: NodeConfig, replica: string, nodeId: str
 }
 
 /**
- * Fetches `bookmarks` (exact names) from node `nodeId`'s remote (`shortId(nodeId)`, which must exist), then checks
- * each arrived: rejects `bookmark <b> not found on <shortId>` for one the node does not have.
+ * Whether `name` matches jj glob `glob`, as far as meddle uses globs: `*` is any run of characters (`/` too), `?` one
+ * character, anything else itself.
  */
-export async function fetchBookmarks(cfg: NodeConfig, replica: string, nodeId: string, bookmarks: string[]): Promise<void> {
+function globMatches(glob: string, name: string): boolean {
+  const re = glob.split("").map((c) => (c === "*" ? ".*" : c === "?" ? "." : c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))).join("");
+  return new RegExp(`^${re}$`).test(name);
+}
+
+/**
+ * Fetches the bookmarks `patterns` select (jj string patterns, passed as they are: `exact:<b>` or `glob:<g>`) from
+ * node `nodeId`'s remote (`shortId(nodeId)`, which must exist), then checks they arrived: rejects
+ * `bookmark <b> not found on <shortId>` for an `exact:` one the node does not have, and, with `requireMatch` (the
+ * default), `no bookmark matching <g> on <shortId>` for a `glob:` one that selects nothing there.
+ */
+export async function fetchBookmarks(
+  cfg: NodeConfig, replica: string, nodeId: string, patterns: string[], opts: { requireMatch?: boolean } = {},
+): Promise<void> {
   const remote = shortId(nodeId);
-  await fetch(replica, remote, bookmarks.map((b) => `exact:${b}`), cfg);
-  const present = new Set((await bookmarkList(replica, cfg)).filter((b) => b.remote === remote).map((b) => b.name));
-  for (const b of bookmarks) if (!present.has(b)) throw new Error(`bookmark ${b} not found on ${remote}`);
+  const requireMatch = opts.requireMatch ?? true;
+  for (const p of patterns) if (!p.startsWith("exact:") && !p.startsWith("glob:")) throw new Error(`bookmark pattern ${p} is neither exact: nor glob:`);
+  await fetch(replica, remote, patterns, cfg);
+  const checked = patterns.filter((p) => p.startsWith("exact:") || requireMatch);
+  if (checked.length === 0) return;
+  const present = (await bookmarkList(replica, cfg)).filter((b) => b.remote === remote).map((b) => b.name);
+  for (const p of checked) {
+    if (p.startsWith("exact:")) {
+      const b = p.slice("exact:".length);
+      if (!present.includes(b)) throw new Error(`bookmark ${b} not found on ${remote}`);
+    } else {
+      const g = p.slice("glob:".length);
+      if (!present.some((name) => globMatches(g, name))) throw new Error(`no bookmark matching ${g} on ${remote}`);
+    }
+  }
 }
 
 /**
@@ -113,9 +139,68 @@ export async function pushBookmark(cfg: NodeConfig, replica: string, home: strin
   const remote = shortId(home);
   await serialised(repoKey(replica), async () => {
     await fetch(replica, remote, [`exact:${bookmark}`], cfg);
-    await track(replica, bookmark, remote, cfg);
+    await track(replica, `exact:${bookmark}`, remote, cfg);
     await bookmarkSet(replica, bookmark, changeId, cfg);
-    await push(replica, remote, bookmark, cfg);
+    await push(replica, remote, `exact:${bookmark}`, cfg);
+  });
+}
+
+/**
+ * What a failed jj command says, as an Error: its `Error:` line, followed by the updates the remote rejected (when it
+ * names them). Anything that is not a jj failure (a time limit) is returned as it is.
+ */
+function jjFailure(err: unknown): unknown {
+  if (!(err instanceof JjError)) return err;
+  const lines = err.stderr.split("\n");
+  const errorLine = lines.find((l) => l.startsWith("Error: "))?.slice("Error: ".length).trim()
+    ?? lines.map((l) => l.trim()).filter(Boolean).at(-1)
+    ?? err.message;
+  const rejected: string[] = [];
+  const from = lines.findIndex((l) => l.includes("rejected the following updates"));
+  if (from >= 0) for (const l of lines.slice(from + 1)) {
+    if (!l.startsWith("  ")) break;
+    rejected.push(l.trim());
+  }
+  return new Error(rejected.length === 0 ? errorLine : `${errorLine}: ${rejected.join(", ")}`);
+}
+
+/**
+ * Pushes every bookmark under task `taskId`'s namespace in `replica` to the project's home `home` (spec 21.5; the
+ * home never fetches, so this push is the backup), first pointing the task's project bookmark `primary` at its change
+ * when given. Under the repo lock: fetch the namespace from the home (nothing there is fine: a task's first push),
+ * track it there, put back what the fetch and track changed of this node's own bookmarks (this node holds the task:
+ * its positions win, sideways or backwards too), restore from the home's copy a bookmark deleted here (the home refuses
+ * deletions, so pushing one would fail every time), then push the namespace. Rejects on a failed fetch or push with
+ * jj's error line; when the home refuses one bookmark, the ones it accepted have still landed.
+ */
+export async function pushNamespace(
+  cfg: NodeConfig, replica: string, home: string, taskId: string, primary: { name: string; changeId: string } | null,
+): Promise<void> {
+  const remote = shortId(home);
+  const glob = taskGlob(taskId);
+  const ns = taskNamespace(taskId);
+  await serialised(repoKey(replica), async () => {
+    try {
+      const want = new Map<string, string>();
+      for (const b of await bookmarkList(replica, cfg)) {
+        if (b.remote === null && b.name.startsWith(ns) && !b.conflicted) want.set(b.name, b.changeId);
+      }
+      if (primary !== null) want.set(primary.name, primary.changeId);
+      await fetchBookmarks(cfg, replica, home, [glob], { requireMatch: false });
+      await track(replica, glob, remote, cfg);
+      const now = (await bookmarkList(replica, cfg)).filter((b) => b.name.startsWith(ns));
+      const local = new Map(now.filter((b) => b.remote === null).map((b) => [b.name, b]));
+      for (const b of now) {
+        if (b.remote === remote && !local.has(b.name) && !want.has(b.name) && !b.conflicted) want.set(b.name, b.changeId);
+      }
+      for (const [name, change] of want) {
+        const here = local.get(name);
+        if (here === undefined || here.conflicted || here.changeId !== change) await bookmarkSet(replica, name, change, cfg);
+      }
+      await push(replica, remote, glob, cfg);
+    } catch (err) {
+      throw jjFailure(err);
+    }
   });
 }
 
@@ -165,7 +250,7 @@ export async function trunkFor(deps: ReplicaDeps, project: Project): Promise<str
   const remote = shortId(project.home);
   if (!pool.net.isOnline(project.home)) throw new Error(`home ${remote} is offline`);
   try {
-    await fetchBookmarks(cfg, project.replica, project.home, ["trunk"]);
+    await fetchBookmarks(cfg, project.replica, project.home, ["exact:trunk"]);
   } catch (err) {
     if (err instanceof Error && err.message === `bookmark trunk not found on ${remote}`) return "root()";
     throw err;

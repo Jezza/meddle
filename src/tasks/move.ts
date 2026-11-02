@@ -17,7 +17,7 @@ import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
 import { writeArchive } from "./archive";
 import { runnerFor, type MeddleHooks, type TaskRunner } from "./durable";
-import type { TaskManifest } from "./manifest";
+import { taskGlob, type TaskManifest } from "./manifest";
 import { exportTask, receiptsMatch, type Receipt } from "./transfer";
 
 export type MoveInput = { taskId: string; to: string; now: boolean };
@@ -316,8 +316,9 @@ async function reset(s: PeerStream): Promise<void> {
 
 /**
  * Archives the task (decision 18), then removes it from this node (decision 19): forgets its workspaces and, unless
- * this node is the project's home (where they stay as the backup), its task bookmarks; removes its folder (the config
- * dir with it) and its event and transcript rows. The row stays, `moved`. A rerun finds pieces already gone.
+ * this node is the project's home (where they stay as the backup), every bookmark under the task's namespace; removes
+ * its folder (the config dir with it) and its event and transcript rows. The row stays, `moved`. A rerun finds pieces
+ * already gone.
  */
 async function removeLocalCopy(cfg: NodeConfig, db: Database, self: string, taskId: string): Promise<void> {
   const row = getTask(db, taskId);
@@ -327,8 +328,7 @@ async function removeLocalCopy(cfg: NodeConfig, db: Database, self: string, task
   for (const p of manifest.projects) {
     await workspaceForget(p.replica, `meddle-${taskId}`, cfg).catch(() => {});
     if (getProject(db, p.id)?.home === self) continue;
-    const bookmark = `meddle/task/${taskId}/${p.name}`;
-    await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, bookmark, cfg)).catch(() => {});
+    await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(taskId), cfg)).catch(() => {});
   }
   await rm(paths(cfg).task(taskId), { recursive: true, force: true });
   clearTaskLog(db, taskId, row.session_id);

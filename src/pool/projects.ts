@@ -35,14 +35,20 @@ export function projectLine(p: PoolProject): string {
   return `${p.id}  ${p.name}  home ${shortId(p.home)}  on ${p.holders.map(shortId).join(",")}`;
 }
 
+/** The shape of a project id (`newId`). */
+const PROJECT_ID = /^[0-9a-f]{12}$/;
+
 /**
  * The project `x` names: a project's id, or the name of exactly one project of the pool. Throws
- * `ambiguous project name: <x>` when several have that name, `unknown project: <x>` when none has it.
+ * `ambiguous project name: <x>` when several have that name; when none has it, an id-shaped `x` (12 hex digits)
+ * passes through for the node to ask the members, and anything else throws `unknown project: <x>`.
  */
 export function resolveProject(projects: readonly PoolProject[], x: string): string {
   if (projects.some((p) => p.id === x)) return x;
   const named = projects.filter((p) => p.name === x);
   if (named.length > 1) throw new Error(`ambiguous project name: ${x}`);
-  if (named.length === 0) throw new Error(`unknown project: ${x}`);
-  return named[0]!.id;
+  if (named.length === 1) return named[0]!.id;
+  // A project id (`newId`: 12 hex digits) the roster does not list yet: the node asks the members, as before.
+  if (PROJECT_ID.test(x)) return x;
+  throw new Error(`unknown project: ${x}`);
 }

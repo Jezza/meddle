@@ -61,7 +61,9 @@ test("a two-project task gets a workspace per project and runs from the task fol
   expect(ca).not.toBe(cb);
   expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toBe(
     "# Task: pair\n\n- a/: jj workspace of project a\n- b/: jj workspace of project b\n\n" +
-      "This folder is a meddle task. Each project is a jj workspace; commit with jj.\n",
+      "This folder is a meddle task. Each project is a jj workspace; commit with jj.\n\n" +
+      `To keep a side branch, give it a bookmark named meddle/task/${m.id}/<project>.<label> (for example meddle/task/${m.id}/<project>.spike). ` +
+      "Bookmarks outside that namespace are not backed up and do not travel, and git refuses a name with a slash after the project name.\n",
   );
   expect(cwdFor(m, cfg)).toEqual({ cwd: task, settingSources: ["user"] });
   expect(await readManifest(cfg, m.id)).toEqual(m);

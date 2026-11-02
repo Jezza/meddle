@@ -352,7 +352,7 @@ test("a turn-end push to an unreachable home is logged once and the turn complet
     const bookmark = `meddle/task/${m.id}/a`;
     const workspace = join(paths(B.cfg).task(m.id), "a");
     const onA = async () => (await bookmarkList(A.project.replica, A.cfg)).find((b) => b.name === bookmark && b.remote === null)?.changeId;
-    const pushLines = () => B.logs.filter((l) => l.startsWith("meddle: git: push "));
+    const pushLines = () => B.logs.filter((l) => l.startsWith("meddle: push: "));
 
     // The home goes away.
     A.net.unwatch(B.id, "bye");
@@ -363,7 +363,7 @@ test("a turn-end push to an unreachable home is logged once and the turn complet
     expect((await first.result).subtype).toBe("success");
     await first.idle;
     expect(B.runner.state(m.id)).toBe("idle");
-    expect(pushLines()).toEqual([`meddle: git: push of ${bookmark} to ${short} failed: home ${short} is offline`]);
+    expect(pushLines()).toEqual([`meddle: push: meddle/task/${m.id}/* to ${short} failed: home ${short} is offline`]);
     expect(await onA()).toBeUndefined();
 
     // The home comes back; the task has moved on to a new change.

@@ -4,7 +4,8 @@ import { paths } from "../src/config";
 import { bookmarkList, fetch, initColocated, isJjRepo, jj, remoteList } from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import { addProjectFromFolder, getProject, listProjects, type Project } from "../src/projects/project";
-import { ensureRemote, ensureReplica, fetchBookmarks, pushBookmark, remoteHeads, trunkFor, type ReplicaDeps } from "../src/projects/replicas";
+import { ensureRemote, ensureReplica, fetchBookmarks, pushBookmark, pushNamespace, remoteHeads, trunkFor, type ReplicaDeps } from "../src/projects/replicas";
+import { taskGlob } from "../src/tasks/manifest";
 import { peerReady, startPoolNode, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 const depsOf = (n: GitPoolNode): ReplicaDeps => ({ cfg: n.cfg, db: n.db, pool: n.pool });
@@ -85,7 +86,7 @@ test("ensureReplica clones a project and its memory from home, and trunkFor foll
     expect(await ensureRemote(B.cfg, memoryB, A.id, { kind: "memory", id })).toBe(shortA);
     expect(await remoteList(memoryB, B.cfg)).toEqual([{ name: shortA, url: memoryUrl }]);
 
-    await expect(fetchBookmarks(B.cfg, project.replica, A.id, ["nope"])).rejects.toThrow(`bookmark nope not found on ${shortA}`);
+    await expect(fetchBookmarks(B.cfg, project.replica, A.id, ["exact:nope"])).rejects.toThrow(`bookmark nope not found on ${shortA}`);
 
     // With the home offline, a replica that is gone cannot be cloned again.
     await rm(project.replica, { recursive: true, force: true });
@@ -169,5 +170,72 @@ test("on the home, trunk follows the newest of trunk and main, and a project add
     await A.close();
     A.db.close();
     await rm(A.home, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("fetchBookmarks takes a glob: every match arrives, and no match is an error unless requireMatch is false", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const trunk = await makeMain(A);
+    const shortA = shortId(A.id);
+    await peerReady(B, A);
+    const project = await ensureReplica(depsOf(B), A.project.id);
+    for (const name of ["meddle/task/t1/a", "meddle/task/t1/a.spike", "meddle/task/t2/a"]) {
+      await jj(["bookmark", "set", name, "-r", "main"], A.project.replica, A.cfg);
+    }
+    await fetchBookmarks(B.cfg, project.replica, A.id, [taskGlob("t1")]);
+    const fetched = (await bookmarkList(project.replica, B.cfg)).filter((b) => b.name.startsWith("meddle/task/"));
+    expect(fetched).toEqual([
+      { name: "meddle/task/t1/a", remote: shortA, changeId: trunk, conflicted: false },
+      { name: "meddle/task/t1/a.spike", remote: shortA, changeId: trunk, conflicted: false },
+    ]);
+    // An exact pattern beside a glob; each is checked.
+    await fetchBookmarks(B.cfg, project.replica, A.id, ["exact:meddle/task/t2/a", taskGlob("t1")]);
+    await expect(fetchBookmarks(B.cfg, project.replica, A.id, [taskGlob("t9")])).rejects.toThrow(`no bookmark matching meddle/task/t9/* on ${shortA}`);
+    await fetchBookmarks(B.cfg, project.replica, A.id, [taskGlob("t9")], { requireMatch: false });
+    await expect(fetchBookmarks(B.cfg, project.replica, A.id, ["exact:meddle/task/t9/a"])).rejects.toThrow(`bookmark meddle/task/t9/a not found on ${shortA}`);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("pushNamespace with no primary pushes nothing for a task without bookmarks and does not throw; a locally deleted one comes back", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const trunk = await makeMain(A);
+    const shortA = shortId(A.id);
+    await peerReady(B, A);
+    const project = await ensureReplica(depsOf(B), A.project.id);
+    const repo = project.replica;
+    const onA = async () => (await bookmarkList(A.project.replica, A.cfg)).filter((b) => b.name.startsWith("meddle/task/"));
+    const onB = async () => (await bookmarkList(repo, B.cfg)).filter((b) => b.name.startsWith("meddle/task/"));
+
+    await pushNamespace(B.cfg, repo, A.id, "t9", null);
+    expect(await onA()).toEqual([]);
+    expect(await onB()).toEqual([]);
+
+    // A primary and a side bookmark go together; then the side one is deleted here: the home keeps it (it refuses
+    // deletions), and the next push restores it here rather than failing on the deletion.
+    const first = await commitOn(B, repo, trunk, "one");
+    await jj(["bookmark", "set", "meddle/task/t1/a.spike", "-r", first], repo, B.cfg);
+    await pushNamespace(B.cfg, repo, A.id, "t1", { name: "meddle/task/t1/a", changeId: first });
+    expect(await onA()).toEqual([
+      { name: "meddle/task/t1/a", remote: null, changeId: first, conflicted: false },
+      { name: "meddle/task/t1/a.spike", remote: null, changeId: first, conflicted: false },
+    ]);
+    await jj(["bookmark", "delete", "exact:meddle/task/t1/a.spike"], repo, B.cfg);
+    await pushNamespace(B.cfg, repo, A.id, "t1", { name: "meddle/task/t1/a", changeId: first });
+    expect((await onB()).filter((b) => b.remote === null).map((b) => b.name)).toEqual(["meddle/task/t1/a", "meddle/task/t1/a.spike"]);
+    expect((await onA()).map((b) => b.name)).toEqual(["meddle/task/t1/a", "meddle/task/t1/a.spike"]);
+    // The home's copy of the side bookmark moved ahead of what B last saw: B's own position wins, sideways.
+    const ahead = await commitOn(A, A.project.replica, first, "ahead");
+    await jj(["bookmark", "set", "meddle/task/t1/a.spike", "-r", ahead], A.project.replica, A.cfg);
+    const second = await commitOn(B, repo, first, "two");
+    await jj(["bookmark", "set", "meddle/task/t1/a.spike", "-r", second], repo, B.cfg);
+    await pushNamespace(B.cfg, repo, A.id, "t1", null);
+    expect((await onA()).find((b) => b.name === "meddle/task/t1/a.spike")?.changeId).toBe(second);
+    expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+  } finally {
+    await close();
   }
 }, 15_000);

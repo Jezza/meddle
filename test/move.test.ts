@@ -16,7 +16,7 @@ import type { PoolRuntime } from "../src/pool/runtime";
 import { readArchive, runJanitor, writeArchive } from "../src/tasks/archive";
 import { TaskRunner } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
-import { readManifest, transcriptPath, type TaskManifest } from "../src/tasks/manifest";
+import { readManifest, sideBookmark, transcriptPath, type TaskManifest } from "../src/tasks/manifest";
 import { MOVE_NOW_FOLLOW_UP } from "../src/tasks/move";
 import { exportTask, receiptsMatch, type Receipt } from "../src/tasks/transfer";
 import { claudeCodeVersion } from "../src/version";
@@ -469,6 +469,69 @@ test("a task moves to another node and back: the old row is replaced, and the no
     await close();
   }
 }, 15_000);
+
+test("every bookmark under the task's namespace travels with a move and is listed there; a non-home source forgets them", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const ownerA = linkClient(A.host);
+  const ownerB = linkClient(B.host);
+  try {
+    const m = await turnedTask(A);
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const ns = `meddle/task/${m.id}/`;
+    const primary = `${ns}a`;
+    const local = async (node: GitPoolNode, replica: string) =>
+      (await bookmarkList(replica, node.cfg)).filter((b) => b.remote === null).map((b) => [b.name, b.changeId] as const);
+    // The agent on A (the home) commits a side branch and bookmarks it, in and outside the namespace.
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    await writeFile(join(workspaceA, "spike.txt"), "spike\n");
+    await jj(["commit", "-m", "spike"], workspaceA, A.cfg);
+    const spike = sideBookmark(m.id, "a", "spike");
+    await jj(["bookmark", "create", spike, "-r", "@-"], workspaceA, A.cfg);
+    await jj(["bookmark", "create", "elsewhere", "-r", "@-"], workspaceA, A.cfg);
+    const spikeChange = await changeAt(A, workspaceA, "@-");
+
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    const replicaB = paths(B.cfg).replica(A.project.id);
+    expect(await local(B, replicaB)).toContainEqual([spike, spikeChange]);
+    expect((await local(B, replicaB)).map(([name]) => name)).not.toContain("elsewhere");
+    const onB = await ownerB.client.get(TaskObject, { id: m.id });
+    try {
+      expect(onB.bookmarks.value.map((b) => b.name)).toEqual([primary, spike]);
+      expect(onB.bookmarks.value).toContainEqual({ project: A.project.id, name: spike, changeId: spikeChange });
+    } finally {
+      onB.release();
+    }
+
+    // On B, not the home: another side bookmark; the turn's end pushes the whole namespace to the home.
+    const workspaceB = join(paths(B.cfg).task(m.id), "a");
+    await writeFile(join(workspaceB, "extra.txt"), "extra\n");
+    await jj(["commit", "-m", "extra"], workspaceB, B.cfg);
+    const extra = sideBookmark(m.id, "a", "extra");
+    await jj(["bookmark", "create", extra, "-r", "@-"], workspaceB, B.cfg);
+    const extraChange = await changeAt(B, workspaceB, "@-");
+    await promptAndWait(B, m.id, "On B.");
+    expect(await local(A, A.project.replica)).toContainEqual([extra, extraChange]);
+    expect(B.logs.filter((l) => l.includes("push"))).toEqual([]);
+
+    await B.runner.moveTo(m.id, A.id, false);
+    await moveSettled(B.harness.harness);
+    expect((await bookmarkList(replicaB, B.cfg)).filter((b) => b.name.startsWith(ns))).toEqual([]);
+    expect(await local(A, A.project.replica)).toContainEqual([spike, spikeChange]);
+    expect(await local(A, A.project.replica)).toContainEqual([extra, extraChange]);
+    const onA = await ownerA.client.get(TaskObject, { id: m.id });
+    try {
+      await until("A's listed bookmarks", () => onA.bookmarks.value.map((b) => b.name).join(" "), [primary, extra, spike].join(" "));
+    } finally {
+      onA.release();
+    }
+  } finally {
+    await ownerA.close();
+    await ownerB.close();
+    await close();
+  }
+}, 20_000);
 
 test("a move without `now` waits for the running turn; prompts sent meanwhile run on the target one turn each, in order", async () => {
   const { A, B, close } = await twoPoolNodes({ nodes: [{ fixture: "approval.jsonl" }, {}] });

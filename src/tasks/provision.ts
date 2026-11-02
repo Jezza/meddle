@@ -11,7 +11,7 @@ import { refreshTrunk } from "../projects/replicas";
 import { insertTask, newId } from "../store/records";
 import { repoKey, serialised } from "../serial";
 import type { TaskState } from "./durable";
-import { writeManifest, type TaskManifest } from "./manifest";
+import { taskNamespace, writeManifest, type TaskManifest } from "./manifest";
 
 export type SettingSource = "user" | "project" | "local";
 
@@ -31,6 +31,8 @@ export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string 
     ...lines,
     "",
     "This folder is a meddle task. Each project is a jj workspace; commit with jj.",
+    "",
+    `To keep a side branch, give it a bookmark named meddle/task/${m.id}/<project>.<label> (for example meddle/task/${m.id}/<project>.spike). Bookmarks outside that namespace are not backed up and do not travel, and git refuses a name with a slash after the project name.`,
     "",
   ].join("\n");
 }
@@ -98,7 +100,7 @@ export async function provisionTask(
       const parent = input.parents?.[project.id] ?? (await refreshTrunk(cfg, project.replica)) ?? "root()";
       added.push(project.replica);
       await workspaceAdd(project.replica, workspaceName, workspace, parent, cfg);
-      const bookmark = `meddle/task/${id}/${project.name}`;
+      const bookmark = `${taskNamespace(id)}${project.name}`;
       await bookmarkSet(project.replica, bookmark, await changeId(workspace, cfg), cfg);
       bookmarks.push({ replica: project.replica, name: bookmark });
       entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent });
@@ -209,7 +211,7 @@ export async function provisionFromManifest(
       const parent = parents[entry.id]!;
       added.push(replica);
       await workspaceAdd(replica, workspaceName, join(task, entry.workspace), parent, cfg);
-      const bookmark = `meddle/task/${id}/${entry.name}`;
+      const bookmark = `${taskNamespace(id)}${entry.name}`;
       await serialised(repoKey(replica), async () => {
         const existed = (await bookmarkList(replica, cfg)).some((b) => b.name === bookmark && b.remote === null);
         await bookmarkSet(replica, bookmark, parent, cfg);
@@ -236,7 +238,7 @@ export async function provisionFromManifest(
     });
     return received;
   } catch (err) {
-    for (const { replica, name } of bookmarks) await serialised(repoKey(replica), () => bookmarkForget(replica, name, cfg)).catch(() => {});
+    for (const { replica, name } of bookmarks) await serialised(repoKey(replica), () => bookmarkForget(replica, `exact:${name}`, cfg)).catch(() => {});
     for (const replica of added) await workspaceForget(replica, workspaceName, cfg).catch(() => {});
     await rm(task, { recursive: true, force: true }).catch(() => {});
     throw err;

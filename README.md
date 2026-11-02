@@ -288,7 +288,8 @@ first line. `--project` is repeatable, one project each, the first the primary; 
 included), so it works while a holder is offline: `<id>  <name>  home <short id>  on <short id>,<short id>,…`, named as
 its home names it, with the nodes that hold a copy after `on`. `--project` (of `task new` and `spawn`) takes a
 project's id, or a name exactly one project of the pool has: `ambiguous project name: <name>` when several have it,
-`unknown project: <x>` when none does (pass the id then). A task is
+`unknown project: <x>` when none does (pass the id then). An id the roster does not list yet (12 hex digits) is
+passed on to the node, which asks the online members for it. A task is
 `idle`, `running` or `waiting` (for an approval) while it lives on a node; a task moving away is `moving` on the node
 it leaves and `receiving` on the node it goes to until it arrives, and the node it left keeps it as `moved`.
 
@@ -346,12 +347,24 @@ otherwise), unless this node has fetched the home's `trunk` before: it then star
 id>` and logs `meddle: project <name>: home unreachable; starting from the last fetched trunk`. A project with nothing
 trunk-like starts its tasks at the root.
 
-At the end of every completed turn meddle points each of the task's bookmarks, `meddle/task/<task id>/<project name>`, at its
-workspace's working copy, and a node that is not the project's home pushes the bookmark to the home, so the home
-holds every task's latest work. A push that fails (the home offline, no jj identity: see [Install](#install)) does not fail the turn: it is
-logged as `meddle: git: push of <bookmark> to <short id> failed: …` (each distinct line at most once a minute, so a
-missing identity does not fill the log), and the next turn end pushes again. A turn that fails pushes nothing; the
-next completed turn pushes its work too.
+A task's bookmarks all live under its namespace, `meddle/task/<task id>/`, in each project's repo: the project's own
+bookmark `meddle/task/<task id>/<project name>`, and any side bookmark the agent (or you) adds as
+`meddle/task/<task id>/<project name>.<label>`, for example `meddle/task/<task id>/app.spike`. The task's
+`CLAUDE.md` tells the agent so. The label follows a dot, not a slash: git keeps refs as files, so it cannot hold
+`…/app` and `…/app/spike` side by side, and refuses the second. Everything under the namespace is backed up, travels
+when the task moves (see [What travels](#what-travels)) and is listed in the task's view on the dashboard (its name
+after the namespace and its change id; re-read when the task changes state and every 60 s); bookmarks outside it are
+not backed up and stay behind on a move.
+
+At the end of every completed turn meddle points the task's project bookmark at its workspace's working copy, and a
+node that is not the project's home pushes the whole namespace to the home. That push is the backup: the home never
+fetches a task's bookmarks itself. The node holding the task wins: its positions replace the home's, sideways or
+backwards too. The home refuses deletions, so a side bookmark deleted here comes back from the home's copy at the
+next turn end. A push that fails (the home offline, no jj identity: see [Install](#install), a bookmark git refuses)
+does not fail the turn: it is logged as `meddle: push: meddle/task/<task id>/* to <short id> failed: …` (each
+distinct line at most once a minute, so a missing identity does not fill the log), and the next turn end pushes
+again. When the home refuses one bookmark, the others still land. A turn that fails pushes nothing; the next
+completed turn pushes its work too.
 
 A replica names its remote for another node after that node's short id, the first 10 characters of its node id, so
 on a node that is not the home `trunk@<short id>` is the home's trunk.
@@ -457,8 +470,9 @@ too, as is one whose turn is parked (retry it first). The dashboard offers only 
 
 ### What travels
 
-- The task's workspaces. meddle points each task bookmark at its workspace's working copy; the target fetches the
-  bookmarks from this node and starts its workspaces from them. Edits not yet committed travel in the working-copy
+- The task's workspaces. meddle points each task bookmark at its workspace's working copy; the target fetches every
+  bookmark under the task's namespace from this node, side bookmarks included, and starts its workspaces from the
+  project bookmarks. Edits not yet committed travel in the working-copy
   commit; files git ignores do not. The target first clones any project it does not hold from the project's home,
   so moving a task of a project the target has never held needs the home online.
 - The conversation: the task's event log, the transcript mirror's rows, and Claude Code's transcript files in the
@@ -476,7 +490,7 @@ with the project's home around the task's turns there, as for any task.
 While a task moves, its view shows `Moving to <node>: <step>` and disables its controls and composer.
 
 1. `prepare` checks the move again, marks the task `moving` and waits for its turn to end (or interrupts it).
-2. `handoff` sets the task bookmarks; the target clones what it lacks, fetches them and provisions the task as
+2. `handoff` sets the task bookmarks; the target clones what it lacks, fetches the task's namespace and provisions the task as
    `receiving`; then the task's log, transcript and files go over one stream, and the two sides' receipts must match.
 3. `commit` has the target activate the task (it is `idle` there, and its queued prompts start), and records it here
    as `moved`.
@@ -527,7 +541,7 @@ under it. A step of a move that was already rolled back here goes no further: th
 Once the target has activated the task, this node writes its archive, `<data dir>/archive/<task id>.json.gz`
 (directory mode 700, file 600: the task's row, manifest, event log, transcript rows and transcript files), before it
 removes anything. It then forgets the task's workspaces and, unless it is the project's home (where they stay as the
-backup), its task bookmarks, and removes the task folder (with its Claude Code config dir) and its event and
+backup), every bookmark under the task's namespace, and removes the task folder (with its Claude Code config dir) and its event and
 transcript rows. The task's row stays, as `moved`: its view here says where it went and links there, and commands on
 it answer `task has moved to <short id>`. A task can move back to a node it left.
 
