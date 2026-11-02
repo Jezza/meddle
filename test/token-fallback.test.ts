@@ -78,6 +78,21 @@ async function assistantErrorFixture(error: string): Promise<string> {
   return file;
 }
 
+/** A copy of hello.jsonl whose rate-limit event is `rejected` (until RESETS_AT) while its `result` stays a success. */
+async function rejectedButSucceededFixture(): Promise<string> {
+  const lines = (await readFile(fixture("hello.jsonl"), "utf8")).split("\n").filter(Boolean).map((l) => {
+    const entry = JSON.parse(l) as { dir: string; line?: string };
+    if (entry.dir !== "out" || entry.line === undefined) return l;
+    const frame = JSON.parse(entry.line) as { type?: string; rate_limit_info?: object };
+    if (frame.type !== "rate_limit_event") return l;
+    const info = { ...frame.rate_limit_info, status: "rejected", resetsAt: 4102444800, rateLimitType: "five_hour" };
+    return JSON.stringify({ ...entry, line: JSON.stringify({ ...frame, rate_limit_info: info }) });
+  });
+  const file = `${await mkdtemp("/tmp/meddle-fixture-")}/rejected-success.jsonl`;
+  await writeFile(file, `${lines.join("\n")}\n`);
+  return file;
+}
+
 /** A pool node with no default token, the fixture chosen by the token a turn runs with, and a client on its host. */
 async function tokenNode(byToken: Record<string, string>) {
   const env = { MEDDLE_FIXTURE_BY_TOKEN: Object.entries(byToken).map(([t, f]) => `${t}=${f}`).join(",") };
@@ -261,7 +276,7 @@ test("a service restart after the fault reruns once with TOKEN_RETRY_PROMPT", as
 
     const harness = await openHarness(node.cfg, createRegistry());
     reopened = harness;
-    const runner = new TaskRunner(node.cfg, node.db, harness.harness, {
+    new TaskRunner(node.cfg, node.db, harness.harness, {
       claudePath: replay, claudeRuntime: "bun",
       extraEnv: { MEDDLE_FIXTURE: fixture("hello.jsonl"), MEDDLE_FIXTURE_BY_TOKEN: byToken },
       pool: node.pool, log: (line) => node.logs.push(line),
@@ -271,11 +286,105 @@ test("a service restart after the fault reruns once with TOKEN_RETRY_PROMPT", as
       () => `the rerun to complete: ${JSON.stringify(messages(node.db, m.id).map((x) => x.subtype ?? x.type))}`,
       20_000,
     );
-    void runner;
     const log = messages(node.db, m.id);
     expect(log.filter((x) => x.type === "meddle" && x.subtype === "turn_started")).toHaveLength(2);
     expect(prompts(node.db, m.id)).toEqual(["Reply with the single word ok.", TOKEN_RETRY_PROMPT]);
     expect(log.filter((x) => x.type === "result").map((r) => r.subtype)).toEqual(["error_during_execution", "success"]);
+  } finally {
+    await reopened?.close();
+    await node.close();
+  }
+}, 40_000);
+
+test("a fault in a turn that succeeds marks the token but does not rerun the turn", async () => {
+  const node = await tokenNode({ "tok-a": await rejectedButSucceededFixture(), "tok-b": fixture("hello.jsonl") });
+  try {
+    const a = await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
+    const b = await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
+    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const over = turnOver(node.runner, m.id);
+    await node.runner.prompt(m.id, "Reply with the single word ok.");
+    await over;
+
+    const log = messages(node.db, m.id);
+    expect(log.filter((x) => x.type === "meddle" && x.subtype === "turn_started")).toHaveLength(1);
+    expect(log.filter((x) => x.type === "result").map((r) => r.subtype)).toEqual(["success"]);
+    expect(log.some((x) => x.type === "meddle" && x.subtype === "token_fault")).toBe(false);
+    expect(listTokens(node.db).find((t) => t.id === a.id)).toMatchObject({ status: "exhausted", until: RESETS_AT, detail: "five_hour" });
+    await until(node.poolObject.activeTokenId, (id) => id === b.id);
+    await until(node.nodeObject.notifications, (n) => n.some((x) => x.taskId === m.id && x.kind === "finished"));
+    await Bun.sleep(200);
+    expect(notesOf(node.nodeObject.notifications.value, m.id)).toEqual([{ kind: "finished", text: "Turn finished" }]);
+  } finally {
+    await node.close();
+  }
+}, 30_000);
+
+test("a turn reruns for its token at most once: a second fault stops it and says another login is left", async () => {
+  const node = await tokenNode({
+    "tok-a": fixture("rate-limited.jsonl"), "tok-b": fixture("rate-limited.jsonl"), "tok-c": fixture("hello.jsonl"),
+  });
+  try {
+    const a = await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
+    const b = await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
+    const c = await node.add("tok-c", "c", "2026-01-01T00:00:02.000Z");
+    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    const over = turnOver(node.runner, m.id);
+    await node.runner.prompt(m.id, "Reply with the single word ok.");
+    await over;
+
+    const log = messages(node.db, m.id);
+    expect(log.filter((x) => x.type === "meddle" && x.subtype === "turn_started")).toHaveLength(2);
+    const faults = log.filter((x) => x.type === "meddle" && x.subtype === "token_fault");
+    expect(faults.map((f) => [f.tokenId, f.rerun, f.retried])).toEqual([[a.id, true, undefined], [b.id, false, true]]);
+    expect(prompts(node.db, m.id)).toEqual(["Reply with the single word ok.", TOKEN_RETRY_PROMPT]);
+    expect(listTokens(node.db).map((t) => [t.id, t.status])).toEqual([[a.id, "exhausted"], [b.id, "exhausted"], [c.id, "ok"]]);
+    await until(node.nodeObject.notifications, (n) => n.some((x) => x.taskId === m.id && x.kind === "token"));
+    await Bun.sleep(200);
+    expect(notesOf(node.nodeObject.notifications.value, m.id)).toEqual([{
+      kind: "token",
+      text: `token b exhausted until ${RESETS_AT}; already switched login once, send the message again to use the next token`,
+    }]);
+  } finally {
+    await node.close();
+  }
+}, 30_000);
+
+test("a restart before the rerun's sleep is stored still reruns at most once", async () => {
+  const byToken = `tok-a=${fixture("rate-limited.jsonl")},tok-b=${fixture("rate-limited.jsonl")},tok-c=${fixture("hello.jsonl")}`;
+  const node = await tokenNode({
+    "tok-a": fixture("rate-limited.jsonl"), "tok-b": fixture("rate-limited.jsonl"), "tok-c": fixture("hello.jsonl"),
+  });
+  let reopened: { close(): Promise<void> } | undefined;
+  try {
+    await node.add("tok-a", "a", "2026-01-01T00:00:00.000Z");
+    await node.add("tok-b", "b", "2026-01-01T00:00:01.000Z");
+    await node.add("tok-c", "c", "2026-01-01T00:00:02.000Z");
+    const m = await node.nodeObject.createTask({ title: "t", projectIds: [node.project.id] });
+    let closing: Promise<void> | undefined;
+    node.hooks.afterTokenFault = () => { closing ??= node.harness.close(); };
+    await node.runner.prompt(m.id, "Reply with the single word ok.");
+    await eventually(() => closing !== undefined, () => "the token fault");
+    await closing;
+
+    const harness = await openHarness(node.cfg, createRegistry());
+    reopened = harness;
+    new TaskRunner(node.cfg, node.db, harness.harness, {
+      claudePath: replay, claudeRuntime: "bun",
+      extraEnv: { MEDDLE_FIXTURE: fixture("hello.jsonl"), MEDDLE_FIXTURE_BY_TOKEN: byToken },
+      pool: node.pool, log: (line) => node.logs.push(line),
+    });
+    const faults = () => messages(node.db, m.id).filter((x) => x.type === "meddle" && x.subtype === "token_fault");
+    await eventually(
+      () => getTask(node.db, m.id)!.state === "idle" && faults().length === 2,
+      () => `the rerun to stop: ${JSON.stringify(messages(node.db, m.id).map((x) => x.subtype ?? x.type))}`,
+      20_000,
+    );
+    await Bun.sleep(300); // no third attempt is on its way
+    const log = messages(node.db, m.id);
+    expect(log.filter((x) => x.type === "meddle" && x.subtype === "turn_started")).toHaveLength(2);
+    expect(faults().map((f) => [f.label, f.rerun, f.retried])).toEqual([["a", true, undefined], ["b", false, true]]);
+    expect(log.filter((x) => x.type === "result").map((r) => r.subtype)).toEqual(["error_during_execution", "error_during_execution"]);
   } finally {
     await reopened?.close();
     await node.close();

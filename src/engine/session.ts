@@ -21,7 +21,8 @@ export type MeddleEvent =
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput }
   /**
    * The turn's login failed it (`fault`), or no token was usable (`kind: "none"`, no token named): appended once the
-   * turn has settled. `rerun` says whether the turn runs again with the next token.
+   * turn has settled with an error. `rerun` says whether the turn runs again with the next token; `retried` that it did
+   * not because it already had once, though another token is usable now.
    */
   | {
     type: "meddle";
@@ -31,7 +32,23 @@ export type MeddleEvent =
     label: string | null;
     fault: TokenFault | { kind: "none" };
     rerun: boolean;
+    retried?: true;
   };
+
+/**
+ * What a `token_fault` that ended a turn says, for a notification or the CLI: `no usable token`, or the token, what
+ * happened to it, and whether another login is left (`retried`: one is, send the message again to use it).
+ */
+export function tokenFaultNotice(e: { readonly [key: string]: unknown }): string {
+  const fault = (e.fault ?? {}) as { kind?: unknown; until?: unknown; reason?: unknown };
+  if (fault.kind === "none") return "no usable token";
+  const name = typeof e.label === "string" ? e.label : "?";
+  const what = fault.kind === "disabled"
+    ? `disabled: ${String(fault.reason)}`
+    : `exhausted${typeof fault.until === "string" ? ` until ${fault.until}` : ""}`;
+  const rest = e.retried === true ? "already switched login once, send the message again to use the next token" : "no other token";
+  return `token ${name} ${what}; ${rest}`;
+}
 
 /**
  * What a turn's messages say about the login it ran with: it hit a usage limit (`exhausted`, usable again `until`, an

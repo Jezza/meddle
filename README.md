@@ -88,19 +88,24 @@ During a turn, a `rate_limit_event` whose status is `rejected`, or an assistant 
 marks the turn's token `exhausted` until the limit's reset time (one hour from now when the event gives none), with
 the limit's type as its reason. The errors `billing_error`, `account_on_hold`, `authentication_failed`,
 `oauth_org_not_allowed` and `verification_required` mark it `disabled` until `token enable`. The mark replicates, so
-every node of the pool stops using that token. If another token is usable, the turn then runs once more with it, in
-the same session, sending this instead of the original message:
+every node of the pool stops using that token. If the turn ended with an error and another token is usable, the turn
+then runs once more with it, in the same session, sending this instead of the original message (a turn that succeeded
+all the same, past a limit Claude Code retried, is only marked):
 
 > The previous attempt at this message failed because the login it used hit a usage limit; meddle switched to another
 > login. If you had not started on it, start now; otherwise continue where you left off and do not redo finished work.
 
 (The original message is sent again when the session has no transcript yet to resume.) The failed attempt stays in
 the task's log, followed by a status line `Token <label> exhausted until <time>; switching login`. A turn reruns for
-its token at most once. When no other token is usable, or the rerun's token fails too, the turn ends there and the
-node raises a notification of kind `token` (`token <label> exhausted until <time>; no other token`, `token <label>
-disabled: <reason>; no other token`), instead of a `failed` one. A turn that finds no usable token at all fails with
-`no usable token` and raises a `token` notification saying so. A service restart between the fault and the rerun
-reruns the turn once with the next token when it starts again.
+its token at most once. When no other token is usable, the turn ends there and the node raises a notification of kind
+`token` (`token <label> exhausted until <time>; no other token`, `token <label> disabled: <reason>; no other token`),
+instead of a `failed` one. When the rerun's token fails too while yet another token is usable, the turn also ends,
+with `token <label> exhausted until <time>; already switched login once, send the message again to use the next
+token` (or the `disabled: <reason>` form; the status line ends `already switched login once`). A turn that finds no
+usable token at all fails with `no usable token` and raises a `token` notification saying so. A service restart
+after the fault is logged reruns the turn once with the next token when it starts again (before the fault is logged,
+the message is sent again). `meddle task prompt` follows a turn through its token rerun: it exits 0 when the rerun
+succeeds, and fails with the `token` notification's text when the turn ends there.
 
 The token commands work on the node's database and secrets directory directly, with or without a running node, so a
 value never goes over the node's socket; when a node runs, they tell it and it tells the pool. `token list` reads the

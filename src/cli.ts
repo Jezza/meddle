@@ -21,7 +21,7 @@ import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
-import { resultError } from "./engine/session";
+import { resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
 import { PoolObject } from "./state/contracts";
 import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
@@ -442,7 +442,9 @@ const QUEUED_FOR_MOVE = "queued; it runs once the task has arrived";
 /**
  * Submits a turn and prints each new event's `type[/subtype]` to stderr until a `result` arrives. A `result` other
  * than a success, a `turn_failed` event, or the task going idle again with no `result` (a turn that failed before it
- * logged anything) fails it. A text the node queued for a task it is moving away (or one that has moved before a
+ * logged anything) fails it. An error `result` of an attempt whose messages reported a token fault is provisional: a
+ * `token_fault` that reruns the turn drops it and the rerun is followed; one that does not fails it with the token's
+ * notice; the task going idle, or a meddle event other than a `token_fault`, fails it with the result's error. A text the node queued for a task it is moving away (or one that has moved before a
  * `result` came) runs on the other node: that is printed (`QUEUED_FOR_MOVE`) and the command succeeds.
  */
 function taskPrompt(id: string, text: string): Promise<number> {
@@ -453,15 +455,33 @@ function taskPrompt(id: string, text: string): Promise<number> {
     const finished = Promise.withResolvers<"done" | "queued">();
     finished.promise.catch(() => {}); // a failed prompt leaves it unawaited when the socket then closes
     socket.addEventListener("close", () => finished.reject(new Error("the node closed the connection")));
+    /** This attempt's messages reported a token fault: its error `result` waits for the node's `token_fault`. */
+    let faulted = false;
+    /** The failure an error `result` stands for until a token rerun replaces it. */
+    let provisional: Error | null = null;
     const follow = (events: readonly WindowEvent[]) => {
       for (const { seq, message } of events) {
         if (seq <= printed) continue;
         printed = seq;
         const { type, subtype } = message as { type?: string; subtype?: string };
         console.error(subtype === undefined ? `${type}` : `${type}/${subtype}`);
+        if (type === "meddle" && subtype === "token_fault" && provisional !== null) {
+          const fault = message as { rerun?: unknown };
+          if (fault.rerun !== true) return finished.reject(new Error(`the turn ended: ${tokenFaultNotice(message as Record<string, unknown>)}`));
+          provisional = null;
+          faulted = false;
+          continue;
+        }
+        // The SDK's own messages after the result (the child's last words) do not decide; meddle's next one does.
+        if (provisional !== null && type === "meddle") return finished.reject(provisional);
+        if (tokenFaultOf(message as Parameters<typeof tokenFaultOf>[0]) !== null) faulted = true;
         if (type === "result") {
           const error = resultError(message as { subtype?: unknown; is_error?: unknown });
-          return error === null ? finished.resolve("done") : finished.reject(new Error(`the turn ended with ${error}`));
+          if (error === null) return finished.resolve("done");
+          const failure = new Error(`the turn ended with ${error}`);
+          if (!faulted) return finished.reject(failure);
+          provisional = failure;
+          continue;
         }
         if (type === "meddle" && subtype === "turn_failed") {
           return finished.reject(new Error(`the turn failed: ${String((message as { error?: unknown }).error)}`));
@@ -471,7 +491,7 @@ function taskPrompt(id: string, text: string): Promise<number> {
     /** Idle again: the database has every event the turn logged, so a `result` missing from its newest means failure. */
     const settle = async () => {
       follow(await session.loadEarlier({ beforeSeq: Number.MAX_SAFE_INTEGER, limit: SETTLE_EVENTS }));
-      finished.reject(new Error("the turn failed"));
+      finished.reject(provisional ?? new Error("the turn failed"));
     };
     let busy = false;
     const unsubscribe = [

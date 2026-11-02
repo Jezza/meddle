@@ -203,7 +203,8 @@ function tokenFaultText(m: Message): string {
   const what = fault.kind === "disabled"
     ? `disabled: ${str(fault.reason)}`
     : `exhausted${typeof fault.until === "string" ? ` until ${fault.until}` : ""}`;
-  return `Token ${str(m.label) || str(m.tokenId)} ${what}; ${m.rerun === true ? "switching login" : "no other token"}`;
+  const rest = m.rerun === true ? "switching login" : m.retried === true ? "already switched login once" : "no other token";
+  return `Token ${str(m.label) || str(m.tokenId)} ${what}; ${rest}`;
 }
 
 function resultText(m: Message): string {

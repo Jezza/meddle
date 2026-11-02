@@ -48,6 +48,7 @@ test("a token fault renders as a status line", () => {
     { seq: 3, message: fault({ kind: "disabled", reason: "billing_error" }, true) },
     { seq: 4, message: fault({ kind: "disabled", reason: "account_on_hold" }, false) },
     { seq: 5, message: fault({ kind: "none" }, false, null) },
+    { seq: 6, message: { ...fault({ kind: "exhausted", until: "2100-01-01T00:00:00.000Z", type: null }, false), retried: true } },
   ]);
   expect(items).toEqual([
     { kind: "status", text: "Token a exhausted until 2100-01-01T00:00:00.000Z; switching login" },
@@ -55,5 +56,6 @@ test("a token fault renders as a status line", () => {
     { kind: "status", text: "Token a disabled: billing_error; switching login" },
     { kind: "status", text: "Token a disabled: account_on_hold; no other token" },
     { kind: "status", text: "No usable token" },
+    { kind: "status", text: "Token a exhausted until 2100-01-01T00:00:00.000Z; already switched login once" },
   ]);
 });

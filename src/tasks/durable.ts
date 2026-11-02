@@ -10,7 +10,7 @@ import type { NodeConfig } from "../config";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
-import { promptEvent, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
+import { promptEvent, resultError, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
 import { bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceForget } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
@@ -438,8 +438,10 @@ export class TaskRunner {
   /**
    * The `run` phase of `meddle.turn`: drives the turn to its end with the first usable token. A rerun that resumes the
    * session sends `CARRY_ON_PROMPT` (the turn was cut off) or `TOKEN_RETRY_PROMPT` (its token failed it) instead of the
-   * prompt. When the turn's token hit a limit or was refused, the token is marked for the pool; `"rerun"` when this was
-   * the turn's first try (`tokenRetries` 0) and another token is usable now, so the phase enters itself again.
+   * prompt. When the turn's token hit a limit or was refused, the token is marked for the pool. When the turn also ended
+   * with an error, a `token_fault` is logged, and `"rerun"` is returned when this was the turn's first try
+   * (`tokenRetries` 0, and this run is not already the rerun) and another token is usable now, so the phase enters
+   * itself again. A turn that succeeded all the same is done.
    * Not for callers outside this module.
    */
   async runTurnPhase(input: TurnInput, tokenRetries: number, context: Context): Promise<"done" | "rerun"> {
@@ -447,6 +449,8 @@ export class TaskRunner {
     let failureLogged = false; // the turn's own turn_failed is in the log
     try {
       const cutOff = lastTurnCutOff(this.#db, taskId, input.freshAfter ?? 0);
+      // A stop after the fault was logged but before the sleep was committed re-enters with the old checkpoint.
+      const retries = cutOff === "token" ? Math.max(tokenRetries, 1) : tokenRetries;
       const row = this.#row(taskId);
       const started = row.started === 1;
       const moving = this.#isMoving(row);
@@ -485,8 +489,9 @@ export class TaskRunner {
         onTokenFault: (f) => { fault = f; },
       });
       this.#live.set(taskId, { query, queue, state: "running" });
+      let result: Awaited<typeof done>;
       try {
-        await done;
+        result = await done;
       } catch (err) {
         // A turn that ended without a result after its token failed it fails as before; the token is marked all the same.
         if (fault !== null) await this.#markFault(picked.id, fault).catch(() => {});
@@ -497,9 +502,12 @@ export class TaskRunner {
       }
       if (fault === null) return "done";
       const marked = await this.#markFault(picked.id, fault);
+      // Only a turn that failed reruns (a limit Claude Code retried past still ends in a success).
+      if (resultError(result) === null) return "done";
       const next = await pickToken(this.#cfg, this.#db);
-      const rerun = tokenRetries === 0 && next !== null && next.id !== picked.id;
-      this.#record(taskId, tokenFaultEvent(picked, marked, rerun));
+      const another = next !== null && next.id !== picked.id;
+      const rerun = retries === 0 && another;
+      this.#record(taskId, tokenFaultEvent(picked, marked, rerun, !rerun && another));
       if (!rerun) return "done";
       await this.#deps.hooks?.afterTokenFault?.(taskId);
       return "rerun";
@@ -1186,11 +1194,11 @@ function lastTurnCutOff(db: Database, taskId: string, afterSeq: number): "token"
 
 /** The `token_fault` event for the token a turn ran with (null: none was usable). */
 function tokenFaultEvent(
-  token: { id: string; label: string } | null, fault: TokenFault | { kind: "none" }, rerun: boolean,
+  token: { id: string; label: string } | null, fault: TokenFault | { kind: "none" }, rerun: boolean, retried = false,
 ): MeddleEvent {
   return {
     type: "meddle", subtype: "token_fault", at: new Date().toISOString(),
-    tokenId: token?.id ?? null, label: token?.label ?? null, fault, rerun,
+    tokenId: token?.id ?? null, label: token?.label ?? null, fault, rerun, ...(retried ? { retried: true as const } : {}),
   };
 }
 

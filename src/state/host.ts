@@ -7,7 +7,7 @@ import { createHost, forbidden, type Ctx, type Host, type Subscribable } from "@
 import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { checkTaskRoot, type NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
-import { resultError, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
+import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { peerOf, servePool } from "../pool/object";
 import type { PoolRuntime } from "../pool/runtime";
@@ -208,7 +208,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       } else if (m.type === "meddle" && m.subtype === "token_fault") {
         const fault = m.fault as TokenFault | { kind: "none" };
         if (fault.kind === "none") noTokenFailures.add(taskId);
-        if (m.rerun !== true) notify(ctx, { taskId, kind: "token", text: tokenFaultText(m.label, fault) });
+        if (m.rerun !== true) notify(ctx, { taskId, kind: "token", text: tokenFaultNotice(m) });
       } else if (m.type === "system" && m.subtype === "init") {
         // The turn's query is live from its first message on, so its model list is asked for here.
         const query = runner.liveQuery(taskId);
@@ -543,16 +543,6 @@ function questionText(req: PendingApproval): string {
   const questions = req.input.questions;
   const first = Array.isArray(questions) ? (questions[0] as { question?: unknown } | undefined)?.question : undefined;
   return typeof first === "string" ? first : "Claude has a question";
-}
-
-/** A `token` notification's text, from a `token_fault` that did not rerun the turn. */
-function tokenFaultText(label: unknown, fault: TokenFault | { kind: "none" }): string {
-  const name = typeof label === "string" ? label : "?";
-  switch (fault.kind) {
-    case "none": return "no usable token";
-    case "exhausted": return `token ${name} exhausted${fault.until === null ? "" : ` until ${fault.until}`}; no other token`;
-    case "disabled": return `token ${name} disabled: ${fault.reason}; no other token`;
-  }
 }
 
 // ─── folding the event log into a task's log summary and a session's view ───

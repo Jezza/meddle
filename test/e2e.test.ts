@@ -117,6 +117,46 @@ test("a client command without a running node asks for one", async () => {
   expect(result.stderr).toBe('meddle: start "meddle serve" first\n');
 });
 
+test("task prompt follows a turn its token reruns to the rerun's success, and fails with the token's notice when none is left", async () => {
+  const { dir, env } = await home();
+  const byToken = `tok-a=${import.meta.dir}/fixtures/rate-limited.jsonl,tok-b=${import.meta.dir}/fixtures/hello.jsonl`;
+  await writeFile(`${dir}/a`, "tok-a\n");
+  await writeFile(`${dir}/b`, "tok-b\n");
+  expect((await meddle(["token", "add", "--file", `${dir}/a`, "--label", "a"], env)).code).toBe(0);
+  await Bun.sleep(5); // set later, so second in order
+  expect((await meddle(["token", "add", "--file", `${dir}/b`, "--label", "b"], env)).code).toBe(0);
+  const node = await startServe({ ...env, MEDDLE_PORT: "0", MEDDLE_FIXTURE_BY_TOKEN: byToken });
+  const client = { ...env, MEDDLE_PORT: String(node.port) };
+  try {
+    const projectId = (await meddle(["project", "add", `${dir}/repo`], client)).stdout.trim();
+    const taskId = (await meddle(["task", "new", "--title", "t", "--project", projectId], client)).stdout.trim();
+
+    const prompted = await meddle(["task", "prompt", taskId, "Reply with the single word ok."], client);
+    expect(prompted.stderr).not.toContain("meddle: ");
+    expect(prompted.code).toBe(0);
+    const lines = prompted.stderr.trim().split("\n");
+    const fault = lines.indexOf("meddle/token_fault");
+    expect(lines.slice(0, fault).filter((l) => l.startsWith("result"))).toEqual(["result/error_during_execution"]);
+    expect(lines[fault + 1]).toBe("meddle/turn_started");
+    expect(lines.slice(fault).filter((l) => l.startsWith("result"))).toEqual(["result/success"]);
+    expect(lines.at(-1)).toBe("result/success");
+
+    const listed = await meddle(["token", "list"], client);
+    expect(listed.stdout).toMatch(/ {2}a {2}exhausted until 2100-01-01T00:00:00\.000Z \(five_hour\)/);
+
+    // with a usable again and b gone, a fails the turn with no token to switch to: the token's notice is the error
+    expect((await meddle(["token", "enable", "a"], client)).code).toBe(0);
+    expect((await meddle(["token", "remove", "b"], client)).code).toBe(0);
+    const stopped = await meddle(["task", "prompt", taskId, "Reply with the single word ok."], client);
+    expect(stopped.code).toBe(1);
+    expect(stopped.stderr).toEndWith(
+      "result/error_during_execution\nmeddle/token_fault\nmeddle: the turn ended: token a exhausted until 2100-01-01T00:00:00.000Z; no other token\n",
+    );
+  } finally {
+    await node.stop();
+  }
+}, 60_000);
+
 test("task prompt fails fast when the turn fails", async () => {
   const { dir, env } = await home();
   await writeFile(`${dir}/token`, "tok\n");
