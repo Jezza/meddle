@@ -344,17 +344,21 @@ type WindowEvent = { seq: number; message: unknown };
 /** How many of the newest events `task prompt` reads once the task is idle again; the turn's end is among them. */
 const SETTLE_EVENTS = 20;
 
+/** What `task prompt` prints for a text queued for a task on its way to another node. */
+const QUEUED_FOR_MOVE = "queued; it runs once the task has arrived";
+
 /**
  * Submits a turn and prints each new event's `type[/subtype]` to stderr until a `result` arrives. A `result` other
  * than a success, a `turn_failed` event, or the task going idle again with no `result` (a turn that failed before it
- * logged anything) fails it.
+ * logged anything) fails it. A text the node queued for a task it is moving away (or one that has moved before a
+ * `result` came) runs on the other node: that is printed (`QUEUED_FOR_MOVE`) and the command succeeds.
  */
 function taskPrompt(id: string, text: string): Promise<number> {
   return withNode(async (client, socket) => {
     const task = await client.get(TaskObject, { id });
     const session = await client.get(SessionObject, { taskId: id });
     let printed = session.window.value.at(-1)?.seq ?? 0;
-    const finished = Promise.withResolvers<void>();
+    const finished = Promise.withResolvers<"done" | "queued">();
     finished.promise.catch(() => {}); // a failed prompt leaves it unawaited when the socket then closes
     socket.addEventListener("close", () => finished.reject(new Error("the node closed the connection")));
     const follow = (events: readonly WindowEvent[]) => {
@@ -365,7 +369,7 @@ function taskPrompt(id: string, text: string): Promise<number> {
         console.error(subtype === undefined ? `${type}` : `${type}/${subtype}`);
         if (type === "result") {
           const error = resultError(message as { subtype?: unknown; is_error?: unknown });
-          return error === null ? finished.resolve() : finished.reject(new Error(`the turn ended with ${error}`));
+          return error === null ? finished.resolve("done") : finished.reject(new Error(`the turn ended with ${error}`));
         }
         if (type === "meddle" && subtype === "turn_failed") {
           return finished.reject(new Error(`the turn failed: ${String((message as { error?: unknown }).error)}`));
@@ -381,13 +385,17 @@ function taskPrompt(id: string, text: string): Promise<number> {
     const unsubscribe = [
       session.window.subscribe(follow),
       task.state.subscribe((state) => {
-        if (state !== "idle") busy = true;
+        // Gone before a `result`: the text went with the task.
+        if (state === "moved") finished.resolve("queued");
+        else if (state !== "idle") busy = true;
         else if (busy) settle().catch((err: Error) => finished.reject(err));
       }),
     ];
     try {
       await task.prompt({ text });
-      await finished.promise;
+      const state = task.state.value;
+      if (state === "moving" || state === "receiving" || task.move.value !== null) finished.resolve("queued");
+      if ((await finished.promise) === "queued") console.log(QUEUED_FOR_MOVE);
     } finally {
       for (const stop of unsubscribe) stop();
     }
