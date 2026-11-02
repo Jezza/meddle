@@ -415,9 +415,12 @@ test("an idle task moves to another node: the source keeps only its row and an a
     expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
     expect(countRows(A, m)).toEqual({ events: 0, transcript: 0 });
     expect((await jj(["workspace", "list", "-T", 'name ++ "\\n"'], A.project.replica, A.cfg)).includes(m.id)).toBe(false);
-    const file = paths(A.cfg).archiveFile(m.id);
+    const file = paths(A.cfg).movedFile(m.id);
+    expect(file).toBe(join(A.cfg.dataDir, "moved", `${m.id}.json.gz`));
     expect((await stat(file)).mode & 0o777).toBe(0o600);
-    expect((await stat(paths(A.cfg).archive)).mode & 0o777).toBe(0o700);
+    expect((await stat(paths(A.cfg).moved)).mode & 0o777).toBe(0o700);
+    // A move's leftover is not an archived task's archive.
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(false);
     const archive = await readArchive(file);
     expect(archive.manifest).toEqual(m);
     expect({ events: archive.events.length, transcript: archive.transcript.length }).toEqual(before);
@@ -461,7 +464,7 @@ test("a task moves to another node and back: the old row is replaced, and the no
     const replicaB = paths(B.cfg).replica(A.project.id);
     expect((await bookmarkList(replicaB, B.cfg)).filter((b) => b.name.includes(m.id))).toEqual([]);
     expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", moved_to: null, receiving_from: null, turns: 2 });
-    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(true);
+    expect(existsSync(paths(A.cfg).movedFile(m.id))).toBe(true);
     await promptAndWait(A, m.id, "Home again.");
     const started = listEvents(A.db, m.id).filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
     expect(started.map((e) => (e.message as { resume: boolean }).resume)).toEqual([false, true, true]);
@@ -670,7 +673,7 @@ test("a source that stops after the receipt finishes the move when it starts aga
     expect(calls).toBe(2);
     expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
     expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
-    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(true);
+    expect(existsSync(paths(A.cfg).movedFile(m.id))).toBe(true);
     expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", receiving_from: null, turns: 1 });
     expect(A.logs.filter((l) => l.startsWith("meddle: move:"))).toEqual([]);
   } finally {
@@ -1008,20 +1011,32 @@ test("a move is refused for this node, an offline target, one that hosts no task
   }
 }, 15_000);
 
-test("the archive janitor deletes archives older than seven days", async () => {
+test("the janitor deletes move leftovers older than seven days, sweeps the old archive directory until it is empty and removes it, and never touches archives", async () => {
   const node = await setupNode();
   try {
-    const dir = paths(node.cfg).archive;
-    await mkdir(dir, { recursive: true });
+    const p = paths(node.cfg);
+    const legacy = join(node.cfg.dataDir, "archive");
     const now = Date.now();
     const day = 24 * 60 * 60 * 1000;
-    for (const [name, age] of [["old.json.gz", 8], ["new.json.gz", 6], ["other.txt", 30]] as const) {
+    const put = async (dir: string, name: string, age: number) => {
+      await mkdir(dir, { recursive: true });
       await writeFile(join(dir, name), "x");
       const at = new Date(now - age * day);
       await utimes(join(dir, name), at, at);
-    }
+    };
+    for (const [name, age] of [["old.json.gz", 8], ["new.json.gz", 6], ["other.txt", 30]] as const) await put(p.moved, name, age);
+    for (const [name, age] of [["gone.json.gz", 9], ["kept.json.gz", 2]] as const) await put(legacy, name, age);
+    await put(p.archives, "archived.json.gz", 30);
+    expect(await runJanitor(node.cfg, now)).toBe(2);
+    expect((await readdir(p.moved)).sort()).toEqual(["new.json.gz", "other.txt"]);
+    expect(await readdir(legacy)).toEqual(["kept.json.gz"]);
+    expect(await readdir(p.archives)).toEqual(["archived.json.gz"]);
+    // Once its last leftover is old enough, the old directory goes too.
+    await utimes(join(legacy, "kept.json.gz"), new Date(now - 8 * day), new Date(now - 8 * day));
     expect(await runJanitor(node.cfg, now)).toBe(1);
-    expect((await readdir(dir)).sort()).toEqual(["new.json.gz", "other.txt"]);
+    expect(existsSync(legacy)).toBe(false);
+    expect(await runJanitor(node.cfg, now)).toBe(0);
+    expect(await readdir(p.archives)).toEqual(["archived.json.gz"]);
   } finally {
     await node.harness.close();
     node.db.close();
@@ -1033,15 +1048,16 @@ test("an archive is written once per stay: kept on a rerun, replaced after the t
   const node = await setupNode();
   try {
     const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
-    const file = await writeArchive(node.cfg, node.db, m.id);
+    const file = await writeArchive(node.cfg, node.db, m.id, paths(node.cfg).movedFile(m.id));
+    expect(file).toBe(paths(node.cfg).movedFile(m.id));
     const first = (await readArchive(file)).archivedAt;
     await Bun.sleep(5);
-    expect(await writeArchive(node.cfg, node.db, m.id)).toBe(file);
+    expect(await writeArchive(node.cfg, node.db, m.id, file)).toBe(file);
     expect((await readArchive(file)).archivedAt).toBe(first);
     // A later stay of the task here (its row changed since): archived anew.
     await Bun.sleep(5);
     updateTask(node.db, m.id, { turns: 3 });
-    await writeArchive(node.cfg, node.db, m.id);
+    await writeArchive(node.cfg, node.db, m.id, file);
     const second = await readArchive(file);
     expect(second.archivedAt > first).toBe(true);
     expect(second.row.turns).toBe(3);

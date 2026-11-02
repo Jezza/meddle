@@ -99,6 +99,9 @@ const ADDED_COLUMNS = [
   { table: "tasks", column: "moved_to", type: "TEXT" },
   // The node a `receiving` task comes from.
   { table: "tasks", column: "receiving_from", type: "TEXT" },
+  // The node an `archived` task was archived on, and when.
+  { table: "tasks", column: "archived_on", type: "TEXT" },
+  { table: "tasks", column: "archived_at", type: "TEXT" },
 ];
 
 export function openDb(path: string): Database {

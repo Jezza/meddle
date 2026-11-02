@@ -1,13 +1,15 @@
-// What a task that moved away leaves on its old node (decision 18): one gzipped JSON file, kept for seven days.
-import { chmod, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+// A task's files and rows in one gzipped JSON file: the archive of a task archived here (kept until it is restored or
+// deleted, `<data>/archives/`) and what a task that moved away leaves on its old node (decision 18, kept seven days,
+// `<data>/moved/`).
+import { chmod, mkdir, readdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { ensurePrivateDir, paths } from "../paths";
 import { getTask } from "../store/records";
-import { regularFiles } from "./transfer";
+import { prepareParent, regularFiles, safeSegments } from "./transfer";
 
-/** How long an archive is kept. */
+/** How long a move's leftover is kept. */
 export const ARCHIVE_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -24,15 +26,14 @@ export type TaskArchive = {
 };
 
 /**
- * Writes task `taskId`'s archive to `<data>/archive/<taskId>.json.gz` (directory 700, file 600) and returns its path.
- * The file appears whole or not at all (written aside, then renamed). An archive written since the task's row last
- * changed is kept: a rerun of a move's cleanup after it removed pieces of the task never replaces it with less, while
- * one left from an earlier stay of the task here is replaced.
+ * Writes task `taskId`'s archive to `file` (its directory made mode 700, the file 600) and returns `file`. The file
+ * appears whole or not at all (written aside, then renamed). An archive written there since the task's row last changed
+ * is kept: a rerun of a move's cleanup after it removed pieces of the task never replaces it with less, while one left
+ * from an earlier stay of the task here is replaced.
  */
-export async function writeArchive(cfg: NodeConfig, db: Database, taskId: string): Promise<string> {
+export async function writeArchive(cfg: NodeConfig, db: Database, taskId: string, file: string): Promise<string> {
   const p = paths(cfg);
-  const file = p.archiveFile(taskId);
-  await ensurePrivateDir(p.archive);
+  await ensurePrivateDir(dirname(file));
   const row = getTask(db, taskId);
   if (row === null) throw new Error(`unknown task: ${taskId}`);
   // The row is untouched since that archive was written: this stay's (a file's mtime is too coarse to tell).
@@ -66,14 +67,44 @@ export async function readArchive(file: string): Promise<TaskArchive> {
   return JSON.parse(new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await readFile(file))))) as TaskArchive;
 }
 
-/** Deletes the archives (and stray partial writes) older than `ARCHIVE_DAYS` at `now`; how many it deleted. */
+/**
+ * Writes the archive's `files` back under task `taskId`'s `<taskConfig>/projects/` (each mode 600; a path that leaves
+ * that directory or passes through anything but a directory is refused, as in a transfer). How many it wrote.
+ */
+export async function unpackArchiveFiles(cfg: NodeConfig, taskId: string, archive: TaskArchive): Promise<number> {
+  const root = join(paths(cfg).taskConfig(taskId), "projects");
+  await mkdir(root, { recursive: true });
+  for (const f of archive.files) {
+    const target = await prepareParent(root, safeSegments(f.path));
+    await writeFile(target, Buffer.from(f.base64, "base64"), { mode: 0o600 });
+    await chmod(target, 0o600);
+  }
+  return archive.files.length;
+}
+
+/**
+ * Deletes the move leftovers (and stray partial writes) in `<data>/moved/` older than `ARCHIVE_DAYS` at `now`; how many
+ * it deleted. The `<data>/archive/` directory an earlier meddle kept them in gets the same rule, and is removed once
+ * empty. Archives of archived tasks (`<data>/archives/`) are never touched.
+ */
 export async function runJanitor(cfg: NodeConfig, now = Date.now()): Promise<number> {
-  const dir = paths(cfg).archive;
+  const legacy = join(cfg.dataDir, "archive");
+  let deleted = (await sweep(paths(cfg).moved, now)) ?? 0;
+  const old = await sweep(legacy, now);
+  if (old !== null) {
+    deleted += old;
+    await rmdir(legacy).catch(() => {}); // not empty yet: the next run tries again
+  }
+  return deleted;
+}
+
+/** Deletes the `.json.gz` and `.tmp` files in `dir` older than `ARCHIVE_DAYS`; how many, or null when `dir` does not exist. */
+async function sweep(dir: string, now: number): Promise<number | null> {
   let names: string[];
   try {
     names = await readdir(dir);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
   let deleted = 0;

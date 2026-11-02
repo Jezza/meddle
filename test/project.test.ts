@@ -3,7 +3,7 @@ import { test, expect } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { loadConfig, ensureDataDirs, paths } from "../src/config";
 import { openDb } from "../src/store/db";
-import { claimHomelessProjects, insertTask, listLiveTasks, listTasks } from "../src/store/records";
+import { claimHomelessProjects, insertTask, listArchivedTasks, listLiveTasks, listTasks, updateTask } from "../src/store/records";
 import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, registerReplica } from "../src/projects/project";
 import { initColocated, isJjRepo, jj } from "../src/jj";
 
@@ -104,11 +104,14 @@ test("openDb adds the project home and the task move columns to an older databas
   db.close();
 });
 
-test("listLiveTasks leaves out moved and receiving tasks", async () => {
+test("listLiveTasks leaves out moved, receiving and archived tasks; listArchivedTasks lists only archived ones", async () => {
   const { db } = await freshNode();
-  for (const [id, state] of [["t1", "idle"], ["t2", "moved"], ["t3", "running"], ["t4", "receiving"], ["t5", "waiting"]] as const) {
+  for (const [id, state] of [["t1", "idle"], ["t2", "moved"], ["t3", "running"], ["t4", "receiving"], ["t5", "waiting"], ["t6", "archived"], ["t7", "moved"]] as const) {
     insertTask(db, { id, title: id, state, session_id: id, manifest: "{}", started: 0, turns: 0 });
   }
+  // A moved row that still says where it was archived is not an archived task.
+  updateTask(db, "t7", { archived_on: "n", archived_at: new Date().toISOString() });
   expect(listLiveTasks(db).map((t) => t.id)).toEqual(["t1", "t3", "t5"]);
-  expect(listTasks(db)).toHaveLength(5);
+  expect(listArchivedTasks(db).map((t) => t.id)).toEqual(["t6"]);
+  expect(listTasks(db)).toHaveLength(7);
 });

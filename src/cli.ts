@@ -49,6 +49,7 @@ const USAGE = `usage: meddle --version
        meddle task new --title <t> [--project <id|name>]... [--node <id|prefix> | --here]
        meddle task prompt <id> <text> | meddle task retry <id>
        meddle task move <id> <node> [--now]
+       meddle task archive <id> | meddle task restore <id> | meddle task delete <id>
        meddle service install [--dry-run]
        meddle git-remote <name> <url>   (git's remote helper for meddle:// remotes)`;
 
@@ -582,6 +583,36 @@ function taskMove(id: string, nodeText: string, now: boolean): Promise<number> {
   });
 }
 
+/** Archives an idle task on its node: its folder goes, its log stays (`task restore` brings it back). */
+function taskArchive(id: string): Promise<number> {
+  return withNode(async (client) => {
+    const task = await client.get(TaskObject, { id });
+    await task.archive({});
+    console.log(`archived ${id}`);
+    return 0;
+  });
+}
+
+/** Restores an archived task on the node it was archived on. */
+function taskRestore(id: string): Promise<number> {
+  return withNode(async (client) => {
+    const task = await client.get(TaskObject, { id });
+    const { nodeId } = await task.restore({ node: null });
+    console.log(`restored ${id} on ${shortId(nodeId)}`);
+    return 0;
+  });
+}
+
+/** Deletes an archived or moved task's rows and archive from this node. */
+function taskDelete(id: string): Promise<number> {
+  return withNode(async (client) => {
+    const task = await client.get(TaskObject, { id });
+    await task.delete({});
+    console.log(`deleted ${id}`);
+    return 0;
+  });
+}
+
 /** This checkout's root; inside a compiled binary it names a directory with no `src/cli.ts`. */
 const CHECKOUT = resolve(import.meta.dir, "..");
 
@@ -744,6 +775,9 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "task" && sub === "move" && (rest.length === 2 || (rest.length === 3 && rest[2] === "--now"))) {
     return () => taskMove(rest[0]!, rest[1]!, rest.length === 3);
   }
+  if (command === "task" && sub === "archive" && rest.length === 1) return () => taskArchive(rest[0]!);
+  if (command === "task" && sub === "restore" && rest.length === 1) return () => taskRestore(rest[0]!);
+  if (command === "task" && sub === "delete" && rest.length === 1) return () => taskDelete(rest[0]!);
   // git runs a helper as `git-remote-<scheme> <remote> [<url>]`; without a url, the remote is the url.
   if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);
   if (command === "service" && sub === "install" && rest.length === 0) return () => serviceInstall(false);

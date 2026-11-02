@@ -171,7 +171,8 @@ export function checkReceivedManifest(m: TaskManifest): void {
  * Provisions a task another node sent: the steps of `provisionTask`, keeping the manifest's id, title, session,
  * primary project, creation time and projects (ids, names, workspaces), with each project's `replica` this node's and
  * its `parent` the change `parents[projectId]` (fetched from the sender), where the workspace starts and the task's
- * bookmark points. Writes `task.json` and the row (`started` 1, `state`, no turns). On failure, removes what it made.
+ * bookmark points. Writes `task.json` and the row (`started` 1, `state`, no turns); with `keepRow` (a task restored from
+ * its archive on this node, whose row is still here), no row: the caller updates it. On failure, removes what it made.
  */
 export async function provisionFromManifest(
   cfg: NodeConfig,
@@ -179,6 +180,7 @@ export async function provisionFromManifest(
   manifest: TaskManifest,
   parents: Record<string, string>,
   state: TaskState,
+  options: { keepRow?: boolean } = {},
 ): Promise<TaskManifest> {
   const root = await checkTaskRoot(cfg);
   if (!root.ok) throw new Error(root.reason);
@@ -227,15 +229,17 @@ export async function provisionFromManifest(
     const received: TaskManifest = { ...manifest, projects: entries };
     await writeFile(join(task, "CLAUDE.md"), generatedClaudeMd(received, projects));
     await writeManifest(cfg, received);
-    insertTask(db, {
-      id,
-      title: received.title,
-      state,
-      session_id: received.sessionId,
-      manifest: JSON.stringify(received),
-      started: 1,
-      turns: 0,
-    });
+    if (options.keepRow !== true) {
+      insertTask(db, {
+        id,
+        title: received.title,
+        state,
+        session_id: received.sessionId,
+        manifest: JSON.stringify(received),
+        started: 1,
+        turns: 0,
+      });
+    }
     return received;
   } catch (err) {
     for (const { replica, name } of bookmarks) await serialised(repoKey(replica), () => bookmarkForget(replica, `exact:${name}`, cfg)).catch(() => {});

@@ -39,8 +39,9 @@ import {
 import { markToken, pickToken } from "../token";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
+import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
 import { readManifest, taskGlob, taskNamespace, transcriptPath, type TaskManifest } from "./manifest";
-import { MeddleMove, type MoveInput } from "./move";
+import { MeddleMove, releaseFolder, type MoveInput } from "./move";
 import { checkReceivedManifest, provisionFromManifest, provisionTask } from "./provision";
 import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
 
@@ -206,6 +207,8 @@ export class TaskRunner {
   #moveListeners = new Set<(taskId: string, move: MoveState | null) => void>();
   /** Woken whenever a turn of the task ends (completed, failed or aborted): a move waits for it. */
   #turnWaiters = new Map<string, Set<() => void>>();
+  /** Tasks being archived: until the row says `archived`, no turn or move of them starts. */
+  #archiving = new Set<string>();
 
   constructor(cfg: NodeConfig, db: Database, harness: Harness, deps: RunnerDeps) {
     this.#cfg = cfg;
@@ -291,6 +294,7 @@ export class TaskRunner {
   async prompt(taskId: string, text: string): Promise<void> {
     const row = this.#row(taskId);
     if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
+    if (this.#archiving.has(taskId)) throw new Error("task is being archived");
     refuseReceiving(row);
     refuseMoved(row);
     if (this.#isMoving(row)) {
@@ -353,6 +357,7 @@ export class TaskRunner {
   async startQueued(taskId: string, options: { freshAfter?: number } = {}): Promise<void> {
     const row = getTask(this.#db, taskId);
     if (row === null || row.state !== "idle" || this.#moving.has(taskId) || this.#pending.has(taskId) || this.#live.has(taskId)) return;
+    if (this.#archiving.has(taskId)) return;
     const [head] = queuedOf(row);
     if (head === undefined) return;
     this.#pending.add(taskId);
@@ -876,6 +881,146 @@ export class TaskRunner {
     deleteTask(this.#db, row.id, row.session_id);
   }
 
+  // ─── archiving a task ───
+
+  /**
+   * Archives idle task `taskId` on this node (spec 21.4): refused (`task is <state>`, `task has queued prompts`) unless
+   * its row is `idle` with nothing queued and no turn of it is live, pending or in the Harness, and it is not moving.
+   * Sets its bookmarks; for each project homed on another node, the home must be online (else `cannot archive: home
+   * <short> of <project> is offline`) and takes the push of the task's namespace (`pushNamespace`, whose failure
+   * rejects the archive): once this node forgets them, the home's copy is the only one. Then writes the archive to
+   * `<data>/archives/<id>.json.gz`, records the row `archived` here (its event and transcript rows stay) and takes the
+   * folder off this node (`releaseFolder`: on a project's home its bookmarks stay). A refused or failed archive leaves
+   * the task idle and in place.
+   */
+  async archive(taskId: string): Promise<void> {
+    const pool = this.#pool;
+    if (pool === undefined) throw new Error("this node has no pool");
+    const self = pool.identity.id;
+    if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+    this.#refuseArchive(this.#row(taskId));
+    // Reserved before the first await: no prompt, queued turn or move starts meanwhile. Under the task's key, so a
+    // restore or delete waits until the folder is gone.
+    this.#archiving.add(taskId);
+    try {
+      await serialised(taskKey(taskId), async () => {
+        if ((await this.#durableTurn(taskId)) !== undefined) throw new Error("task is running");
+        this.#refuseArchive(this.#row(taskId));
+        const manifest = await readManifest(this.#cfg, taskId);
+        const homes = new Map<string, string>();
+        for (const p of manifest.projects) {
+          const home = getProject(this.#db, p.id)?.home;
+          if (home === undefined || home === "") throw new Error(`cannot archive: project ${p.name} has no known home`);
+          if (home === self) continue;
+          if (!pool.net.isOnline(home)) throw new Error(`cannot archive: home ${shortId(home)} of ${p.name} is offline`);
+          homes.set(p.id, home);
+        }
+        for (const b of await this.setTaskBookmarks(manifest)) {
+          const home = homes.get(b.projectId);
+          if (home !== undefined) await pushNamespace(this.#cfg, b.replica, home, taskId, { name: b.bookmark, changeId: b.change });
+        }
+        await writeArchive(this.#cfg, this.#db, taskId, paths(this.#cfg).archiveFile(taskId));
+        // Recorded before the folder goes: a node that stops in between has an archived task whose leftovers a
+        // restore clears, never an idle one without its folder.
+        updateTask(this.#db, taskId, { state: "archived", archived_on: self, archived_at: new Date().toISOString() });
+        try {
+          await releaseFolder(this.#cfg, this.#db, self, taskId);
+        } catch (err) {
+          this.#log(`meddle: archive: ${taskId} is archived, but its folder could not be removed: ${messageOf(err)}`);
+        }
+      });
+    } finally {
+      this.#archiving.delete(taskId);
+    }
+    this.#emitState(taskId, "archived");
+  }
+
+  /** Throws why task `row` cannot be archived now, as `archive` says. */
+  #refuseArchive(row: TaskRow): void {
+    if (this.#isMoving(row)) throw new Error("task is moving");
+    const live = this.#live.get(row.id);
+    if (live !== undefined) throw new Error(`task is ${live.state}`);
+    if (this.#pending.has(row.id)) throw new Error("task is running");
+    if (row.state !== "idle") throw new Error(`task is ${row.state}`);
+    if (queuedOf(row).length > 0) throw new Error("task has queued prompts");
+  }
+
+  /**
+   * Restores task `taskId`, archived on this node, here: each project's workspace starts on the task's project bookmark
+   * (on the project's home, the local one; elsewhere, fetched from the home with the rest of the task's namespace, which
+   * must be online: else `cannot restore: home <short> of <project> is offline`), the folder is provisioned from the
+   * manifest and the archive's files are unpacked into it (a task without a project's transcript into this node's
+   * slot). The row is `idle` again, no longer archived, and the archive is deleted. On failure, what it made is taken
+   * off again and the task stays archived.
+   */
+  async restoreHere(taskId: string): Promise<TaskManifest> {
+    const pool = this.#pool;
+    if (pool === undefined) throw new Error("this node has no pool");
+    const self = pool.identity.id;
+    return serialised(taskKey(taskId), async () => {
+      const row = this.#row(taskId);
+      if (row.state !== "archived") throw new Error(`task is ${row.state}`);
+      if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
+      const manifest = JSON.parse(row.manifest) as TaskManifest;
+      const file = paths(this.#cfg).archiveFile(taskId);
+      const archive = await readArchive(file);
+      // What a node that stopped while archiving it left.
+      await this.#clearLeftovers(manifest);
+      let restored: TaskManifest;
+      try {
+        const parents: Record<string, string> = {};
+        for (const p of manifest.projects) {
+          const project = getProject(this.#db, p.id);
+          if (project === null) throw new Error(`unknown project: ${p.id}`);
+          const bookmark = `${taskNamespace(taskId)}${p.name}`;
+          if (project.home === self) {
+            parents[p.id] = await this.#localTaskChange(project, bookmark);
+            continue;
+          }
+          if (!pool.net.isOnline(project.home)) throw new Error(`cannot restore: home ${shortId(project.home)} of ${p.name} is offline`);
+          parents[p.id] = (await this.#fetchTaskChange(project, project.home, taskId, bookmark)).change;
+        }
+        restored = await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "idle", { keepRow: true });
+        await unpackArchiveFiles(this.#cfg, taskId, archive);
+        await adoptTranscriptSlot(this.#cfg, this.#db, restored);
+        updateTask(this.#db, taskId, { state: "idle", archived_on: null, archived_at: null, manifest: JSON.stringify(restored) });
+      } catch (err) {
+        // Back to what an archived task has here: no folder, no workspace, and (off the home) no task bookmarks.
+        await releaseFolder(this.#cfg, this.#db, self, taskId).catch(() => {});
+        throw err;
+      }
+      await rm(file, { force: true });
+      this.#emitState(taskId, "idle");
+      return restored;
+    });
+  }
+
+  /** The change the local bookmark `bookmark` of `project`'s replica points at; throws when it is missing or conflicted. */
+  async #localTaskChange(project: Project, bookmark: string): Promise<string> {
+    const listed = await serialised(repoKey(project.replica), () => bookmarkList(project.replica, this.#cfg));
+    const found = listed.find((b) => b.name === bookmark && b.remote === null);
+    if (found === undefined) throw new Error(`bookmark ${bookmark} is missing`);
+    if (found.conflicted || found.changeId === "") throw new Error(`bookmark ${bookmark} is conflicted`);
+    return found.changeId;
+  }
+
+  /**
+   * Deletes task `taskId` from this node: only an `archived` or `moved` one (else `task is <state>`). Its archive (or a
+   * move's leftover), then its row, event log and transcript rows go.
+   */
+  async deleteTask(taskId: string): Promise<void> {
+    await serialised(taskKey(taskId), async () => {
+      const row = this.#row(taskId);
+      if (row.state !== "archived" && row.state !== "moved") throw new Error(`task is ${row.state}`);
+      const p = paths(this.#cfg);
+      await rm(p.archiveFile(taskId), { force: true });
+      await rm(p.movedFile(taskId), { force: true });
+      deleteTask(this.#db, taskId, row.session_id);
+      // Told with the state it had: whoever lists this node's tasks reads them again.
+      this.#emitState(taskId, row.state as TaskState);
+    });
+  }
+
   // ─── moving a task to another node ───
 
   /**
@@ -914,6 +1059,7 @@ export class TaskRunner {
     refuseReceiving(row);
     refuseMoved(row);
     if (row.state === "archived") throw new Error(`task is archived: ${row.id}`);
+    if (this.#archiving.has(row.id)) throw new Error("task is being archived");
     if (!own && this.#isMoving(row)) throw new Error("task is moving");
     const pool = this.#pool;
     if (pool === undefined) throw new Error("this node has no pool");
@@ -1067,11 +1213,12 @@ export class TaskRunner {
     return this.#moving.has(row.id) || row.state === "moving";
   }
 
-  /** Refuses what only a task live here takes (interrupt, retry, settings): received, moved and moving tasks. */
+  /** Refuses what only a task live here takes (interrupt, retry, settings): received, moved, archived and moving tasks. */
   #refuseElsewhere(taskId: string): void {
     const row = this.#row(taskId);
     refuseReceiving(row);
     refuseMoved(row);
+    if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
     if (this.#isMoving(row)) throw new Error("task is moving");
   }
 

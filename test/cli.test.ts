@@ -320,3 +320,30 @@ test("the usage text lists spawn and the project choice by name", async () => {
   expect(out.stderr).toContain("meddle spawn <prompt> [--project <id|name>]... [--node <id|prefix> | --here] [--title <t>]");
   expect(out.stderr).toContain("meddle task new --title <t> [--project <id|name>]... [--node <id|prefix> | --here]");
 });
+
+test("task archive, restore and delete go through the running node; the usage text lists them", async () => {
+  const usage = Bun.spawn(["bun", "run", "src/cli.ts"], { env: await env(), stdout: "pipe", stderr: "pipe" });
+  const [err] = await Promise.all([new Response(usage.stderr).text(), usage.exited]);
+  expect(err.split("\n").map((l) => l.trim())).toContain("meddle task archive <id> | meddle task restore <id> | meddle task delete <id>");
+
+  const { A, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const port = new URL(dashboard.url).port;
+    const run = (args: string[]) => meddle(["task", ...args], { HOME: A.home, MEDDLE_PORT: port });
+    const refused = await run(["delete", m.id]);
+    expect(refused).toMatchObject({ stdout: "", code: 1 });
+    expect(refused.stderr).toContain("task is idle");
+    expect(await run(["archive", m.id])).toEqual({ stdout: `archived ${m.id}\n`, stderr: "", code: 0 });
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", archived_on: A.id });
+    expect(await run(["restore", m.id])).toEqual({ stdout: `restored ${m.id} on ${shortId(A.id)}\n`, stderr: "", code: 0 });
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", archived_on: null });
+    expect(await run(["archive", m.id])).toEqual({ stdout: `archived ${m.id}\n`, stderr: "", code: 0 });
+    expect(await run(["delete", m.id])).toEqual({ stdout: `deleted ${m.id}\n`, stderr: "", code: 0 });
+    expect(getTask(A.db, m.id)).toBeNull();
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 30_000);

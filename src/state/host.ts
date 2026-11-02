@@ -17,7 +17,7 @@ import { bookmarkList } from "../jj";
 import { loadContext } from "../projects/context";
 import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, type Project } from "../projects/project";
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
-import { claimHomelessProjects, getTask, getTaskSettings, listLiveTasks, listTasks } from "../store/records";
+import { claimHomelessProjects, getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
 import { taskNamespace, type TaskManifest } from "../tasks/manifest";
 import { shortId } from "../pool/ids";
@@ -204,6 +204,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   host.serve(NodeStore, (_input, _principal, self) => {
     const taskIds = self.state("taskIds", NodeStore.def.members.taskIds, { init: () => listLiveTasks(db).map((t) => t.id) });
+    const archivedIds = self.state("archivedIds", NodeStore.def.members.archivedIds, { init: () => listArchivedTasks(db).map((t) => t.id) });
     const projectIds = self.state("projectIds", NodeStore.def.members.projectIds, { init: projectIdsNow });
     const token = self.state("token", NodeStore.def.members.token, { init: () => tokenNow(cfg, db) });
     const metricsNow = self.state("metrics", NodeStore.def.members.metrics, { init: () => metrics.latest() });
@@ -280,10 +281,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     });
     /** The running count the pool last heard from here (placement reads it from the roster). */
     let reportedRunning = runner.running();
-    // A task received from another node, or created for one, turns live through the runner; a moved one leaves. The
-    // pool hears of a new or gone task, and of one that started or stopped running, now.
+    // A task received from another node, or created for one, turns live through the runner; a moved or archived one
+    // leaves (an archived one joins `archivedIds`). The pool hears of a new or gone task, and of one that started or
+    // stopped running, now.
     self.on("taskStates", states, (_event, ctx) => {
       const ids = listLiveTasks(db).map((t) => t.id);
+      const archived = listArchivedTasks(db).map((t) => t.id);
+      if (archived.join() !== archivedIds.value.join()) archivedIds.replace(ctx, archived);
       const running = runner.running();
       const changed = ids.join() !== taskIds.value.join();
       if (changed) taskIds.replace(ctx, ids);
@@ -316,6 +320,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       metrics: metricsNow,
       token,
       taskIds,
+      archivedIds,
       projectIds,
       models,
       notifications,
@@ -380,6 +385,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       metrics: store.metrics,
       token: store.token,
       taskIds: store.taskIds,
+      archivedIds: store.archivedIds,
       projectIds: store.projectIds,
       models: store.models,
       notifications: store.notifications,
@@ -444,6 +450,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const state = self.state("state", members.state, { init: () => runner.state(id) });
     const move = self.state("move", members.move, { init: () => runner.moveState(id) });
     const movedTo = self.state("movedTo", members.movedTo, { init: () => getTask(db, id)?.moved_to ?? null });
+    const archivedOn = self.state("archivedOn", members.archivedOn, { init: () => archivedOnNow(id) });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
@@ -460,6 +467,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       state.replace(ctx, event.state);
       const to = getTask(db, id)?.moved_to ?? null;
       if (to !== movedTo.value) movedTo.replace(ctx, to);
+      const on = archivedOnNow(id);
+      if (on !== archivedOn.value) archivedOn.replace(ctx, on);
       // A turn's end set (and pushed) them; a move fetched or forgot them.
       return refreshBookmarks(ctx);
     });
@@ -473,6 +482,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       state.replace(ctx, runner.state(id));
       move.replace(ctx, runner.moveState(id));
       movedTo.replace(ctx, getTask(db, id)?.moved_to ?? null);
+      archivedOn.replace(ctx, archivedOnNow(id));
       pending.replace(ctx, approvals.pending(id));
       catchUpLog(ctx);
     });
@@ -495,6 +505,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       contextUsage: self.derive([log], (l) => l.contextUsage),
       move,
       movedTo,
+      archivedOn,
       bookmarks,
       prompt: ({ text }) => runner.prompt(id, text),
       interrupt: () => runner.interrupt(id),
@@ -512,6 +523,15 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       setModel: ({ model }) => runner.setModel(id, model),
       setEffort: ({ effort }, ctx) => store.setEffort({ taskId: id, effort }, ctx),
       moveTo: ({ nodeId, now }) => runner.moveTo(id, nodeId, now),
+      archive: () => runner.archive(id),
+      // Restoring on another node (through a move) is not available yet.
+      restore: async ({ node }) => {
+        const selfId = pool.identity.id;
+        if (node !== null && node !== "here" && node !== selfId) throw new Error("restore to another node is not available yet");
+        await runner.restoreHere(id);
+        return { nodeId: selfId };
+      },
+      delete: () => runner.deleteTask(id),
     };
   });
 
@@ -543,6 +563,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       },
     };
   });
+
+  /** The node task `taskId` is archived on, while it is archived; null otherwise (and for a task with no row). */
+  function archivedOnNow(taskId: string): string | null {
+    const row = getTask(db, taskId);
+    return row?.state === "archived" ? row.archived_on : null;
+  }
 
   /**
    * Every local bookmark under task `taskId`'s namespace in each of its projects' replicas (the manifest's order); a

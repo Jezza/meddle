@@ -36,6 +36,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const pending = useValue(task.pending);
   const move = useValue(task.move);
   const movedTo = useValue(task.movedTo);
+  const archivedOn = useValue(task.archivedOn);
   const bookmarks = useValue(task.bookmarks);
   const nodes = useValue(pool.nodes);
   const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
@@ -68,6 +69,16 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
       </>
     );
   }
+  // An archived task has its rows here and no folder: its thread, read-only, with Restore and Delete.
+  if (state === "archived") {
+    return (
+      <>
+        {head}
+        <ArchivedControls task={task} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} />
+        <Thread session={session} readOnly />
+      </>
+    );
+  }
   const moving = state === "moving" || move !== null;
   return (
     <>
@@ -95,7 +106,7 @@ function bookmarkText(taskId: string, b: { name: string; changeId: string }): st
 
 // ─── the thread ───
 
-function Thread({ session }: { session: SessionRef }) {
+function Thread({ session, readOnly = false }: { session: SessionRef; readOnly?: boolean }) {
   const window = useValue(session.window);
   const live = useValue(session.live);
   /** Every event seen since the view opened: the window slides past events, and "load earlier" adds older ones. */
@@ -121,7 +132,7 @@ function Thread({ session }: { session: SessionRef }) {
         <button disabled={action.busy} onClick={loadEarlier}>Load earlier</button>
       )}
       {action.error !== null && <p class="error">{action.error}</p>}
-      {items.length === 0 && live === null && <p class="muted">Nothing yet: send a prompt below.</p>}
+      {items.length === 0 && live === null && <p class="muted">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
       {items.map((item, i) => <Item key={i} item={item} />)}
       {live !== null && (
         <div class="item assistant live">
@@ -307,6 +318,26 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 
 // ─── controls and composer ───
 
+/** An archived task's only controls: restore it on the node it was archived on, or delete it with its archive. */
+function ArchivedControls({ task, archivedOn }: { task: TaskRef; archivedOn: string | null }) {
+  const action = useAction();
+  const remove = () => action.run(async () => {
+    if (!confirm("Delete this task, its log and its archive? This cannot be undone.")) return;
+    await task.delete({});
+    location.hash = hashOf({ name: "pool" });
+  });
+  return (
+    <section class="controls">
+      <p class="muted">Archived{archivedOn === null ? "" : ` on ${archivedOn}`}: its folder is gone, its log is kept. Restore it to carry on.</p>
+      <div class="row">
+        <button disabled={action.busy} onClick={() => action.run(() => task.restore({ node: null }))}>Restore</button>
+        <button disabled={action.busy} onClick={remove}>Delete</button>
+      </div>
+      {action.error !== null && <p class="error">{action.error}</p>}
+    </section>
+  );
+}
+
 /** The task's controls; all of them `disabled` while it moves. */
 function Controls({ node, pool, task, disabled }: { node: NodeRef; pool: PoolRef; task: TaskRef; disabled: boolean }) {
   const state = useValue(task.state);
@@ -327,6 +358,11 @@ function Controls({ node, pool, task, disabled }: { node: NodeRef; pool: PoolRef
         {/* A turn that crashed the node too often is parked; retry says so when none is. */}
         {(state === "running" || state === "waiting") && pending.length === 0 && (
           <button disabled={off} onClick={() => action.run(() => task.retry({}))}>Retry turn</button>
+        )}
+        {/* Only an idle task archives; the node says why it refuses one (queued prompts, a home offline, …). */}
+        {state === "idle" && (
+          <button disabled={off} title="Removes the task's folder from this node and keeps its log; Restore brings it back"
+            onClick={() => action.run(() => task.archive({}))}>Archive</button>
         )}
         <label>Permission mode{" "}
           <select disabled={disabled} value={permissionMode ?? ""} onChange={(e) => {

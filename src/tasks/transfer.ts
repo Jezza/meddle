@@ -132,7 +132,7 @@ export async function exportTask(cfg: NodeConfig, db: Database, taskId: string, 
 }
 
 /** `path` split into segments; throws "bad file path" unless it is relative, non-empty and free of `.`/`..`. */
-function safeSegments(path: unknown): string[] {
+export function safeSegments(path: unknown): string[] {
   if (typeof path !== "string" || path === "" || path.startsWith("/") || path.includes("\\") || path.includes("\0")) {
     throw new Error("bad file path");
   }
@@ -142,7 +142,7 @@ function safeSegments(path: unknown): string[] {
 }
 
 /** Creates the directories of `segments` under `root`, refusing to pass through anything that is not a directory. */
-async function prepareParent(root: string, segments: string[]): Promise<string> {
+export async function prepareParent(root: string, segments: string[]): Promise<string> {
   let dir = root;
   for (const segment of segments.slice(0, -1)) {
     dir = join(dir, segment);

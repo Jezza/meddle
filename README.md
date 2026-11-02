@@ -276,6 +276,9 @@ bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fi
 bun run src/cli.ts spawn "Find out why test_sync is flaky and fix it" --project myproject   # prints: task <id> on <node>
 bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
 bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to another node
+bun run src/cli.ts task archive <task-id>   # takes an idle task's folder off its node, keeps its log
+bun run src/cli.ts task restore <task-id>   # brings an archived task back on the node it was archived on
+bun run src/cli.ts task delete <task-id>    # deletes an archived or moved task's log and archive
 ```
 
 `spawn <prompt> [--project <id|name>]... [--node <id|prefix> | --here] [--title <t>]` creates a task, places it like
@@ -291,7 +294,8 @@ project's id, or a name exactly one project of the pool has: `ambiguous project 
 `unknown project: <x>` when none does (pass the id then). An id the roster does not list yet (12 hex digits) is
 passed on to the node, which asks the online members for it. A task is
 `idle`, `running` or `waiting` (for an approval) while it lives on a node; a task moving away is `moving` on the node
-it leaves and `receiving` on the node it goes to until it arrives, and the node it left keeps it as `moved`.
+it leaves and `receiving` on the node it goes to until it arrives, and the node it left keeps it as `moved`. An
+archived task is `archived` (see [Archiving a task](#archiving-a-task)).
 
 ### Where a new task runs
 
@@ -540,15 +544,51 @@ under it. A step of a move that was already rolled back here goes no further: th
 
 ### On the node a task left
 
-Once the target has activated the task, this node writes its archive, `<data dir>/archive/<task id>.json.gz`
-(directory mode 700, file 600: the task's row, manifest, event log, transcript rows and transcript files), before it
-removes anything. It then forgets the task's workspaces and, unless it is the project's home (where they stay as the
+Once the target has activated the task, this node writes what it leaves of it, `<data dir>/moved/<task id>.json.gz`
+(directory mode 700, file 600: the task's row, manifest, event log, transcript rows and transcript files, in the same
+format as an [archive](#archiving-a-task)), before it removes anything. It then forgets the task's workspaces and, unless it is the project's home (where they stay as the
 backup), every bookmark under the task's namespace, and removes the task folder (with its Claude Code config dir) and its event and
 transcript rows. The task's row stays, as `moved`: its view here says where it went and links there, and commands on
 it answer `task has moved to <short id>`. A task can move back to a node it left.
 
-A janitor deletes archives older than seven days, when `serve` starts and every 24 hours after. meddle has no
-command to restore one.
+A janitor deletes the files in `moved/` older than seven days, when `serve` starts and every 24 hours after; meddle
+has no command to restore one. An earlier meddle kept them in `<data dir>/archive/`: the janitor applies the same rule
+there and removes that directory once it is empty. It never touches `archives/`, the archives of archived tasks.
+`task delete <task-id>` deletes a `moved` task's row (and its file in `moved/`) at once.
+
+## Archiving a task
+
+An idle task can be archived on the node that holds it, from its view in the dashboard (Archive) or with
+`task archive <task-id>`: meddle writes the task's files to `<data dir>/archives/<task id>.json.gz` (directory mode
+700, file 600: the task's row, manifest, event log, transcript rows and the transcript files under its Claude Code
+config dir), forgets its workspaces, removes its folder, keeps its event and transcript rows, and records the row as
+`archived` on this node. The task's bookmarks stay as a move's cleanup leaves them: on a project's home they stay as
+the backup, on any other node they are forgotten after the push below. Archives are kept until the task is restored
+or deleted; the seven-day janitor never touches them.
+
+An archived task renders read-only from its rows in its view (its thread, no composer and no controls), with Restore
+and Delete as the only actions; each node's card lists its archived tasks under "Archived", with Restore and Delete
+links. Prompts, moves and the other controls answer `task is archived: <id>`.
+
+Only an idle task archives: one with a turn running or waiting, prompts queued, or a move in progress is refused
+(`task is running`, `task has queued prompts`, `task is moving`, …). On a node that is not a project's home, the
+archive first sets the task's bookmarks and pushes every bookmark under its namespace to the home, as a turn end does:
+once this node forgets them, the home's copy is the only one. The home must be online, or the archive is refused with
+`cannot archive: home <short id> of <project> is offline`, and a push that fails refuses it with the push's error;
+either way the task stays idle and in place. A bookmark git refuses (such as one with a slash after the project name,
+see [Homes and replicas](#homes-and-replicas)) therefore blocks every archive of the task on a node that is not the
+home until it is deleted.
+
+`task restore <task-id>` (or Restore) brings the task back on the node it was archived on: each project's workspace
+starts on the task's project bookmark (on the project's home, the local one; elsewhere, fetched from the home with
+the rest of the task's namespace, so the home must be online: `cannot restore: home <short id> of <project> is
+offline`), the folder is provisioned again from the manifest, and the archive's files are unpacked into it (a task
+without a project's transcript into this node's slot). The task is `idle` again, its next turn resumes its session,
+and the archive is deleted; a restore that fails leaves the task archived. It prints `restored <task-id> on <short
+id>`. Restoring on another node is not available yet.
+
+`task delete <task-id>` (or Delete) deletes an archived task's archive, row, event log and transcript rows; it is
+refused for a task that is not archived or moved (`task is idle`, …). The bookmarks the home keeps for the task stay.
 
 ## Known limits
 
@@ -579,7 +619,8 @@ card shows its meddle and Claude Code versions, token, task root, resources and 
 what the roster last recorded of it (its versions, whether it hosts tasks and how many tasks it has) and when it was
 last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle
 or Claude Code versions. The Projects view lists every project of the pool (see
-[Homes and replicas](#homes-and-replicas)), and a task's view moves it (see [Moving a task](#moving-a-task)).
+[Homes and replicas](#homes-and-replicas)), and a task's view moves it (see [Moving a task](#moving-a-task)) or
+archives it (see [Archiving a task](#archiving-a-task)); a node's card lists its archived tasks under "Archived".
 
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an

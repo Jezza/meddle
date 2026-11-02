@@ -113,6 +113,7 @@ function LiveCard({ host, node, row, selfRow, open }: { host: Host; node: NodeRe
   const hostsTasks = useValue(node.hostsTasks);
   const taskRoot = useValue(node.taskRoot);
   const taskIds = useValue(node.taskIds);
+  const archivedIds = useValue(node.archivedIds);
   const openHere = (taskId: string) => open(row.nodeId, taskId);
   return (
     <section class="card" title={row.nodeId}>
@@ -139,7 +140,44 @@ function LiveCard({ host, node, row, selfRow, open }: { host: Host; node: NodeRe
           <tbody>{taskIds.map((id) => <TaskRow key={id} host={host} id={id} open={openHere} />)}</tbody>
         </table>
       )}
+      {archivedIds.length > 0 && (
+        <>
+          <h3>Archived</h3>
+          <table>
+            <thead><tr><th>Title</th><th>Archived</th><th>Projects</th><th></th></tr></thead>
+            <tbody>{archivedIds.map((id) => <ArchivedRow key={id} host={host} id={id} open={openHere} />)}</tbody>
+          </table>
+        </>
+      )}
     </section>
+  );
+}
+
+function ArchivedRow({ host, id, open }: { host: Host; id: string; open: (taskId: string) => void }) {
+  const task = useObject(host, TaskObject, { id });
+  if (task.ref === undefined) return <tr><td colSpan={4} class={task.error ? "error" : "muted"}>{task.error ?? id}</td></tr>;
+  return <ArchivedRowLoaded task={task.ref} open={open} />;
+}
+
+/** An archived task: its title (opens its read-only view), and Restore (here) and Delete links. */
+function ArchivedRowLoaded({ task, open }: { task: Ref<typeof TaskObject>; open: (taskId: string) => void }) {
+  const manifest = useValue(task.manifest);
+  const archivedOn = useValue(task.archivedOn);
+  const action = useAction();
+  const link = (label: string, run: () => Promise<unknown>) => (
+    <a href="#" class={action.busy ? "muted" : ""} onClick={(e) => { e.preventDefault(); if (!action.busy) void action.run(run); }}>{label}</a>
+  );
+  return (
+    <tr>
+      <td><a href="#" onClick={(e) => { e.preventDefault(); open(manifest.id); }}>{manifest.title}</a></td>
+      <td>{archivedOn === null ? "" : <span class="muted" title={archivedOn}>{shortId(archivedOn)}</span>}</td>
+      <td>{manifest.projects.length === 0 ? <span class="muted">no project</span> : manifest.projects.map((p) => p.name).join(", ")}</td>
+      <td>
+        {link("Restore", () => task.restore({ node: null }))}{" · "}
+        {link("Delete", async () => { if (confirm(`Delete "${manifest.title}", its log and its archive?`)) await task.delete({}); })}
+        {action.error !== null && <span class="error"> {action.error}</span>}
+      </td>
+    </tr>
   );
 }
 

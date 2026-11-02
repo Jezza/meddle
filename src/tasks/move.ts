@@ -315,21 +315,32 @@ async function reset(s: PeerStream): Promise<void> {
 }
 
 /**
- * Archives the task (decision 18), then removes it from this node (decision 19): forgets its workspaces and, unless
- * this node is the project's home (where they stay as the backup), every bookmark under the task's namespace; removes
- * its folder (the config dir with it) and its event and transcript rows. The row stays, `moved`. A rerun finds pieces
+ * Writes the task's leftover to `<data>/moved/` (decision 18, kept seven days), then removes it from this node
+ * (decision 19): `releaseFolder`, then its event and transcript rows. The row stays, `moved`. A rerun finds pieces
  * already gone.
  */
 async function removeLocalCopy(cfg: NodeConfig, db: Database, self: string, taskId: string): Promise<void> {
   const row = getTask(db, taskId);
   if (row === null) return;
-  await writeArchive(cfg, db, taskId);
+  await writeArchive(cfg, db, taskId, paths(cfg).movedFile(taskId));
+  await releaseFolder(cfg, db, self, taskId);
+  clearTaskLog(db, taskId, row.session_id);
+}
+
+/**
+ * Takes task `taskId`'s folder off this node (`selfId`): forgets its workspaces and, in each replica of a project whose
+ * home is not this node, every bookmark under the task's namespace (on the home they stay, as the backup); removes the
+ * task folder with its Claude Code config dir. Writes no archive and leaves the rows alone. A task without a row, and
+ * pieces already gone, are no-ops.
+ */
+export async function releaseFolder(cfg: NodeConfig, db: Database, selfId: string, taskId: string): Promise<void> {
+  const row = getTask(db, taskId);
+  if (row === null) return;
   const manifest = JSON.parse(row.manifest) as TaskManifest;
   for (const p of manifest.projects) {
     await workspaceForget(p.replica, `meddle-${taskId}`, cfg).catch(() => {});
-    if (getProject(db, p.id)?.home === self) continue;
+    if (getProject(db, p.id)?.home === selfId) continue;
     await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(taskId), cfg)).catch(() => {});
   }
   await rm(paths(cfg).task(taskId), { recursive: true, force: true });
-  clearTaskLog(db, taskId, row.session_id);
 }

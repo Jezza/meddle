@@ -35,6 +35,10 @@ export type TaskRow = {
   moved_to: string | null;
   /** The node a `receiving` task comes from. */
   receiving_from: string | null;
+  /** The node an `archived` task was archived on (its archive is there). */
+  archived_on: string | null;
+  /** When the task was archived (ISO). */
+  archived_at: string | null;
 };
 
 /** What the user chose for a task's later turns; an absent field takes the default. */
@@ -69,7 +73,7 @@ export function listProjectRows(db: Database): ProjectRow[] {
 
 export function insertTask(
   db: Database,
-  row: Omit<TaskRow, "created_at" | "updated_at" | "settings" | "queued" | "moved_to" | "receiving_from">,
+  row: Omit<TaskRow, "created_at" | "updated_at" | "settings" | "queued" | "moved_to" | "receiving_from" | "archived_on" | "archived_at">,
 ): void {
   const now = new Date().toISOString();
   db.query(
@@ -92,7 +96,9 @@ export function getTask(db: Database, id: string): TaskRow | null {
   return db.query<TaskRow, [string]>("SELECT * FROM tasks WHERE id = ?").get(id);
 }
 
-const TASK_PATCH_COLUMNS = ["state", "started", "turns", "session_id", "manifest", "settings", "queued", "moved_to", "receiving_from"] as const;
+const TASK_PATCH_COLUMNS = [
+  "state", "started", "turns", "session_id", "manifest", "settings", "queued", "moved_to", "receiving_from", "archived_on", "archived_at",
+] as const;
 
 /** Sets the given columns of a task row (`null` clears a nullable one; `undefined` leaves it). */
 export function updateTask(db: Database, id: string, patch: Partial<Pick<TaskRow, (typeof TASK_PATCH_COLUMNS)[number]>>): void {
@@ -112,9 +118,17 @@ export function listTasks(db: Database): TaskRow[] {
   return db.query<TaskRow, []>("SELECT * FROM tasks ORDER BY created_at, id").all();
 }
 
-/** The tasks that live on this node: every state but `moved` (gone to another node) and `receiving` (not here yet). */
+/**
+ * The tasks that live on this node: every state but `moved` (gone to another node), `receiving` (not here yet) and
+ * `archived` (only its rows and archive are here).
+ */
 export function listLiveTasks(db: Database): TaskRow[] {
-  return db.query<TaskRow, []>("SELECT * FROM tasks WHERE state NOT IN ('moved', 'receiving') ORDER BY created_at, id").all();
+  return db.query<TaskRow, []>("SELECT * FROM tasks WHERE state NOT IN ('moved', 'receiving', 'archived') ORDER BY created_at, id").all();
+}
+
+/** The tasks archived on this node (state `archived`; a `moved` row that still names where it was archived is not one). */
+export function listArchivedTasks(db: Database): TaskRow[] {
+  return db.query<TaskRow, []>("SELECT * FROM tasks WHERE state = 'archived' ORDER BY created_at, id").all();
 }
 
 /** How many of this node's tasks are in state `running` or `waiting`. */

@@ -14,6 +14,7 @@ export const TaskStateSchema = Type.Union([
   Type.Literal("moving"),
   /** Moved to another node (`movedTo`); nothing of it is left here but its row. */
   Type.Literal("moved"),
+  /** Archived on `archivedOn`: its rows and archive are there, its folder is not; it renders read-only. */
   Type.Literal("archived"),
 ]);
 
@@ -103,7 +104,10 @@ const nodeState = {
   metrics: Nullable(NodeMetricsSchema),
   /** Whether this node holds a usable token now (`pickToken`), and when that one expires. */
   token: Type.Object({ present: Type.Boolean(), expiresAt: Nullable(Type.String()) }),
+  /** The tasks that live on this node (archived, moved and received-but-not-yet-active ones left out). */
   taskIds: Type.Array(Type.String()),
+  /** The tasks archived on this node: their rows and archive are here, their folder is not. */
+  archivedIds: Type.Array(Type.String()),
   projectIds: Type.Array(Type.String()),
   models: Type.Array(Type.String()),
   /** Newest last; the newest 50 are kept. */
@@ -197,6 +201,8 @@ export const TaskObject = remote("meddle.task", {
         move: Nullable(Type.Object({ to: Type.String(), phase: Type.String(), error: Nullable(Type.String()) })),
         /** The node a `moved` task went to. */
         movedTo: Nullable(Type.String()),
+        /** The node an `archived` task was archived on (its archive is there); null for any other. */
+        archivedOn: Nullable(Type.String()),
         /**
          * Every local bookmark under the task's namespace, per project (its id) in the manifest's order: the project's
          * own and the side bookmarks. Re-read like `ProjectObject.heads`: when projects change, when the task changes
@@ -220,6 +226,18 @@ export const TaskObject = remote("meddle.task", {
          * with the reason when the move is refused; resolves once it has started (`move` follows it).
          */
         moveTo: method(Type.Object({ nodeId: Type.String(), now: Type.Boolean() })),
+        /**
+         * Archives the idle task on its node: its folder goes, its rows stay, and on a node that is not a project's
+         * home the task's bookmarks are pushed to the home first. Rejects with the reason when refused.
+         */
+        archive: method(Type.Object({})),
+        /**
+         * Restores an archived task on the node `node` names: null or `"here"` (or this node's id), the node it was
+         * archived on; another node is not available yet. Answers the node it is on.
+         */
+        restore: method(Type.Object({ node: Nullable(Type.String()) }), Type.Object({ nodeId: Type.String() })),
+        /** Deletes an archived or moved task's rows and archive from its node; refused for any other. */
+        delete: method(Type.Object({})),
       },
     },
   },

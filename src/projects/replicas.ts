@@ -169,8 +169,10 @@ function jjFailure(err: unknown): unknown {
  * home never fetches, so this push is the backup), first pointing the task's project bookmark `primary` at its change
  * when given. Under the repo lock:
  * 1. Notes what this node changed since its last push: each local bookmark of the namespace whose commit differs from
- *    its tracked `<name>@<home>` entry, or that tracks no such entry, and `primary`.
- * 2. Fetches the namespace from the home (nothing there is fine: a task's first push) and tracks it there.
+ *    its tracked `<name>@<home>` entry, or that tracks no such entry.
+ * 2. Fetches the namespace from the home (nothing there is fine: a task's first push) and tracks it there; then notes
+ *    `primary` at the commit its change has now (resolved after the fetch, never before it: a caller that did not
+ *    set the bookmark first must not pin it to a commit the fetch has since rewritten).
  * 3. Puts back what it noted, by commit id (a commit the fetch hid still resolves by it): this node's changes win,
  *    sideways or backwards too. A bookmark it did not change keeps what the fetch made of it: deleted or moved on the
  *    home, it is deleted or moved here.
@@ -196,9 +198,9 @@ export async function pushNamespace(
         const h = atHome(before, b.name);
         if (h === undefined || !h.tracked || h.conflicted || h.commitId !== b.commitId) changed.set(b.name, b.commitId);
       }
-      if (primary !== null) changed.set(primary.name, await commitOf(cfg, replica, primary.changeId));
       await fetchBookmarks(cfg, replica, home, [glob], { requireMatch: false });
       await track(replica, glob, remote, cfg);
+      if (primary !== null) changed.set(primary.name, await commitOf(cfg, replica, primary.changeId));
       const after = await bookmarkRefs(replica, glob, cfg);
       const local = new Map(after.filter((b) => b.remote === null).map((b) => [b.name, b]));
       const want = new Map(changed);
