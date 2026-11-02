@@ -424,8 +424,10 @@ export const PoolObject = remote("meddle.pool", {
         activeTokenId: Nullable(Type.String()),
         /** Members report more than one meddle or Claude Code version. */
         mixedVersions: Type.Boolean(),
-        /** The pool's settings with a value, by key. */
-        settings: Type.Array(Type.Object({ key: Type.String(), value: Type.String() })),
+        /** The pool's settings with a value, by key, with the node that last set each and when. */
+        settings: Type.Array(
+          Type.Object({ key: Type.String(), value: Type.String(), setBy: Type.String(), updatedAt: Type.String() }),
+        ),
       },
       methods: {
         invite: method(Type.Object({}), Type.Object({ ticket: Type.String() })),
@@ -433,6 +435,12 @@ export const PoolObject = remote("meddle.pool", {
         remove: method(Type.Object({ nodeId: Type.String() })),
         /** The tokens changed on this node (written by the CLI); re-read them and tell the pool. */
         tokenChanged: method(Type.Object({})),
+        /**
+         * Makes the token with this full id usable again (`ok`, its `until` and `detail` cleared) and tells the pool;
+         * refuses `no such token: <id>` for an id this node does not list or lists as removed
+         * (`no such token` when it is not an id at all).
+         */
+        enableToken: method(Type.Object({ id: Type.String() })),
         /** Sets a pool setting; refuses an invalid key, a reserved env name or an invalid value. */
         setSetting: method(Type.Object({ key: Type.String(), value: Type.String() })),
         /** Unsets a pool setting. */

@@ -5,7 +5,7 @@ import Type from "typebox";
 import { forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
 import { NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema, TokenMetaSchema } from "../state/contracts";
-import { listTokens, pickToken, tokenRow, tokenValue } from "../token";
+import { TOKEN_ID, enableToken, listTokens, pickToken, tokenRow, tokenValue } from "../token";
 import { isNodeId } from "./identity";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore, WireRosterRow } from "./store";
@@ -132,10 +132,13 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     const live = self.state("live", LiveSchema, { init: liveNow });
     const online = self.state("online", Type.Array(Type.String()), { init: onlineNow });
     const poolId = self.state("poolId", defaultState.poolId, { init: () => store.pool().poolId });
-    const listed = self.state("settings", defaultState.settings, { init: () => settings.list() });
+    /** The settings with a value, as the dashboard lists them: who set each, and when. */
+    const withValue = () => settings.rows()
+      .flatMap(({ key, value, setBy, updatedAt }) => (value === null ? [] : [{ key, value, setBy, updatedAt }]));
+    const listed = self.state("settings", defaultState.settings, { init: withValue });
     self.on("changes", deps.changes, async (_event, ctx) => {
       roster.replace(ctx, store.roster());
-      listed.replace(ctx, settings.list());
+      listed.replace(ctx, withValue());
       tokens.replace(ctx, listTokens(db));
       online.replace(ctx, onlineNow());
       poolId.replace(ctx, store.pool().poolId);
@@ -154,6 +157,14 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       join: ({ ticket }) => deps.join(ticket),
       remove: ({ nodeId }) => deps.remove(nodeId),
       tokenChanged: () => deps.tokenChanged(),
+      enableToken: async ({ id }) => {
+        // Only a full id the table lists (a label is the CLI's convenience; the dashboard always has the id).
+        const row = TOKEN_ID.test(id) ? tokenRow(db, id) : null;
+        // The text the caller sent is echoed only when it has an id's shape.
+        if (row === null || row.removed) throw new Error(TOKEN_ID.test(id) ? `no such token: ${id}` : "no such token");
+        enableToken(db, row.id);
+        await deps.tokenChanged();
+      },
       setSetting: ({ key, value }) => deps.setSetting(key, value),
       unsetSetting: ({ key }) => deps.unsetSetting(key),
     };

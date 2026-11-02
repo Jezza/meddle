@@ -6,11 +6,13 @@ Claude Code session running in auto mode, which you watch, approve, interrupt an
 the fidelity of sitting at that machine's terminal. The services find each other and form one pool, sharing one
 set of Claude logins and each project's memory, and a task can move between machines without losing its conversation.
 
-Status: Plan 3, repos across the pool and task moves. Nodes form a pool over iroh: they find each other through a
-lighthouse, share their login tokens, and the dashboard of any node shows every node and opens its tasks. A project's
-repo and memory follow its tasks to whichever node they run on, and a task moves between nodes with its workspaces,
-conversation and queued prompts. Moving a project's home to another node is not here yet (see
-[Known limits](#known-limits)).
+Status: Plan 4, settings, tokens, placement, archive and spawn. Nodes form a pool over iroh: they find each other
+through a lighthouse, share their settings and an ordered list of login tokens (a turn whose login hits a limit
+switches to the next), and the dashboard of any node shows every node and opens its tasks. meddle places a new task
+on a node unless you name one, a task may have no project, and `spawn` creates a task and sends its first prompt in
+one command. A project's repo and memory follow its tasks to whichever node they run on, a task moves between nodes
+with its workspaces, conversation and queued prompts, and an idle task can be archived off its node and restored on
+any node. Moving a project's home to another node is not here yet (see [Known limits](#known-limits)).
 
 ## Install
 
@@ -66,6 +68,9 @@ bun run src/cli.ts token list                             # or token status
 bun run src/cli.ts token remove <id|label>
 bun run src/cli.ts token enable <id|label>
 ```
+
+The dashboard's Settings view lists the same tokens, and its Enable button does what `token enable` does for an
+`exhausted` or `disabled` one; adding and removing stay on the CLI, so a value never passes through the dashboard.
 
 A token's id is the first 16 hex characters of the SHA-256 of its value, so the same token added twice, on one node
 or on two, is listed once. Adding it again with `--label` renames it, and adding a removed token brings it back.
@@ -211,7 +216,8 @@ bun run src/cli.ts config list
 ```
 
 `config list` prints one `<key> = <value>` line per setting, by key. Without a running node they fail with
-`start "meddle serve" first`.
+`start "meddle serve" first`. The dashboard's Settings view lists the settings with the node that set each, unsets
+one, and sets a key picked from the table below (an `env.` key with the name typed).
 
 | Key | Applied as |
 | --- | --- |
@@ -319,8 +325,10 @@ projects it holds with its summary, at once when a task starts or ends, a task i
 every 15 s. The node that took the request asks the chosen node to create the task (and to run its first prompt, when
 one is given); the task is born there, no move involved. Only a member may ask. A node of an older meddle reports none
 of this: it counts as idle, with no limit and no projects, and it cannot create a task for another node, so a task
-placed on it fails; name a node with `--node` or `--here` while the pool upgrades. A task without a project cannot
-move to an older node either.
+placed on it fails; name a node with `--node` or `--here` while the pool upgrades. Worse, an older node reports
+`running` 0, so placement tends to pick it. Upgrade every node of the pool together: the nodes' peer interface
+gained calls in this release without a new version, so a newer node cannot use an older node's at all: it can neither
+create a task there nor move one to it.
 
 ### Tasks without a project
 
@@ -330,6 +338,10 @@ no project ticked. Claude Code then starts in the task folder with the user sett
 directory: they travel with the task and end with it, and nothing syncs them. The task folder holds only a generated
 `CLAUDE.md` saying so; it is scratch space that moves with the task. Such a task has no bookmarks, pushes nothing and
 syncs no memory; meddle places it by load alone. A task with a project keeps per-project memory as before.
+
+Claude Code keys the transcript and memory of such a task on the task folder's path, and meddle does not shorten a
+long path the way Claude Code does when it makes that key, so a task without a project under a very long task root
+may not resume its session.
 
 ## Projects across the pool
 
@@ -366,11 +378,12 @@ fetches a task's bookmarks itself. What the node holding the task changed since 
 replace the home's, sideways or backwards too. A bookmark it did not change follows the home: one deleted or moved
 in the home's repo is deleted or moved on the holder at the next turn end, so a side bookmark is deleted on the home.
 The home refuses deletions pushed to it, so a side bookmark deleted on the holder comes back from the home's copy at
-the next turn end. A push that fails (the home offline, no jj identity: see [Install](#install), a bookmark git refuses)
-does not fail the turn: it is logged as `meddle: push: meddle/task/<task id>/* to <short id> failed: …` (each
-distinct line at most once a minute, so a missing identity does not fill the log), and the next turn end pushes
-again. When the home refuses one bookmark, the others still land. A turn that fails pushes nothing; the next
-completed turn pushes its work too.
+the next turn end: while the task is on a node that is not the home, delete a side bookmark in the home's repo. A
+push that fails (the home offline, no jj identity: see [Install](#install), a bookmark git refuses, such as one with
+a slash after the project name, which fails every turn end's push until it is deleted) does not fail the turn: it is
+logged as `meddle: push: meddle/task/<task id>/* to <short id> failed: …` (each distinct line at most once a minute,
+so a missing identity does not fill the log), and the next turn end pushes again. When the home refuses one
+bookmark, the others still land. A turn that fails pushes nothing; the next completed turn pushes its work too.
 
 A replica names its remote for another node after that node's short id, the first 10 characters of its node id, so
 on a node that is not the home `trunk@<short id>` is the home's trunk.
@@ -563,8 +576,9 @@ An idle task can be archived on the node that holds it, from its view in the das
 700, file 600: the task's row, manifest, event log, transcript rows and the transcript files under its Claude Code
 config dir), forgets its workspaces, removes its folder, keeps its event and transcript rows, and records the row as
 `archived` on this node. The task's bookmarks stay as a move's cleanup leaves them: on a project's home they stay as
-the backup, on any other node they are forgotten after the push below. Archives are kept until the task is restored
-or deleted; the seven-day janitor never touches them.
+the backup, on any other node they are forgotten after the push below. Only committed work (in the bookmarks) and the
+conversation survive an archive: files git ignores inside a workspace are lost with the folder. Archives are kept
+until the task is restored or deleted; the seven-day janitor never touches them.
 
 An archived task renders read-only from its rows in its view (its thread, no composer and no controls), with Restore
 and Delete as the only actions. The pool view lists the archived tasks of every online node in one "Archived" list,
@@ -604,14 +618,16 @@ resumes the session, with no follow-up prompt), the archive becomes the move's l
 seven days, see [On the node a task left](#on-the-node-a-task-left)), the staged bookmarks are forgotten again off the
 home, the event and transcript rows go, and a `moved` row remains. A restore-move that fails (the target refuses, the
 home is offline, a restart parks it) leaves the task `archived` here again, its archive intact and nothing staged. The
-command prints `restoring to <short id>` once the move has started; the task's view in the dashboard shows how it goes.
+command prints `restoring to <short id>` once the move has started and returns; the move goes on in the background,
+and the task's view in the dashboard shows how it goes (`status` does not).
 
 `task delete <task-id>` (or Delete) deletes an archived task's archive, row, event log and transcript rows; it is
-refused for a task that is not archived or moved (`task is idle`, …). The bookmarks the home keeps for the task stay.
+refused for a task that is not archived or moved (`task is idle`, …). The bookmarks the home keeps for the task stay;
+`jj bookmark delete 'glob:meddle/task/<task id>/*'` in the project's repo on the home removes them.
 
 ## Known limits
 
-- A project's home cannot be moved to another node yet (planned for Plan 4). While the home is offline, other nodes
+- A project's home cannot be moved to another node yet (left for a later plan). While the home is offline, other nodes
   cannot clone its projects, and create tasks of them only from the `trunk` they fetched last; their tasks' turns still run, and their pushes and memory syncs
   are logged and retried at the next turn end.
 - When a node's last push of a project's memory to the home failed, the memory commits it has not pushed do not
@@ -622,6 +638,30 @@ refused for a task that is not archived or moved (`task is idle`, …). The book
 - Background shells and subagents do not travel on "move now", and the dashboard cannot list them.
 - When a node restarts in the middle of a turn, the turn's rerun resumes the session and tells Claude to carry on;
   text you sent into that turn that Claude Code had not yet written to its transcript is not sent again.
+- Every node of a pool must be upgraded together: the nodes' peer interface gained calls without a new version, so a
+  newer node cannot use an older node's at all (no task created there, no move to it), and placement tends to pick an
+  older node, which reports no running turns (see [Where a new task runs](#where-a-new-task-runs)).
+- The commits meddle makes no longer need a jj user config on each node: the pool's `jj.user` and `jj.email` settings
+  give every node one identity (see [Install](#install)). Without them, and without a node's own config, pushes to a
+  project's home fail.
+- A side bookmark cannot be deleted on a node that is not the project's home while the task is there: the home
+  refuses deletions and the next turn end restores it. Delete it in the home's repo. A bookmark name git refuses (a
+  slash after the project name) fails every turn end's push, and every archive of the task off the home, until it is
+  deleted.
+- Deleting a task leaves its bookmarks in each project's repo on the home; `jj bookmark delete
+  'glob:meddle/task/<task id>/*'` there removes them.
+- Archiving on a node that is not a project's home needs every such home online: the push to the home is the archive's
+  precondition. Files git ignores inside a workspace are lost on archive; only committed work and the conversation are
+  kept.
+- Archives in `<data dir>/archives/` are kept until the task is restored or deleted, however old; the files in
+  `<data dir>/moved/` (what a task that moved away, or an archive restored on another node, left) are deleted after
+  seven days, and meddle has no command to restore one.
+- `task restore` to another node prints `restoring to <short id>` and finishes in the background: the dashboard shows
+  its progress, `status` does not.
+- Tokens from different organisations may not offer the same models: a turn that switches to the next token may run
+  under a login whose organisation does not allow the task's model, and fail there.
+- Claude Code keys a task without a project on its folder's path, and meddle does not shorten long paths the way
+  Claude Code does, so such a task under a very long task root may not resume its session.
 
 ## Dashboard
 
@@ -632,8 +672,9 @@ bun run src/cli.ts serve
 Then open <http://127.0.0.1:7777/> (`MEDDLE_PORT` changes the port). The dashboard binds to localhost only.
 
 The dashboard of any node shows the whole pool: a card per node with its state (online, offline or removed); the
-notifications of every online node; and a form for a new task, placed by meddle or on a chosen online node that
-hosts tasks (see [Where a new task runs](#where-a-new-task-runs)). An online node's
+notifications of every online node; and a form for a new task, placed by meddle (the node select's Automatic, the
+default) or on a chosen online node that hosts tasks (see [Where a new task runs](#where-a-new-task-runs)), with any
+of the pool's projects or none, and an optional first prompt that starts the task's first turn. An online node's
 card shows its meddle and Claude Code versions, token, task root, resources and tasks. An offline member's card shows
 what the roster last recorded of it (its versions, whether it hosts tasks and how many tasks it has) and when it was
 last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle
@@ -644,8 +685,15 @@ one "Archived" list naming the node that holds each, and Restore offers a node s
 
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an
-offline member 503. Settings shows this node's id, the pool id, the members, invites, joining another pool and the
-tokens in order, with the one a turn would use now marked active.
+offline member 503.
+
+Settings shows this node's id, the pool id, the members (with Remove), invites and joining another pool; then the
+pool settings, as a table of key, value and the node that set it, each with Unset, and a form that sets a key picked
+from `jj.user`, `jj.email`, `lighthouse.url`, `limits.running` or `env.<NAME>` (see [Pool settings](#pool-settings)),
+under a note that every member and its dashboard see these values, so none is for a secret; then the tokens in
+order (label, id, status, set by, expiry), with the one a turn would use now marked active and an Enable button on
+each `exhausted` or `disabled` one. Token values never pass through the dashboard: tokens are added and removed with
+the CLI.
 
 ## Service
 
@@ -665,3 +713,4 @@ and `systemctl --user enable --now meddle.service`, and prints the task-root com
 - [Plan 1: single node](docs/superpowers/plans/2026-10-30-meddle-single-node.md)
 - [Plan 2: pool over iroh](docs/superpowers/plans/2026-10-31-meddle-pool.md)
 - [Plan 3: repos across the pool and task moves](docs/superpowers/plans/2026-10-31-meddle-mesh.md)
+- [Plan 4: settings, tokens, placement, archive and spawn](docs/superpowers/plans/2026-11-02-meddle-settings-placement-archive.md)

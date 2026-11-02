@@ -11,7 +11,7 @@ import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
 import { NodeObject, PeerObject, PoolObject } from "../src/state/contracts";
-import { addToken, tokenId, tokenValue } from "../src/token";
+import { addToken, markToken, removeToken, tokenId, tokenValue } from "../src/token";
 import { VERSION } from "../src/version";
 import { initColocated } from "../src/jj";
 import { addProjectFromFolder } from "../src/projects/project";
@@ -161,6 +161,54 @@ test("tokenChanged replicates the tokens; remove propagates and the removed node
     await until(poolB.nodes, (rows) => rows.some((r) => r.nodeId === B.id && r.status === "removed"));
     expect(B.net.online()).toEqual([]);
     await expect(poolA.remove({ nodeId: A.id })).rejects.toThrow("a node cannot remove itself");
+  });
+}, 15_000);
+
+test("the dashboard enables a token by its full id and the pool learns it; anything else is refused", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    const poolA = a!.pool;
+    const poolB = b!.pool;
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+
+    // `tok` exhausted on A, and the pool told: B lists it so and no node has a usable token
+    const tok = tokenId("tok");
+    markToken(A.db, tok, "exhausted", "2100-01-01T00:00:00.000Z", "five_hour");
+    await poolA.tokenChanged({});
+    await until(poolB.tokens, (ts) => ts.some((t) => t.id === tok && t.status === "exhausted"));
+    await until(poolA.activeTokenId, (id) => id === null);
+
+    await poolA.enableToken({ id: tok });
+    await until(poolA.tokens, (ts) => ts.some((t) => t.id === tok && t.status === "ok" && t.until === null && t.detail === null));
+    await until(poolA.activeTokenId, (id) => id === tok);
+    await until(poolB.tokens, (ts) => ts.some((t) => t.id === tok && t.status === "ok"));
+
+    // an unknown id, a label (the CLI's convenience, not the dashboard's) and a removed token are refused
+    await expect(poolA.enableToken({ id: "0".repeat(16) })).rejects.toThrow(`no such token: ${"0".repeat(16)}`);
+    const labelled = await addToken(A.cfg, A.db, "tok2", { label: "second", setBy: A.id });
+    await expect(poolA.enableToken({ id: "second" })).rejects.toThrow(/: no such token$/);
+    await expect(poolA.enableToken({ id: "x\u001b[2J" })).rejects.toThrow(/: no such token$/);
+    await removeToken(A.cfg, A.db, labelled.id);
+    await expect(poolA.enableToken({ id: labelled.id })).rejects.toThrow(`no such token: ${labelled.id}`);
+  });
+}, 15_000);
+
+test("the dashboard's settings show who set each one", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+    await a!.pool.setSetting({ key: "jj.user", value: "Lab" });
+    const row = { key: "jj.user", value: "Lab", setBy: A.id, updatedAt: expect.any(String) };
+    await until(a!.pool.settings, (rows) => rows.length === 1);
+    expect(a!.pool.settings.value).toEqual([row]);
+    await until(b!.pool.settings, (rows) => rows.length === 1);
+    expect(b!.pool.settings.value).toEqual([row]);
+    await b!.pool.unsetSetting({ key: "jj.user" });
+    await until(a!.pool.settings, (rows) => rows.length === 0);
   });
 }, 15_000);
 

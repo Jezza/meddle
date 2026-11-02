@@ -597,10 +597,10 @@ chord objects, replicated; contracts are the builder's.
 
 | Object | State |
 |---|---|
-| Pool | roster, token metadata (set-by, set-at, expires-at), versions |
-| Node | identity, hostname, online, resources sampled, budget, versions, tasks owned |
+| Pool | roster (each member's summary: versions, hosts tasks, task count, running turns, running limit, projects held with their home), settings (key, value, set by, updated at; an unset kept as a tombstone), tokens in order (id, label, set by, set at, expires at, status `ok` / `exhausted` until a time / `disabled` with a reason; removed ones kept so the removal replicates), the token a turn would use now, versions |
+| Node | identity, hostname, online, resources sampled, budget, versions, tasks owned, archived tasks held, whether it holds a usable token |
 | Project | id, name, upstream, context, nodes holding it with heads, memory head |
-| Task | id, title, state (`new`, `provisioning`, `idle`, `running`, `waiting`, `moving`, `archived`), owner, projects with parent and current change, session id, queue |
+| Task | id, title, state (`new`, `provisioning`, `idle`, `running`, `waiting`, `moving`, `receiving`, `moved`, `archived`), owner (the node it was placed on or moved to; for an archived task, the node holding its archive), zero or more projects with parent and current change, the bookmarks under its namespace, session id, queue |
 | Session | a window over the event log, pending approvals, live mode, model, effort, usage, context size |
 
 Durable storage holds the full event log and transcripts; chord carries
@@ -828,8 +828,9 @@ its running-turn count for this.
 ### 21.4 Archive and restore
 
 Archiving an idle task on the node that holds it: write the task's files
-(the manifest, the transcript tree, the config directory minus symlinks)
-to `<data>/archives/<taskId>.json.gz`, forget the workspaces, remove the
+(the manifest and the transcript tree under the config directory;
+everything else there is a symlink or regenerated) to
+`<data>/archives/<taskId>.json.gz`, forget the workspaces, remove the
 folder, keep the event and transcript rows, set the row `archived` with
 `archivedOn` = this node. Task bookmarks stay as a move's cleanup leaves
 them: the backup on the home, forgotten elsewhere after the final push.

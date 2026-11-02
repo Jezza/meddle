@@ -210,11 +210,13 @@ async function s2() {
 async function s3() {
   const scn = "s3";
   await writeFile(`${S}/nodes/a/token.txt`, "tok-lab\n");
-  const r = await meddle("a", "token", "set", "--file", `${S}/nodes/a/token.txt`);
-  check(scn, "token set on a", r.code === 0, r.out || r.err);
-  const ms = await waitFor(async () => (await meddle("c", "token", "status")).out.includes("present: true"), 30_000);
-  check(scn, "token status on c present", ms !== null, `after ${secs(ms)}`);
-  const f = await readFile(`${S}/nodes/c/d/secrets/claude-token`, "utf8").catch(() => "(missing)");
+  const r = await meddle("a", "token", "add", "--file", `${S}/nodes/a/token.txt`, "--label", "lab");
+  // `token <id> (<label>)`: the id names the value file every node pulls
+  const id = /^token ([0-9a-f]{16}) \(lab\)$/m.exec(r.out)?.[1] ?? null;
+  check(scn, "token add on a", r.code === 0 && id !== null, r.out || r.err);
+  const ms = await waitFor(async () => id !== null && (await meddle("c", "token", "list")).out.includes(`active: ${id}`), 30_000);
+  check(scn, "token list on c shows it active", ms !== null, `after ${secs(ms)}`);
+  const f = id === null ? "(no id)" : await readFile(`${S}/nodes/c/d/secrets/tokens/${id}`, "utf8").catch(() => "(missing)");
   check(scn, "c's data dir has the token file", f.trim() === "tok-lab", JSON.stringify(f));
 }
 
