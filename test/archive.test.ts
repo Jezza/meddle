@@ -3,6 +3,8 @@ import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type { SendStream } from "@number0/iroh";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { shortId } from "../src/pool/ids";
@@ -10,9 +12,11 @@ import { NodeObject, SessionObject, TaskObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
 import { getTask, listArchivedTasks, listLiveTasks, updateTask } from "../src/store/records";
 import { readArchive, sweepArchiveTemps, writeArchive } from "../src/tasks/archive";
+import { ALPN_POOL, StreamReader } from "../src/pool/frames";
+import { exportArchive, exportTask, importTask, type Receipt } from "../src/tasks/transfer";
 import { transcriptPath, type TaskManifest } from "../src/tasks/manifest";
 import { setupNode } from "./helpers";
-import { linkClient, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+import { endpointPair, linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** Sends `text` to the task on `node` and waits for the turn to end. */
 async function promptAndWait(node: GitPoolNode, taskId: string, text: string): Promise<void> {
@@ -117,7 +121,7 @@ test("an idle task archived on its project's home keeps its rows and bookmarks, 
       await expect(A.runner.moveTo(m.id, "0".repeat(64), false)).rejects.toThrow("task is archived");
       await expect(task.interrupt({})).rejects.toThrow("task is archived");
       await expect(task.archive({})).rejects.toThrow("task is archived");
-      await expect(task.restore({ node: "f".repeat(64) })).rejects.toThrow("restore to another node is not available yet");
+      await expect(task.restore({ node: "f".repeat(64) })).rejects.toThrow("ffffffffff is not a member of this pool");
 
       // Restored here: folder, workspace and transcript back, the archive gone, and the next turn resumes the session.
       expect(await task.restore({ node: "here" })).toEqual({ nodeId: A.id });
@@ -294,3 +298,211 @@ test("deleting an archived task whose archive stopped before its folder was remo
     await close();
   }
 }, 20_000);
+
+// ─── restore anywhere (Task 8) ───
+
+/** Sends a task with `exporter` over a fresh stream into `to` (`importTask`); the sender's receipt and the receiver's. */
+async function transferInto(
+  to: Awaited<ReturnType<typeof setupNode>>, taskId: string, exporter: (send: SendStream) => Promise<Receipt>,
+): Promise<{ sent: Receipt; got: Receipt }> {
+  const pair = await endpointPair();
+  try {
+    await mkdir(paths(to.cfg).taskConfig(taskId), { recursive: true });
+    const { a, b } = await pair.connect(ALPN_POOL);
+    const out = await a.openBi();
+    const sending = exporter(out.send);
+    const reader = new StreamReader((await b.acceptBi()).recv);
+    const got = await importTask(to.cfg, to.db, reader, { taskId });
+    return { sent: await sending, got: got.receipt };
+  } finally {
+    await pair.close();
+  }
+}
+
+async function closeNode(n: Awaited<ReturnType<typeof setupNode>>): Promise<void> {
+  await n.harness.close();
+  n.db.close();
+  await rm(n.home, { recursive: true, force: true });
+}
+
+/** Polls until `harness` has no `meddle.move` left (done, failed or aborted). */
+async function moveSettled(node: GitPoolNode): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const { tasks } = await node.harness.harness.inspect(BACKGROUND_CONTEXT);
+    const move = tasks.find((t) => t.record.kind === "meddle.move");
+    if (move === undefined) return;
+    if (Date.now() > deadline) throw new Error(`the move is still ${JSON.stringify(move.state)} at ${JSON.stringify(move.record.state)}`);
+    await Bun.sleep(25);
+  }
+}
+
+function statesOf(node: GitPoolNode, taskId: string): string[] {
+  const seen: string[] = [];
+  node.runner.onState((id, s) => { if (id === taskId) seen.push(s); });
+  return seen;
+}
+
+function resumes(node: GitPoolNode, taskId: string): boolean[] {
+  return listEvents(node.db, taskId)
+    .filter((e) => (e.message as { subtype?: string }).subtype === "turn_started")
+    .map((e) => (e.message as { resume: boolean }).resume);
+}
+
+test("exportArchive sends an archived task as exportTask sent it before: importTask takes the frames and the receipts match, hash included", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  const R1 = await setupNode();
+  const R2 = await setupNode();
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    A.db.query("INSERT INTO transcript (project_key, session_id, subpath, seq, uuid, ts, json) VALUES (?, ?, '', 1, NULL, 0, '{}')").run(m.primaryProjectId, m.sessionId);
+    A.db.query("INSERT INTO transcript (project_key, session_id, subpath, seq, uuid, ts, json) VALUES (?, ?, 'subagents/x', 1, 'u', 0, '{\"a\":1}')").run(m.primaryProjectId, m.sessionId);
+    await A.runner.setModel(m.id, "claude-test");
+    const before = await transferInto(R1, m.id, (send) => exportTask(A.cfg, A.db, m.id, send));
+    expect(before.got).toEqual(before.sent);
+    expect(before.sent).toMatchObject({ transcript: 2 });
+    expect(before.sent.files).toBeGreaterThan(0);
+
+    await A.runner.archive(m.id);
+    const archive = await readArchive(paths(A.cfg).archiveFile(m.id));
+    const after = await transferInto(R2, m.id, (send) => exportArchive(A.cfg, archive, send));
+    expect(after.sent).toEqual(before.sent);
+    expect(after.got).toEqual(after.sent);
+    expect(after.sent.sha256).toBe(before.sent.sha256);
+  } finally {
+    await closeNode(R1);
+    await closeNode(R2);
+    await close();
+  }
+}, 30_000);
+
+test("restore with no node named lands a task archived off its project's home on the home through a move: staged during the handoff, forgotten after, the archive becomes the leftover, and it resumes there", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const owner = linkClient(A.host);
+  try {
+    // B is the project's home; the task ran and is archived on A.
+    const m = await A.runner.create({ title: "t", projectIds: [B.project.id] });
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    const replicaA = paths(A.cfg).replica(B.project.id);
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    const change = await changeAt(A, workspaceA, "@");
+    await A.runner.archive(m.id);
+    expect(await namespace(A, replicaA, m.id)).toEqual({ local: [], remote: 0 });
+    await peerReady(A, B);
+
+    let staged: { local: string[]; remote: number } | null = null;
+    B.hooks.beforeReceive = async () => { staged = await namespace(A, replicaA, m.id); };
+    const states = statesOf(A, m.id);
+    const task = await owner.client.get(TaskObject, { id: m.id });
+    try {
+      expect(await task.restore({ node: null })).toEqual({ nodeId: B.id });
+    } finally {
+      task.release();
+    }
+    await moveSettled(A);
+
+    // A fetched the task's namespace from B before B fetched it from A.
+    expect(staged).not.toBeNull();
+    expect(staged!.local).toEqual([`meddle/task/${m.id}/a ${change}`]);
+    expect(states).toEqual(["moving", "moved"]);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(await namespace(A, replicaA, m.id)).toEqual({ local: [], remote: 0 });
+    expect(countRows(A, m)).toEqual({ events: 0, transcript: 0 });
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(false);
+    expect((await readdir(paths(A.cfg).archives)).filter((f) => f.startsWith(m.id))).toEqual([]);
+    const leftover = paths(A.cfg).movedFile(m.id);
+    expect((await readArchive(leftover)).manifest).toEqual(m);
+    expect(Date.now() - (await stat(leftover)).mtimeMs).toBeLessThan(60_000);
+    expect(A.logs.filter((l) => l.startsWith("meddle: move:"))).toEqual([]);
+
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", archived_on: null, receiving_from: null, turns: 1 });
+    expect(await changeAt(B, join(paths(B.cfg).task(m.id), "a"), "@-")).toBe(change);
+    await promptAndWait(B, m.id, "Carry on.");
+    expect(resumes(B, m.id)).toEqual([false, true]);
+  } finally {
+    await owner.close();
+    await close();
+  }
+}, 45_000);
+
+test("restore on a named node from a node that is not the project's home stages the task's side bookmarks there during the handoff and forgets them after", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    // A is the home; the task lives on B, with a side bookmark, and is archived there (pushed to A).
+    const m = await B.runner.create({ title: "t", projectIds: [A.project.id] });
+    const replicaB = paths(B.cfg).replica(A.project.id);
+    const workspaceB = join(paths(B.cfg).task(m.id), "a");
+    await writeFile(join(workspaceB, "note.txt"), "made on B\n");
+    await jj(["bookmark", "create", `meddle/task/${m.id}/a.spike`, "-r", "@"], workspaceB, B.cfg);
+    const change = await changeAt(B, workspaceB, "@");
+    await B.runner.archive(m.id);
+    const both = [`meddle/task/${m.id}/a ${change}`, `meddle/task/${m.id}/a.spike ${change}`];
+    expect((await namespace(A, A.project.replica, m.id)).local).toEqual(both);
+    expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
+    await peerReady(B, A);
+
+    let staged: { local: string[]; remote: number } | null = null;
+    A.hooks.beforeReceive = async () => { staged = await namespace(B, replicaB, m.id); };
+    expect(await B.runner.restore(m.id, A.id)).toEqual({ nodeId: A.id });
+    await moveSettled(B);
+
+    expect(staged!.local).toEqual(both);
+    expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "moved", moved_to: A.id });
+    expect(existsSync(paths(B.cfg).archiveFile(m.id))).toBe(false);
+    expect(existsSync(paths(B.cfg).movedFile(m.id))).toBe(true);
+    // The home keeps them, and the task runs there on the archived change.
+    expect((await namespace(A, A.project.replica, m.id)).local).toEqual(both);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    expect(await changeAt(A, workspaceA, "@-")).toBe(change);
+    expect(await Bun.file(join(workspaceA, "note.txt")).text()).toBe("made on B\n");
+  } finally {
+    await close();
+  }
+}, 45_000);
+
+test("a restore-move the target refuses leaves the task archived on the source with its archive, nothing staged; one to an offline node is refused with the move's message", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    // B is the project's home; the task is archived on A.
+    const m = await A.runner.create({ title: "t", projectIds: [B.project.id] });
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await A.runner.archive(m.id);
+    const replicaA = paths(A.cfg).replica(B.project.id);
+    const file = paths(A.cfg).archiveFile(m.id);
+    const archived = await readArchive(file);
+    await peerReady(A, B);
+    await expect(A.runner.restore(m.id, "nope")).rejects.toThrow("nope is not a member of this pool");
+
+    // B's task root is gone: its receiveTask refuses.
+    await rm(B.cfg.taskRoot, { recursive: true, force: true });
+    const states = statesOf(A, m.id);
+    await A.runner.restore(m.id, B.id);
+    await moveSettled(A);
+    expect(states).toEqual(["moving", "archived"]);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", archived_on: A.id, moved_to: null });
+    expect(A.runner.moveState(m.id)).toBeNull();
+    expect(A.logs.filter((l) => l.startsWith(`meddle: move: ${m.id} failed at handoff: `))).toEqual([
+      `meddle: move: ${m.id} failed at handoff: this node does not host tasks`,
+    ]);
+    expect((await readArchive(file)).events).toEqual(archived.events);
+    expect(await namespace(A, replicaA, m.id)).toEqual({ local: [], remote: 0 });
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
+    expect(getTask(B.db, m.id)).toBeNull();
+    expect(listArchivedTasks(A.db).map((t) => t.id)).toEqual([m.id]);
+    await expect(A.runner.prompt(m.id, "hi")).rejects.toThrow("task is archived");
+
+    // B offline: refused before anything starts, and the task stays archived.
+    A.net.unwatch(B.id, "bye");
+    B.net.unwatch(A.id, "bye");
+    await until("B online to A", () => A.net.isOnline(B.id), false);
+    await expect(A.runner.restore(m.id, B.id)).rejects.toThrow(`${shortId(B.id)} is offline`);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", archived_on: A.id });
+    expect(existsSync(file)).toBe(true);
+  } finally {
+    await close();
+  }
+}, 45_000);

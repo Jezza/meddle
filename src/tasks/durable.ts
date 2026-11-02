@@ -19,8 +19,9 @@ import type { PoolRuntime } from "../pool/runtime";
 import { loadContext, loadProjectSettings } from "../projects/context";
 import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
 import type { StreamReader } from "../pool/frames";
-import { getProject, type Project } from "../projects/project";
+import { getProject, listProjects, type Project } from "../projects/project";
 import { ensureRemote, ensureReplica, fetchBookmarks, pushNamespace, trunkFor, type ReplicaDeps } from "../projects/replicas";
+import { place, placementCandidates } from "../pool/placement";
 import { appendEvent, latestEventOfType, listEventsTail, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
@@ -29,6 +30,7 @@ import {
   deleteTask,
   getTask,
   getTaskSettings,
+  listLiveTasks,
   listTasks,
   queuedOf,
   updateTask,
@@ -70,6 +72,11 @@ export type RunnerHooks = {
   beforeReceive?(taskId: string): void | Promise<void>;
   /** Called as a failed move restores the task's state; a throw stands for a failure there. */
   beforeRestore?(taskId: string): void | Promise<void>;
+  /**
+   * Called in a move's `prepare` once the task is marked moving, before the step commits; `signal` aborts when the
+   * Harness closes (a test stops the node there).
+   */
+  afterEnterMove?(taskId: string, signal: AbortSignal): void | Promise<void>;
   /** Called once a turn's `token_fault` with `rerun: true` is in the log, before the `run` phase enters itself again. */
   afterTokenFault?(taskId: string): void | Promise<void>;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
@@ -298,6 +305,8 @@ export class TaskRunner {
     refuseReceiving(row);
     refuseMoved(row);
     if (this.#isMoving(row)) {
+      // A restore-move sends the archive's row, which has no queue: nothing sent meanwhile would travel.
+      if (row.archived_on !== null) throw new Error("task is being restored; send it again once it has arrived");
       // Queued prompts travel with the task, and its export reads them once the handoff has begun: one sent after that
       // would be left behind.
       if (this.#moving.get(taskId)?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
@@ -841,6 +850,7 @@ export class TaskRunner {
       this.#log(`meddle: move: could not tell whether ${taskId} has a turn running: ${messageOf(err)}`);
       this.#setState(taskId, this.#knownState(taskId));
     }
+    await this.#unstage(taskId);
     this.#log(line);
     await this.startQueued(taskId).catch((err: unknown) => {
       this.#log(`meddle: move: task ${taskId}'s next queued prompt did not start a turn: ${messageOf(err)}`);
@@ -960,6 +970,8 @@ export class TaskRunner {
     const self = pool.identity.id;
     return serialised(taskKey(taskId), async () => {
       const row = this.#row(taskId);
+      // A restore-move of it has started (its row still says `archived` until its `prepare` runs).
+      if (this.#moving.has(taskId)) throw new Error("task is moving");
       if (row.state !== "archived") throw new Error(`task is ${row.state}`);
       if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
       const manifest = JSON.parse(row.manifest) as TaskManifest;
@@ -1006,6 +1018,115 @@ export class TaskRunner {
   }
 
   /**
+   * Restores task `taskId`, archived on this node, on node `node` (spec 21.4): `"here"` or this node's id restores it
+   * here (`restoreHere`); another node's id moves it there from its archive (a `meddle.move` with `fromArchive`, refused
+   * first as `checkMove` says); null lets placement pick the node over the roster, as for a new task of the manifest's
+   * projects (the primary's home first). Resolves with the node once the restore is done here, or once the move has
+   * started (`onMove` and `onState` tell how it goes).
+   */
+  async restore(taskId: string, node: string | null): Promise<{ nodeId: string }> {
+    const pool = this.#pool;
+    if (pool === undefined) throw new Error("this node has no pool");
+    const self = pool.identity.id;
+    const row = this.#row(taskId);
+    if (this.#moving.has(taskId)) throw new Error("task is moving");
+    if (row.state !== "archived") throw new Error(`task is ${row.state}`);
+    if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
+    let target: string;
+    if (node === "here" || node === self) target = self;
+    else if (node !== null) {
+      this.checkMove(row, node, false, true);
+      target = node;
+    } else {
+      const manifest = JSON.parse(row.manifest) as TaskManifest;
+      const ids = manifest.projects.map((p) => p.id);
+      const primary = manifest.primaryProjectId;
+      target = await this.chooseNode(primary === null ? ids : [primary, ...ids.filter((id) => id !== primary)]);
+    }
+    if (target === self) {
+      await this.restoreHere(taskId);
+      return { nodeId: self };
+    }
+    await this.moveTo(taskId, target, false, true);
+    return { nodeId: target };
+  }
+
+  /**
+   * The node a task of `projectIds` (the first is the primary) goes to when none is named: `place` over every member
+   * as the roster last heard of it and this node as it is now. Refused with placement's reason, or this node's own when
+   * no other node is online.
+   */
+  async chooseNode(projectIds: string[]): Promise<string> {
+    const pool = this.#pool;
+    if (pool === undefined) throw new Error("this node has no pool");
+    const self = {
+      nodeId: pool.identity.id,
+      hostsTasks: (await checkTaskRoot(this.#cfg)).ok,
+      running: this.running(),
+      taskCount: listLiveTasks(this.#db).length,
+      projects: listProjects(this.#db).map((p) => ({ id: p.id, home: p.home })),
+      limit: pool.settings.runningLimit(),
+    };
+    const nodes = placementCandidates(pool.store.roster(), (id) => pool.net.isOnline(id), self);
+    const choice = place({ projectIds, nodes });
+    if (!("error" in choice)) return choice.nodeId;
+    // Alone (the only member, or the only one online): the reason is this node's own.
+    if (!nodes.some((n) => n.online && n.nodeId !== self.nodeId)) {
+      if (!self.hostsTasks) throw new Error("this node has no task root");
+      if (self.limit > 0 && self.running >= self.limit) throw new Error("this node is at its running limit; use --here");
+    }
+    throw new Error(choice.error);
+  }
+
+  /**
+   * Stages an archived task's namespace for its restore-move (decision 8): for each project homed on another node, the
+   * home must be online (else `home <short> of <project> is offline`, checked for all before any fetch); every bookmark
+   * under the task's namespace is fetched from it (at least one must be there) and set as a local bookmark at the home's
+   * change, so the target's `receiveTask` fetches them from here. On a project's home they are local already.
+   */
+  async stageNamespace(manifest: TaskManifest): Promise<void> {
+    const deps = this.#replicaDeps();
+    if (deps === null) throw new Error("this node has no pool");
+    const self = deps.pool.identity.id;
+    const homes: Array<{ project: Project; home: string }> = [];
+    for (const p of manifest.projects) {
+      const project = getProject(this.#db, p.id);
+      if (project === null) throw new Error(`unknown project: ${p.id}`);
+      if (project.home === self) continue;
+      if (!deps.pool.net.isOnline(project.home)) throw new Error(`home ${shortId(project.home)} of ${p.name} is offline`);
+      homes.push({ project, home: project.home });
+    }
+    const ns = taskNamespace(manifest.id);
+    for (const { project, home } of homes) {
+      const remote = shortId(home);
+      await serialised(repoKey(project.replica), async () => {
+        await ensureRemote(this.#cfg, project.replica, home, { kind: "project", id: project.id });
+        await fetchBookmarks(this.#cfg, project.replica, home, [taskGlob(manifest.id)], { requireMatch: true });
+        const listed = await bookmarkList(project.replica, this.#cfg);
+        for (const b of listed) {
+          if (b.remote !== remote || !b.name.startsWith(ns) || b.conflicted || b.changeId === "") continue;
+          const here = listed.find((l) => l.name === b.name && l.remote === null);
+          if (here !== undefined && !here.conflicted && here.changeId === b.changeId) continue;
+          await bookmarkSet(project.replica, b.name, b.changeId, this.#cfg, { ignoreWorkingCopy: true });
+        }
+      });
+    }
+  }
+
+  /**
+   * What an archived task has off its projects' homes again: no task bookmarks (staged by a restore-move that did not
+   * happen), no folder, no workspace. A no-op unless the row says `archived`; best effort (logged).
+   */
+  async #unstage(taskId: string): Promise<void> {
+    if (getTask(this.#db, taskId)?.state !== "archived") return;
+    const self = this.#pool?.identity.id;
+    if (self === undefined) return;
+    await releaseFolder(this.#cfg, this.#db, self, taskId).catch((err: unknown) => {
+      this.#log(`meddle: move: ${taskId} is archived again, but its staged bookmarks were not forgotten: ${messageOf(err)}`);
+    });
+  }
+
+  /**
    * Deletes task `taskId` from this node: only an `archived` or `moved` one (else `task is <state>`). What is left of its
    * folder goes first (an archive whose folder removal was cut short, a move whose cleanup has not run: the folder, the
    * workspaces and, off a project's home, the task's bookmarks), then its archive (or a move's leftover), then its row,
@@ -1014,6 +1135,7 @@ export class TaskRunner {
   async deleteTask(taskId: string): Promise<void> {
     await serialised(taskKey(taskId), async () => {
       const row = this.#row(taskId);
+      if (this.#moving.has(taskId)) throw new Error("task is moving");
       if (row.state !== "archived" && row.state !== "moved") throw new Error(`task is ${row.state}`);
       const self = this.#pool?.identity.id;
       if (self !== undefined) await releaseFolder(this.#cfg, this.#db, self, taskId);
@@ -1031,19 +1153,19 @@ export class TaskRunner {
 
   /**
    * Starts moving task `taskId` to node `to` (a durable `meddle.move`); with `now`, a live turn is interrupted rather
-   * than waited for. Refused, before anything starts, as `checkMove` says, or when the task's turn is parked. Resolves
+   * than waited for; with `fromArchive`, the task archived here is restored there from its archive (`restore`). Refused, before anything starts, as `checkMove` says, or when the task's turn is parked. Resolves
    * once the move has started; `onMove` and `onState` tell how it goes.
    */
-  async moveTo(taskId: string, to: string, now: boolean): Promise<void> {
+  async moveTo(taskId: string, to: string, now: boolean, fromArchive = false): Promise<void> {
     const row = this.#row(taskId);
-    this.checkMove(row, to);
+    this.checkMove(row, to, false, fromArchive);
     // Reserved before the first await: one move per task.
     const reservation: MoveState = { to, phase: "prepare", error: null };
     this.#moving.set(taskId, reservation);
     try {
       const turn = await this.#durableTurn(taskId);
       if (turn !== undefined && isParked(turn)) throw new Error("the task's turn is parked; retry it first");
-      const input: MoveInput = { taskId, to, now };
+      const input: MoveInput = { taskId, to, now, ...(fromArchive ? { fromArchive: true } : {}) };
       const root = await this.#harness.root(BACKGROUND_CONTEXT);
       await root.commit((tx) => tx.createTask(MeddleMove, input, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
     } catch (err) {
@@ -1059,14 +1181,29 @@ export class TaskRunner {
   /**
    * Throws why task `row` cannot move to `to` (decision 16): it is not live here (received, moved, archived) or is
    * already moving (unless `own`: the move's own steps check again), there is no pool, `to` is this node, not a
-   * member, offline or hosts no tasks, or the two report different or unknown Claude Code versions.
+   * member, offline or hosts no tasks, or the two report different or unknown Claude Code versions. With
+   * `fromArchive` (a restore-move) it is the other way round: the task must be archived here, or (`own`, a rerun of
+   * `prepare`) moving with its row still naming this node as where it is archived.
    */
-  checkMove(row: TaskRow, to: string, own = false): void {
+  checkMove(row: TaskRow, to: string, own = false, fromArchive = false): void {
     refuseReceiving(row);
     refuseMoved(row);
-    if (row.state === "archived") throw new Error(`task is archived: ${row.id}`);
-    if (this.#archiving.has(row.id)) throw new Error("task is being archived");
-    if (!own && this.#isMoving(row)) throw new Error("task is moving");
+    if (fromArchive) {
+      const self = this.#pool?.identity.id;
+      // `prepare` runs again after it marked the task moving (a restart before its checkpoint).
+      const rerun = own && row.state === "moving" && row.archived_on !== null && row.archived_on === self;
+      if (!rerun) {
+        if (row.state !== "archived") throw new Error(`task is ${row.state}`);
+        if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
+      }
+      // Only the move's own steps pass a reservation: an archive still finishing, or another move.
+      if (!own && this.#archiving.has(row.id)) throw new Error("task is being archived");
+      if (!own && this.#isMoving(row)) throw new Error("task is moving");
+    } else {
+      if (row.state === "archived") throw new Error(`task is archived: ${row.id}`);
+      if (this.#archiving.has(row.id)) throw new Error("task is being archived");
+      if (!own && this.#isMoving(row)) throw new Error("task is moving");
+    }
     const pool = this.#pool;
     if (pool === undefined) throw new Error("this node has no pool");
     const short = shortId(to);
@@ -1091,9 +1228,11 @@ export class TaskRunner {
   }
 
   /** What a move's steps work with. Not for callers outside this module and `move.ts`. */
-  moveDeps(): { cfg: NodeConfig; db: Database; pool: PoolRuntime; log(line: string): void; callMs: number | undefined } {
+  moveDeps(): {
+    cfg: NodeConfig; db: Database; pool: PoolRuntime; log(line: string): void; callMs: number | undefined; hooks: RunnerHooks | undefined;
+  } {
     if (this.#pool === undefined) throw new Error("this node has no pool");
-    return { cfg: this.#cfg, db: this.#db, pool: this.#pool, log: this.#log, callMs: this.#deps.hooks?.callMs };
+    return { cfg: this.#cfg, db: this.#db, pool: this.#pool, log: this.#log, callMs: this.#deps.hooks?.callMs, hooks: this.#deps.hooks };
   }
 
   /**
@@ -1176,7 +1315,8 @@ export class TaskRunner {
 
   /**
    * Ends a move that did not happen: the task is live here again (idle, or its turn's state), the prompts queued
-   * meanwhile run, and the failure is logged once and told (`onMove` with the error, then null).
+   * meanwhile run, and the failure is logged once and told (`onMove` with the error, then null). A restore-move's task
+   * is archived here again instead, its staged bookmarks forgotten off its projects' homes.
    */
   async failMove(taskId: string, to: string, phase: string, error: string): Promise<void> {
     // First, before anything that can throw: the row must never be left `moving` with no move behind it (nor be written
@@ -1195,6 +1335,7 @@ export class TaskRunner {
         this.#log(`meddle: move: could not tell whether ${taskId} has a turn running: ${messageOf(err)}`);
         this.#emitState(taskId, this.#row(taskId).state as TaskState);
       }
+      await this.#unstage(taskId);
     }
     this.#emitMove(taskId);
     this.#log(`meddle: move: ${taskId} failed at ${phase}: ${error}`);
@@ -1203,16 +1344,27 @@ export class TaskRunner {
     });
   }
 
-  /** The state of the task's turn as this runner alone knows it (live or pending), without asking the Harness. */
-  #knownState(taskId: string): "idle" | "running" | "waiting" {
-    return this.#live.get(taskId)?.state ?? (this.#pending.has(taskId) ? "running" : "idle");
+  /**
+   * The state of the task's turn as this runner alone knows it (live or pending), without asking the Harness; with
+   * none, `archived` for a task archived here (a restore-move's), else `idle`.
+   */
+  #knownState(taskId: string): "idle" | "running" | "waiting" | "archived" {
+    return this.#live.get(taskId)?.state ?? (this.#pending.has(taskId) ? "running" : this.#restingState(taskId));
   }
 
-  /** Writes the state the task's turn has, if any (`running` for one between its phases), else `idle`. */
+  /**
+   * Writes the state the task's turn has, if any (`running` for one between its phases), else `archived` for a task
+   * archived here (a restore-move's), else `idle`.
+   */
   async #restoreState(taskId: string): Promise<void> {
     const live = this.#live.get(taskId);
     const busy = live !== undefined || this.#pending.has(taskId) || (await this.#durableTurn(taskId)) !== undefined;
-    this.#setState(taskId, live?.state ?? (busy ? "running" : "idle"));
+    this.#setState(taskId, live?.state ?? (busy ? "running" : this.#restingState(taskId)));
+  }
+
+  /** A task's state with no turn: `archived` when its row says where it is archived, else `idle`. */
+  #restingState(taskId: string): "idle" | "archived" {
+    return getTask(this.#db, taskId)?.archived_on != null ? "archived" : "idle";
   }
 
   #isMoving(row: TaskRow): boolean {

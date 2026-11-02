@@ -7,6 +7,7 @@ import type { NodeConfig } from "../config";
 import { paths } from "../paths";
 import { MAX_FRAME, writeFrame, type StreamReader } from "../pool/frames";
 import type { TaskSettings } from "../store/records";
+import type { TaskArchive } from "./archive";
 import { transcriptSlot, type TaskManifest } from "./manifest";
 
 /*
@@ -89,7 +90,72 @@ export async function exportTask(cfg: NodeConfig, db: Database, taskId: string, 
       "SELECT project_key, session_id, subpath, seq, uuid, ts, json FROM transcript WHERE session_id = ? ORDER BY project_key, session_id, subpath, seq",
     )
     .all(row.session_id);
+  const root = join(paths(cfg).taskConfig(taskId), "projects");
+  async function* files(): AsyncGenerator<{ path: string; data: Uint8Array }> {
+    // The size sent is what was read, so a file that grows meanwhile still matches its frames.
+    for (const path of await regularFiles(root)) yield { path, data: new Uint8Array(await readFile(join(root, path))) };
+  }
+  return sendFrames(send, manifestFrame(row), events, transcript, files());
+}
 
+/**
+ * Sends an archived task (`writeArchive`'s `archive`) on `send` as `exportTask` sends a task live here: the same frames
+ * in the same order, from the archive's row, event log, transcript rows and files, so the receiver (and the receipt's
+ * hash) cannot tell the two apart. Returns the sender's receipt.
+ */
+export async function exportArchive(_cfg: NodeConfig, archive: TaskArchive, send: SendStream): Promise<Receipt> {
+  const row = archive.row as { manifest?: unknown; settings?: unknown; queued?: unknown; turns?: unknown };
+  const manifest = typeof row.manifest === "string" ? row.manifest : JSON.stringify(archive.manifest);
+  const header = manifestFrame({
+    manifest,
+    settings: typeof row.settings === "string" ? row.settings : null,
+    queued: typeof row.queued === "string" ? row.queued : null,
+    turns: typeof row.turns === "number" ? row.turns : 0,
+  });
+  // The archive keeps its rows in `exportTask`'s order already; sorted again so an older archive's order cannot differ.
+  const transcript = [...archive.transcript].sort((a, b) =>
+    compare(a.project_key, b.project_key) || compare(a.session_id, b.session_id) || compare(a.subpath, b.subpath) || a.seq - b.seq);
+  async function* files(): AsyncGenerator<{ path: string; data: Uint8Array }> {
+    for (const f of [...archive.files].sort((a, b) => compareFilePaths(a.path, b.path))) {
+      yield { path: f.path, data: new Uint8Array(Buffer.from(f.base64, "base64")) };
+    }
+  }
+  return sendFrames(send, header, [...archive.events].sort((a, b) => a.seq - b.seq), transcript, files());
+}
+
+function compare(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** `regularFiles`' order: depth first, each directory's names sorted. */
+function compareFilePaths(a: string, b: string): number {
+  const x = a.split("/");
+  const y = b.split("/");
+  for (let i = 0; i < Math.min(x.length, y.length); i++) {
+    if (x[i] !== y[i]) return compare(x[i]!, y[i]!);
+  }
+  return x.length - y.length;
+}
+
+/** The `manifest` frame of a task row's columns. */
+function manifestFrame(row: { manifest: string; settings: string | null; queued: string | null; turns: number }): TransferFrame {
+  return {
+    t: "manifest",
+    manifest: JSON.parse(row.manifest) as TaskManifest,
+    settings: row.settings === null ? null : (JSON.parse(row.settings) as TaskSettings),
+    queued: row.queued === null ? [] : (JSON.parse(row.queued) as string[]),
+    turns: row.turns,
+  };
+}
+
+/** Sends a task's frames (header, events, transcript rows, files, then `done`) on `send` and finishes it; the receipt. */
+async function sendFrames(
+  send: SendStream,
+  header: TransferFrame,
+  events: EventRow[],
+  transcript: TranscriptRow[],
+  files: AsyncIterable<{ path: string; data: Uint8Array }>,
+): Promise<Receipt> {
   const hash = new FrameHash();
   const sendFrame = async (kind: number, data: Uint8Array) => {
     hash.add(kind, data);
@@ -97,35 +163,26 @@ export async function exportTask(cfg: NodeConfig, db: Database, taskId: string, 
   };
   const sendHeader = (frame: TransferFrame) => sendFrame(HEADER, encoder.encode(JSON.stringify(frame)));
 
-  await sendHeader({
-    t: "manifest",
-    manifest: JSON.parse(row.manifest) as TaskManifest,
-    settings: row.settings === null ? null : (JSON.parse(row.settings) as TaskSettings),
-    queued: row.queued === null ? [] : (JSON.parse(row.queued) as string[]),
-    turns: row.turns,
-  });
+  await sendHeader(header);
   for (const e of events) await sendHeader({ t: "event", seq: e.seq, json: e.json });
   for (const r of transcript) {
     await sendHeader({
       t: "transcript", projectKey: r.project_key, sessionId: r.session_id, subpath: r.subpath, seq: r.seq, uuid: r.uuid, ts: r.ts, json: r.json,
     });
   }
-  const root = join(paths(cfg).taskConfig(taskId), "projects");
-  let files = 0;
+  let count = 0;
   let bytes = 0;
-  for (const path of await regularFiles(root)) {
-    // The size sent is what was read, so a file that grows meanwhile still matches its frames.
-    const data = new Uint8Array(await readFile(join(root, path)));
+  for await (const { path, data } of files) {
     await sendHeader({ t: "file", path, size: data.length });
     for (let at = 0; at === 0 || at < data.length; at += MAX_FRAME) await sendFrame(BYTES, data.subarray(at, at + MAX_FRAME));
-    files += 1;
+    count += 1;
     bytes += data.length;
   }
   const receipt: Receipt = {
-    events: events.length, transcript: transcript.length, files, bytes, lastEventSeq: events.at(-1)?.seq ?? 0, sha256: hash.digest(),
+    events: events.length, transcript: transcript.length, files: count, bytes, lastEventSeq: events.at(-1)?.seq ?? 0, sha256: hash.digest(),
   };
   await writeFrame(send, HEADER, encoder.encode(JSON.stringify({
-    t: "done", events: receipt.events, transcript: receipt.transcript, files, bytes, sha256: receipt.sha256,
+    t: "done", events: receipt.events, transcript: receipt.transcript, files: count, bytes, sha256: receipt.sha256,
   } satisfies TransferFrame)));
   await send.finish();
   return receipt;

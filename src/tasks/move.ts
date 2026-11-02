@@ -1,12 +1,12 @@
 // The sending side of moving a task to another node: the durable `meddle.move` (decisions 10, 11, 16, 18, 19).
-import { rm } from "node:fs/promises";
+import { rename, rm, utimes } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { isChordError, type Ref } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, withAbortSignal, type Context } from "@earendil-works/chord/context";
 import { defineTask, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
 import { bookmarkForget, workspaceForget } from "../jj";
-import { paths } from "../paths";
+import { ensurePrivateDir, paths } from "../paths";
 import { shortId } from "../pool/ids";
 import type { PeerStream } from "../pool/net";
 import type { PoolRuntime } from "../pool/runtime";
@@ -15,12 +15,16 @@ import { PeerObject } from "../state/contracts";
 import { clearTaskLog, getTask } from "../store/records";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
-import { writeArchive } from "./archive";
+import { readArchive, writeArchive } from "./archive";
 import { runnerFor, type MeddleHooks, type TaskRunner } from "./durable";
 import { taskGlob, type TaskManifest } from "./manifest";
-import { exportTask, receiptsMatch, type Receipt } from "./transfer";
+import { exportArchive, exportTask, receiptsMatch, type Receipt } from "./transfer";
 
-export type MoveInput = { taskId: string; to: string; now: boolean };
+/**
+ * `fromArchive`: the task is archived here and is restored on `to` from its archive (a restore-move). A move stored by
+ * an earlier meddle has none: read it as false.
+ */
+export type MoveInput = { taskId: string; to: string; now: boolean; fromArchive?: boolean };
 /** `attempt` counts the times `commit` had no answer from the target (absent: none yet). */
 export type MoveCheckpoint =
   | { phase: "prepare" }
@@ -65,7 +69,10 @@ function stopping(runtime: MoveRuntime, context: Context): boolean {
  * Moves a task to another node. `prepare` checks the move again (decision 16), marks the task `moving` and waits for its
  * turn to end (or interrupts it with `now`); `handoff` sets the task bookmarks, has the target fetch them and provision
  * the task (`receiveTask`), sends the task over a `blob` stream and compares receipts; `commit` activates the task on the
- * target and records it here as `moved`; `cleanup` archives and removes the local copy. A step before `commit` that
+ * target and records it here as `moved`; `cleanup` archives and removes the local copy. A restore-move (`fromArchive`,
+ * spec 21.4, decision 8) moves a task archived here: no turn to wait for, the namespace staged from the projects' homes
+ * instead of set from a workspace, the archive sent instead of the live task, no follow-up, and the archive kept as the
+ * leftover; one that fails leaves the task `archived` here again. A step before `commit` that
  * fails rolls the move back itself (pi-durable faults a throwing phase and runs `abort` only after an abort mark) and
  * ends `failed`. Once the receipt is recorded, only a definite answer from the target rolls back (`activateTask`
  * answering `ok: false` or `forbidden`); without an answer, `commit` keeps asking (2 s doubling to 30 s) while the task
@@ -81,10 +88,12 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
   phases: {
     prepare: (task, runtime, context) => step("prepare", task.input, runtime, context, async (runner) => {
       const { taskId, to, now } = task.input;
-      runner.checkMove(taskRow(runner, taskId), to, true);
+      const fromArchive = task.input.fromArchive ?? false;
+      runner.checkMove(taskRow(runner, taskId), to, true, fromArchive);
       runner.enterMove(taskId, to, "prepare");
-      // Remembered before the interrupt: a rerun after a crash still knows it cut the turn.
-      await runner.awaitTurnEnd(taskId, now, context, async () => { await runtime.memo(CUT_MEMO, true, context); });
+      await runner.moveDeps().hooks?.afterEnterMove?.(taskId, runtime.signal);
+      // Remembered before the interrupt: a rerun after a crash still knows it cut the turn. An archived task has no turn.
+      if (!fromArchive) await runner.awaitTurnEnd(taskId, now, context, async () => { await runtime.memo(CUT_MEMO, true, context); });
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "handoff" } }), context);
     }),
     handoff: (task, runtime, context) => step("handoff", task.input, runtime, context, async (runner) => {
@@ -93,15 +102,24 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       // A rerun after this move was rolled back here (its end never recorded) finds the task live again: it stops.
       runner.requireMoving(taskId);
       runner.enterMove(taskId, to, "handoff");
-      // Nothing is set or sent under a turn: one that is running here ends first.
-      await runner.awaitTurnEnd(taskId, false, context, async () => {});
+      const fromArchive = task.input.fromArchive ?? false;
       const manifest = JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest;
-      await runner.setTaskBookmarks(manifest);
+      if (fromArchive) {
+        // No workspace to set bookmarks from: the home's copy of the task's namespace is staged here for the target.
+        await runner.stageNamespace(manifest);
+      } else {
+        // Nothing is set or sent under a turn: one that is running here ends first.
+        await runner.awaitTurnEnd(taskId, false, context, async () => {});
+        await runner.setTaskBookmarks(manifest);
+      }
       // A rerun of this step finds its partial copy there: the target replaces it.
       // No time limit: the target may clone the project from its home first. A dropped link still fails it at once.
       const answer = await withPeer(pool, to, context, (peer) => peer.receiveTask({ manifest, claudeCodeVersion: claudeCodeVersion() }), null);
       if (!answer.ok) throw new Error(answer.reason ?? `${shortId(to)} refused the task`);
-      const receipt = await sendTask(cfg, db, pool, to, taskId, context);
+      const exporter: Exporter = fromArchive
+        ? async (send) => exportArchive(cfg, await readArchive(paths(cfg).archiveFile(taskId)), send)
+        : (send) => exportTask(cfg, db, taskId, send);
+      const receipt = await sendTask(pool, to, taskId, context, exporter);
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "commit", receipt } }), context);
     }),
     commit: async (task, runtime, context) => {
@@ -121,7 +139,8 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
         let refusal: string | null = null;
         try {
           runner.enterMove(taskId, to, "commit");
-          const cut = (await runtime.memo<boolean>(CUT_MEMO, context)) === true;
+          // A restore-move's task had no turn to cut.
+          const cut = !(task.input.fromArchive ?? false) && (await runtime.memo<boolean>(CUT_MEMO, context)) === true;
           // A repeated call (a retry, or a rerun after a crash) is a no-op `ok` for a task the target activated.
           const answer = await withPeer(
             pool, to, context, (peer) => peer.activateTask({ taskId, followUp: cut ? MOVE_NOW_FOLLOW_UP : null }), callMs ?? CALL_MS,
@@ -162,7 +181,8 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       const { taskId, to } = task.input;
       const { cfg, db, pool, log } = runner.moveDeps();
       try {
-        await removeLocalCopy(cfg, db, pool.identity.id, taskId);
+        if (task.input.fromArchive ?? false) await removeArchivedCopy(cfg, db, pool.identity.id, taskId);
+        else await removeLocalCopy(cfg, db, pool.identity.id, taskId);
       } catch (err) {
         if (stopping(runtime, context)) throw err;
         // The task lives on the target; what is left here is only disk space.
@@ -288,11 +308,17 @@ async function abandonOnTarget(pool: PoolRuntime, to: string, taskId: string): P
   }
 }
 
-/** Sends the task to `to` over a `blob` stream and checks its receipt against the sender's; the sender's receipt. */
-async function sendTask(cfg: NodeConfig, db: Database, pool: PoolRuntime, to: string, taskId: string, context: Context): Promise<Receipt> {
+/** Writes a task's frames on a stream: `exportTask`, or `exportArchive` for a restore-move. */
+type Exporter = (send: PeerStream["stream"]["send"]) => Promise<Receipt>;
+
+/**
+ * Sends the task to `to` over a `blob` stream (its frames as `exporter` writes them) and checks its receipt against
+ * the sender's; the sender's receipt.
+ */
+async function sendTask(pool: PoolRuntime, to: string, taskId: string, context: Context, exporter: Exporter): Promise<Receipt> {
   const s = await awaitWithContext(pool.net.openStream(to, { stream: "blob", kind: "task", taskId }), context);
   try {
-    const sent = await awaitWithContext(exportTask(cfg, db, taskId, s.stream.send), context);
+    const sent = await awaitWithContext(exporter(s.stream.send), context);
     const line = await awaitWithContext(s.reader.readLine().catch(() => null), context);
     if (line === null) throw new Error("no receipt");
     let got: Receipt;
@@ -323,6 +349,29 @@ async function removeLocalCopy(cfg: NodeConfig, db: Database, self: string, task
   const row = getTask(db, taskId);
   if (row === null) return;
   await writeArchive(cfg, db, taskId, paths(cfg).movedFile(taskId));
+  await releaseFolder(cfg, db, self, taskId);
+  clearTaskLog(db, taskId, row.session_id);
+}
+
+/**
+ * What a restore-move leaves of a task archived here once the target has it: its archive becomes the move's leftover
+ * in `<data>/moved/` (kept seven days from now, as a move's), the task bookmarks staged off its projects' homes are
+ * forgotten (`releaseFolder`; it has no folder or workspace), and its event and transcript rows go. The row stays,
+ * `moved`. A rerun finds pieces already gone.
+ */
+async function removeArchivedCopy(cfg: NodeConfig, db: Database, self: string, taskId: string): Promise<void> {
+  const row = getTask(db, taskId);
+  if (row === null) return;
+  const p = paths(cfg);
+  await ensurePrivateDir(p.moved);
+  const moved = p.movedFile(taskId);
+  try {
+    await rename(p.archiveFile(taskId), moved);
+    const now = new Date();
+    await utimes(moved, now, now);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
   await releaseFolder(cfg, db, self, taskId);
   clearTaskLog(db, taskId, row.session_id);
 }

@@ -277,7 +277,7 @@ bun run src/cli.ts spawn "Find out why test_sync is flaky and fix it" --project 
 bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
 bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to another node
 bun run src/cli.ts task archive <task-id>   # takes an idle task's folder off its node, keeps its log
-bun run src/cli.ts task restore <task-id>   # brings an archived task back on the node it was archived on
+bun run src/cli.ts task restore <task-id> [--node <id|prefix> | --here]   # brings an archived task back, here or on another node
 bun run src/cli.ts task delete <task-id>    # deletes an archived or moved task's log and archive
 ```
 
@@ -567,8 +567,9 @@ the backup, on any other node they are forgotten after the push below. Archives 
 or deleted; the seven-day janitor never touches them.
 
 An archived task renders read-only from its rows in its view (its thread, no composer and no controls), with Restore
-and Delete as the only actions; each node's card lists its archived tasks under "Archived", with Restore and Delete
-links. Prompts, moves and the other controls answer `task is archived: <id>`.
+and Delete as the only actions. The pool view lists the archived tasks of every online node in one "Archived" list,
+each with the node that holds it, with Restore and Delete links. Prompts, moves and the other controls answer
+`task is archived: <id>`.
 
 Only an idle task archives: one with a turn running or waiting, prompts queued, or a move in progress is refused
 (`task is running`, `task has queued prompts`, `task is moving`, …). On a node that is not a project's home, the
@@ -579,13 +580,31 @@ either way the task stays idle and in place. A bookmark git refuses (such as one
 see [Homes and replicas](#homes-and-replicas)) therefore blocks every archive of the task on a node that is not the
 home until it is deleted.
 
-`task restore <task-id>` (or Restore) brings the task back on the node it was archived on: each project's workspace
-starts on the task's project bookmark (on the project's home, the local one; elsewhere, fetched from the home with
-the rest of the task's namespace, so the home must be online: `cannot restore: home <short id> of <project> is
-offline`), the folder is provisioned again from the manifest, and the archive's files are unpacked into it (a task
-without a project's transcript into this node's slot). The task is `idle` again, its next turn resumes its session,
-and the archive is deleted; a restore that fails leaves the task archived. It prints `restored <task-id> on <short
-id>`. Restoring on another node is not available yet.
+`task restore <task-id> [--node <id|prefix> | --here]` (or Restore, whose node select defaults to Automatic) brings
+the task back, on any node that can take it. Without `--node` or `--here` meddle places it as it places a new task of
+the task's projects (see [Where a new task runs](#where-a-new-task-runs)): the primary project's home first. The node
+holding the archive runs it: `task restore` on that node, or Restore in the dashboard of any node.
+
+On the node it was archived on (`--here`, or placement picks it), each project's workspace starts on the task's
+project bookmark (on the project's home, the local one; elsewhere, fetched from the home with the rest of the task's
+namespace, so the home must be online: `cannot restore: home <short id> of <project> is offline`), the folder is
+provisioned again from the manifest, and the archive's files are unpacked into it (a task without a project's
+transcript into this node's slot). The task is `idle` again, its next turn resumes its session, and the archive is
+deleted; a restore that fails leaves the task archived. It prints `task <task-id> on <short id>`.
+
+On another node, the archiving node runs the [move procedure](#moving-a-task) with the archive as its source: it is
+refused as a move is (an offline target, one that hosts no tasks, another Claude Code version, …), the task is
+`moving` meanwhile (prompts answer `task is being restored; send it again once it has arrived`), and there is no turn
+to wait for. Since the archiving node has no workspace to set the task's bookmarks from, it first stages them: for
+each project homed on another node, it fetches every bookmark under the task's namespace from the home (which must be
+online: `home <short id> of <project> is offline` fails the restore) and sets them as local bookmarks, so the target
+fetches them from it as in any move; on a project's home they are there already. It then sends the same frames a move
+sends, read from the archive, under the same receipt rule. Once the target has activated the task (its next turn
+resumes the session, with no follow-up prompt), the archive becomes the move's leftover in `<data dir>/moved/` (kept
+seven days, see [On the node a task left](#on-the-node-a-task-left)), the staged bookmarks are forgotten again off the
+home, the event and transcript rows go, and a `moved` row remains. A restore-move that fails (the target refuses, the
+home is offline, a restart parks it) leaves the task `archived` here again, its archive intact and nothing staged. The
+command prints `restoring to <short id>` once the move has started; the task's view in the dashboard shows how it goes.
 
 `task delete <task-id>` (or Delete) deletes an archived task's archive, row, event log and transcript rows; it is
 refused for a task that is not archived or moved (`task is idle`, …). The bookmarks the home keeps for the task stay.
@@ -620,7 +639,8 @@ what the roster last recorded of it (its versions, whether it hosts tasks and ho
 last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle
 or Claude Code versions. The Projects view lists every project of the pool (see
 [Homes and replicas](#homes-and-replicas)), and a task's view moves it (see [Moving a task](#moving-a-task)) or
-archives it (see [Archiving a task](#archiving-a-task)); a node's card lists its archived tasks under "Archived".
+archives it (see [Archiving a task](#archiving-a-task)); the pool view lists every online node's archived tasks in
+one "Archived" list naming the node that holds each, and Restore offers a node select (Automatic by default).
 
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an

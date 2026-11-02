@@ -321,12 +321,14 @@ test("the usage text lists spawn and the project choice by name", async () => {
   expect(out.stderr).toContain("meddle task new --title <t> [--project <id|name>]... [--node <id|prefix> | --here]");
 });
 
-test("task archive, restore and delete go through the running node; the usage text lists them", async () => {
+test("task archive, restore and delete go through the running node; restore takes --here, --node or neither; the usage text lists them", async () => {
   const usage = Bun.spawn(["bun", "run", "src/cli.ts"], { env: await env(), stdout: "pipe", stderr: "pipe" });
   const [err] = await Promise.all([new Response(usage.stderr).text(), usage.exited]);
-  expect(err.split("\n").map((l) => l.trim())).toContain("meddle task archive <id> | meddle task restore <id> | meddle task delete <id>");
+  const lines = err.split("\n").map((l) => l.trim());
+  expect(lines).toContain("meddle task archive <id> | meddle task delete <id>");
+  expect(lines).toContain("meddle task restore <id> [--node <id|prefix> | --here]");
 
-  const { A, close } = await twoPoolNodes();
+  const { A, B, close } = await twoPoolNodes();
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
   try {
     const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
@@ -335,15 +337,29 @@ test("task archive, restore and delete go through the running node; the usage te
     const refused = await run(["delete", m.id]);
     expect(refused).toMatchObject({ stdout: "", code: 1 });
     expect(refused.stderr).toContain("task is idle");
+    expect((await run(["restore", m.id, "--here", "--node", B.id])).code).toBe(2);
     expect(await run(["archive", m.id])).toEqual({ stdout: `archived ${m.id}\n`, stderr: "", code: 0 });
     expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", archived_on: A.id });
-    expect(await run(["restore", m.id])).toEqual({ stdout: `restored ${m.id} on ${shortId(A.id)}\n`, stderr: "", code: 0 });
+    expect(await run(["restore", m.id, "--here"])).toEqual({ stdout: `task ${m.id} on ${shortId(A.id)}\n`, stderr: "", code: 0 });
     expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", archived_on: null });
+    // Neither: placement picks the project's home, this node.
+    expect(await run(["archive", m.id])).toEqual({ stdout: `archived ${m.id}\n`, stderr: "", code: 0 });
+    expect(await run(["restore", m.id])).toEqual({ stdout: `task ${m.id} on ${shortId(A.id)}\n`, stderr: "", code: 0 });
     expect(await run(["archive", m.id])).toEqual({ stdout: `archived ${m.id}\n`, stderr: "", code: 0 });
     expect(await run(["delete", m.id])).toEqual({ stdout: `deleted ${m.id}\n`, stderr: "", code: 0 });
     expect(getTask(A.db, m.id)).toBeNull();
+
+    // On another node, named by a prefix: the move starts and the node runs it.
+    const n = await A.runner.create({ title: "u", projectIds: [A.project.id] });
+    expect(await run(["archive", n.id])).toEqual({ stdout: `archived ${n.id}\n`, stderr: "", code: 0 });
+    expect(await run(["restore", n.id, "--node", B.id.slice(0, 10)])).toEqual({ stdout: `restoring to ${shortId(B.id)}\n`, stderr: "", code: 0 });
+    const deadline = Date.now() + 15_000;
+    while (getTask(B.db, n.id)?.state !== "idle" || getTask(A.db, n.id)?.state !== "moved") {
+      if (Date.now() > deadline) throw new Error(`A ${getTask(A.db, n.id)?.state}, B ${getTask(B.db, n.id)?.state}`);
+      await Bun.sleep(25);
+    }
   } finally {
     await dashboard.stop();
     await close();
   }
-}, 30_000);
+}, 60_000);

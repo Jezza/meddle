@@ -10,7 +10,6 @@ import type { PendingApproval } from "../engine/approvals";
 import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { peerOf, servePool } from "../pool/object";
-import { place, placementCandidates } from "../pool/placement";
 import type { PoolRuntime } from "../pool/runtime";
 import { acceptPeerLinks } from "../pool/sync";
 import { bookmarkList } from "../jj";
@@ -524,13 +523,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       setEffort: ({ effort }, ctx) => store.setEffort({ taskId: id, effort }, ctx),
       moveTo: ({ nodeId, now }) => runner.moveTo(id, nodeId, now),
       archive: () => runner.archive(id),
-      // Restoring on another node (through a move) is not available yet.
-      restore: async ({ node }) => {
-        const selfId = pool.identity.id;
-        if (node !== null && node !== "here" && node !== selfId) throw new Error("restore to another node is not available yet");
-        await runner.restoreHere(id);
-        return { nodeId: selfId };
-      },
+      // Here (`"here"`, this node's id), on another node through a move from the archive, or (null) where placement says.
+      restore: ({ node }) => runner.restore(id, node),
       delete: () => runner.deleteTask(id),
     };
   });
@@ -610,23 +604,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   /** The node `place` picks for a new task of `projectIds`, from the roster and this node's live numbers. */
   async function placeTask(projectIds: string[]): Promise<string> {
-    const self = {
-      nodeId: pool.identity.id,
-      hostsTasks: (await checkTaskRoot(cfg)).ok,
-      running: runner.running(),
-      taskCount: listLiveTasks(db).length,
-      projects: listProjects(db).map((p) => ({ id: p.id, home: p.home })),
-      limit: pool.settings.runningLimit(),
-    };
-    const nodes = placementCandidates(pool.store.roster(), (id) => pool.net.isOnline(id), self);
-    const choice = place({ projectIds, nodes });
-    if (!("error" in choice)) return choice.nodeId;
-    // Alone (the only member, or the only one online): the reason is this node's own.
-    if (!nodes.some((n) => n.online && n.nodeId !== self.nodeId)) {
-      if (!self.hostsTasks) throw new Error("this node has no task root");
-      if (self.limit > 0 && self.running >= self.limit) throw new Error("this node is at its running limit; use --here");
-    }
-    throw new Error(choice.error);
+    return runner.chooseNode(projectIds);
   }
 
   function projectIdsNow(): string[] {

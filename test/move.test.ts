@@ -1102,3 +1102,86 @@ test("a task without a project moves to another node, its transcript lands in th
     await close();
   }
 }, 30_000);
+
+test("a restart during a restore-move's handoff ends with the task moved (or archived), never idle", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  let reopened: { close(): Promise<void> } | undefined;
+  try {
+    const m = await turnedTask(A);
+    await A.runner.archive(m.id);
+    await peerReady(A, B);
+    // A stops during its handoff: the move stays at `handoff`, and B keeps the copy it was sent.
+    const stopped = Promise.withResolvers<void>();
+    let calls = 0;
+    B.hooks.beforeReceive = async () => {
+      calls += 1;
+      if (calls > 1) return;
+      await A.harness.close();
+      stopped.resolve();
+    };
+    await A.runner.restore(m.id, B.id);
+    await stopped.promise;
+    expect(getTask(A.db, m.id)!.state).toBe("moving");
+
+    const harness = await openHarness(A.cfg, createRegistry());
+    reopened = harness;
+    const runner = new TaskRunner(A.cfg, A.db, harness.harness, {
+      claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl` },
+      pool: A.pool, log: (line) => A.logs.push(line),
+    });
+    const states: string[] = [];
+    runner.onState((id, s) => { if (id === m.id) states.push(s); });
+    await moveSettled(harness.harness);
+    expect(states).not.toContain("idle");
+    expect(["archived", "moved"]).toContain(getTask(A.db, m.id)!.state);
+    // The handoff ran again and finished the move.
+    expect(calls).toBe(2);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(false);
+    expect(existsSync(paths(A.cfg).movedFile(m.id))).toBe(true);
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", receiving_from: null, turns: 1 });
+  } finally {
+    await reopened?.close();
+    await close();
+  }
+}, 30_000);
+
+test("a restore-move whose node stops after marking the task moving and before prepare's checkpoint runs prepare again and still completes", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  let reopened: { close(): Promise<void> } | undefined;
+  try {
+    const m = await turnedTask(A);
+    await A.runner.archive(m.id);
+    await peerReady(A, B);
+    const stopped = Promise.withResolvers<void>();
+    let calls = 0;
+    A.hooks.afterEnterMove = async (_id, signal) => {
+      calls += 1;
+      if (calls > 1) return;
+      void A.harness.close().then(() => stopped.resolve());
+      // The step stops as the Harness closes, before its checkpoint.
+      if (!signal.aborted) await new Promise((res) => signal.addEventListener("abort", res, { once: true }));
+      throw new Error("stopped");
+    };
+    await A.runner.restore(m.id, B.id);
+    await stopped.promise;
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moving", archived_on: A.id });
+    expect(getTask(B.db, m.id)).toBeNull();
+
+    const harness = await openHarness(A.cfg, createRegistry());
+    reopened = harness;
+    new TaskRunner(A.cfg, A.db, harness.harness, {
+      claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl` },
+      pool: A.pool, log: (line) => A.logs.push(line), hooks: A.hooks,
+    });
+    await moveSettled(harness.harness);
+    expect(calls).toBe(2);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(existsSync(paths(A.cfg).movedFile(m.id))).toBe(true);
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
+    expect(A.logs.filter((l) => l.startsWith("meddle: move:"))).toEqual([]);
+  } finally {
+    await reopened?.close();
+    await close();
+  }
+}, 30_000);

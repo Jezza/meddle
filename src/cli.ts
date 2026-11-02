@@ -49,7 +49,8 @@ const USAGE = `usage: meddle --version
        meddle task new --title <t> [--project <id|name>]... [--node <id|prefix> | --here]
        meddle task prompt <id> <text> | meddle task retry <id>
        meddle task move <id> <node> [--now]
-       meddle task archive <id> | meddle task restore <id> | meddle task delete <id>
+       meddle task archive <id> | meddle task delete <id>
+       meddle task restore <id> [--node <id|prefix> | --here]
        meddle service install [--dry-run]
        meddle git-remote <name> <url>   (git's remote helper for meddle:// remotes)`;
 
@@ -595,14 +596,39 @@ function taskArchive(id: string): Promise<number> {
   });
 }
 
-/** Restores an archived task on the node it was archived on. */
-function taskRestore(id: string): Promise<number> {
+/**
+ * Restores a task archived on this node: here (`here`), on the node named (its id or a unique prefix), or where
+ * placement picks (`auto`). Prints `task <id> on <node>` once it is restored here, or `restoring to <node>` once its move
+ * to another node has started (the node runs it; the dashboard shows how it goes).
+ */
+function taskRestore(id: string, where: Where): Promise<number> {
   return withNode(async (client) => {
+    const pool = await poolView(client);
+    let node: string | null;
+    let self: string;
+    try {
+      self = pool.self.value;
+      node = where === "here" ? "here" : where === "auto" ? null : resolveNodeId(pool.nodes.value.map((n) => n.nodeId), where.node);
+    } finally {
+      pool.release();
+    }
     const task = await client.get(TaskObject, { id });
-    const { nodeId } = await task.restore({ node: null });
-    console.log(`restored ${id} on ${shortId(nodeId)}`);
+    try {
+      const { nodeId } = await task.restore({ node });
+      console.log(nodeId === self ? `task ${id} on ${shortId(nodeId)}` : `restoring to ${shortId(nodeId)}`);
+    } finally {
+      task.release();
+    }
     return 0;
   });
+}
+
+/** `--node <id|prefix>` or `--here`, or neither (`auto`); null for anything else. */
+function whereArgs(args: string[]): Where | null {
+  if (args.length === 0) return "auto";
+  if (args.length === 1 && args[0] === "--here") return "here";
+  if (args.length === 2 && args[0] === "--node") return { node: args[1]! };
+  return null;
 }
 
 /** Deletes an archived or moved task's rows and archive from this node. */
@@ -778,7 +804,10 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
     return () => taskMove(rest[0]!, rest[1]!, rest.length === 3);
   }
   if (command === "task" && sub === "archive" && rest.length === 1) return () => taskArchive(rest[0]!);
-  if (command === "task" && sub === "restore" && rest.length === 1) return () => taskRestore(rest[0]!);
+  if (command === "task" && sub === "restore" && rest.length >= 1 && !rest[0]!.startsWith("--")) {
+    const where = whereArgs(rest.slice(1));
+    return where === null ? null : () => taskRestore(rest[0]!, where);
+  }
   if (command === "task" && sub === "delete" && rest.length === 1) return () => taskDelete(rest[0]!);
   // git runs a helper as `git-remote-<scheme> <remote> [<url>]`; without a url, the remote is the url.
   if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);

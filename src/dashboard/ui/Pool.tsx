@@ -1,11 +1,11 @@
-// The pool: a card per node with its tasks, the notifications strip merged from every online node, and a form for a
-// new task, placed automatically or on a chosen online node that hosts tasks.
+// The pool: a card per node with its tasks, the notifications strip and the archived tasks merged from every online
+// node, and a form for a new task, placed automatically or on a chosen online node that hosts tasks.
 import type { Host, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
 import { NodeObject, PoolObject, TaskObject, type Notification } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, type HostStatus, useAction, useObject, useValue } from "./hooks";
-import { projectChoices } from "./pool-model";
+import { moveTargets, projectChoices } from "./pool-model";
 import type { Open } from "./routes";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -27,6 +27,7 @@ export function Pool({ hosts, pool, open }: { hosts: Hosts; pool: PoolRef; open:
       <section class="cards">
         {ordered.map((row) => <NodeCard key={row.nodeId} hosts={hosts} row={row} selfRow={selfRow} open={open} />)}
       </section>
+      <Archived hosts={hosts} pool={pool} open={open} />
       <NewTask hosts={hosts} nodes={nodes} canHost={canHost} selfId={selfId} open={open} />
     </>
   );
@@ -113,7 +114,6 @@ function LiveCard({ host, node, row, selfRow, open }: { host: Host; node: NodeRe
   const hostsTasks = useValue(node.hostsTasks);
   const taskRoot = useValue(node.taskRoot);
   const taskIds = useValue(node.taskIds);
-  const archivedIds = useValue(node.archivedIds);
   const openHere = (taskId: string) => open(row.nodeId, taskId);
   return (
     <section class="card" title={row.nodeId}>
@@ -140,44 +140,7 @@ function LiveCard({ host, node, row, selfRow, open }: { host: Host; node: NodeRe
           <tbody>{taskIds.map((id) => <TaskRow key={id} host={host} id={id} open={openHere} />)}</tbody>
         </table>
       )}
-      {archivedIds.length > 0 && (
-        <>
-          <h3>Archived</h3>
-          <table>
-            <thead><tr><th>Title</th><th>Archived</th><th>Projects</th><th></th></tr></thead>
-            <tbody>{archivedIds.map((id) => <ArchivedRow key={id} host={host} id={id} open={openHere} />)}</tbody>
-          </table>
-        </>
-      )}
     </section>
-  );
-}
-
-function ArchivedRow({ host, id, open }: { host: Host; id: string; open: (taskId: string) => void }) {
-  const task = useObject(host, TaskObject, { id });
-  if (task.ref === undefined) return <tr><td colSpan={4} class={task.error ? "error" : "muted"}>{task.error ?? id}</td></tr>;
-  return <ArchivedRowLoaded task={task.ref} open={open} />;
-}
-
-/** An archived task: its title (opens its read-only view), and Restore (here) and Delete links. */
-function ArchivedRowLoaded({ task, open }: { task: Ref<typeof TaskObject>; open: (taskId: string) => void }) {
-  const manifest = useValue(task.manifest);
-  const archivedOn = useValue(task.archivedOn);
-  const action = useAction();
-  const link = (label: string, run: () => Promise<unknown>) => (
-    <a href="#" class={action.busy ? "muted" : ""} onClick={(e) => { e.preventDefault(); if (!action.busy) void action.run(run); }}>{label}</a>
-  );
-  return (
-    <tr>
-      <td><a href="#" onClick={(e) => { e.preventDefault(); open(manifest.id); }}>{manifest.title}</a></td>
-      <td>{archivedOn === null ? "" : <span class="muted" title={archivedOn}>{shortId(archivedOn)}</span>}</td>
-      <td>{manifest.projects.length === 0 ? <span class="muted">no project</span> : manifest.projects.map((p) => p.name).join(", ")}</td>
-      <td>
-        {link("Restore", () => task.restore({ node: null }))}{" · "}
-        {link("Delete", async () => { if (confirm(`Delete "${manifest.title}", its log and its archive?`)) await task.delete({}); })}
-        {action.error !== null && <span class="error"> {action.error}</span>}
-      </td>
-    </tr>
   );
 }
 
@@ -197,6 +160,119 @@ function TaskRowLoaded({ task, open }: { task: Ref<typeof TaskObject>; open: (ta
       <td><span class={`state ${state}`}>{state}</span></td>
       <td>{pending.length > 0 ? pending.length : ""}</td>
       <td>{manifest.projects.length === 0 ? <span class="muted">no project</span> : manifest.projects.map((p) => p.name).join(", ")}</td>
+    </tr>
+  );
+}
+
+// ─── archived tasks ───
+
+type ArchivedReport = (nodeId: string, ids: readonly string[] | null) => void;
+
+/** Every online node's archived tasks in one list, each with the node that holds it (its archive and log). */
+function Archived({ hosts, pool, open }: { hosts: Hosts; pool: PoolRef; open: Open }) {
+  const nodes = useValue(pool.nodes);
+  const online = nodes.filter((n) => n.nodeId === hosts.selfId || (n.status === "member" && n.online));
+  const [byNode, setByNode] = useState<ReadonlyMap<string, readonly string[]>>(() => new Map());
+  const report = useCallback<ArchivedReport>((nodeId, ids) => setByNode((prev) => {
+    const next = new Map(prev);
+    if (ids === null) next.delete(nodeId);
+    else next.set(nodeId, ids);
+    return next;
+  }), []);
+  const rows = online.flatMap((row) => {
+    const host = hosts.for(row.nodeId);
+    return host === undefined ? [] : (byNode.get(row.nodeId) ?? []).map((id) => ({ row, host, id }));
+  });
+  return (
+    <>
+      {online.map((row) => {
+        const host = hosts.for(row.nodeId);
+        return host === undefined ? null : <ArchivedSource key={row.nodeId} host={host} nodeId={row.nodeId} report={report} />;
+      })}
+      {rows.length > 0 && (
+        <section>
+          <h2>Archived</h2>
+          <table>
+            <thead><tr><th>Title</th><th>Held by</th><th>Projects</th><th></th></tr></thead>
+            <tbody>
+              {rows.map(({ row, host, id }) => (
+                <ArchivedRow key={`${row.nodeId}/${id}`} host={host} holder={row} nodes={nodes} id={id} open={(taskId) => open(row.nodeId, taskId)} />
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+    </>
+  );
+}
+
+/** Reports one node's archived task ids up while it is reachable. */
+function ArchivedSource({ host, nodeId, report }: { host: Host; nodeId: string; report: ArchivedReport }) {
+  const node = useObject(host, NodeObject, {});
+  return node.ref === undefined ? null : <ArchivedSourceLoaded node={node.ref} nodeId={nodeId} report={report} />;
+}
+
+function ArchivedSourceLoaded({ node, nodeId, report }: { node: NodeRef; nodeId: string; report: ArchivedReport }) {
+  const ids = useValue(node.archivedIds);
+  useEffect(() => {
+    report(nodeId, ids);
+    return () => report(nodeId, null);
+  }, [nodeId, ids, report]);
+  return null;
+}
+
+function ArchivedRow({ host, holder, nodes, id, open }: {
+  host: Host; holder: PoolNode; nodes: readonly PoolNode[]; id: string; open: (taskId: string) => void;
+}) {
+  const task = useObject(host, TaskObject, { id });
+  if (task.ref === undefined) return <tr><td colSpan={4} class={task.error ? "error" : "muted"}>{task.error ?? id}</td></tr>;
+  return <ArchivedRowLoaded task={task.ref} holder={holder} nodes={nodes} open={open} />;
+}
+
+/** The restore select's value for `Automatic` (placement picks the node). */
+const RESTORE_AUTOMATIC = "";
+
+/**
+ * An archived task: its title (opens its read-only view on its holder), the holder, its projects, and Restore (which
+ * opens a node select: `Automatic`, the holder, or another node that can take it) and Delete.
+ */
+function ArchivedRowLoaded({ task, holder, nodes, open }: {
+  task: Ref<typeof TaskObject>; holder: PoolNode; nodes: readonly PoolNode[]; open: (taskId: string) => void;
+}) {
+  const manifest = useValue(task.manifest);
+  const action = useAction();
+  const [choosing, setChoosing] = useState(false);
+  const [picked, setPicked] = useState(RESTORE_AUTOMATIC);
+  const targets = [holder, ...moveTargets(nodes, holder.nodeId, holder.claudeCodeVersion)];
+  const where = targets.some((n) => n.nodeId === picked) ? picked : RESTORE_AUTOMATIC;
+  const link = (label: string, run: () => void) => (
+    <a href="#" class={action.busy ? "muted" : ""} onClick={(e) => { e.preventDefault(); if (!action.busy) run(); }}>{label}</a>
+  );
+  return (
+    <tr>
+      <td><a href="#" onClick={(e) => { e.preventDefault(); open(manifest.id); }}>{manifest.title}</a></td>
+      <td><span title={holder.nodeId}>{holder.hostname} <span class="muted">{shortId(holder.nodeId)}</span></span></td>
+      <td>{manifest.projects.length === 0 ? <span class="muted">no project</span> : manifest.projects.map((p) => p.name).join(", ")}</td>
+      <td>
+        {choosing ? (
+          <>
+            <select disabled={action.busy} value={where} onChange={(e) => setPicked(e.currentTarget.value)}>
+              <option value={RESTORE_AUTOMATIC}>Automatic</option>
+              {targets.map((n) => <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)})</option>)}
+            </select>{" "}
+            <button disabled={action.busy} onClick={() => void action.run(() => task.restore({ node: where === RESTORE_AUTOMATIC ? null : where }))}>Restore</button>{" "}
+            {link("Cancel", () => setChoosing(false))}
+          </>
+        ) : (
+          <>
+            {link("Restore", () => setChoosing(true))}{" · "}
+            {link("Delete", () => void action.run(async () => {
+              if (confirm(`Delete "${manifest.title}", its log and its archive?`)) await task.delete({});
+            }))}
+          </>
+        )}
+        {action.error !== null && <span class="error"> {action.error}</span>}
+      </td>
     </tr>
   );
 }

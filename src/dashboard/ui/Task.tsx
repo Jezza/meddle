@@ -74,7 +74,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
     return (
       <>
         {head}
-        <ArchivedControls task={task} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} />
+        <ArchivedControls node={node} pool={pool} task={task} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} />
         <Thread session={session} readOnly />
       </>
     );
@@ -318,8 +318,22 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 
 // ─── controls and composer ───
 
-/** An archived task's only controls: restore it on the node it was archived on, or delete it with its archive. */
-function ArchivedControls({ task, archivedOn }: { task: TaskRef; archivedOn: string | null }) {
+/** The restore select's value for `Automatic` (placement picks the node). */
+const AUTOMATIC = "";
+
+/**
+ * An archived task's only controls: restore it (on the node chosen: this one, another that can take it, or
+ * `Automatic`, where placement picks), or delete it with its archive.
+ */
+function ArchivedControls({ node, pool, task, archivedOn }: { node: NodeRef; pool: PoolRef; task: TaskRef; archivedOn: string | null }) {
+  const nodes = useValue(pool.nodes);
+  const selfId = useValue(node.nodeId);
+  const version = useValue(node.claudeCodeVersion);
+  const self = nodes.find((n) => n.nodeId === selfId);
+  const targets = [...(self === undefined ? [] : [self]), ...moveTargets(nodes, selfId, version)];
+  const [picked, setPicked] = useState(AUTOMATIC);
+  // A node that went offline since it was picked falls back to Automatic.
+  const where = targets.some((n) => n.nodeId === picked) ? picked : AUTOMATIC;
   const action = useAction();
   const remove = () => action.run(async () => {
     if (!confirm("Delete this task, its log and its archive? This cannot be undone.")) return;
@@ -330,7 +344,15 @@ function ArchivedControls({ task, archivedOn }: { task: TaskRef; archivedOn: str
     <section class="controls">
       <p class="muted">Archived{archivedOn === null ? "" : ` on ${archivedOn}`}: its folder is gone, its log is kept. Restore it to carry on.</p>
       <div class="row">
-        <button disabled={action.busy} onClick={() => action.run(() => task.restore({ node: null }))}>Restore</button>
+        <label>Restore on{" "}
+          <select disabled={action.busy} value={where} onChange={(e) => setPicked(e.currentTarget.value)}>
+            <option value={AUTOMATIC}>Automatic</option>
+            {targets.map((n) => (
+              <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)}){n.nodeId === selfId ? ", here" : ""}</option>
+            ))}
+          </select>
+        </label>
+        <button disabled={action.busy} onClick={() => action.run(() => task.restore({ node: where === AUTOMATIC ? null : where }))}>Restore</button>
         <button disabled={action.busy} onClick={remove}>Delete</button>
       </div>
       {action.error !== null && <p class="error">{action.error}</p>}
