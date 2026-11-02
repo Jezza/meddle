@@ -36,8 +36,15 @@ const ENV_PREFIX = "env.";
 const NON_NEGATIVE_INTEGER = /^\d+$/;
 /** The longest value a setting may have: it goes into the environment of every jj and Claude Code. */
 export const MAX_SETTING_VALUE = 4096;
-/** Control characters other than tab: a NUL makes every spawn throw, the others have no place in a setting. */
-const CONTROL = /[\x00-\x08\x0a-\x1f\x7f]/;
+/** The longest key a setting may have: an `env.*` name goes into the environment of every jj and Claude Code. */
+export const MAX_SETTING_KEY = 256;
+/** The most the settings add to an environment, counting each name's and value's length; later entries are left out. */
+export const MAX_POOL_ENV = 65536;
+/**
+ * Control characters (C0 other than tab, DEL and C1): a NUL makes every spawn throw, and the others could print a
+ * terminal escape in `config list`.
+ */
+const CONTROL = /[\x00-\x08\x0a-\x1f\x7f-\x9f]/;
 const BAD_VALUE = `setting value must be at most ${MAX_SETTING_VALUE} characters with no control characters`;
 /** The keys whose value may not be empty: an empty jj identity overrides the node's own and jj refuses to push. */
 const NON_EMPTY = new Set(["jj.user", "jj.email", "lighthouse.url"]);
@@ -52,7 +59,7 @@ function toRow(r: SettingRecord): SettingRow {
 
 /** Why `key` may not be stored (`invalid setting key: …`, `reserved environment name: …`), or null when it may. */
 function keyProblem(key: string): string | null {
-  if (!SETTING_KEY.test(key)) return `invalid setting key: ${key}`;
+  if (key.length > MAX_SETTING_KEY || !SETTING_KEY.test(key)) return `invalid setting key: ${key.slice(0, LOGGED_KEY_CHARS)}`;
   if (key.startsWith(ENV_PREFIX) && reservedEnv(key.slice(ENV_PREFIX.length))) {
     return `reserved environment name: ${key.slice(ENV_PREFIX.length)}`;
   }
@@ -106,6 +113,8 @@ function nonNegativeInteger(raw: string): number | null {
 export class PoolSettings {
   /** Replicated rows dropped because of their key or value, since this object was made. */
   ignored = 0;
+  /** `env()` logged that the settings exceed `MAX_POOL_ENV`: it says so once. */
+  private loggedOversize = false;
   /** The keys whose drop was logged already (at most `MAX_LOGGED`): each is logged once. */
   private readonly logged = new Set<string>();
   private readonly log: (line: string) => void;
@@ -197,28 +206,43 @@ export class PoolSettings {
     })();
   }
 
-  /** Counts a dropped replicated row and logs its key, once per key and for at most `MAX_LOGGED` keys. */
+  /**
+   * Counts a dropped replicated row and logs its key, once per key (as cut to `LOGGED_KEY_CHARS`, so keys that differ
+   * only further on share a line and the set stays small) and for at most `MAX_LOGGED` keys.
+   */
   private ignore(key: string): void {
     this.ignored++;
-    if (this.logged.has(key) || this.logged.size >= MAX_LOGGED) return;
-    this.logged.add(key);
-    this.log(`meddle: settings: ignored replicated key ${JSON.stringify(key.slice(0, LOGGED_KEY_CHARS))}`);
+    const shown = key.slice(0, LOGGED_KEY_CHARS);
+    if (this.logged.has(shown) || this.logged.size >= MAX_LOGGED) return;
+    this.logged.add(shown);
+    this.log(`meddle: settings: ignored replicated key ${JSON.stringify(shown)}`);
   }
 
   /**
-   * The environment the settings give jj and Claude Code: `jj.user`, `jj.email` and `env.*`, reserved names and values
-   * no spawn could take (or an empty identity) left out.
+   * The environment the settings give jj and Claude Code: `jj.user`, `jj.email` and `env.*`, in key order, with
+   * invalid keys, reserved names and values no spawn could take (or an empty identity) left out. Once the names and
+   * values added would exceed `MAX_POOL_ENV` characters, no later entry is added (logged once: an environment that
+   * large makes every spawn fail).
    */
   env(): Record<string, string> {
     const env: Record<string, string> = {};
+    let total = 0;
     for (const { key, value } of this.list()) {
-      if (!replicableValue(key, value)) continue;
-      if (key === "jj.user") env.JJ_USER = value;
-      else if (key === "jj.email") env.JJ_EMAIL = value;
-      else if (key.startsWith(ENV_PREFIX)) {
-        const name = key.slice(ENV_PREFIX.length);
-        if (!reservedEnv(name)) env[name] = value;
+      if (keyProblem(key) !== null || !replicableValue(key, value)) continue;
+      let name: string;
+      if (key === "jj.user") name = "JJ_USER";
+      else if (key === "jj.email") name = "JJ_EMAIL";
+      else if (key.startsWith(ENV_PREFIX)) name = key.slice(ENV_PREFIX.length);
+      else continue;
+      if (total + name.length + value.length > MAX_POOL_ENV) {
+        if (!this.loggedOversize) {
+          this.loggedOversize = true;
+          this.log("meddle: settings: environment over 64 KiB; later settings not applied");
+        }
+        break;
       }
+      total += name.length + value.length;
+      env[name] = value;
     }
     return env;
   }

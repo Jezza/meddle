@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { loadConfig, type NodeConfig } from "../src/config";
 import { buildEnv, type EngineInput } from "../src/engine/options";
 import { initColocated, jj, jjEnv } from "../src/jj";
-import { MAX_SETTING_VALUE, PoolSettings, discoveryLighthouseUrl, reservedEnv, type SettingRow } from "../src/pool/settings";
+import { MAX_POOL_ENV, MAX_SETTING_KEY, MAX_SETTING_VALUE, PoolSettings, discoveryLighthouseUrl, reservedEnv, type SettingRow } from "../src/pool/settings";
 import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { twoPoolNodes } from "./pool-helpers";
@@ -274,4 +274,48 @@ test("equal times converge: the greater setBy wins, then the greater value", () 
     expect(one.merge(two.rows())).toBe(false);
     expect(two.merge(one.rows())).toBe(false);
   }
+});
+
+test("a key is at most 256 characters, at set, at merge and in env()", async () => {
+  const lines: string[] = [];
+  const db = openDb(":memory:");
+  const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
+  const settings = new PoolSettings(db, cfg, SELF, (line) => lines.push(line));
+  const long = `env.${"A".repeat(296)}`;
+  expect(long).toHaveLength(300);
+  expect(() => settings.set(long, "x")).toThrow(`invalid setting key: ${long.slice(0, 80)}`);
+  expect(() => settings.set(long, "x")).not.toThrow(long.slice(0, 81));
+  expect(settings.set(`env.${"B".repeat(MAX_SETTING_KEY - 4)}`, "ok").value).toBe("ok");
+  const huge = `env.${"A".repeat(200_000)}`;
+  expect(settings.merge([row(huge, "x", "2026-01-01T00:00:00.000Z"), row(long, "x", "2026-01-01T00:00:00.000Z")])).toBe(false);
+  expect(lines).toEqual([`meddle: settings: ignored replicated key ${JSON.stringify(huge.slice(0, 80))}`]);
+  // A row stored before this rule (or by any other way in) is skipped by env() too.
+  db.query("INSERT INTO settings (key, value, updated_at, set_by) VALUES (?, ?, ?, ?)").run(huge, "x", "2026-01-01T00:00:00.000Z", PEER);
+  settings.apply();
+  expect(Object.keys(cfg.poolEnv)).toEqual(["B".repeat(MAX_SETTING_KEY - 4)]);
+  expect(await jj(["--version"], "/", cfg)).toMatch(/^jj /);
+});
+
+test("env() stops adding settings past 64 KiB, in key order, and logs it once", async () => {
+  const lines: string[] = [];
+  const { cfg, settings } = fresh({}, (line) => lines.push(line));
+  const names = Array.from({ length: 20 }, (_, i) => `V${String(i).padStart(2, "0")}`);
+  for (const name of names) settings.set(`env.${name}`, "x".repeat(MAX_SETTING_VALUE));
+  settings.apply();
+  settings.apply();
+  // Each entry is 3 + 4096 characters: 15 fit in 65536, the 16th would not.
+  const fit = Math.floor(MAX_POOL_ENV / (3 + MAX_SETTING_VALUE));
+  expect(fit).toBe(15);
+  expect(Object.keys(cfg.poolEnv)).toEqual(names.slice(0, fit));
+  expect(lines).toEqual(["meddle: settings: environment over 64 KiB; later settings not applied"]);
+  expect(await jj(["--version"], "/", cfg)).toMatch(/^jj /);
+});
+
+test("C1 control characters are refused like C0 ones", () => {
+  const { settings } = fresh({}, () => {});
+  for (const c of ["\u0080", "\u009b", "\u009f"]) {
+    expect(() => settings.set("env.FOO", `a${c}b`)).toThrow(BAD_VALUE);
+    expect(settings.merge([row("env.FOO", `a${c}b`, "2026-01-01T00:00:00.000Z")])).toBe(false);
+  }
+  expect(settings.set("env.FOO", "caf\u00e9 \u00a0").value).toBe("caf\u00e9 \u00a0");
 });
