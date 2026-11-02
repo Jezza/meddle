@@ -16,6 +16,14 @@ import { writeManifest, type TaskManifest } from "./manifest";
 export type SettingSource = "user" | "project" | "local";
 
 export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string {
+  if (projects.length === 0) {
+    return [
+      `# Task: ${m.title}`,
+      "",
+      "This task has no project attached. This folder is scratch space; it travels with the task.",
+      "",
+    ].join("\n");
+  }
   const lines = projects.map((p) => `- ${p.name}/: jj workspace of project ${p.name}`);
   return [
     `# Task: ${m.title}`,
@@ -27,20 +35,26 @@ export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string 
   ].join("\n");
 }
 
+/**
+ * Where a task's Claude Code runs: one project → its workspace, with the replica's project settings; several → the
+ * task folder, user settings only (each project's settings are composed in); none → the task folder, user settings
+ * only and no project config root.
+ */
 export function cwdFor(
   m: TaskManifest,
   cfg: NodeConfig,
-): { cwd: string; projectConfigRoot?: string; settingSources: SettingSource[] } {
+): { cwd: string; projectConfigRoot?: string | null; settingSources: SettingSource[] } {
   const task = paths(cfg).task(m.id);
   const [only] = m.projects;
   if (m.projects.length === 1 && only) {
     return { cwd: join(task, only.workspace), projectConfigRoot: only.replica, settingSources: ["user", "project", "local"] };
   }
+  if (m.projects.length === 0) return { cwd: task, projectConfigRoot: null, settingSources: ["user"] };
   return { cwd: task, settingSources: ["user"] };
 }
 
+/** The projects `projectIds` name, in order (none for a task without a project). */
 function resolveProjects(db: Database, projectIds: string[]): Project[] {
-  if (projectIds.length === 0) throw new Error("a task needs at least one project");
   const projects: Project[] = [];
   const names = new Set<string>();
   for (const id of projectIds) {
@@ -90,15 +104,18 @@ export async function provisionTask(
       entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent });
     }
     await linkProfile(configDir, cfg);
-    const primary = projects[0]!;
-    await ensureMemoryReplica(cfg, primary.id);
-    await linkMemory(configDir, cfg, primary.id);
+    // The primary project's memory; a task without a project has none.
+    const primary = projects[0];
+    if (primary !== undefined) {
+      await ensureMemoryReplica(cfg, primary.id);
+      await linkMemory(configDir, cfg, primary.id);
+    }
     const manifest: TaskManifest = {
       id,
       title: input.title,
       sessionId: crypto.randomUUID(),
       projects: entries,
-      primaryProjectId: primary.id,
+      primaryProjectId: primary?.id ?? null,
       createdAt: new Date().toISOString(),
     };
     await writeFile(join(task, "CLAUDE.md"), generatedClaudeMd(manifest, projects));
@@ -131,12 +148,11 @@ function safeName(name: string): boolean {
 
 /**
  * Throws unless a manifest from another node is safe to provision here: ids and folder names are single path
- * segments, workspaces are distinct, and the primary project is one of the task's.
+ * segments, workspaces are distinct, and the primary project is one of the task's (null, for a task without one).
  */
 export function checkReceivedManifest(m: TaskManifest): void {
   if (!SAFE_ID.test(m.id)) throw new Error(`invalid task id: ${m.id}`);
   if (!SAFE_ID.test(m.sessionId)) throw new Error(`invalid session id: ${m.sessionId}`);
-  if (m.projects.length === 0) throw new Error("a task needs at least one project");
   const workspaces = new Set<string>();
   for (const p of m.projects) {
     if (!safeName(p.name)) throw new Error(`invalid project name: ${p.name}`);
@@ -144,7 +160,9 @@ export function checkReceivedManifest(m: TaskManifest): void {
     if (workspaces.has(p.workspace)) throw new Error(`duplicate workspace in task: ${p.workspace}`);
     workspaces.add(p.workspace);
   }
-  if (!m.projects.some((p) => p.id === m.primaryProjectId)) throw new Error("the primary project is not one of the task's");
+  if (m.projects.length === 0 ? m.primaryProjectId !== null : !m.projects.some((p) => p.id === m.primaryProjectId)) {
+    throw new Error("the primary project is not one of the task's");
+  }
 }
 
 /**
@@ -200,8 +218,10 @@ export async function provisionFromManifest(
       entries.push({ ...entry, replica, parent });
     }
     await linkProfile(configDir, cfg);
-    await ensureMemoryReplica(cfg, manifest.primaryProjectId);
-    await linkMemory(configDir, cfg, manifest.primaryProjectId);
+    if (manifest.primaryProjectId !== null) {
+      await ensureMemoryReplica(cfg, manifest.primaryProjectId);
+      await linkMemory(configDir, cfg, manifest.primaryProjectId);
+    }
     const received: TaskManifest = { ...manifest, projects: entries };
     await writeFile(join(task, "CLAUDE.md"), generatedClaudeMd(received, projects));
     await writeManifest(cfg, received);

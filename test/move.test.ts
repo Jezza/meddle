@@ -988,3 +988,38 @@ test("an archive is written once per stay: kept on a rerun, replaced after the t
     await rm(node.home, { recursive: true, force: true });
   }
 });
+
+test("a task without a project moves to another node, its transcript lands in the target's slot, and it resumes there", async () => {
+  const { realpathSync } = await import("node:fs");
+  const { claudeSlot } = await import("../src/memory");
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await A.runner.create({ title: "loose", projectIds: [] });
+    expect(m.primaryProjectId).toBeNull();
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    expect(existsSync(transcriptPath(A.cfg, m))).toBe(true);
+    // A store row under A's slot travels, and is filed under B's.
+    const slotA = claudeSlot(realpathSync(paths(A.cfg).task(m.id)));
+    A.db.query("INSERT INTO transcript (project_key, session_id, subpath, seq, uuid, ts, json) VALUES (?, ?, '', 1, NULL, 0, '{}')").run(slotA, m.sessionId);
+    await peerReady(A, B);
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    await until("the task's state on A", () => getTask(A.db, m.id)?.state, "moved");
+    expect(B.runner.state(m.id)).toBe("idle");
+    const onB = await readManifest(B.cfg, m.id);
+    expect(onB).toEqual(m);
+    const slotB = claudeSlot(realpathSync(paths(B.cfg).task(m.id)));
+    expect(slotB).not.toBe(slotA);
+    expect(existsSync(transcriptPath(B.cfg, onB))).toBe(true);
+    expect(await readdir(join(paths(B.cfg).taskConfig(m.id), "projects"))).toEqual([slotB]);
+    const keys = B.db.query("SELECT DISTINCT project_key AS k FROM transcript WHERE session_id = ?").all(m.sessionId) as Array<{ k: string }>;
+    expect(keys.map((r) => r.k)).toEqual([slotB]);
+    await promptAndWait(B, m.id, "Carry on.");
+    const started = listEvents(B.db, m.id).filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
+    expect(started.map((e) => (e.message as { resume: boolean }).resume)).toEqual([false, true]);
+    // No project: nothing to push, no memory to sync, on either node.
+    expect([...A.logs, ...B.logs].filter((l) => /push|memory/.test(l))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 30_000);

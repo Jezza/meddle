@@ -28,7 +28,8 @@ export const TaskManifestSchema = Type.Object({
     workspace: Type.String(),
     parent: Type.String(),
   })),
-  primaryProjectId: Type.String(),
+  /** Null for a task without a project. */
+  primaryProjectId: Nullable(Type.String()),
   createdAt: Type.String(),
 });
 

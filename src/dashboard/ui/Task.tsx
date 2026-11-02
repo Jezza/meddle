@@ -42,7 +42,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
     <header class="task-head">
       <h2>{manifest.title} <span class={`state ${state}`}>{state}</span></h2>
       <p class="muted">
-        {manifest.projects.map((p) => `${p.name} (${p.workspace})`).join(", ")} · session {manifest.sessionId}
+        {manifest.projects.length === 0 ? "no project" : manifest.projects.map((p) => `${p.name} (${p.workspace})`).join(", ")} · session {manifest.sessionId}
       </p>
     </header>
   );

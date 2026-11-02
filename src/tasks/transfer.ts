@@ -1,4 +1,5 @@
-import { lstat, mkdir, open, readdir, readFile, type FileHandle } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { cp, lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { SendStream } from "@number0/iroh";
@@ -6,7 +7,7 @@ import type { NodeConfig } from "../config";
 import { paths } from "../paths";
 import { MAX_FRAME, writeFrame, type StreamReader } from "../pool/frames";
 import type { TaskSettings } from "../store/records";
-import type { TaskManifest } from "./manifest";
+import { transcriptSlot, type TaskManifest } from "./manifest";
 
 /*
  * A task's move, as frames on one `blob` stream: JSON header frames (kind 0) in the order manifest, events, transcript
@@ -279,4 +280,32 @@ export async function importTask(
 export function receiptsMatch(sent: Receipt, got: Receipt): boolean {
   return sent.events === got.events && sent.transcript === got.transcript && sent.files === got.files && sent.bytes === got.bytes
     && sent.lastEventSeq === got.lastEventSeq && sent.sha256 === got.sha256;
+}
+
+/**
+ * Files a received task without a project under this node's transcript slot. Claude Code names that slot after the
+ * task folder, which sits under another task root on the sender: every other directory under `<taskConfig>/projects/`
+ * is merged into this node's slot, and the session's store rows are keyed by it. A task with a project keeps its
+ * slot (the project id) and is left alone. Needs the task folder.
+ */
+export async function adoptTranscriptSlot(cfg: NodeConfig, db: Database, m: TaskManifest): Promise<void> {
+  if (m.primaryProjectId !== null) return;
+  const root = join(paths(cfg).taskConfig(m.id), "projects");
+  const slot = transcriptSlot(cfg, m);
+  const names = await readdir(root).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return [] as string[];
+    throw err;
+  });
+  for (const name of names) {
+    if (name === slot) continue;
+    const from = join(root, name);
+    if (!(await lstat(from)).isDirectory()) continue;
+    const to = join(root, slot);
+    if (!existsSync(to)) await rename(from, to);
+    else {
+      await cp(from, to, { recursive: true, force: true });
+      await rm(from, { recursive: true, force: true });
+    }
+  }
+  db.query("UPDATE OR REPLACE transcript SET project_key = ? WHERE session_id = ? AND project_key != ?").run(slot, m.sessionId, slot);
 }

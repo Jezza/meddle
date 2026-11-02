@@ -1,0 +1,48 @@
+// The pool's projects as the roster lists them: `meddle project list` and `--project <id|name>`. Pure: they read what
+// each node's summary says (decision 6), never a peer.
+import { shortId } from "./ids";
+
+/** A node of the roster as `PoolObject.nodes` gives it: its status and the projects its summary lists. */
+export type ProjectHolder = { nodeId: string; status: string; projects: ReadonlyArray<{ id: string; name: string; home: string }> };
+
+/** One project of the pool: named as its home lists it, held by every node whose summary lists it (by node id). */
+export type PoolProject = { id: string; name: string; home: string; holders: string[] };
+
+/**
+ * Every project the members' summaries list (this node's included, as `nodes` has it), one per id, by name then id.
+ * A project's name and home are its home's entry when the home lists it, else the first holder's.
+ */
+export function poolProjects(nodes: readonly ProjectHolder[]): PoolProject[] {
+  const byId = new Map<string, PoolProject>();
+  for (const node of nodes) {
+    if (node.status === "removed") continue;
+    for (const p of node.projects) {
+      const row = byId.get(p.id);
+      if (row === undefined) byId.set(p.id, { id: p.id, name: p.name, home: p.home, holders: [node.nodeId] });
+      else {
+        if (!row.holders.includes(node.nodeId)) row.holders.push(node.nodeId);
+        if (node.nodeId === p.home) Object.assign(row, { name: p.name, home: p.home });
+      }
+    }
+  }
+  const rows = [...byId.values()];
+  for (const row of rows) row.holders.sort();
+  return rows.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/** `<id>  <name>  home <short>  on <short,short,…>`. */
+export function projectLine(p: PoolProject): string {
+  return `${p.id}  ${p.name}  home ${shortId(p.home)}  on ${p.holders.map(shortId).join(",")}`;
+}
+
+/**
+ * The project `x` names: a project's id, or the name of exactly one project of the pool. Throws
+ * `ambiguous project name: <x>` when several have that name, `unknown project: <x>` when none has it.
+ */
+export function resolveProject(projects: readonly PoolProject[], x: string): string {
+  if (projects.some((p) => p.id === x)) return x;
+  const named = projects.filter((p) => p.name === x);
+  if (named.length > 1) throw new Error(`ambiguous project name: ${x}`);
+  if (named.length === 0) throw new Error(`unknown project: ${x}`);
+  return named[0]!.id;
+}

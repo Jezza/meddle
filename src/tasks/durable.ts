@@ -42,7 +42,7 @@ import { claudeCodeVersion } from "../version";
 import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
 import { MeddleMove, type MoveInput } from "./move";
 import { checkReceivedManifest, provisionFromManifest, provisionTask } from "./provision";
-import { importTask, type Receipt } from "./transfer";
+import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
 
 export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" | "moved" | "archived";
 
@@ -236,8 +236,9 @@ export class TaskRunner {
   }
 
   /**
-   * Provisions a task. With a pool, each project is first replicated here when it is homed elsewhere and unknown
-   * (cloned from its home), and the task starts from the home's trunk.
+   * Provisions a task (with no project, or several). With a pool, each project is first replicated here when it is
+   * homed elsewhere and unknown (cloned from its home), and the task starts from the home's trunk; from the trunk last
+   * fetched from the home when the home cannot be reached now (`#startOf`).
    */
   async create(input: { title: string; projectIds: string[] }): Promise<TaskManifest> {
     if ((await pickToken(this.#cfg, this.#db)) === null) throw new Error("no usable token");
@@ -248,13 +249,32 @@ export class TaskRunner {
       const parents: Record<string, string> = {};
       for (const id of input.projectIds) {
         if (id in parents) continue; // provisionTask refuses the duplicate
-        parents[id] = await trunkFor(deps, await ensureReplica(deps, id));
+        parents[id] = await this.#startOf(deps, await ensureReplica(deps, id));
       }
       manifest = await provisionTask(this.#cfg, this.#db, { ...input, parents });
     }
     // The new task is live here: whoever lists this node's tasks hears of it, whichever node asked for it.
     this.#emitState(manifest.id, "idle");
     return manifest;
+  }
+
+  /**
+   * Where a new task of `project` starts: `trunkFor`. When that fails for a project homed on another node (the home is
+   * offline, or the fetch failed) and this replica has fetched the home's `trunk` before, that `trunk@<home>` instead,
+   * logged: placement may pick a node holding a replica because the home is down.
+   */
+  async #startOf(deps: ReplicaDeps, project: Project): Promise<string> {
+    try {
+      return await trunkFor(deps, project);
+    } catch (err) {
+      if (project.home === deps.pool.identity.id) throw err;
+      const remote = shortId(project.home);
+      const known = await serialised(repoKey(project.replica), () => bookmarkList(project.replica, this.#cfg)).catch(() => []);
+      const last = known.find((b) => b.name === "trunk" && b.remote === remote);
+      if (last === undefined || last.conflicted || last.changeId === "") throw err;
+      this.#log(`meddle: project ${project.name}: home unreachable; starting from the last fetched trunk`);
+      return `trunk@${remote}`;
+    }
   }
 
   /** How many of this node's tasks are in state `running` or `waiting`. */
@@ -472,7 +492,8 @@ export class TaskRunner {
       const manifest = await readManifest(this.#cfg, taskId);
       const primary = manifest.primaryProjectId;
       const deps = this.#replicaDeps();
-      if (deps !== null) {
+      // A task without a project has no memory to sync.
+      if (deps !== null && primary !== null) {
         const live = this.#projectLiveElsewhere(taskId, primary);
         this.#primaries.set(taskId, primary);
         await syncMemoryBefore(deps, primary, live, this.#log);
@@ -553,6 +574,7 @@ export class TaskRunner {
       if (deps === null) return;
       for (const m of moved) await this.#pushToHome(deps, m);
       const primary = manifest.primaryProjectId;
+      if (primary === null) return; // no project: no bookmarks moved, no memory
       const live = this.#projectLiveElsewhere(taskId, primary);
       // Decided and dropped in one go: of two tasks ending together, the second then sees the first gone and syncs.
       // A task that syncs stays live for others until its sync is done, so a turn starting meanwhile defers its own.
@@ -662,6 +684,8 @@ export class TaskRunner {
       const row = this.#receivingFrom(taskId, from);
       clearTaskLog(this.#db, taskId, row.session_id);
       const got = await importTask(this.#cfg, this.#db, reader, { taskId });
+      // The manifest checked as the task was received, not the stream's copy.
+      await adoptTranscriptSlot(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest);
       updateTask(this.#db, taskId, {
         settings: got.settings === null ? null : JSON.stringify(got.settings),
         queued: got.queued.length === 0 ? null : JSON.stringify(got.queued),

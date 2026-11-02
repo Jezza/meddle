@@ -149,3 +149,95 @@ test("PeerObject.createTask refuses a peer that is not a member, before creating
     await host.close();
   }
 });
+
+test("with the home unreachable, a node holding a replica starts the task from the trunk it last fetched", async () => {
+  const { writeFile } = await import("node:fs/promises");
+  const { jj } = await import("../src/jj");
+  const { shortId } = await import("../src/pool/ids");
+  const { paths } = await import("../src/config");
+  const { A, B, close } = await twoPoolNodes();
+  const linked = linkClient(B.host);
+  try {
+    // A is the home of its project; give it a trunk.
+    const repo = A.project.replica;
+    await writeFile(`${repo}/README`, "hello\n");
+    await jj(["commit", "-m", "init"], repo, A.cfg);
+    await jj(["bookmark", "set", "main", "-r", "@-"], repo, A.cfg);
+    const trunk = (await jj(["log", "-r", "main", "--no-graph", "-T", "change_id"], repo, A.cfg)).trim();
+    await peerReady(B, A);
+    const first = await B.runner.create({ title: "first", projectIds: [A.project.id] });
+    expect(first.projects[0]!.parent).toBe(`trunk@${shortId(A.id)}`);
+
+    await A.net.stop();
+    await eventually(() => !B.net.isOnline(A.id), () => "B to see A offline");
+    const nodeB = await linked.client.get(NodeObject, {});
+    try {
+      const placed = await nodeB.createTask({ title: "second", projectIds: [A.project.id], node: null });
+      expect(placed.nodeId).toBe(B.id);
+      expect(placed.manifest.projects[0]!.parent).toBe(`trunk@${shortId(A.id)}`);
+      const workspace = `${paths(B.cfg).task(placed.manifest.id)}/a`;
+      expect((await jj(["log", "-r", "@-", "--no-graph", "-T", "change_id"], workspace, B.cfg)).trim()).toBe(trunk);
+      expect(B.logs.filter((l) => l.includes("home unreachable"))).toEqual([
+        "meddle: project a: home unreachable; starting from the last fetched trunk",
+      ]);
+    } finally {
+      nodeB.release();
+    }
+  } finally {
+    await linked.close();
+    await close();
+  }
+}, 60_000);
+
+test("a peer's refusal of a create names the node that refused", async () => {
+  const { rm } = await import("node:fs/promises");
+  const { shortId } = await import("../src/pool/ids");
+  const { A, B, close } = await twoPoolNodes();
+  const linked = linkClient(A.host);
+  try {
+    await peerReady(A, B);
+    await rm(B.cfg.taskRoot, { recursive: true, force: true });
+    const nodeA = await linked.client.get(NodeObject, {});
+    try {
+      let refusal: unknown = null;
+      await nodeA.createTask({ title: "t", projectIds: [], node: B.id }).catch((err: unknown) => { refusal = err; });
+      expect(refusal).toBeInstanceOf(Error);
+      const message = (refusal as Error).message;
+      expect(message).toContain(`${shortId(B.id)}: task root ${B.cfg.taskRoot} does not exist`);
+    } finally {
+      nodeA.release();
+    }
+  } finally {
+    await linked.close();
+    await close();
+  }
+}, 60_000);
+
+test("with no other node online, an automatic create says why this node cannot take the task", async () => {
+  const { rm } = await import("node:fs/promises");
+  const { startPoolNode } = await import("./pool-helpers");
+  const rootless = await startPoolNode();
+  const full = await startPoolNode(undefined, { MEDDLE_MAX_RUNNING: "1", MEDDLE_FIXTURE_STALL: "1" });
+  const one = linkClient(rootless.host);
+  const two = linkClient(full.host);
+  try {
+    await rm(rootless.cfg.taskRoot, { recursive: true, force: true });
+    const nodeOne = await one.client.get(NodeObject, {});
+    await expect(nodeOne.createTask({ title: "t", projectIds: [], node: null })).rejects.toThrow("this node has no task root");
+    nodeOne.release();
+
+    const busy = await full.runner.create({ title: "busy", projectIds: [] });
+    await full.runner.prompt(busy.id, "Reply with the single word ok.");
+    await eventually(() => full.runner.running() === 1, () => "the stalled turn to run");
+    const nodeTwo = await two.client.get(NodeObject, {});
+    await expect(nodeTwo.createTask({ title: "t", projectIds: [], node: null })).rejects.toThrow("this node is at its running limit; use --here");
+    const here = await nodeTwo.createTask({ title: "h", projectIds: [], node: "here" });
+    expect(here.nodeId).toBe(full.id);
+    nodeTwo.release();
+  } finally {
+    await one.close();
+    await two.close();
+    await rootless.close();
+    await full.close();
+  }
+}, 60_000);

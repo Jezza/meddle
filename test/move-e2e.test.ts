@@ -91,7 +91,7 @@ test("a task moves from one node to another through the CLI and resumes there", 
     expect(added.code).toBe(0);
     const projectId = added.stdout.trim();
     const listed = await meddle(["project", "list"], atA);
-    expect(listed.stdout).toBe(`${projectId}  repo  ${a.dir}/repo  home ${shortId(A.id)}\n`);
+    expect(listed.stdout).toBe(`${projectId}  repo  home ${shortId(A.id)}  on ${shortId(A.id)}\n`);
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], atA);
     expect(created.stderr).toBe("");
     expect(created.code).toBe(0);

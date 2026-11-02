@@ -104,3 +104,64 @@ test("a provision failing after a workspace exists undoes workspaces, bookmarks 
   const { listTasks } = await import("../src/store/records");
   expect(listTasks(db)).toEqual([]);
 });
+test("a task without a project is scratch space: no workspace, no primary, no memory slot, run from the task folder", async () => {
+  const { mkdir, readdir } = await import("node:fs/promises");
+  const { realpathSync } = await import("node:fs");
+  const { claudeSlot } = await import("../src/memory");
+  const { transcriptPath, readManifest } = await import("../src/tasks/manifest");
+  const { buildEnv } = await import("../src/engine/options");
+  const { checkReceivedManifest } = await import("../src/tasks/provision");
+  const home = await mkdtemp("/tmp/meddle-prov-");
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/data`, MEDDLE_TASK_ROOT: `${home}/tasks` });
+  await ensureDataDirs(cfg);
+  await mkdir(cfg.taskRoot, { recursive: true });
+  const db = openDb(`${home}/data/meddle.sqlite`);
+  const m = await provisionTask(cfg, db, { title: "loose", projectIds: [] });
+  const task = paths(cfg).task(m.id);
+  expect(m.projects).toEqual([]);
+  expect(m.primaryProjectId).toBeNull();
+  expect(await readManifest(cfg, m.id)).toEqual(m);
+  // Only the generated CLAUDE.md and meddle's own folder: no workspace, no `projects/` (memory) slot.
+  expect((await readdir(task)).sort()).toEqual([".meddle", "CLAUDE.md"]);
+  expect(await Bun.file(`${paths(cfg).taskConfig(m.id)}/projects`).exists()).toBe(false);
+  expect(await readdir(paths(cfg).taskConfig(m.id))).not.toContain("projects");
+  expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toBe(
+    "# Task: loose\n\nThis task has no project attached. This folder is scratch space; it travels with the task.\n",
+  );
+  expect(cwdFor(m, cfg)).toEqual({ cwd: task, projectConfigRoot: null, settingSources: ["user"] });
+  const env = buildEnv({
+    cfg, manifest: m, contexts: [], projectSettings: [], token: "tok", prompt: (async function* () {})(),
+    canUseTool: async () => ({ behavior: "deny" as const, message: "x" }), onPermissionDenied: () => {}, sessionStore: {} as never, resume: false,
+  });
+  expect(env).not.toHaveProperty("CLAUDE_CODE_PROJECT_DIR_NAME");
+  expect(env.CLAUDE_CONFIG_DIR).toBe(paths(cfg).taskConfig(m.id));
+  // Claude Code's own slot for the folder it runs in (resolved: the child's cwd is the real path).
+  expect(transcriptPath(cfg, m)).toBe(`${paths(cfg).taskConfig(m.id)}/projects/${claudeSlot(realpathSync(task))}/${m.sessionId}.jsonl`);
+  // A received manifest may have no project too.
+  expect(() => checkReceivedManifest(m)).not.toThrow();
+  expect(() => checkReceivedManifest({ ...m, primaryProjectId: "p1" })).toThrow("the primary project is not one of the task's");
+});
+test("a projectless task's turn runs to success, leaves its transcript where Claude Code writes it, and the next turn resumes", async () => {
+  const { setupNode } = await import("./helpers");
+  const { listEvents } = await import("../src/store/events");
+  const { transcriptPath } = await import("../src/tasks/manifest");
+  const { existsSync } = await import("node:fs");
+  const { runner, db, cfg } = await setupNode();
+  const m = await runner.create({ title: "loose", projectIds: [] });
+  const turn = (text: string) => new Promise<void>((res) => {
+    let ran = false;
+    const off = runner.onState((id, s) => {
+      if (id !== m.id) return;
+      if (s === "running") ran = true;
+      else if (s === "idle" && ran) { off(); res(); }
+    });
+    void runner.prompt(m.id, text);
+  });
+  await turn("Reply with the single word ok.");
+  const results = listEvents(db, m.id).filter((e) => (e.message as { type?: string }).type === "result");
+  expect(results.map((e) => (e.message as { subtype?: string }).subtype)).toEqual(["success"]);
+  expect(existsSync(transcriptPath(cfg, m))).toBe(true);
+  await turn("Again.");
+  const started = listEvents(db, m.id).filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
+  expect(started.map((e) => (e.message as { resume?: boolean }).resume)).toEqual([false, true]);
+}, 30_000);

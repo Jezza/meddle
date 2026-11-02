@@ -16,13 +16,16 @@ import { endpointPair } from "./pool-helpers";
 type Node = Awaited<ReturnType<typeof setupNode>>;
 
 /** A node with one task that ran one replayed turn. */
-async function turnedNode(): Promise<{ node: Node; m: TaskManifest }> {
+/** A task with a project: its primary is a string. */
+type ProjectTask = TaskManifest & { primaryProjectId: string };
+
+async function turnedNode(): Promise<{ node: Node; m: ProjectTask }> {
   const node = await setupNode();
   const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
   const idle = new Promise<void>((res) => node.runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); }));
   await node.runner.prompt(m.id, "Reply with the single word ok.");
   await idle;
-  return { node, m };
+  return { node, m: m as ProjectTask };
 }
 
 async function closeNodes(...nodes: Node[]): Promise<void> {

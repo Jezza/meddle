@@ -133,8 +133,9 @@ function sessionArg(): string | undefined {
 let transcribed = false;
 /**
  * Like the real CLI, writes the session's transcript once it reads the first user message: one line, that message,
- * appended to `<CLAUDE_CONFIG_DIR>/projects/<CLAUDE_CODE_PROJECT_DIR_NAME>/<session id>.jsonl`. Without a session id
- * or those variables it writes nothing. With MEDDLE_FIXTURE_MEMORY=1 it also appends the message's text as one line
+ * appended to `<CLAUDE_CONFIG_DIR>/projects/<CLAUDE_CODE_PROJECT_DIR_NAME>/<session id>.jsonl`; without
+ * CLAUDE_CODE_PROJECT_DIR_NAME, the project dir is the working directory with every character but letters and digits
+ * made `-` (Claude Code's own name for it). Without a session id or CLAUDE_CONFIG_DIR it writes nothing. With MEDDLE_FIXTURE_MEMORY=1 it also appends the message's text as one line
  * to `memory/MEMORY.md` in that directory, as a session that saves a memory would.
  */
 function transcribe(f: Frame) {
@@ -142,7 +143,7 @@ function transcribe(f: Frame) {
   transcribed = true;
   const id = sessionArg();
   const configDir = process.env.CLAUDE_CONFIG_DIR;
-  const projectDir = process.env.CLAUDE_CODE_PROJECT_DIR_NAME;
+  const projectDir = process.env.CLAUDE_CODE_PROJECT_DIR_NAME ?? process.cwd().replace(/[^A-Za-z0-9]/g, "-");
   if (!id || !configDir || !projectDir) return;
   const dir = join(configDir, "projects", projectDir);
   mkdirSync(dir, { recursive: true });

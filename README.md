@@ -266,18 +266,29 @@ with `(this node)` after this node's line.
 ## Projects and tasks
 
 With the node running (see [Dashboard](#dashboard)), add a project from an existing folder or an upstream URL, then
-create a task on it and send it a prompt:
+create a task on it and send it a prompt, or do both at once with `spawn`:
 
 ```sh
 bun run src/cli.ts project add ~/src/myproject [--name myproject]   # prints the project id
 bun run src/cli.ts project list
-bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id>   # prints: task <id> on <node>
+bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id|name>   # prints: task <id> on <node>
 bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fix it"
+bun run src/cli.ts spawn "Find out why test_sync is flaky and fix it" --project myproject   # prints: task <id> on <node>
 bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
 bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to another node
 ```
 
-`project list` prints one line per project this node holds: `<id>  <name>  <replica>  home <short id>`. A task is
+`spawn <prompt> [--project <id|name>]... [--node <id|prefix> | --here] [--title <t>]` creates a task, places it like
+`task new` (see [Where a new task runs](#where-a-new-task-runs)) and sends it the prompt as its first turn, which starts
+on the node chosen; it prints `task <id> on <short id>` once the turn has started, not when it ends (follow it in the
+dashboard, or send the next prompt with `task prompt`). The title defaults to the first 60 characters of the prompt's
+first line. `--project` is repeatable, one project each, the first the primary; with none the task has no project.
+
+`project list` prints one line per project of the pool, from what each node's summary in the roster says (this node
+included), so it works while a holder is offline: `<id>  <name>  home <short id>  on <short id>,<short id>,…`, named as
+its home names it, with the nodes that hold a copy after `on`. `--project` (of `task new` and `spawn`) takes a
+project's id, or a name exactly one project of the pool has: `ambiguous project name: <name>` when several have it,
+`unknown project: <x>` when none does (pass the id then). A task is
 `idle`, `running` or `waiting` (for an approval) while it lives on a node; a task moving away is `moving` on the node
 it leaves and `receiving` on the node it goes to until it arrives, and the node it left keeps it as `moved`.
 
@@ -286,22 +297,34 @@ it leaves and `receiving` on the node it goes to until it arrives, and the node 
 `task new` creates the task on the node meddle picks for it, and prints `task <id> on <short id>`; `--here` creates
 it on this node and `--node <id|prefix>` on that member (an id or a unique prefix of one; `no such node: <x>`
 otherwise). The dashboard's new-task form has the same choice: `Automatic` (the default) or one of the online nodes
-that host tasks.
+that host tasks; the form also takes a first prompt, and needs no project.
 
 meddle picks among the online members that host tasks (have a task root) and run fewer tasks (`running` or `waiting`)
 than their limit, `limits.running` (see [Pool settings](#pool-settings); `MEDDLE_MAX_RUNNING` on a node overrides it,
 and `0` is no limit). Of those it prefers the home of the task's first project; else the nodes holding a copy of every
 project of the task; else any of them. Ties go to the fewest running tasks, then the fewest tasks, then the lower
 node id. With no node to pick, creation fails with `no online node hosts tasks` or `every node is at its running
-limit`. A pick or a named node never skips the task's own checks there: that node refuses a create without a task
-root or a usable token as it would locally.
+limit`; when this node is the only member, or the only one online, it says why this node cannot take it: `this node
+has no task root`, or `this node is at its running limit; use --here` (`--here` skips the limit). A pick or a named
+node never skips the task's own checks there: that node refuses a create without a task root or a usable token as it
+would locally, and its refusal reaches you prefixed with its short id (`<short id>: <reason>`).
 
 meddle picks from what the roster says of each node: every node reports its running count, its limit and the
 projects it holds with its summary, at once when a task starts or ends, a task is created or a project is added, and
 every 15 s. The node that took the request asks the chosen node to create the task (and to run its first prompt, when
 one is given); the task is born there, no move involved. Only a member may ask. A node of an older meddle reports none
 of this: it counts as idle, with no limit and no projects, and it cannot create a task for another node, so a task
-placed on it fails; name a node with `--node` or `--here` while the pool upgrades.
+placed on it fails; name a node with `--node` or `--here` while the pool upgrades. A task without a project cannot
+move to an older node either.
+
+### Tasks without a project
+
+A task may have no project: `spawn` without `--project`, `task new` without `--project`, or the dashboard's form with
+no project ticked. Claude Code then starts in the task folder with the user settings layer only and
+`CLAUDE_CODE_PROJECT_DIR_NAME` unset, so its memory and transcript key on the task folder inside the task's config
+directory: they travel with the task and end with it, and nothing syncs them. The task folder holds only a generated
+`CLAUDE.md` saying so; it is scratch space that moves with the task. Such a task has no bookmarks, pushes nothing and
+syncs no memory; meddle places it by load alone. A task with a project keeps per-project memory as before.
 
 ## Projects across the pool
 
@@ -319,7 +342,9 @@ A new task starts from the home's `trunk`. On the home, meddle keeps a local `tr
 the local `trunk`, `main` and `master` bookmarks. It moves it when the project is added, when a task is created on
 the home, and before another node fetches the project. Another node fetches `trunk` from the home as it creates a
 task, so creating a task of a project homed elsewhere needs the home online (`home <short id> is offline`
-otherwise). A project with nothing trunk-like starts its tasks at the root.
+otherwise), unless this node has fetched the home's `trunk` before: it then starts the task from that `trunk@<short
+id>` and logs `meddle: project <name>: home unreachable; starting from the last fetched trunk`. A project with nothing
+trunk-like starts its tasks at the root.
 
 At the end of every completed turn meddle points each of the task's bookmarks, `meddle/task/<task id>/<project name>`, at its
 workspace's working copy, and a node that is not the project's home pushes the bookmark to the home, so the home
@@ -512,7 +537,7 @@ command to restore one.
 ## Known limits
 
 - A project's home cannot be moved to another node yet (planned for Plan 4). While the home is offline, other nodes
-  cannot create tasks of its projects or clone them; their tasks' turns still run, and their pushes and memory syncs
+  cannot clone its projects, and create tasks of them only from the `trunk` they fetched last; their tasks' turns still run, and their pushes and memory syncs
   are logged and retried at the next turn end.
 - When a node's last push of a project's memory to the home failed, the memory commits it has not pushed do not
   travel with a task that moves away: the target syncs memory from the home. They stay in this node's memory repo

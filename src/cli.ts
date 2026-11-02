@@ -17,13 +17,14 @@ import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
 import { loadOrCreateIdentity, shortId } from "./pool/identity";
 import { resolveNodeId } from "./pool/ids";
+import { poolProjects, projectLine, resolveProject } from "./pool/projects";
 import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
 import { resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
 import { PoolObject } from "./state/contracts";
-import { createNodeHost, NodeObject, ProjectObject, SessionObject, TaskObject } from "./state/host";
+import { createNodeHost, NodeObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
 import { listProjects } from "./projects/project";
 import { countRunningTasks, listLiveTasks } from "./store/records";
@@ -44,7 +45,8 @@ const USAGE = `usage: meddle --version
        meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
        meddle project add <path-or-url> [--name <n>] | meddle project list
-       meddle task new --title <t> --project <id>... [--node <id|prefix> | --here]
+       meddle spawn <prompt> [--project <id|name>]... [--node <id|prefix> | --here] [--title <t>]
+       meddle task new --title <t> [--project <id|name>]... [--node <id|prefix> | --here]
        meddle task prompt <id> <text> | meddle task retry <id>
        meddle task move <id> <node> [--now]
        meddle service install [--dry-run]
@@ -415,42 +417,54 @@ function projectAdd(source: string, name: string | undefined): Promise<number> {
   });
 }
 
+/** One line per project of the pool, as the roster's summaries list them (`projectLine`). */
 function projectList(): Promise<number> {
-  return withNode(async (client) => {
-    const node = await client.get(NodeObject, {});
-    for (const id of node.projectIds.value) {
-      const project = await client.get(ProjectObject, { id });
-      console.log(`${project.id.value}  ${project.name.value}  ${project.replica.value}  home ${shortId(project.home.value)}`);
-      project.release();
-    }
+  return withPool(async (pool) => {
+    for (const p of poolProjects(pool.nodes.value)) console.log(projectLine(p));
     return 0;
   });
 }
 
+/** Where a new task goes: `auto` (placement picks it), `here` (this node), or a node's id or unique prefix. */
+type Where = { node: string } | "here" | "auto";
+
 /**
- * Creates a task on the node `where` names: `auto` (placement picks it), `here` (this node), or a node's id or a
- * unique prefix of one in the pool's roster. Prints `task <id> on <node>`.
+ * Creates a task of the projects `projects` names (each an id or a name one project of the pool has, see
+ * `resolveProject`; none for a task without a project) on the node `where` names, with `prompt` as its first turn when
+ * given. Prints `task <id> on <node>`.
  */
-function taskNew(title: string, projectIds: string[], where: { node: string } | "here" | "auto"): Promise<number> {
+function createTask(title: string, projects: string[], where: Where, prompt: string | null): Promise<number> {
   return withNode(async (client) => {
     let node: string | null = where === "here" ? "here" : null;
-    if (typeof where === "object") {
+    let projectIds: string[] = [];
+    if (typeof where === "object" || projects.length > 0) {
       const pool = await poolView(client);
       try {
-        node = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), where.node);
+        const known = poolProjects(pool.nodes.value);
+        projectIds = projects.map((x) => resolveProject(known, x));
+        if (typeof where === "object") node = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), where.node);
       } finally {
         pool.release();
       }
     }
     const ref = await client.get(NodeObject, {});
     try {
-      const { manifest, nodeId } = await ref.createTask({ title, projectIds, node });
+      const { manifest, nodeId } = await ref.createTask({ title, projectIds, node, prompt });
       console.log(`task ${manifest.id} on ${shortId(nodeId)}`);
     } finally {
       ref.release();
     }
     return 0;
   });
+}
+
+/** How many characters of a prompt's first line `spawn` takes for the task's title when none is given. */
+const SPAWN_TITLE_CHARS = 60;
+
+/** The title `spawn` gives a task without `--title`: the first `SPAWN_TITLE_CHARS` characters of the prompt's first line. */
+function spawnTitle(prompt: string): string {
+  const first = prompt.trim().split("\n")[0]!.trim();
+  return Array.from(first).slice(0, SPAWN_TITLE_CHARS).join("");
 }
 
 type WindowEvent = { seq: number; message: unknown };
@@ -631,21 +645,45 @@ function tokenAddArgs(args: string[]): { file?: string; label?: string } | null 
 }
 
 /**
- * `--title <t>`, `--project <id>...` (one or more ids, the flag repeatable) and at most one of `--node <id|prefix>` and
- * `--here` (neither: `auto`).
+ * `--title <t>`, `--project <id|name>...` (none, or one or more, the flag repeatable) and at most one of
+ * `--node <id|prefix>` and `--here` (neither: `auto`).
  */
-function taskNewArgs(args: string[]): { title: string; projectIds: string[]; where: { node: string } | "here" | "auto" } | null {
+function taskNewArgs(args: string[]): { title: string; projects: string[]; where: Where } | null {
   let title: string | undefined;
-  const projectIds: string[] = [];
-  let where: { node: string } | "here" | "auto" = "auto";
+  const projects: string[] = [];
+  let where: Where = "auto";
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--title" && i + 1 < args.length) title = args[++i];
-    else if (args[i] === "--project") while (i + 1 < args.length && !args[i + 1]!.startsWith("--")) projectIds.push(args[++i]!);
-    else if (args[i] === "--node" && i + 1 < args.length && where === "auto") where = { node: args[++i]! };
+    else if (args[i] === "--project" && i + 1 < args.length && !args[i + 1]!.startsWith("--")) {
+      while (i + 1 < args.length && !args[i + 1]!.startsWith("--")) projects.push(args[++i]!);
+    } else if (args[i] === "--node" && i + 1 < args.length && where === "auto") where = { node: args[++i]! };
     else if (args[i] === "--here" && where === "auto") where = "here";
     else return null;
   }
-  return title === undefined || projectIds.length === 0 ? null : { title, projectIds, where };
+  return title === undefined ? null : { title, projects, where };
+}
+
+/**
+ * `<prompt>` (the words that are not options, joined by spaces), `--project <id|name>` (repeatable, one each),
+ * `--title <t>` and at most one of `--node <id|prefix>` and `--here`.
+ */
+function spawnArgs(args: string[]): { prompt: string; title: string; projects: string[]; where: Where } | null {
+  let title: string | undefined;
+  const projects: string[] = [];
+  const words: string[] = [];
+  let where: Where = "auto";
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--title" && i + 1 < args.length && title === undefined) title = args[++i];
+    else if (arg === "--project" && i + 1 < args.length) projects.push(args[++i]!);
+    else if (arg === "--node" && i + 1 < args.length && where === "auto") where = { node: args[++i]! };
+    else if (arg === "--here" && where === "auto") where = "here";
+    else if (arg.startsWith("--")) return null;
+    else words.push(arg);
+  }
+  const prompt = words.join(" ");
+  if (prompt.trim() === "") return null;
+  return { prompt, title: title ?? spawnTitle(prompt), projects, where };
 }
 
 /**
@@ -693,9 +731,13 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "project" && sub === "add" && rest.length === 1) return () => projectAdd(rest[0]!, undefined);
   if (command === "project" && sub === "add" && rest.length === 3 && rest[1] === "--name") return () => projectAdd(rest[0]!, rest[2]);
   if (command === "project" && sub === "list" && rest.length === 0) return projectList;
+  if (command === "spawn") {
+    const parsed = spawnArgs(args.slice(1));
+    return parsed === null ? null : () => createTask(parsed.title, parsed.projects, parsed.where, parsed.prompt);
+  }
   if (command === "task" && sub === "new") {
     const parsed = taskNewArgs(rest);
-    return parsed === null ? null : () => taskNew(parsed.title, parsed.projectIds, parsed.where);
+    return parsed === null ? null : () => createTask(parsed.title, parsed.projects, parsed.where, null);
   }
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
   if (command === "task" && sub === "retry" && rest.length === 1) return () => taskRetry(rest[0]!);

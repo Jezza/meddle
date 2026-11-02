@@ -54,7 +54,7 @@ test("serve, add a project, run a task's turn, and report status", async () => {
 
     const listed = await meddle(["project", "list"], client);
     expect(listed.code).toBe(0);
-    expect(listed.stdout).toBe(`${projectId}  repo  ${dir}/repo  home ${shortId(node.id)}\n`);
+    expect(listed.stdout).toBe(`${projectId}  repo  home ${shortId(node.id)}  on ${shortId(node.id)}\n`);
 
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], client);
     expect(created.stderr).toBe("");

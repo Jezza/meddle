@@ -54,7 +54,8 @@ export function buildEnv(i: EngineInput): Record<string, string> {
     ...i.cfg.poolEnv,
     MEDDLE_GIT_SOCKET: meddle.MEDDLE_GIT_SOCKET!,
     CLAUDE_CONFIG_DIR: paths(i.cfg).taskConfig(i.manifest.id),
-    CLAUDE_CODE_PROJECT_DIR_NAME: i.manifest.primaryProjectId,
+    // Without a project, Claude Code names the project dir after the folder it runs in, as it does on its own.
+    ...(typeof i.manifest.primaryProjectId === "string" ? { CLAUDE_CODE_PROJECT_DIR_NAME: i.manifest.primaryProjectId } : {}),
     CLAUDE_CODE_OAUTH_TOKEN: i.token,
     ENABLE_CLAUDEAI_MCP_SERVERS: "false",
     ...composeEnv(i.contexts),
@@ -93,7 +94,7 @@ export function buildOptions(i: EngineInput): Options {
     sessionStore: i.sessionStore,
     persistSession: true,
   };
-  if (projectConfigRoot !== undefined) options.projectConfigRoot = projectConfigRoot;
+  if (projectConfigRoot != null) options.projectConfigRoot = projectConfigRoot;
   if (i.resume) options.resume = i.manifest.sessionId;
   else options.sessionId = i.manifest.sessionId;
   if (Object.keys(mcpServers).length > 0) options.mcpServers = mcpServers as Record<string, McpServerConfig>;

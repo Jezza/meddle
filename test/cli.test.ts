@@ -216,5 +216,107 @@ test("task new --here creates the task on this node and says so; an unknown --no
 
 test("the usage text lists task new's node choice", async () => {
   const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
-  expect(out.stderr).toContain("meddle task new --title <t> --project <id>... [--node <id|prefix> | --here]");
+  expect(out.stderr).toContain("meddle task new --title <t> [--project <id|name>]... [--node <id|prefix> | --here]");
+});
+
+/** Waits until `cond` holds, or fails with `what()`. */
+async function eventually(cond: () => boolean, what: () => string, ms = 15_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`timed out waiting: ${what()}`);
+    await Bun.sleep(20);
+  }
+}
+
+test("spawn creates a task and sends its first prompt; the title defaults to the prompt's first line", async () => {
+  const { listEvents } = await import("../src/store/events");
+  const { A, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    const port = new URL(dashboard.url).port;
+    const run = (args: string[]) => meddle(["spawn", ...args], { HOME: A.home, MEDDLE_PORT: port });
+    const out = await run(["Say hello", "--here"]);
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    const match = /^task (\S+) on (\S+)\n$/.exec(out.stdout);
+    expect(match?.[2]).toBe(shortId(A.id));
+    const id = match![1]!;
+    const row = getTask(A.db, id);
+    expect(row?.title).toBe("Say hello");
+    expect(JSON.parse(row!.manifest).projects).toEqual([]);
+    const prompts = () => listEvents(A.db, id)
+      .map((e) => e.message as { type?: string; message?: { content?: unknown } })
+      .filter((m) => m.type === "user" && typeof m.message?.content === "string")
+      .map((m) => m.message!.content);
+    await eventually(() => prompts().length > 0, () => "the first prompt in the log");
+    expect(prompts()).toEqual(["Say hello"]);
+
+    const long = `${"x".repeat(70)}\nsecond line`;
+    const titled = await run([long, "--here"]);
+    expect(titled.code).toBe(0);
+    expect(getTask(A.db, /^task (\S+) on/.exec(titled.stdout)![1]!)?.title).toBe("x".repeat(60));
+    const named = await run(["Say hello", "--here", "--title", "Greeting"]);
+    expect(getTask(A.db, /^task (\S+) on/.exec(named.stdout)![1]!)?.title).toBe("Greeting");
+
+    expect((await run(["--here"])).code).toBe(2);
+    expect((await run(["hi", "--here", "--node", A.id])).code).toBe(2);
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);
+
+test("project list shows every project in the pool and who holds it; --project takes a name the pool has once", async () => {
+  const { mkdir } = await import("node:fs/promises");
+  const { initColocated } = await import("../src/jj");
+  const { A, B, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    const port = new URL(dashboard.url).port;
+    const env = { HOME: A.home, MEDDLE_PORT: port };
+    await peerReady(A, B);
+    // A holds a replica of B's project (both are named "a").
+    await A.runner.create({ title: "r", projectIds: [B.project.id] });
+    await eventually(
+      () => A.store.row(B.id)?.summary?.projects.some((p) => p.id === B.project.id) === true,
+      () => `A to hear of B's project: ${JSON.stringify(A.store.row(B.id)?.summary)}`,
+    );
+    const listed = await meddle(["project", "list"], env);
+    expect(listed.stderr).toBe("");
+    expect(listed.code).toBe(0);
+    const [sa, sb] = [shortId(A.id), shortId(B.id)];
+    const holders = [A.id, B.id].sort().map(shortId).join(",");
+    const lines = listed.stdout.trimEnd().split("\n");
+    expect(lines).toContain(`${A.project.id}  a  home ${sa}  on ${sa}`);
+    expect(lines).toContain(`${B.project.id}  a  home ${sb}  on ${holders}`);
+    expect(lines).toHaveLength(2);
+
+    // A name two projects share is refused; one only one has is taken.
+    const ambiguous = await meddle(["spawn", "Say hello", "--project", "a", "--here"], env);
+    expect(ambiguous.code).toBe(1);
+    expect(ambiguous.stderr).toBe("meddle: ambiguous project name: a\n");
+    const unknown = await meddle(["task", "new", "--title", "t", "--project", "nope", "--here"], env);
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toBe("meddle: unknown project: nope\n");
+
+    await mkdir(`${A.home}/solo`);
+    await initColocated(`${A.home}/solo`);
+    const added = await meddle(["project", "add", `${A.home}/solo`, "--name", "solo"], env);
+    expect(added.code).toBe(0);
+    const soloId = added.stdout.trim();
+    const spawned = await meddle(["spawn", "Say hello", "--project", "solo", "--here"], env);
+    expect(spawned.stderr).toBe("");
+    expect(spawned.code).toBe(0);
+    const id = /^task (\S+) on/.exec(spawned.stdout)![1]!;
+    expect(JSON.parse(getTask(A.db, id)!.manifest).projects.map((p: { id: string }) => p.id)).toEqual([soloId]);
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);
+
+test("the usage text lists spawn and the project choice by name", async () => {
+  const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
+  expect(out.stderr).toContain("meddle spawn <prompt> [--project <id|name>]... [--node <id|prefix> | --here] [--title <t>]");
+  expect(out.stderr).toContain("meddle task new --title <t> [--project <id|name>]... [--node <id|prefix> | --here]");
 });

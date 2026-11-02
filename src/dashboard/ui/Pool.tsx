@@ -158,7 +158,7 @@ function TaskRowLoaded({ task, open }: { task: Ref<typeof TaskObject>; open: (ta
       <td><a href="#" onClick={(e) => { e.preventDefault(); open(manifest.id); }}>{manifest.title}</a></td>
       <td><span class={`state ${state}`}>{state}</span></td>
       <td>{pending.length > 0 ? pending.length : ""}</td>
-      <td>{manifest.projects.map((p) => p.name).join(", ")}</td>
+      <td>{manifest.projects.length === 0 ? <span class="muted">no project</span> : manifest.projects.map((p) => p.name).join(", ")}</td>
     </tr>
   );
 }
@@ -256,6 +256,7 @@ function NewTaskForm({ node, nodes, canHost, open }: { node: NodeRef; nodes: rea
   const projects = projectChoices(nodes);
   const [title, setTitle] = useState("");
   const [chosen, setChosen] = useState<string[]>([]);
+  const [prompt, setPrompt] = useState("");
   const [picked, setPicked] = useState(AUTOMATIC);
   // A node that went offline (or stopped hosting tasks) since it was picked falls back to Automatic.
   const where = canHost.some((n) => n.nodeId === picked) ? picked : AUTOMATIC;
@@ -265,7 +266,8 @@ function NewTaskForm({ node, nodes, canHost, open }: { node: NodeRef; nodes: rea
     e.preventDefault();
     let created: { taskId: string; nodeId: string } | undefined;
     const ok = await action.run(async () => {
-      const { manifest, nodeId } = await node.createTask({ title, projectIds: chosen, node: where === AUTOMATIC ? null : where });
+      const first = prompt.trim() === "" ? null : prompt;
+      const { manifest, nodeId } = await node.createTask({ title, projectIds: chosen, node: where === AUTOMATIC ? null : where, prompt: first });
       created = { taskId: manifest.id, nodeId };
     });
     if (ok && created !== undefined) open(created.nodeId, created.taskId);
@@ -280,8 +282,8 @@ function NewTaskForm({ node, nodes, canHost, open }: { node: NodeRef; nodes: rea
         </select>
       </label>
       <fieldset>
-        <legend>Projects (the first chosen is the primary)</legend>
-        {projects.length === 0 && <p class="muted">Add a project first.</p>}
+        <legend>Projects (the first chosen is the primary; none for a task without a project)</legend>
+        {projects.length === 0 && <p class="muted">No project yet: the task gets a scratch folder.</p>}
         {projects.map((p) => (
           <label key={p.id} class="option" title={p.id}>
             <input type="checkbox" checked={chosen.includes(p.id)} onChange={() => toggle(p.id)} />{" "}
@@ -289,7 +291,10 @@ function NewTaskForm({ node, nodes, canHost, open }: { node: NodeRef; nodes: rea
           </label>
         ))}
       </fieldset>
-      <button type="submit" disabled={action.busy || title.trim() === "" || chosen.length === 0}>Create</button>
+      <label>First prompt (optional){" "}
+        <textarea value={prompt} rows={3} onInput={(e) => setPrompt(e.currentTarget.value)} />
+      </label>
+      <button type="submit" disabled={action.busy || title.trim() === ""}>Create</button>
       {action.error !== null && <p class="error">{action.error}</p>}
     </form>
   );

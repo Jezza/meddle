@@ -308,7 +308,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         const peer = await pool.peerRef(target, PeerObject);
         try {
           if (peer.variant !== "peer") throw new Error(`${shortId(target)} did not serve the peer variant of PeerObject`);
-          const { manifest } = await peer.createTask({ title, projectIds: ids, prompt: prompt ?? null });
+          let manifest: TaskManifest;
+          try {
+            ({ manifest } = await peer.createTask({ title, projectIds: ids, prompt: prompt ?? null }));
+          } catch (err) {
+            // Said here, the peer's reason (no task root, no usable token, …) would read as this node's own.
+            throw new Error(`${shortId(target)}: ${remoteReason(err)}`);
+          }
           return { manifest, nodeId: target };
         } finally {
           peer.release();
@@ -548,9 +554,15 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       projects: listProjects(db).map((p) => ({ id: p.id, home: p.home })),
       limit: pool.settings.runningLimit(),
     };
-    const choice = place({ projectIds, nodes: placementCandidates(pool.store.roster(), (id) => pool.net.isOnline(id), self) });
-    if ("error" in choice) throw new Error(choice.error);
-    return choice.nodeId;
+    const nodes = placementCandidates(pool.store.roster(), (id) => pool.net.isOnline(id), self);
+    const choice = place({ projectIds, nodes });
+    if (!("error" in choice)) return choice.nodeId;
+    // Alone (the only member, or the only one online): the reason is this node's own.
+    if (!nodes.some((n) => n.online && n.nodeId !== self.nodeId)) {
+      if (!self.hostsTasks) throw new Error("this node has no task root");
+      if (self.limit > 0 && self.running >= self.limit) throw new Error("this node is at its running limit; use --here");
+    }
+    throw new Error(choice.error);
   }
 
   function projectIdsNow(): string[] {
@@ -642,4 +654,12 @@ function foldSession(view: SessionView, events: EventRecord[]): SessionView {
   }
   if (added.length > 0) window = [...window, ...added].slice(-WINDOW_SIZE);
   return { lastSeq: events.at(-1)?.seq ?? view.lastSeq, window, live };
+}
+
+/** A peer's error as it said it: without the `<code>: ` (or `<code>/<reason>: `) a chord error's message starts with. */
+function remoteReason(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === "string" && err.message.startsWith(code)) return err.message.replace(/^[^:]*: /, "");
+  return err.message;
 }
