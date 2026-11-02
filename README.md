@@ -161,20 +161,23 @@ bun run src/cli.ts config list
 
 | Key | Applied as |
 | --- | --- |
-| `jj.user`, `jj.email` | `JJ_USER` and `JJ_EMAIL` for every jj command meddle runs and for every task's Claude Code, so commits carry one identity on every node. |
-| `env.<NAME>` | `<NAME>` (upper case, digits and `_`) in every task's Claude Code environment and in meddle's own jj and git calls. A project's context `env` wins over it for that project's tasks. |
+| `jj.user`, `jj.email` | `JJ_USER` and `JJ_EMAIL` for every jj command meddle runs and for every task's Claude Code, so commits carry one identity on every node. Neither can be empty. |
+| `env.<NAME>` | `<NAME>` (upper case, digits and `_`) in every task's Claude Code environment and in every jj command meddle runs (with the git processes jj starts). Not in the `git upload-pack` and `git receive-pack` a node runs to serve another node's fetch or push. A project's context `env` wins over it for that project's tasks. |
 | `lighthouse.url` | The discovery lighthouse, applied live; it cannot be set empty. A node that sets `MEDDLE_LIGHTHOUSE_URL` (even empty, which turns discovery off there) uses its own instead. |
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
 
-Each key replicates on its own, last writer wins on the time it was set, the roster's rule; an unset replicates too.
-Values are plain pool state: every member sees and stores them, so they are not for secrets (the token has its own
-path). Some names cannot be set through `env.*`, because meddle sets them itself or because they would let a member
-take over another node's processes: `PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
-`CLAUDE_CODE_PROJECT_DIR_NAME`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `JJ_USER`,
-`JJ_EMAIL`, `JJ_CONFIG`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_PARAMETERS`, `GIT_DIR`, `LD_PRELOAD`, `LD_LIBRARY_PATH` and
-every name starting `MEDDLE_`. `config set` refuses them, and a node ignores such a setting from a peer (logging
-`meddle: settings: ignored replicated key <key>` once). A node that joins another pool drops its old pool's settings
-and takes the new pool's.
+Each key replicates on its own, last writer wins on the time it was set, the roster's rule (on equal times, the
+setting from the node with the greater id wins, then the greater value); an unset replicates too. A value is at most
+4096 characters, with no control characters other than tab. Values are plain pool state: every member sees and stores
+them, so they are not for secrets (the token has its own path). Some names cannot be set through `env.*`, because
+meddle sets them itself or because they would let a member take over another node's processes: `PATH`, `HOME`,
+`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_PROJECT_DIR_NAME`, `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `JJ_USER`, `JJ_EMAIL`, `JJ_CONFIG`, `GIT_CONFIG_GLOBAL`,
+`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_DIR`, `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`, `XDG_CONFIG_HOME`,
+`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `NODE_OPTIONS`, `BASH_ENV`, and every name starting `MEDDLE_`,
+`GIT_CONFIG_KEY_` or `GIT_CONFIG_VALUE_`. `config set` refuses them and any value it cannot take; a node ignores such
+a setting from a peer, logging `meddle: settings: ignored replicated key "<key>"` once per key. A node that joins
+another pool drops its old pool's settings and takes the new pool's.
 
 ### `meddle pool`
 

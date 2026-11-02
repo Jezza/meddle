@@ -7,19 +7,24 @@ import type { NodeConfig } from "../config";
 export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|env\.[A-Z_][A-Z0-9_]*)$/;
 
 /**
- * Environment names an `env.*` setting may not set (besides every `MEDDLE_*`): what meddle sets itself, the token and
- * API settings, the jj and git identity and config, and the loaders that could hijack a child.
+ * Environment names an `env.*` setting may not set (besides those starting with a `RESERVED_ENV_PREFIXES` entry):
+ * what meddle sets itself, the token and API settings, the jj and git identity and config, and the loaders that could
+ * hijack a child.
  */
 export const RESERVED_ENV: Set<string> = new Set([
   "PATH", "HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_PROJECT_DIR_NAME",
   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-  "JJ_USER", "JJ_EMAIL", "JJ_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_PARAMETERS", "GIT_DIR",
-  "LD_PRELOAD", "LD_LIBRARY_PATH", "MEDDLE_GIT_SOCKET",
+  "JJ_USER", "JJ_EMAIL", "JJ_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_DIR",
+  "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "XDG_CONFIG_HOME",
+  "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "NODE_OPTIONS", "BASH_ENV", "MEDDLE_GIT_SOCKET",
 ]);
 
-/** `name` is in `RESERVED_ENV` or starts `MEDDLE_`. */
+/** Every environment name starting with one of these is reserved too. */
+export const RESERVED_ENV_PREFIXES: readonly string[] = ["MEDDLE_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/** `name` is in `RESERVED_ENV` or starts with one of `RESERVED_ENV_PREFIXES`. */
 export function reservedEnv(name: string): boolean {
-  return RESERVED_ENV.has(name) || name.startsWith("MEDDLE_");
+  return RESERVED_ENV.has(name) || RESERVED_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
 /** One setting as stored and replicated; `value: null` is an unset (a tombstone, kept so the unset replicates). */
@@ -29,6 +34,17 @@ type SettingRecord = { key: string; value: string | null; updated_at: string; se
 
 const ENV_PREFIX = "env.";
 const NON_NEGATIVE_INTEGER = /^\d+$/;
+/** The longest value a setting may have: it goes into the environment of every jj and Claude Code. */
+export const MAX_SETTING_VALUE = 4096;
+/** Control characters other than tab: a NUL makes every spawn throw, the others have no place in a setting. */
+const CONTROL = /[\x00-\x08\x0a-\x1f\x7f]/;
+const BAD_VALUE = `setting value must be at most ${MAX_SETTING_VALUE} characters with no control characters`;
+/** The keys whose value may not be empty: an empty jj identity overrides the node's own and jj refuses to push. */
+const NON_EMPTY = new Set(["jj.user", "jj.email", "lighthouse.url"]);
+/** The most distinct ignored keys logged; later ones are only counted. */
+const MAX_LOGGED = 100;
+/** How much of an ignored key a log line shows. */
+const LOGGED_KEY_CHARS = 80;
 
 function toRow(r: SettingRecord): SettingRow {
   return { key: r.key, value: r.value, updatedAt: r.updated_at, setBy: r.set_by };
@@ -43,6 +59,37 @@ function keyProblem(key: string): string | null {
   return null;
 }
 
+/**
+ * Why `value` may not be stored under `key` (`setting value must be …`, `<key> must not be empty`,
+ * `limits.running must be …`), or null when it may.
+ */
+function valueProblem(key: string, value: string): string | null {
+  if (value.length > MAX_SETTING_VALUE || CONTROL.test(value)) return BAD_VALUE;
+  if (NON_EMPTY.has(key) && value === "") return `${key} must not be empty`;
+  if (key === "limits.running" && nonNegativeInteger(value) === null) return "limits.running must be a non-negative integer";
+  return null;
+}
+
+/**
+ * Whether a replicated value may be stored: the checks every reader relies on (length, control characters, a
+ * non-empty identity). An odd `limits.running` or an empty `lighthouse.url` is stored and the readers ignore it.
+ */
+function replicableValue(key: string, value: string | null): boolean {
+  if (value === null) return true;
+  if (value.length > MAX_SETTING_VALUE || CONTROL.test(value)) return false;
+  return !((key === "jj.user" || key === "jj.email") && value === "");
+}
+
+/** Orders two rows of one key: the later `updatedAt`, then the greater `setBy`, then the greater value (null least). */
+function newer(remote: SettingRow, local: SettingRow): boolean {
+  if (remote.updatedAt !== local.updatedAt) return remote.updatedAt > local.updatedAt;
+  if (remote.setBy !== local.setBy) return remote.setBy > local.setBy;
+  if (remote.value === local.value) return false;
+  if (local.value === null) return true;
+  if (remote.value === null) return false;
+  return remote.value > local.value;
+}
+
 /** The non-negative integer `raw` spells, else null. */
 function nonNegativeInteger(raw: string): number | null {
   if (!NON_NEGATIVE_INTEGER.test(raw)) return null;
@@ -52,13 +99,14 @@ function nonNegativeInteger(raw: string): number | null {
 
 /**
  * The pool's settings in `meddle.sqlite`. Local writes (`set`, `unset`) validate the key and value; replicated rows
- * (`merge`) are filtered by key only, and the readers (`env`, `runningLimit`, `lighthouseUrl`) cope with any value.
+ * (`merge`) are filtered by key and by what every reader needs of a value (`replicableValue`), and the readers
+ * (`env`, `runningLimit`, `lighthouseUrl`) cope with the rest.
  * `apply` puts the settings into `cfg.poolEnv`, which `jjEnv` and the engine overlay on their environments.
  */
 export class PoolSettings {
-  /** Replicated rows dropped because of their key, since this object was made. */
+  /** Replicated rows dropped because of their key or value, since this object was made. */
   ignored = 0;
-  /** The keys whose drop was logged already: each is logged once. */
+  /** The keys whose drop was logged already (at most `MAX_LOGGED`): each is logged once. */
   private readonly logged = new Set<string>();
   private readonly log: (line: string) => void;
 
@@ -101,10 +149,8 @@ export class PoolSettings {
    * clock may be ahead of this one's): a local write always supersedes the row it acts on.
    */
   set(key: string, value: string, now: string = new Date().toISOString()): SettingRow {
-    const problem = keyProblem(key);
+    const problem = keyProblem(key) ?? valueProblem(key, value);
     if (problem !== null) throw new Error(problem);
-    if (key === "limits.running" && nonNegativeInteger(value) === null) throw new Error("limits.running must be a non-negative integer");
-    if (key === "lighthouse.url" && value === "") throw new Error("lighthouse.url must not be empty");
     return this.write(key, value, now);
   }
 
@@ -128,23 +174,22 @@ export class PoolSettings {
 
   /**
    * Folds a peer's rows into this node's: a row is taken when its `updatedAt` is later than the local one's (an ISO
-   * string compare, as the roster's). Rows with an invalid key or a reserved env name are dropped, and each such key
-   * is logged once (`meddle: settings: ignored replicated key <key>`). True when any row changed.
+   * string compare, as the roster's); on equal times the greater `setBy`, then the greater value wins, so that every
+   * node ends on the same row. Rows with an invalid key, a reserved env name or a value no reader could use (too long,
+   * a control character, an empty jj identity) are dropped, and each such key is logged once
+   * (`meddle: settings: ignored replicated key "<key>"`, the key JSON-escaped and cut to 80 characters).
+   * True when any row changed.
    */
   merge(rows: SettingRow[]): boolean {
     return this.db.transaction(() => {
       let changed = false;
       for (const remote of rows) {
-        if (keyProblem(remote.key) !== null) {
-          this.ignored++;
-          if (!this.logged.has(remote.key)) {
-            this.logged.add(remote.key);
-            this.log(`meddle: settings: ignored replicated key ${remote.key}`);
-          }
+        if (keyProblem(remote.key) !== null || !replicableValue(remote.key, remote.value)) {
+          this.ignore(remote.key);
           continue;
         }
         const local = this.row(remote.key);
-        if (local !== null && !(remote.updatedAt > local.updatedAt)) continue;
+        if (local !== null && !newer(remote, local)) continue;
         this.upsert({ key: remote.key, value: remote.value, updatedAt: remote.updatedAt, setBy: remote.setBy });
         changed = true;
       }
@@ -152,10 +197,22 @@ export class PoolSettings {
     })();
   }
 
-  /** The environment the settings give jj and Claude Code: `jj.user`, `jj.email` and `env.*`, reserved names left out. */
+  /** Counts a dropped replicated row and logs its key, once per key and for at most `MAX_LOGGED` keys. */
+  private ignore(key: string): void {
+    this.ignored++;
+    if (this.logged.has(key) || this.logged.size >= MAX_LOGGED) return;
+    this.logged.add(key);
+    this.log(`meddle: settings: ignored replicated key ${JSON.stringify(key.slice(0, LOGGED_KEY_CHARS))}`);
+  }
+
+  /**
+   * The environment the settings give jj and Claude Code: `jj.user`, `jj.email` and `env.*`, reserved names and values
+   * no spawn could take (or an empty identity) left out.
+   */
   env(): Record<string, string> {
     const env: Record<string, string> = {};
     for (const { key, value } of this.list()) {
+      if (!replicableValue(key, value)) continue;
       if (key === "jj.user") env.JJ_USER = value;
       else if (key === "jj.email") env.JJ_EMAIL = value;
       else if (key.startsWith(ENV_PREFIX)) {

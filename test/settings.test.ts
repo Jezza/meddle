@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { loadConfig, type NodeConfig } from "../src/config";
 import { buildEnv, type EngineInput } from "../src/engine/options";
 import { initColocated, jj, jjEnv } from "../src/jj";
-import { PoolSettings, discoveryLighthouseUrl, reservedEnv, type SettingRow } from "../src/pool/settings";
+import { MAX_SETTING_VALUE, PoolSettings, discoveryLighthouseUrl, reservedEnv, type SettingRow } from "../src/pool/settings";
 import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { twoPoolNodes } from "./pool-helpers";
@@ -83,8 +83,8 @@ test("invalid keys and reserved names are refused at set and dropped at merge", 
   expect(settings.merge([row("nonsense", "x", "2026-01-01T00:00:00.000Z")])).toBe(false);
   expect(settings.env().PATH).toBeUndefined();
   expect(settings.rows()).toEqual([]);
-  expect(lines.filter((l) => l === "meddle: settings: ignored replicated key env.PATH")).toHaveLength(1);
-  expect(lines).toContain("meddle: settings: ignored replicated key nonsense");
+  expect(lines.filter((l) => l === 'meddle: settings: ignored replicated key "env.PATH"')).toHaveLength(1);
+  expect(lines).toContain('meddle: settings: ignored replicated key "nonsense"');
   expect(settings.ignored).toBe(3);
 });
 
@@ -186,3 +186,92 @@ test("settings replicate between two nodes and jj commits on the other node carr
     await rm(dir, { recursive: true, force: true });
   }
 }, 30_000);
+
+const BAD_VALUE = "setting value must be at most 4096 characters with no control characters";
+
+test("a value must be at most 4096 characters with no control characters but tab, at set and at merge", async () => {
+  const lines: string[] = [];
+  const { cfg, settings } = fresh({}, (line) => lines.push(line));
+  expect(() => settings.set("env.FOO", "a\0b")).toThrow(BAD_VALUE);
+  expect(() => settings.set("env.FOO", "x".repeat(MAX_SETTING_VALUE + 1))).toThrow(BAD_VALUE);
+  expect(() => settings.set("jj.user", "Lab\nInjected")).toThrow(BAD_VALUE);
+  expect(() => settings.set("env.FOO", "\x1b[31m")).toThrow(BAD_VALUE);
+  expect(settings.set("env.TABBED", "a\tb").value).toBe("a\tb");
+  expect(settings.set("env.LONG", "x".repeat(MAX_SETTING_VALUE)).value).toHaveLength(MAX_SETTING_VALUE);
+
+  expect(settings.merge([row("env.FOO", "a\0b", "2026-01-01T00:00:00.000Z")])).toBe(false);
+  expect(settings.merge([row("env.BIG", "x".repeat(200_000), "2026-01-01T00:00:00.000Z")])).toBe(false);
+  expect(settings.rows().map((r) => r.key)).toEqual(["env.LONG", "env.TABBED"]);
+  settings.apply();
+  expect(cfg.poolEnv.FOO).toBeUndefined();
+  expect(cfg.poolEnv.BIG).toBeUndefined();
+  expect(cfg.poolEnv.TABBED).toBe("a\tb");
+  expect(lines).toEqual(['meddle: settings: ignored replicated key "env.FOO"', 'meddle: settings: ignored replicated key "env.BIG"']);
+  // Every jj still spawns.
+  expect(await jj(["--version"], "/", cfg)).toMatch(/^jj /);
+});
+
+test("the reserved names include git config, ssh and exec, node, bash and XDG config, and the loaders", () => {
+  const { settings } = fresh({}, () => {});
+  for (const name of ["GIT_CONFIG_COUNT", "NODE_OPTIONS", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "LD_AUDIT", "BASH_ENV", "XDG_CONFIG_HOME"]) {
+    expect(reservedEnv(name)).toBe(true);
+    expect(() => settings.set(`env.${name}`, "x")).toThrow(`reserved environment name: ${name}`);
+  }
+  for (const name of ["GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_12", "MEDDLE_X"]) {
+    expect(reservedEnv(name)).toBe(true);
+    expect(() => settings.set(`env.${name}`, "x")).toThrow(`reserved environment name: ${name}`);
+  }
+  expect(settings.merge([row("env.GIT_CONFIG_KEY_0", "core.sshCommand", "2026-01-01T00:00:00.000Z")])).toBe(false);
+  expect(settings.merge([row("env.NODE_OPTIONS", "--import=data:,", "2026-01-01T00:00:00.000Z")])).toBe(false);
+  expect(settings.env()).toEqual({});
+  for (const name of ["GIT_CONFIG", "GIT_CONFIG_KEYS", "XDG_CONFIG_DIRS", "NODE_ENV", "GIT_AUTHOR_NAME"]) expect(reservedEnv(name)).toBe(false);
+});
+
+test("the ignored-key log line escapes the peer's key and cuts it to 80 characters", () => {
+  const lines: string[] = [];
+  const { settings } = fresh({}, (line) => lines.push(line));
+  settings.merge([row("bad\nmeddle: forged line \x1b[31m", "x", "2026-01-01T00:00:00.000Z")]);
+  settings.merge([row("y".repeat(500), "x", "2026-01-01T00:00:00.000Z")]);
+  expect(lines).toEqual([
+    'meddle: settings: ignored replicated key "bad\\nmeddle: forged line \\u001b[31m"',
+    `meddle: settings: ignored replicated key "${"y".repeat(80)}"`,
+  ]);
+  // Distinct junk keys are counted but only the first 100 logged.
+  settings.merge(Array.from({ length: 200 }, (_, i) => row(`junk${i}`, "x", "2026-01-01T00:00:00.000Z")));
+  expect(lines).toHaveLength(100);
+  expect(settings.ignored).toBe(202);
+});
+
+test("an empty jj identity is refused at set and dropped at merge", () => {
+  const { settings } = fresh({}, () => {});
+  expect(() => settings.set("jj.user", "")).toThrow("jj.user must not be empty");
+  expect(() => settings.set("jj.email", "")).toThrow("jj.email must not be empty");
+  settings.set("jj.user", "Lab", "2026-01-01T00:00:00.000Z");
+  expect(settings.merge([row("jj.user", "", "2026-01-02T00:00:00.000Z"), row("jj.email", "", "2026-01-02T00:00:00.000Z")])).toBe(false);
+  expect(settings.get("jj.user")).toBe("Lab");
+  expect(settings.env()).toEqual({ JJ_USER: "Lab" });
+  // An empty env.* value is a value like any other.
+  expect(settings.set("env.EMPTY", "").value).toBe("");
+});
+
+test("equal times converge: the greater setBy wins, then the greater value", () => {
+  const at = "2026-01-01T00:00:00.000Z";
+  const pairs: [SettingRow, SettingRow][] = [
+    [row("jj.user", "From A", at, SELF), row("jj.user", "From B", at, PEER)],
+    [row("jj.user", "Apple", at, PEER), row("jj.user", "Banana", at, PEER)],
+    [row("jj.user", null, at, PEER), row("jj.user", "Kept", at, PEER)],
+  ];
+  for (const [x, y] of pairs) {
+    const one = fresh().settings;
+    const two = fresh().settings;
+    one.merge([x]);
+    two.merge([y]);
+    one.merge(two.rows());
+    two.merge(one.rows());
+    expect(one.rows()).toEqual([y]);
+    expect(two.rows()).toEqual([y]);
+    // Both directions agree, and re-merging changes nothing.
+    expect(one.merge(two.rows())).toBe(false);
+    expect(two.merge(one.rows())).toBe(false);
+  }
+});
