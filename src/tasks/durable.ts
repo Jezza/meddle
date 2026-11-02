@@ -855,8 +855,9 @@ export class TaskRunner {
   }
 
   /**
-   * What a receive that died while provisioning (the process stopped; no row was written) left of a task this node
-   * has no row for: its folder and its workspaces.
+   * Removes the task's folder and forgets its workspaces, when the folder is here: what a receive that died while
+   * provisioning left of a task this node has no row for, or what an archive stopped between its row update and the
+   * folder's removal left of an archived one (cleared before a restore).
    */
   async #clearLeftovers(manifest: TaskManifest): Promise<void> {
     const task = paths(this.#cfg).task(manifest.id);
@@ -1005,13 +1006,18 @@ export class TaskRunner {
   }
 
   /**
-   * Deletes task `taskId` from this node: only an `archived` or `moved` one (else `task is <state>`). Its archive (or a
-   * move's leftover), then its row, event log and transcript rows go.
+   * Deletes task `taskId` from this node: only an `archived` or `moved` one (else `task is <state>`). What is left of its
+   * folder goes first (an archive whose folder removal was cut short, a move whose cleanup has not run: the folder, the
+   * workspaces and, off a project's home, the task's bookmarks), then its archive (or a move's leftover), then its row,
+   * event log and transcript rows.
    */
   async deleteTask(taskId: string): Promise<void> {
     await serialised(taskKey(taskId), async () => {
       const row = this.#row(taskId);
       if (row.state !== "archived" && row.state !== "moved") throw new Error(`task is ${row.state}`);
+      const self = this.#pool?.identity.id;
+      if (self !== undefined) await releaseFolder(this.#cfg, this.#db, self, taskId);
+      else await this.#clearLeftovers(JSON.parse(row.manifest) as TaskManifest);
       const p = paths(this.#cfg);
       await rm(p.archiveFile(taskId), { force: true });
       await rm(p.movedFile(taskId), { force: true });

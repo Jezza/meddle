@@ -11,7 +11,7 @@ import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { runRemoteHelper } from "./git/helper";
 import { writeHelperWrapper, writeUpdateHook } from "./git/scripts";
 import { acceptGitStreams } from "./git/serve";
-import { JANITOR_INTERVAL_MS, runJanitor } from "./tasks/archive";
+import { JANITOR_INTERVAL_MS, runJanitor, sweepArchiveTemps } from "./tasks/archive";
 import { acceptBlobStreams } from "./tasks/blob";
 import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
@@ -117,6 +117,8 @@ async function serve(): Promise<number> {
     await migrateLegacyToken(cfg, db, (await loadOrCreateIdentity(cfg)).id);
     // What a crash left in the tokens directory: a half-written value, the value of a removed token.
     await sweepTokenValues(cfg, db);
+    // And in the archives directory: a half-written archive.
+    await sweepArchiveTemps(cfg);
     // The pool and git first: the Harness reruns unfinished turns as it opens, and their turn ends push to homes.
     const pool = (node.pool = await startPool(cfg, db, {
       version: VERSION,

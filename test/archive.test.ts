@@ -1,7 +1,7 @@
 // test/archive.test.ts — archiving an idle task without its folder, restoring it on the same node, deleting it.
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
@@ -9,8 +9,9 @@ import { shortId } from "../src/pool/ids";
 import { NodeObject, SessionObject, TaskObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
 import { getTask, listArchivedTasks, listLiveTasks, updateTask } from "../src/store/records";
-import { readArchive } from "../src/tasks/archive";
+import { readArchive, sweepArchiveTemps, writeArchive } from "../src/tasks/archive";
 import { transcriptPath, type TaskManifest } from "../src/tasks/manifest";
+import { setupNode } from "./helpers";
 import { linkClient, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** Sends `text` to the task on `node` and waits for the turn to end. */
@@ -241,6 +242,54 @@ test("archiving is refused while a turn runs, while prompts are queued, and whil
     updateTask(A.db, m.id, { state: "idle" });
     expect(existsSync(join(paths(A.cfg).task(m.id), "a"))).toBe(true);
     expect(getTask(A.db, m.id)!.archived_on).toBeNull();
+  } finally {
+    await close();
+  }
+}, 20_000);
+
+test("writeArchive returns with the archive whole and readable and no partial write left; serve's sweep removes a stray partial write", async () => {
+  const node = await setupNode();
+  try {
+    const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
+    const dir = paths(node.cfg).archives;
+    const file = await writeArchive(node.cfg, node.db, m.id, paths(node.cfg).archiveFile(m.id));
+    expect(await readdir(dir)).toEqual([`${m.id}.json.gz`]);
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    expect((await stat(dir)).mode & 0o777).toBe(0o700);
+    expect((await readArchive(file)).manifest).toEqual(m);
+    // What a crash mid-write leaves is swept; the archive stays.
+    await writeFile(`${file}.123.1.tmp`, "half");
+    await mkdir(paths(node.cfg).moved, { recursive: true });
+    await writeFile(join(paths(node.cfg).moved, "other.json.gz.9.1.tmp"), "half");
+    expect(await sweepArchiveTemps(node.cfg)).toBe(1);
+    expect(await readdir(dir)).toEqual([`${m.id}.json.gz`]);
+    expect(await sweepArchiveTemps(node.cfg)).toBe(0);
+  } finally {
+    await node.harness.close();
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
+  }
+});
+
+test("deleting an archived task whose archive stopped before its folder was removed takes the folder and workspace too", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    // The state an archive leaves when the node stops between the row update and `releaseFolder`.
+    await writeArchive(A.cfg, A.db, m.id, paths(A.cfg).archiveFile(m.id));
+    updateTask(A.db, m.id, { state: "archived", archived_on: A.id, archived_at: new Date().toISOString() });
+    expect(existsSync(join(paths(A.cfg).task(m.id), "a"))).toBe(true);
+    expect((await workspaces(A, A.project.replica)).includes(`meddle-${m.id}`)).toBe(true);
+    const bookmarks = await namespace(A, A.project.replica, m.id);
+
+    await A.runner.deleteTask(m.id);
+    expect(getTask(A.db, m.id)).toBeNull();
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
+    expect((await workspaces(A, A.project.replica)).includes(m.id)).toBe(false);
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(false);
+    // On the project's home its bookmarks stay, as for any archived task.
+    expect(await namespace(A, A.project.replica, m.id)).toEqual(bookmarks);
   } finally {
     await close();
   }

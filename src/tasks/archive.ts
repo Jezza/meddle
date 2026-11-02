@@ -1,7 +1,7 @@
 // A task's files and rows in one gzipped JSON file: the archive of a task archived here (kept until it is restored or
 // deleted, `<data>/archives/`) and what a task that moved away leaves on its old node (decision 18, kept seven days,
 // `<data>/moved/`).
-import { chmod, mkdir, readdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
@@ -25,9 +25,14 @@ export type TaskArchive = {
   files: Array<{ path: string; base64: string }>;
 };
 
+/** Makes each partial write's name unique within this process. */
+let tmpSeq = 0;
+
 /**
  * Writes task `taskId`'s archive to `file` (its directory made mode 700, the file 600) and returns `file`. The file
- * appears whole or not at all (written aside, then renamed). An archive written there since the task's row last changed
+ * appears whole or not at all (written aside, then renamed), and is on disk when this returns: the data is synced before
+ * the rename and the directory after it, since callers remove the task folder (the only other copy of its transcript
+ * files) next. An archive written there since the task's row last changed
  * is kept: a rerun of a move's cleanup after it removed pieces of the task never replaces it with less, while one left
  * from an earlier stay of the task here is replaced.
  */
@@ -55,11 +60,45 @@ export async function writeArchive(cfg: NodeConfig, db: Database, taskId: string
       .all(row.session_id),
     files,
   };
-  const temp = `${file}.${process.pid}.tmp`;
-  await writeFile(temp, Bun.gzipSync(JSON.stringify(archive)), { mode: 0o600 });
+  const temp = `${file}.${process.pid}.${++tmpSeq}.tmp`;
+  const handle = await open(temp, "w", 0o600);
+  try {
+    await handle.writeFile(Bun.gzipSync(JSON.stringify(archive)));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await chmod(temp, 0o600);
   await rename(temp, file);
+  const dir = await open(dirname(file), "r");
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
   return file;
+}
+
+/**
+ * Removes what a crash can leave in `<data>/archives/`: a half-written `*.tmp` (never read: an archive is renamed into
+ * place whole). `serve` runs it at start, before anything writes an archive; how many it removed.
+ */
+export async function sweepArchiveTemps(cfg: NodeConfig): Promise<number> {
+  const dir = paths(cfg).archives;
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw err;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.endsWith(".tmp")) continue;
+    await rm(join(dir, name), { force: true });
+    removed += 1;
+  }
+  return removed;
 }
 
 /** Reads an archive `writeArchive` wrote. */
