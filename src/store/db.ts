@@ -67,6 +67,18 @@ const MIGRATIONS = [
     updated_at TEXT NOT NULL,
     set_by TEXT NOT NULL
   )`,
+  // The pool's login tokens (src/token.ts), last writer wins per id on updated_at; the values are files, never here.
+  `CREATE TABLE IF NOT EXISTS tokens (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    set_at TEXT NOT NULL,
+    set_by TEXT NULL,
+    status TEXT NOT NULL,
+    until TEXT NULL,
+    detail TEXT NULL,
+    updated_at TEXT NOT NULL,
+    removed INTEGER NOT NULL DEFAULT 0
+  )`,
   `CREATE TABLE IF NOT EXISTS invites (
     code TEXT PRIMARY KEY,
     created_at TEXT,

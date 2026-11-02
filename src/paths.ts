@@ -13,7 +13,8 @@ export function paths(cfg: NodeConfig) {
     profile: join(data, "profile"),
     plugins: join(data, "plugins"),
     secrets,
-    tokenFile: join(secrets, "claude-token"),
+    /** One file per login token, named by its id (mode 600, the directory 700); `tokenFile` in token.ts names them. */
+    tokensDir: join(secrets, "tokens"),
     irohKey: join(secrets, "iroh.key"),
     db: join(data, "meddle.sqlite"),
     durableDb: join(data, "durable.sqlite"),

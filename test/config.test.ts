@@ -15,7 +15,7 @@ test("env overrides and derived paths", () => {
   const p = paths(cfg);
   expect(p.taskConfig("abc")).toBe("/t/abc/.meddle/claude");
   expect(p.memory("proj")).toBe("/d/memory/proj");
-  expect(p.tokenFile).toBe("/d/secrets/claude-token");
+  expect(p.tokensDir).toBe("/d/secrets/tokens");
   expect(cfg.claudeHome).toBe("/c");
   expect(loadConfig({ HOME: "/home/x", MEDDLE_ENV_PASSTHROUGH: " FOO  BAR " }).envPassthrough).toEqual(["FOO", "BAR"]);
   expect(loadConfig({ HOME: "/home/x", MEDDLE_JJ_NETWORK_TIMEOUT_MS: "5000" }).jjNetworkTimeoutMs).toBe(5000);

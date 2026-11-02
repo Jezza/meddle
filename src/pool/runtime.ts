@@ -29,7 +29,7 @@ export type PoolRuntime = {
   join(ticket: string): Promise<{ poolId: string; members: number }>;
   /** Removes a node from the pool and cuts it off; rejects "a node cannot remove itself". */
   remove(nodeId: string): Promise<void>;
-  /** The token file changed on this node: tell the pool. */
+  /** The tokens changed on this node (the CLI wrote them, or a turn marked one): tell the pool. */
   tokenChanged(): Promise<void>;
   /** Sets a pool setting here (rejects what `PoolSettings.set` refuses), applies it and tells the pool. */
   setSetting(key: string, value: string): Promise<void>;
@@ -40,7 +40,10 @@ export type PoolRuntime = {
    * Never rejects.
    */
   refresh(): Promise<void>;
-  /** Fires whenever the roster, a peer's online state, the token or the settings changed. Returns the unsubscribe. */
+  /**
+   * Fires whenever the roster, a peer's online state, the tokens or the settings changed, and on each self refresh.
+   * Returns the unsubscribe.
+   */
   onChange(cb: () => void): () => void;
   /**
    * A reference to `contract` (input `{}`) on the peer, over this node's client host for it; rejects
@@ -137,7 +140,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   const net = new PoolNet({
     endpoint, selfId, isMember: admits, refusalReason,
     onJoin: (conn) => handleJoin(conn, {
-      store, selfId, cfg, endpoint,
+      store, selfId, endpoint,
       // The new member's row (with the address it joined from) is in the roster now: follow it.
       onAdmitted: () => {
         enforce();
@@ -189,7 +192,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   }
 
   const sync = new PoolSync({
-    cfg, store, net, selfId, settings, summary: liveSummary,
+    cfg, db, store, net, selfId, settings, summary: liveSummary, log,
     onChange: () => {
       enforce();
       notify();
@@ -269,7 +272,8 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   async function join(ticket: string): Promise<{ poolId: string; members: number }> {
     const joined = await joinPool(decodeTicket(ticket), { endpoint, store, identity, summary: liveSummary });
-    // Joining dropped the old pool's settings; the new pool's arrive by sync.
+    // Joining dropped the old pool's settings; the new pool's arrive by sync. The tokens stay: they are this node's
+    // logins, and replicate to the new pool like any member's.
     settings.apply();
     leftPool = false;
     if (discovery !== null) await discovery.restart(store.pool());
@@ -295,7 +299,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   }
 
   async function tokenChanged(): Promise<void> {
-    // Refreshing the self row tells the pool: the `token` cells re-read the token's metadata on the change.
+    // Refreshing the self row tells the pool: the `tokens` and `activeTokenId` cells re-read the tokens on the change.
     await sync.refreshSelf();
     notify();
   }
@@ -334,7 +338,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   return {
     identity, store, net, endpoint, settings,
     objectDeps: {
-      store, cfg, selfId, settings,
+      store, db, cfg, selfId, settings,
       isOnline: (id) => net.isOnline(id),
       liveSummary,
       invite,

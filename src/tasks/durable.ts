@@ -35,7 +35,7 @@ import {
   type TaskRow,
   type TaskSettings,
 } from "../store/records";
-import { getToken } from "../token";
+import { pickToken } from "../token";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
 import { readManifest, transcriptPath, type TaskManifest } from "./manifest";
@@ -218,8 +218,7 @@ export class TaskRunner {
    * (cloned from its home), and the task starts from the home's trunk.
    */
   async create(input: { title: string; projectIds: string[] }): Promise<TaskManifest> {
-    const token = await getToken(this.#cfg);
-    if (token === null || token === "") throw new Error("no token set");
+    if ((await pickToken(this.#cfg, this.#db)) === null) throw new Error("no usable token");
     const deps = this.#replicaDeps();
     if (deps === null) return provisionTask(this.#cfg, this.#db, input);
     const parents: Record<string, string> = {};
@@ -1007,8 +1006,9 @@ export class TaskRunner {
     manifest: TaskManifest,
     resume: boolean,
   ): Promise<Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">> {
-    const token = await getToken(this.#cfg);
-    if (token === null || token === "") throw new Error("no token set");
+    const picked = await pickToken(this.#cfg, this.#db);
+    if (picked === null) throw new Error("no usable token");
+    const token = picked.value;
     const contexts = [];
     for (const p of manifest.projects) contexts.push(await loadContext(p.replica));
     const projectSettings = [];

@@ -11,7 +11,7 @@ import {
 import { PoolNet, fromEndpoint, toEndpointAddr } from "../src/pool/net";
 import { PoolStore, type NodeSummary, type WireAddr } from "../src/pool/store";
 import { openDb } from "../src/store/db";
-import { setToken } from "../src/token";
+import { addToken, tokenId } from "../src/token";
 import { testNode, type TestNode } from "./pool-helpers";
 
 const A = "a".repeat(64);
@@ -49,12 +49,12 @@ async function inviter() {
     endpoint: node.endpoint, selfId: id, isMember: (peer) => store.isMember(peer), onError: (err) => errors.push(err),
     onJoin: (conn) => {
       joins += 1;
-      return handleJoin(conn, { store, selfId: id, cfg, endpoint: node.endpoint, onAdmitted: (nodeId, addr) => admitted.push([nodeId, addr]) });
+      return handleJoin(conn, { store, selfId: id, endpoint: node.endpoint, onAdmitted: (nodeId, addr) => admitted.push([nodeId, addr]) });
     },
   });
   net.start();
   return {
-    id, node, cfg, store, admitted, errors,
+    id, node, cfg, db, store, admitted, errors,
     joins: () => joins,
     async close() {
       await net.stop();
@@ -108,7 +108,7 @@ test("a node joins with a ticket and both rosters agree", async () => {
   const a = await inviter();
   const joiners: TestNode[] = [];
   try {
-    await setToken(a.cfg, "tok");
+    await addToken(a.cfg, a.db, "tok-a", { setBy: a.id });
     const aPool = a.store.pool();
     for (let i = 0; i < 5; i++) {
       const b = await joiner();
@@ -153,21 +153,23 @@ test("a node joins with a ticket and both rosters agree", async () => {
   }
 }, 15_000);
 
-test("the welcome carries the pool, the roster and token metadata, never the token; a malformed request is refused", async () => {
+test("the welcome carries the pool and the roster, nothing of the tokens; a malformed request is refused", async () => {
   const a = await inviter();
   const b = await testNode();
   try {
-    await setToken(a.cfg, "tok", { setAt: "2026-10-31T00:00:00.000Z" });
+    await addToken(a.cfg, a.db, "tok-a", { label: "work", setBy: a.id, now: "2026-10-31T00:00:00.000Z" });
     const { code } = a.store.createInvite();
     const line = await rawJoin(b, fromEndpoint(a.node.endpoint), JSON.stringify({
       t: "join", code, addr: fromEndpoint(b.endpoint), hostname: "beta", version: "0.1.0", claudeCodeVersion: "2.0.0",
     }));
     expect(line).not.toBeNull();
-    expect(line!.replaceAll('"token"', "")).not.toContain("tok");
+    // Tokens reach a joiner through PoolSync, as for every member.
+    expect(line).not.toContain("tok-a");
+    expect(line).not.toContain(tokenId("tok-a"));
+    expect(line).not.toContain("token");
     const reply = JSON.parse(line!) as JoinReply;
     if (reply.t !== "welcome") throw new Error(`expected welcome, got ${line}`);
     expect(reply.pool).toEqual({ id: a.store.pool().poolId, secret: a.store.pool().poolSecret });
-    expect(reply.token).toEqual({ setAt: "2026-10-31T00:00:00.000Z", setBy: null });
     expect(reply.roster.map((r) => r.nodeId).sort()).toEqual([a.id, b.identity.id].sort());
 
     expect(await rawJoin(b, fromEndpoint(a.node.endpoint), "not json")).toBe(JSON.stringify({ t: "refused", reason: "bad join request" }));

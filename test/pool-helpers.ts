@@ -78,7 +78,7 @@ export type PoolNode = {
   summary: NodeSummary;
   /** What `servePool` was given; `tokenChanged` refreshes the self row and tells the pool. */
   deps: PoolObjectDeps;
-  /** Fires `deps.changes`, as the node does when its roster, a peer's online state or its token changed. */
+  /** Fires `deps.changes`, as the node does when its roster, a peer's online state or its tokens changed. */
   changed(): void;
   /** Everything reported to the net's, the sync's and the host's `onError`. */
   errors: unknown[];
@@ -125,13 +125,13 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
   net.onPeer(() => changed());
   const settings = new PoolSettings(db, cfg, id, () => {});
   settings.apply();
-  const sync = new PoolSync({ cfg, store, net, selfId: id, settings, summary: () => summary, onChange: changed, onError, tap });
+  const sync = new PoolSync({ cfg, db, store, net, selfId: id, settings, summary: () => summary, onChange: changed, onError, tap });
   const settingsChanged = async () => {
     settings.apply();
     await sync.refreshSelf();
   };
   const deps: PoolObjectDeps = {
-    store, cfg, selfId: id,
+    store, db, cfg, selfId: id,
     isOnline: (peer) => net.isOnline(peer),
     liveSummary: () => summary,
     invite: notInThisTest,
@@ -218,14 +218,16 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
 /**
  * A whole node (see `setupNode`, `extraEnv` added to its environment) with its pool runtime started and its chord
  * host (`createNodeHost`, which gives the runner the pool) serving it; the metrics sampler is not started; what the
- * runtime and the runner log is collected in `logs`; `hooks` are the runner's test hooks, set them at will. `close()`
- * stops the pool, the host and the harness.
+ * runtime and the runner log is collected in `logs`; `hooks` are the runner's test hooks, set them at will; `token` is
+ * `setupNode`'s (default `"tok"`, `null` for none). `close()` stops the pool, the host and the harness.
  */
-export async function startPoolNode(fixture?: string, extraEnv: Record<string, string> = {}) {
+export async function startPoolNode(fixture?: string, extraEnv: Record<string, string> = {}, options: { token?: string | null } = {}) {
   /** The lines the runtime and the runner logged (instead of printing them). */
   const logs: string[] = [];
   const hooks: RunnerHooks = {};
-  const node = await setupNode(fixture, { ...POOL_ENV, ...extraEnv }, { log: (line) => logs.push(line), hooks });
+  const node = await setupNode(fixture, { ...POOL_ENV, ...extraEnv }, {
+    log: (line) => logs.push(line), hooks, ...(options.token === undefined ? {} : { token: options.token }),
+  });
   const { cfg, db, runner } = node;
   const metrics = new MetricsSampler({ taskPids: () => findTaskPids(cfg.taskRoot), intervalMs: 60_000, dataDir: cfg.dataDir });
   /** Everything the runtime's net and sync reported. */
@@ -257,9 +259,9 @@ export type GitPoolNode = Awaited<ReturnType<typeof startPoolNode>>;
 
 /**
  * What one node of `poolNodes` runs its turns with, on top of the options for all; `serveGit: false` leaves its `git`
- * streams to the test (no `acceptGitStreams`).
+ * streams to the test (no `acceptGitStreams`); `token` is `startPoolNode`'s (default `"tok"`, `null` for none).
  */
-export type NodeOptions = { fixture?: string; extraEnv?: Record<string, string>; serveGit?: boolean };
+export type NodeOptions = { fixture?: string; extraEnv?: Record<string, string>; serveGit?: boolean; token?: string | null };
 
 /**
  * `count` whole nodes (`startPoolNode`, with `extraEnv` and the node's own `nodes[i]`), each after the first joined to the first's pool and all
@@ -284,7 +286,7 @@ export async function poolNodes(
   try {
     for (let i = 0; i < count; i++) {
       const own = options.nodes?.[i] ?? {};
-      const node = await startPoolNode(own.fixture, { ...options.extraEnv, ...own.extraEnv });
+      const node = await startPoolNode(own.fixture, { ...options.extraEnv, ...own.extraEnv }, own.token === undefined ? {} : { token: own.token });
       nodes.push(node);
       await writeHelperWrapper(node.cfg);
       await writeUpdateHook(node.cfg);

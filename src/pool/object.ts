@@ -1,16 +1,19 @@
 // Serves PoolObject: the pool as dashboards and the CLI see it (`default`), and as other nodes sync it (`peer`): the
-// roster, the token's metadata and the settings.
+// roster, the tokens' metadata and the settings.
+import type { Database } from "bun:sqlite";
 import Type from "typebox";
 import { forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
-import { NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema } from "../state/contracts";
-import { getToken, tokenStatus } from "../token";
+import { NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema, TokenMetaSchema } from "../state/contracts";
+import { listTokens, pickToken, tokenRow, tokenValue } from "../token";
 import { isNodeId } from "./identity";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore, RosterRow } from "./store";
 
 export type PoolObjectDeps = {
   store: PoolStore;
+  /** The node's database: the token rows are read from it. */
+  db: Database;
   cfg: NodeConfig;
   selfId: string;
   isOnline(nodeId: string): boolean;
@@ -26,7 +29,7 @@ export type PoolObjectDeps = {
   setSetting(key: string, value: string): Promise<void>;
   /** Unsets a setting here and tells the pool. */
   unsetSetting(key: string): Promise<void>;
-  /** Fires whenever the roster, a peer's online state, the token or the settings changed. */
+  /** Fires whenever the roster, a peer's online state, the tokens or the settings changed, and on each self refresh. */
   changes: Subscribable<null>;
 };
 
@@ -42,13 +45,7 @@ export function peerOf(principal: unknown): string | null {
 const defaultState = PoolObject.def.variants.default.state;
 const LiveSchema = Type.Object({ summary: NodeSummarySchema, at: Type.String() });
 type Live = Type.Static<typeof LiveSchema>;
-type TokenView = Type.Static<typeof defaultState.token>;
 type PoolNode = Type.Static<typeof defaultState.nodes>[number];
-
-async function tokenNow(cfg: NodeConfig): Promise<TokenView> {
-  const s = await tokenStatus(cfg);
-  return { present: s.present, setAt: s.setAt ?? null, setBy: s.setBy ?? null, expiresAt: s.expiresAt ?? null };
-}
 
 /** One roster row as a dashboard sees it; this node's own row shows its live summary. */
 function nodeOf(row: RosterRow, selfId: string, live: Live, online: readonly string[]): PoolNode {
@@ -78,7 +75,7 @@ function mixed(rows: readonly RosterRow[], selfId: string, live: Live): boolean 
 
 /** Serves PoolObject on `host`: the `peer` variant to `peer:` principals, `default` to everyone else. */
 export function servePool(host: Host, deps: PoolObjectDeps): void {
-  const { store, cfg, selfId, settings } = deps;
+  const { store, db, cfg, selfId, settings } = deps;
   host.serve(PoolObject, (_input, principal, self) => {
     const peer = peerOf(principal);
     if (peer === null && typeof principal === "string" && principal.startsWith(PEER_PRINCIPAL_PREFIX)) {
@@ -87,35 +84,42 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     // The self row as stored: its presence is refreshed by PoolSync.refreshSelf, so a peer merging it sees a change
     // only when the node refreshed it (a fresh `lastSeenAt` on every refresh would bounce between nodes forever).
     const roster = self.state("roster", Type.Array(RosterRowSchema), { init: () => store.roster() });
-    const token = self.state("token", defaultState.token, { init: () => tokenNow(cfg) });
-    /** Token reads in flight: only the newest one's result is kept, and none once the host closed meanwhile. */
-    let tokenReads = 0;
-    const refreshToken = async (ctx: Ctx) => {
-      const n = ++tokenReads;
-      const next = await tokenNow(cfg);
-      if (n === tokenReads && !ctx.signal.aborted) token.replace(ctx, next);
-    };
 
     if (peer !== null) {
       const rows = self.state("settings", Type.Array(SettingRowSchema), { init: () => settings.rows() });
-      self.on("changes", deps.changes, async (_event, ctx) => {
+      const tokens = self.state("tokens", Type.Array(TokenMetaSchema), { init: () => listTokens(db, { includeRemoved: true }) });
+      self.on("changes", deps.changes, (_event, ctx) => {
         roster.replace(ctx, store.roster());
         rows.replace(ctx, settings.rows());
-        await refreshToken(ctx);
+        tokens.replace(ctx, listTokens(db, { includeRemoved: true }));
       });
       return {
         variant: "peer",
         roster,
         settings: rows,
-        token: self.derive([token], (t) => (t.setAt === null ? null : { setAt: t.setAt, setBy: t.setBy })),
-        fetchToken: async () => {
+        tokens,
+        fetchToken: async ({ id }) => {
           if (!store.isMember(peer)) throw forbidden("not a member");
-          const [value, meta] = await Promise.all([getToken(cfg), tokenStatus(cfg)]);
-          if (value === null || meta.setAt === undefined) throw new Error("no token on this node");
-          return { value, setAt: meta.setAt, setBy: meta.setBy ?? null };
+          // The table first: an id this node does not list never reaches the filesystem.
+          const row = tokenRow(db, id);
+          if (row === null || row.removed) throw forbidden("unknown token");
+          const value = await tokenValue(cfg, row.id);
+          if (value === null) throw new Error("the token's value is not on this node");
+          return { value };
         },
       };
     }
+
+    const activeNow = async () => (await pickToken(cfg, db))?.id ?? null;
+    const tokens = self.state("tokens", defaultState.tokens, { init: () => listTokens(db) });
+    const active = self.state("activeTokenId", defaultState.activeTokenId, { init: activeNow });
+    /** Active-token reads in flight: only the newest one's result is kept, and none once the host closed meanwhile. */
+    let activeReads = 0;
+    const refreshActive = async (ctx: Ctx) => {
+      const n = ++activeReads;
+      const next = await activeNow();
+      if (n === activeReads && !ctx.signal.aborted) active.replace(ctx, next);
+    };
 
     const liveNow = async (): Promise<Live> => ({ summary: await deps.liveSummary(), at: new Date().toISOString() });
     const onlineNow = () => store.roster().map((r) => r.nodeId).filter((id) => id !== selfId && deps.isOnline(id));
@@ -126,16 +130,18 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     self.on("changes", deps.changes, async (_event, ctx) => {
       roster.replace(ctx, store.roster());
       listed.replace(ctx, settings.list());
+      tokens.replace(ctx, listTokens(db));
       online.replace(ctx, onlineNow());
       poolId.replace(ctx, store.pool().poolId);
-      await Promise.all([refreshToken(ctx), liveNow().then((l) => { if (!ctx.signal.aborted) live.replace(ctx, l); })]);
+      await Promise.all([refreshActive(ctx), liveNow().then((l) => { if (!ctx.signal.aborted) live.replace(ctx, l); })]);
     });
     return {
       variant: "default",
       poolId,
       self: self.state("self", defaultState.self, selfId),
       nodes: self.derive([roster, live, online], (rows, l, on) => rows.map((r) => nodeOf(r, selfId, l, on))),
-      token,
+      tokens,
+      activeTokenId: active,
       mixedVersions: self.derive([roster, live], (rows, l) => mixed(rows, selfId, l)),
       settings: listed,
       invite: async () => ({ ticket: deps.invite() }),

@@ -7,7 +7,7 @@ the fidelity of sitting at that machine's terminal. The services find each other
 Claude login and each project's memory, and a task can move between machines without losing its conversation.
 
 Status: Plan 3, repos across the pool and task moves. Nodes form a pool over iroh: they find each other through a
-lighthouse, share the login token, and the dashboard of any node shows every node and opens its tasks. A project's
+lighthouse, share their login tokens, and the dashboard of any node shows every node and opens its tasks. A project's
 repo and memory follow its tasks to whichever node they run on, and a task moves between nodes with its workspaces,
 conversation and queued prompts. Moving a project's home to another node is not here yet (see
 [Known limits](#known-limits)).
@@ -36,7 +36,7 @@ jj user config on the node) jj refuses to push the commits, so every push to a p
 logs a `meddle: git: …` line saying so (see [Projects across the pool](#projects-across-the-pool)).
 
 The commands below run from the checkout as `bun run src/cli.ts <command>`. `bun run build` also produces a compiled
-`dist/meddle` for `status` and `token set`; the service itself runs from the checkout. The compiled binary embeds
+`dist/meddle` for `status` and the `token` commands; the service itself runs from the checkout. The compiled binary embeds
 iroh's native modules (two `.node` files, its glibc and musl builds), which make it about 40 MB larger (147 MB on
 linux-x64). It carries no `node_modules`, so it reports its Claude Code version as `unknown`. A node served from it
 reports `unknown` to the pool too, so in a pool with nodes served from a checkout the dashboard flags the members'
@@ -53,24 +53,43 @@ sudo install -d -o $USER -g $(id -gn) -m 755 /opt/meddle/tasks
 
 To use a different root, set `MEDDLE_TASK_ROOT` to it in the environment of every meddle command.
 
-## Login token
+## Login tokens
 
-meddle uses one token from `claude setup-token`. Store it by piping it in on stdin or from a file, never as an
-argument:
+meddle keeps an ordered list of tokens from `claude setup-token`, one per login. Add one by piping it in on stdin or
+from a file, never as an argument:
 
 ```sh
 claude setup-token          # copy the token it prints
-bun run src/cli.ts token set               # paste it, then Ctrl-D
-bun run src/cli.ts token set --file <path>
-bun run src/cli.ts token status
+bun run src/cli.ts token add --label work                 # paste it, then Ctrl-D
+bun run src/cli.ts token add --file <path> [--label <l>]
+bun run src/cli.ts token list                             # or token status
+bun run src/cli.ts token remove <id|label>
+bun run src/cli.ts token enable <id|label>
 ```
 
-It is written mode 600 in the data directory (`~/.local/share/meddle`, or `MEDDLE_DATA_DIR`) and given to Claude
-Code as `CLAUDE_CODE_OAUTH_TOKEN`.
+A token's id is the first 16 hex characters of the SHA-256 of its value, so the same token added twice, on one node
+or on two, is listed once. Adding it again with `--label` renames it, and adding a removed token brings it back.
+Without `--label` a token is named after the first 8 characters of its id; a label is at most 64 characters. `token
+add` prints `token <id> (<label>)`, and `token set` is the same command. `remove` and `enable` take a full id or a
+label; a label two tokens share is refused (`ambiguous token label`), so name the token by its id then.
 
-In a pool, set it on any one node. `token set` writes the token file on that node, recording the node as the one that
-set it, then tells the running node (if any) that the token changed; it prints `token set` either way. The other
-members pull it from there (see [Pool](#pool)).
+Each value is written mode 600 to `secrets/tokens/<id>` in the data directory (`~/.local/share/meddle`, or
+`MEDDLE_DATA_DIR`; the directory is mode 700) and given to Claude Code as `CLAUDE_CODE_OAUTH_TOKEN`. The list itself
+(each token's label, who set it and when, its status and its expiry, a year after it was set) is in the node's
+database.
+
+A turn uses the first token in order (by when each was set) whose status is `ok`, or `exhausted` until a time that
+has passed, and whose value the node holds. A `disabled` token waits for `token enable`. With no usable token a turn
+fails with `no usable token`, and `task new` is refused the same way. `token list` prints a line per token (id, label,
+status with its time and reason, expiry) and then `active: <id>`, the token a turn starting now would use, or
+`active: none`.
+
+The token commands work on the node's database and secrets directory directly, with or without a running node, so a
+value never goes over the node's socket; when a node runs, they tell it and it tells the pool. `token list` reads the
+database read-only and, before the node's first start, prints only `active: none`.
+
+A node that ran an older meddle with a single token (`secrets/claude-token`) imports it at its next `serve` as the
+token labelled `default`, keeping when and by whom it was set, and renames the old files to `*.migrated`.
 
 ## Pool
 
@@ -139,12 +158,21 @@ dials only members whose ids sort after its own. If its id sorts after every rem
 it dials nobody, so it keeps showing itself as a member with every other node offline; it is connected to no one. To
 bring it back, remove the other nodes from its own Settings view, then join it with a new ticket.
 
-### The token
+### Tokens
 
-The token crosses the network only as the answer to a request from a current member, over the encrypted iroh
-connection. It never goes over the node's localhost socket (the CLI's and the dashboard's), and never into a ticket,
-the roster or a log. Each node sees when the others' tokens were set, and pulls the token from a member whose token
-was set later than its own. A token set while no node is running reaches the pool once that node serves.
+Every member lists every token. A token's metadata replicates per id, last writer wins on the time it last changed
+(on equal times every node settles on the same row), and a removal replicates as a removed row. A node pulls the value
+of each token it lists but lacks, by id, from the member that listed it, and deletes the value of a token the pool
+removed. A value crosses the network only as the answer to a request from a current member for a token the answering
+node lists, over the encrypted iroh connection. It never goes over the node's localhost socket (the CLI's and the
+dashboard's), and never into a ticket, the roster, the pool's replicated state or a log. A node drops a replicated row
+whose id is not 16 hex characters, whose label is empty, longer than 64 characters or holds control characters, or
+whose status or times are malformed, and logs `meddle: tokens: ignored replicated token "<id>"` once per id. A token
+added while no node is running reaches the pool once that node serves.
+
+Tokens are the logins of the people who added them, not the pool's: a node that joins another pool keeps its tokens,
+and they replicate to the new pool like any member's. The join itself carries none; the joiner pulls the pool's
+tokens like every other member.
 
 ### Pool settings
 
@@ -169,7 +197,7 @@ bun run src/cli.ts config list
 Each key replicates on its own, last writer wins on the time it was set, the roster's rule (on equal times, the
 setting from the node with the greater id wins, then the greater value); an unset replicates too. A value is at most
 4096 characters, with no control characters other than tab. Values are plain pool state: every member sees and stores
-them, so they are not for secrets (the token has its own path). Some names cannot be set through `env.*`, because
+them, so they are not for secrets (tokens have their own path). Some names cannot be set through `env.*`, because
 meddle sets them itself or because they would let a member take over another node's processes: `PATH`, `HOME`,
 `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_PROJECT_DIR_NAME`, `ANTHROPIC_API_KEY`,
 `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `JJ_USER`, `JJ_EMAIL`, `JJ_CONFIG`, `GIT_CONFIG_GLOBAL`,
@@ -466,7 +494,7 @@ or Claude Code versions. The Projects view lists every project of the pool (see
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an
 offline member 503. Settings shows this node's id, the pool id, the members, invites, joining another pool and the
-token's status.
+tokens in order, with the one a turn would use now marked active.
 
 ## Service
 

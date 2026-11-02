@@ -1,4 +1,4 @@
-// test/pool-state.test.ts — the pool runtime behind a node host: PoolObject, joining, the token and removal.
+// test/pool-state.test.ts — the pool runtime behind a node host: PoolObject, joining, the tokens and removal.
 import { test, expect } from "bun:test";
 import { hostname } from "node:os";
 import { SecretKey } from "@number0/iroh";
@@ -11,7 +11,7 @@ import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
 import { NodeObject, PeerObject, PoolObject } from "../src/state/contracts";
-import { getToken, setToken } from "../src/token";
+import { addToken, tokenId, tokenValue } from "../src/token";
 import { VERSION } from "../src/version";
 import { initColocated } from "../src/jj";
 import { addProjectFromFolder } from "../src/projects/project";
@@ -125,7 +125,7 @@ test("PoolObject shows a pool of one, invites, and a joined node appears online 
   });
 }, 15_000);
 
-test("tokenChanged replicates the token; remove propagates and the removed node is cut off", async () => {
+test("tokenChanged replicates the tokens; remove propagates and the removed node is cut off", async () => {
   await withNodes(2, async ([a, b]) => {
     const A = a!.node;
     const B = b!.node;
@@ -135,14 +135,24 @@ test("tokenChanged replicates the token; remove propagates and the removed node 
     await onlineOn(a!, b!);
     await onlineOn(b!, a!);
 
-    await setToken(A.cfg, "tok2", { setBy: A.id });
+    // Each node has `tok` (set before they met, so first in order): it stays the active one.
+    const tok = tokenId("tok");
+    const added = await addToken(A.cfg, A.db, "tok2", { label: "second", setBy: A.id });
     await poolA.tokenChanged({});
-    await until(poolA.token, (t) => t.setBy === A.id);
-    await until(poolB.token, (t) => t.setBy === A.id);
-    expect((await getToken(B.cfg)) === "tok2").toBe(true);
-    expect(poolB.token.value.setAt).toBe(poolA.token.value.setAt);
+    await until(poolA.tokens, (ts) => ts.some((t) => t.id === added.id));
+    const listed = await until(poolB.tokens, (ts) => ts.some((t) => t.id === added.id && t.label === "second" && t.setBy === A.id));
+    expect(listed.map((t) => t.id)).toEqual(poolA.tokens.value.map((t) => t.id));
+    await eventually(() => poolB.tokens.value.length === 2);
+    const deadline = Date.now() + WAIT_MS;
+    while ((await tokenValue(B.cfg, added.id)) !== "tok2") {
+      if (Date.now() > deadline) throw new Error("B never pulled the token");
+      await Bun.sleep(20);
+    }
+    expect(poolA.activeTokenId.value).toBe(tok);
+    expect(poolB.activeTokenId.value).toBe(tok);
     const nodeB = await b!.client.get(NodeObject, {});
-    await until(nodeB.token, (t) => t.expiresAt === poolB.token.value.expiresAt);
+    const first = poolB.tokens.value.find((t) => t.id === tok)!;
+    await until(nodeB.token, (t) => t.present && t.expiresAt === first.expiresAt);
 
     await poolA.remove({ nodeId: B.id });
     expect(A.net.isOnline(B.id)).toBe(false);

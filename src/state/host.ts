@@ -20,7 +20,7 @@ import { claimHomelessProjects, getTask, getTaskSettings, listLiveTasks, listTas
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
 import type { TaskManifest } from "../tasks/manifest";
 import { shortId } from "../pool/ids";
-import { tokenStatus } from "../token";
+import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
 import {
   HeadSchema,
@@ -167,7 +167,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   host.serve(NodeStore, (_input, _principal, self) => {
     const taskIds = self.state("taskIds", NodeStore.def.members.taskIds, { init: () => listLiveTasks(db).map((t) => t.id) });
     const projectIds = self.state("projectIds", NodeStore.def.members.projectIds, { init: projectIdsNow });
-    const token = self.state("token", NodeStore.def.members.token, { init: () => tokenNow(cfg) });
+    const token = self.state("token", NodeStore.def.members.token, { init: () => tokenNow(cfg, db) });
     const metricsNow = self.state("metrics", NodeStore.def.members.metrics, { init: () => metrics.latest() });
     const hostsTasks = self.state("hostsTasks", NodeStore.def.members.hostsTasks, { init: async () => (await checkTaskRoot(cfg)).ok });
     const models = self.state("models", NodeStore.def.members.models, []);
@@ -218,7 +218,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     });
     self.on("samples", samples, async (sample, ctx) => {
       metricsNow.replace(ctx, sample);
-      token.replace(ctx, await tokenNow(cfg));
+      token.replace(ctx, await tokenNow(cfg, db));
       await refreshHostsTasks(ctx);
     });
     // A move that failed says where and why; the task is live here again.
@@ -235,9 +235,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     });
     // A project added or registered elsewhere than through this object (a replica a task needed).
     self.on("projects", projectChanges, (_event, ctx) => projectIds.replace(ctx, projectIdsNow()));
-    // A token pulled from a peer changes the file without a metrics sample.
+    // A token pulled from a peer, marked or removed changes what is usable without a metrics sample.
     self.on("pool", poolChanges, async (_event, ctx) => {
-      const next = await tokenNow(cfg);
+      const next = await tokenNow(cfg, db);
       // The host may have closed while the file was read (a change as the node shuts down).
       if (!ctx.signal.aborted) token.replace(ctx, next);
       await refreshHostsTasks(ctx);
@@ -517,9 +517,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   return host;
 }
 
-async function tokenNow(cfg: NodeConfig): Promise<{ present: boolean; expiresAt: string | null }> {
-  const status = await tokenStatus(cfg);
-  return { present: status.present, expiresAt: status.expiresAt ?? null };
+/** Whether this node holds a usable token now (`pickToken`), and when that token expires. */
+async function tokenNow(cfg: NodeConfig, db: Database): Promise<{ present: boolean; expiresAt: string | null }> {
+  const picked = await pickToken(cfg, db);
+  if (picked === null) return { present: false, expiresAt: null };
+  return { present: true, expiresAt: listTokens(db).find((t) => t.id === picked.id)?.expiresAt ?? null };
 }
 
 function questionText(req: PendingApproval): string {

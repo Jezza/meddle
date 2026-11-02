@@ -8,22 +8,22 @@ import { addProjectFromFolder } from "../src/projects/project";
 import { openDb } from "../src/store/db";
 import { TaskRunner, type RunnerHooks } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
-import { setToken } from "../src/token";
+import { addToken } from "../src/token";
 
 export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 
 /**
  * A node in a temp home: data dirs, task root, database, its pool identity (the key a later `startPool` loads), one
  * colocated project added from a folder with this node as its home,
- * a token, and a Harness with a TaskRunner that runs Claude Code turns from the `fixture` recording
- * (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the environment the config is read from;
- * its `MEDDLE_FIXTURE_MEMORY` and `MEDDLE_FIXTURE_STALL` also reach the stand-in Claude Code. `log` receives the
- * runner's log lines (default `console.error`); `hooks` are the runner's test hooks.
+ * a token (`options.token`, default `"tok"`; `null` adds none), and a Harness with a TaskRunner that runs Claude Code
+ * turns from the `fixture` recording (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the
+ * environment the config is read from; its `MEDDLE_FIXTURE_MEMORY` and `MEDDLE_FIXTURE_STALL` also reach the stand-in
+ * Claude Code. `log` receives the runner's log lines (default `console.error`); `hooks` are the runner's test hooks.
  */
 export async function setupNode(
   fixture = "hello.jsonl",
   extraEnv: Record<string, string> = {},
-  options: { log?: (line: string) => void; hooks?: RunnerHooks } = {},
+  options: { log?: (line: string) => void; hooks?: RunnerHooks; token?: string | null } = {},
 ) {
   const home = await mkdtemp("/tmp/meddle-node-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t`, ...extraEnv });
@@ -34,7 +34,8 @@ export async function setupNode(
   await initColocated(folder);
   const { id } = await loadOrCreateIdentity(cfg);
   const project = await addProjectFromFolder(cfg, db, folder, id, "a");
-  await setToken(cfg, "tok");
+  const token = options.token === undefined ? "tok" : options.token;
+  if (token !== null) await addToken(cfg, db, token, { setBy: id });
   const harness = await openHarness(cfg, createRegistry());
   const runner = new TaskRunner(cfg, db, harness.harness, {
     claudePath: replay,

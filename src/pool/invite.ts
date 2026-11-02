@@ -1,9 +1,7 @@
 import Type from "typebox";
 import Value from "typebox/value";
 import type { BiStream, Connection, Endpoint } from "@number0/iroh";
-import type { NodeConfig } from "../config";
-import { RosterRowSchema, TokenMetaSchema, WireAddrSchema, type TokenMeta } from "../state/contracts";
-import { tokenStatus } from "../token";
+import { RosterRowSchema, WireAddrSchema } from "../state/contracts";
 import { ALPN_JOIN, StreamReader, writeLine } from "./frames";
 import { hexOf, isNodeId, type Identity } from "./identity";
 import { fromEndpoint, toEndpointAddr } from "./net";
@@ -25,11 +23,11 @@ export const TICKET_PREFIX = "meddle1";
 export type JoinRequest = { t: "join"; code: string; addr: WireAddr; hostname: string; version: string; claudeCodeVersion: string };
 
 export type JoinReply =
-  | { t: "welcome"; pool: { id: string; secret: string }; roster: RosterRow[]; token: TokenMeta | null }
+  | { t: "welcome"; pool: { id: string; secret: string }; roster: RosterRow[] }
   | { t: "refused"; reason: string };
 
 export type JoinHostDeps = {
-  store: PoolStore; selfId: string; cfg: NodeConfig;
+  store: PoolStore; selfId: string;
   /** This node's endpoint: its address goes into the welcome's self row. */
   endpoint: Endpoint;
   onAdmitted(nodeId: string, addr: WireAddr): void;
@@ -57,7 +55,6 @@ const JoinReplySchema = Type.Union([
     t: Type.Literal("welcome"),
     pool: Type.Object({ id: Type.String({ minLength: 1 }), secret: Type.String({ minLength: 1 }) }),
     roster: Type.Array(RosterRowSchema),
-    token: Type.Union([TokenMetaSchema, Type.Null()]),
   }),
   Type.Object({ t: Type.Literal("refused"), reason: Type.String() }),
 ]);
@@ -138,11 +135,6 @@ async function readRequest(conn: Connection, remoteId: string): Promise<{ stream
   return { stream, request: value };
 }
 
-async function tokenMeta(cfg: NodeConfig): Promise<TokenMeta | null> {
-  const s = await tokenStatus(cfg);
-  return s.present && s.setAt !== undefined ? { setAt: s.setAt, setBy: s.setBy ?? null } : null;
-}
-
 /**
  * Serves one connection on ALPN_JOIN: reads one request line (≤ 4 KiB) from its first stream, answers, waits for the
  * joiner to close (≤ 5 s), then closes. A node that is not itself a member refuses with `inviter is not a member`.
@@ -166,7 +158,6 @@ export async function handleJoin(conn: Connection, deps: JoinHostDeps): Promise<
       // A node removed from its pool admits nobody into it; the invite stays unused.
       reply = { t: "refused", reason: NOT_A_MEMBER };
     } else {
-      const token = await tokenMeta(deps.cfg);
       if (!deps.store.consumeInvite(request.code)) {
         reply = { t: "refused", reason: BAD_INVITE };
       } else {
@@ -184,7 +175,6 @@ export async function handleJoin(conn: Connection, deps: JoinHostDeps): Promise<
           t: "welcome",
           pool: { id: pool.poolId, secret: pool.poolSecret },
           roster: deps.store.roster().map((row) => (row.nodeId === deps.selfId ? { ...row, lastAddr: selfAddr } : row)),
-          token,
         };
       }
     }

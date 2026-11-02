@@ -1,9 +1,11 @@
 // Pool sync: each node holds every online peer's PoolObject (peer variant) over a chord link on iroh, merges the
-// peer's roster and settings into its own and pulls the token when the peer's is newer.
+// peer's roster, settings and token rows into its own, pulls the value of each token it lists but lacks, by id, and
+// deletes the value of each token the pool removed.
+import type { Database } from "bun:sqlite";
 import { createHost, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
-import { PoolObject, type TokenMeta } from "../state/contracts";
-import { setToken, tokenStatus } from "../token";
+import { PoolObject } from "../state/contracts";
+import { deleteTokenValue, mergeTokens, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
 import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
 import { fromEndpoint, type PoolNet } from "./net";
@@ -13,15 +15,19 @@ import type { NodeSummary, PoolStore } from "./store";
 
 export type SyncDeps = {
   cfg: NodeConfig;
+  /** The node's database: a peer's token rows are merged into it. */
+  db: Database;
   store: PoolStore;
   net: PoolNet;
   selfId: string;
   /** The pool's settings: a peer's are merged in, then applied. */
   settings: PoolSettings;
   summary(): NodeSummary | Promise<NodeSummary>;
-  /** The roster, the token or the settings changed because of a peer, or the self row was refreshed. */
+  /** The roster, the tokens or the settings changed because of a peer, or the self row was refreshed. */
   onChange(): void;
   onError?(err: unknown): void;
+  /** Log lines (a peer's token rows this node dropped); default `console.error`. */
+  log?(line: string): void;
   /** Tests: every frame sent or received on every peer link. */
   tap?: LinkTap;
   /** Self-row refresh period, default 15000. */
@@ -55,12 +61,20 @@ function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> 
   });
 }
 
+/** How many dropped token ids are logged at most, so that a peer sending junk cannot fill the log. */
+const MAX_LOGGED_REJECTIONS = 100;
+
 export class PoolSync {
   private readonly views = new Map<string, PeerView>();
   /** Client hosts being closed, so that `stop()` can wait for them. */
   private readonly closing = new Set<Promise<void>>();
-  /** Token pulls, one at a time, so two peers' answers cannot interleave between the newer-check and the write. */
+  /**
+   * Token value pulls and deletions, one at a time, so that two peers' answers, or an answer and a removal, cannot
+   * interleave between a check of the row and the write.
+   */
   private pulls: Promise<void> = Promise.resolve();
+  /** Token ids already logged as dropped (at most `MAX_LOGGED_REJECTIONS`), so each is logged once. */
+  private readonly rejectedLogged = new Set<string>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private unsubscribe: (() => void) | undefined;
   private started = false;
@@ -159,13 +173,17 @@ export class PoolSync {
         this.deps.settings.apply();
         this.deps.onChange();
       });
-      pool.token.subscribe((meta) => {
-        if (meta === null) return;
-        // A call in flight when the view is dropped is not settled by closing its client host: the drop's abort ends
-        // it, so that one gone peer cannot hold up the pull chain (and `stop()`).
-        this.pulls = this.pulls
-          .then(() => this.pull(meta, () => unlessAborted(pool.fetchToken({}), view.abort.signal), current))
-          .catch((err: unknown) => { if (current()) this.report(err); });
+      pool.tokens.subscribe((rows) => {
+        if (!current()) return;
+        const merged = mergeTokens(this.deps.cfg, this.deps.db, rows);
+        for (const id of merged.rejected) this.logRejected(id);
+        for (const id of merged.removedValues) this.serially(() => this.dropValue(id), current);
+        for (const id of merged.missingValues) {
+          // A call in flight when the view is dropped is not settled by closing its client host: the drop's abort
+          // ends it, so that one gone peer cannot hold up the chain (and `stop()`).
+          this.serially(() => this.pull(id, () => unlessAborted(pool.fetchToken({ id }), view.abort.signal), current), current);
+        }
+        if (merged.changed) this.deps.onChange();
       });
     } catch (err) {
       if (!current()) return;
@@ -174,20 +192,42 @@ export class PoolSync {
     }
   }
 
-  /** Fetches the peer's token and stores it, when it is newer than this node's (checked again after the fetch). */
-  private async pull(
-    meta: TokenMeta, fetch: () => Promise<{ value: string; setAt: string; setBy: string | null }>, current: () => boolean,
-  ): Promise<void> {
-    if (!current() || !(await this.isNewer(meta.setAt))) return;
-    const got = await fetch();
-    if (!current() || !(await this.isNewer(got.setAt))) return;
-    await setToken(this.deps.cfg, got.value, { setAt: got.setAt, ...(got.setBy === null ? {} : { setBy: got.setBy }) });
+  /** Runs `step` after the pulls and deletions before it; its failure is reported while the view is current. */
+  private serially(step: () => Promise<void>, current: () => boolean): void {
+    this.pulls = this.pulls.then(step).catch((err: unknown) => { if (current()) this.report(err); });
+  }
+
+  /** Whether token `id` is listed here, not removed, and its value is not here yet. */
+  private async wanted(id: string): Promise<boolean> {
+    const row = tokenRow(this.deps.db, id);
+    return row !== null && !row.removed && (await tokenValue(this.deps.cfg, id)) === null;
+  }
+
+  /**
+   * Fetches token `id`'s value from the peer and stores it, when this node still lists it and lacks it (checked again
+   * after the fetch). A value that is not the one the id names is refused.
+   */
+  private async pull(id: string, fetch: () => Promise<{ value: string }>, current: () => boolean): Promise<void> {
+    if (!current() || !(await this.wanted(id))) return;
+    const { value } = await fetch();
+    if (!current() || !(await this.wanted(id))) return;
+    if (tokenId(value) !== id) throw new Error(`a peer answered token ${id} with a value of another id`);
+    await writeTokenValue(this.deps.cfg, id, value.trim());
     this.deps.onChange();
   }
 
-  private async isNewer(setAt: string): Promise<boolean> {
-    const local = await tokenStatus(this.deps.cfg);
-    return !local.present || local.setAt === undefined || setAt > local.setAt;
+  /** Deletes token `id`'s value, when the token is still removed here. */
+  private async dropValue(id: string): Promise<void> {
+    if (tokenRow(this.deps.db, id)?.removed !== true) return;
+    await deleteTokenValue(this.deps.cfg, id);
+    this.deps.onChange();
+  }
+
+  private logRejected(id: string): void {
+    const key = id.slice(0, 80);
+    if (this.rejectedLogged.has(key) || this.rejectedLogged.size >= MAX_LOGGED_REJECTIONS) return;
+    this.rejectedLogged.add(key);
+    (this.deps.log ?? ((line: string) => console.error(line)))(`meddle: tokens: ignored replicated token ${JSON.stringify(key)}`);
   }
 
   /** Forgets the peer's view at once, ends its calls in flight and closes its client host, if it has one yet. */

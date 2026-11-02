@@ -82,8 +82,8 @@ test("a task moves from one node to another through the CLI and resumes there", 
     expect(joined.code).toBe(0);
     await until(["pool"], atA, new RegExp(`^${shortId(B.id)} \\S+ online `, "m"));
     await writeFile(`${a.dir}/token`, "tok\n");
-    expect(await meddle(["token", "set", "--file", `${a.dir}/token`], atA)).toEqual({ stdout: "token set\n", stderr: "", code: 0 });
-    await until(["token", "status"], atB, /^present: true$/m);
+    expect((await meddle(["token", "set", "--file", `${a.dir}/token`], atA)).code).toBe(0);
+    await until(["token", "status"], atB, /^active: [0-9a-f]{16}$/m);
 
     // A: a project, a task and a turn
     const added = await meddle(["project", "add", `${a.dir}/repo`, "--name", "repo"], atA);

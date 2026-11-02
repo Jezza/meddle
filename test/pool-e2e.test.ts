@@ -3,7 +3,9 @@
 import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createHost, webSocketLink } from "@earendil-works/chord";
+import { Database } from "bun:sqlite";
 import { shortId } from "../src/pool/identity";
+import { tokenId } from "../src/token";
 import { NodeObject } from "../src/state/host";
 import { startFakeLighthouse } from "./fake-lighthouse";
 import { closedPort, meddle, replay, startServe } from "./helpers";
@@ -41,7 +43,7 @@ async function until(args: string[], env: Record<string, string>, pattern: RegEx
   throw new Error(`meddle ${args.join(" ")} never matched ${pattern}; last output:\n${last}`);
 }
 
-test("two nodes form a pool: invite, join, replicate the token, and tunnel a dashboard link", async () => {
+test("two nodes form a pool: invite, join, replicate a token, and tunnel a dashboard link", async () => {
   const lighthouse = await startFakeLighthouse();
   const a = await home(lighthouse.url);
   const b = await home(lighthouse.url);
@@ -76,13 +78,15 @@ test("two nodes form a pool: invite, join, replicate the token, and tunnel a das
       await Bun.sleep(250);
     }
 
-    // the token set on A reaches B, with the same setAt, and is never printed
+    // the token added on A reaches B, listed alike and active there, and is never printed
     await writeFile(`${a.dir}/token`, "tok2\n");
-    const set = await meddle(["token", "set", "--file", `${a.dir}/token`], atA);
-    expect(set).toEqual({ stdout: "token set\n", stderr: "", code: 0 });
-    const setAt = (await until(["token", "status"], atA, /^setAt: (\S+)$/m))[1]!;
-    const replicated = await until(["token", "status"], atB, /^present: true\nsetAt: (\S+)$/m);
-    expect(replicated[1]).toBe(setAt);
+    const id = tokenId("tok2");
+    const set = await meddle(["token", "add", "--file", `${a.dir}/token`, "--label", "work"], atA);
+    expect(set).toEqual({ stdout: `token ${id} (work)\n`, stderr: "", code: 0 });
+    const atAList = (await meddle(["token", "list"], atA)).stdout;
+    expect(atAList).toMatch(new RegExp(`^${id}  work  ok  expires \\S+\nactive: ${id}\n$`));
+    const replicated = await until(["token", "list"], atB, new RegExp(`^active: ${id}$`, "m"));
+    expect(replicated.input).toBe(atAList);
     expect(replicated.input).not.toContain("tok2");
 
     // a dashboard link to B through A
@@ -105,12 +109,19 @@ test("two nodes form a pool: invite, join, replicate the token, and tunnel a das
 test("token set without a running node writes the token and says so", async () => {
   const { dir, env } = await home("");
   await writeFile(`${dir}/token`, "tok\n");
+  const id = tokenId("tok");
   const set = await meddle(["token", "set", "--file", `${dir}/token`], { ...env, MEDDLE_PORT: String(await closedPort()) });
-  expect(set).toEqual({ stdout: "token set\n", stderr: "", code: 0 });
+  expect(set).toEqual({ stdout: `token ${id} (${id.slice(0, 8)})\n`, stderr: "", code: 0 });
   const status = await meddle(["token", "status"], env);
-  expect(status.stdout).toStartWith("present: true\n");
+  expect(status.stdout).toEndWith(`active: ${id}\n`);
+  expect((await readFile(`${dir}/d/secrets/tokens/${id}`, "utf8"))).toBe("tok");
   // set by this node: its identity, created for the purpose
   const nodeId = /^node ([0-9a-f]{64})$/m.exec((await meddle(["status"], env)).stdout)?.[1];
   expect(nodeId).toBeDefined();
-  expect(JSON.parse(await readFile(`${dir}/d/secrets/claude-token.meta.json`, "utf8")).setBy).toBe(nodeId);
+  const db = new Database(`${dir}/d/meddle.sqlite`, { readonly: true });
+  try {
+    expect(db.query("SELECT set_by FROM tokens WHERE id = ?").get(id)).toEqual({ set_by: nodeId });
+  } finally {
+    db.close();
+  }
 });

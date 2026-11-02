@@ -100,6 +100,7 @@ const nodeState = {
   taskRoot: Type.String(),
   hostsTasks: Type.Boolean(),
   metrics: Nullable(NodeMetricsSchema),
+  /** Whether this node holds a usable token now (`pickToken`), and when that one expires. */
   token: Type.Object({ present: Type.Boolean(), expiresAt: Nullable(Type.String()) }),
   taskIds: Type.Array(Type.String()),
   projectIds: Type.Array(Type.String()),
@@ -279,9 +280,23 @@ export const SettingRowSchema = Type.Object({
   setBy: Type.String(),
 });
 
-/** When the token was set and the node it came from (null: set on that node by hand). Never the value. */
-export const TokenMetaSchema = Type.Object({ setAt: Type.String(), setBy: Nullable(Type.String()) });
-export type TokenMeta = Type.Static<typeof TokenMetaSchema>;
+/**
+ * One login token's metadata as replicated and shown (`TokenMeta` in src/token.ts), never its value. Plain strings, so
+ * that one malformed row from a peer is dropped by `mergeTokens` rather than failing the whole state.
+ */
+export const TokenMetaSchema = Type.Object({
+  id: Type.String(),
+  label: Type.String(),
+  setAt: Type.String(),
+  setBy: Nullable(Type.String()),
+  /** `ok`, `exhausted` (until `until`) or `disabled`. */
+  status: Type.String(),
+  until: Nullable(Type.String()),
+  detail: Nullable(Type.String()),
+  updatedAt: Type.String(),
+  removed: Type.Boolean(),
+  expiresAt: Type.String(),
+});
 
 export const PoolNodeSchema = Type.Object({
   nodeId: Type.String(),
@@ -339,12 +354,10 @@ export const PoolObject = remote("meddle.pool", {
         poolId: Type.String(),
         self: Type.String(),
         nodes: Type.Array(PoolNodeSchema),
-        token: Type.Object({
-          present: Type.Boolean(),
-          setAt: Nullable(Type.String()),
-          setBy: Nullable(Type.String()),
-          expiresAt: Nullable(Type.String()),
-        }),
+        /** The login tokens in the order turns try them, removed ones left out. */
+        tokens: Type.Array(TokenMetaSchema),
+        /** The token a turn starting now would use on this node, or null when none is usable. */
+        activeTokenId: Nullable(Type.String()),
         /** Members report more than one meddle or Claude Code version. */
         mixedVersions: Type.Boolean(),
         /** The pool's settings with a value, by key. */
@@ -354,7 +367,7 @@ export const PoolObject = remote("meddle.pool", {
         invite: method(Type.Object({}), Type.Object({ ticket: Type.String() })),
         join: method(Type.Object({ ticket: Type.String() }), Type.Object({ poolId: Type.String(), members: Type.Number() })),
         remove: method(Type.Object({ nodeId: Type.String() })),
-        /** The token file changed on this node (written by the CLI); re-read it and tell the pool. */
+        /** The tokens changed on this node (written by the CLI); re-read them and tell the pool. */
         tokenChanged: method(Type.Object({})),
         /** Sets a pool setting; refuses an invalid key, a reserved env name or an invalid value. */
         setSetting: method(Type.Object({ key: Type.String(), value: Type.String() })),
@@ -364,9 +377,15 @@ export const PoolObject = remote("meddle.pool", {
     },
     /** Other nodes (principal `peer:<nodeId>`). */
     peer: {
-      state: { roster: Type.Array(RosterRowSchema), token: Nullable(TokenMetaSchema), settings: Type.Array(SettingRowSchema) },
+      state: {
+        roster: Type.Array(RosterRowSchema),
+        /** Every token row, removed ones included, so that a removal replicates. */
+        tokens: Type.Array(TokenMetaSchema),
+        settings: Type.Array(SettingRowSchema),
+      },
       methods: {
-        fetchToken: method(Type.Object({}), Type.Object({ value: Type.String(), setAt: Type.String(), setBy: Nullable(Type.String()) })),
+        /** The value of a token this node lists (not removed); refuses non-members and any other id. */
+        fetchToken: method(Type.Object({ id: Type.String() }), Type.Object({ value: Type.String() })),
       },
     },
   },

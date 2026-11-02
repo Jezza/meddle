@@ -1,4 +1,4 @@
-// Settings: the pool (this node, its members, invites and joining) and the shared login's token status.
+// Settings: the pool (this node, its members, invites and joining) and the pool's login tokens.
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { useAction, useValue } from "./hooks";
@@ -95,23 +95,41 @@ function Join({ pool, state }: { pool: PoolRef; state: JoinState }) {
   );
 }
 
+/** `ok`, `exhausted until <time>`, `disabled (<why>)`. */
+function tokenState(t: { status: string; until: string | null; detail: string | null }): string {
+  const until = t.until === null ? "" : ` until ${new Date(t.until).toLocaleString()}`;
+  return `${t.status}${until}${t.detail === null ? "" : ` (${t.detail})`}`;
+}
+
 function TokenSection({ pool }: { pool: PoolRef }) {
-  const token = useValue(pool.token);
+  const tokens = useValue(pool.tokens);
+  const active = useValue(pool.activeTokenId);
   const nodes = useValue(pool.nodes);
-  const selfId = useValue(pool.self);
-  const setBy = token.setBy === null ? null : nodes.find((n) => n.nodeId === token.setBy)?.hostname ?? shortId(token.setBy);
+  const setByName = (id: string | null) => (id === null ? "?" : nodes.find((n) => n.nodeId === id)?.hostname ?? shortId(id));
   return (
     <>
-      <h3>Token</h3>
-      <p class={token.present ? "" : "error"}>{tokenText(token)}</p>
-      {token.present && (
-        <dl>
-          <dt>Set at</dt><dd>{token.setAt === null ? "unknown" : new Date(token.setAt).toLocaleString()}</dd>
-          <dt>Set by</dt><dd title={token.setBy ?? selfId}>{setBy ?? "this node, by hand"}</dd>
-          <dt>Expires</dt><dd>{token.expiresAt === null ? "unknown" : new Date(token.expiresAt).toLocaleString()}</dd>
-        </dl>
+      <h3>Tokens</h3>
+      {active === null && <p class="error">{tokens.length === 0 ? "No token: turns cannot run." : "No usable token on this node: turns cannot run."}</p>}
+      {tokens.length > 0 && (
+        <table>
+          <thead><tr><th>Label</th><th>Id</th><th>Status</th><th>Set by</th><th>Expires</th></tr></thead>
+          <tbody>
+            {tokens.map((t) => (
+              <tr key={t.id} class={t.id === active ? "active" : ""}>
+                <td>{t.label}{t.id === active ? " (active)" : ""}</td>
+                <td title={t.id}><code>{t.id.slice(0, 8)}</code></td>
+                <td>{tokenState(t)}</td>
+                <td title={t.setBy ?? ""}>{setByName(t.setBy)}</td>
+                <td>{tokenText({ present: true, expiresAt: t.expiresAt })}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
-      <p class="muted">The Claude Code OAuth token is set on a node with <code>meddle token set</code> and shared with the pool; it never passes through the dashboard.</p>
+      <p class="muted">
+        Claude Code OAuth tokens are added on a node with <code>meddle token add</code> and shared with the pool; turns use
+        the first usable one in this order. They never pass through the dashboard.
+      </p>
     </>
   );
 }

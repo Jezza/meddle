@@ -26,7 +26,7 @@ test("a prompt runs a durable turn and leaves the task idle", async () => {
   const db = openDb(paths(cfg).db);
   const a = `${home}/a`; await initColocated(a);
   const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
-  await (await import("../src/token")).setToken(cfg, "tok");
+  await (await import("../src/token")).addToken(cfg, db, "tok", { setBy: null });
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
   const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };
   const { h, runner } = await open();
@@ -57,7 +57,7 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   const db = openDb(paths(cfg).db);
   const a = `${home}/a`; await initColocated(a);
   const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
-  await (await import("../src/token")).setToken(cfg, "tok");
+  await (await import("../src/token")).addToken(cfg, db, "tok", { setBy: null });
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
   const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };
   const turnsStarted = () => listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started").map(e => (e.message as any).resume);
@@ -103,8 +103,8 @@ test("a pending approval makes the task waiting until it is answered", async () 
   const { createRegistry } = await import("@earendil-works/pi-durable");
   const h = await openHarness(cfg, createRegistry());
   const runner = new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/approval.jsonl` } });
-  await expect(runner.create({ title: "t", projectIds: [p.id] })).rejects.toThrow("no token set");
-  await (await import("../src/token")).setToken(cfg, "tok");
+  await expect(runner.create({ title: "t", projectIds: [p.id] })).rejects.toThrow("no usable token");
+  await (await import("../src/token")).addToken(cfg, db, "tok", { setBy: null });
   const m = await runner.create({ title: "t", projectIds: [p.id] });
   const states: string[] = [];
   runner.onState((tid, s) => { if (tid === m.id) states.push(`${s}/${runner.state(m.id)}`); });
@@ -122,7 +122,7 @@ async function setup() {
   const db = openDb(paths(cfg).db);
   const a = `${home}/a`; await initColocated(a);
   const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
-  await (await import("../src/token")).setToken(cfg, "tok");
+  await (await import("../src/token")).addToken(cfg, db, "tok", { setBy: null });
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
   const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };
   const { h, runner } = await open();

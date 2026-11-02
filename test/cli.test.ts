@@ -1,9 +1,14 @@
 import { test, expect } from "bun:test";
+import { existsSync } from "node:fs";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { startDashboard } from "../src/dashboard/server";
 import { resolveNodeId } from "../src/pool/ids";
+import { PoolObject } from "../src/state/contracts";
+import { openDb } from "../src/store/db";
 import { getTask } from "../src/store/records";
+import { markToken, tokenId } from "../src/token";
 import { childEnv, closedPort, meddle } from "./helpers";
-import { peerReady, twoPoolNodes } from "./pool-helpers";
+import { linkClient, peerReady, twoPoolNodes } from "./pool-helpers";
 
 /** The env a CLI child runs with: no inherited MEDDLE_* and a port nothing listens on. */
 async function env() {
@@ -99,4 +104,86 @@ test("the usage text lists the config subcommands", async () => {
   const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
   expect(out.code).toBe(2);
   expect(out.stderr).toContain("meddle config set <key> <value> | meddle config unset <key> | meddle config list");
+});
+
+test("token add, set, list, enable, remove and status work on the database, without a node, never printing a value", async () => {
+  const dir = await mkdtemp("/tmp/meddle-cli-token-");
+  const env = { HOME: dir, MEDDLE_DATA_DIR: `${dir}/d`, MEDDLE_TASK_ROOT: `${dir}/t`, MEDDLE_PORT: String(await closedPort()) };
+  // No database yet: nothing to list, and none is created.
+  expect(await meddle(["token", "list"], env)).toEqual({ stdout: "active: none\n", stderr: "", code: 0 });
+  expect(await meddle(["token", "status"], env)).toEqual({ stdout: "active: none\n", stderr: "", code: 0 });
+  expect(existsSync(`${dir}/d/meddle.sqlite`)).toBe(false);
+
+  await writeFile(`${dir}/a`, "tok-a\n");
+  await writeFile(`${dir}/b`, "tok-b\n");
+  const a = tokenId("tok-a");
+  const b = tokenId("tok-b");
+  expect(await meddle(["token", "add", "--file", `${dir}/a`, "--label", "work"], env)).toEqual({ stdout: `token ${a} (work)\n`, stderr: "", code: 0 });
+  // `set` is `add`; without a label the token is named after its id.
+  expect(await meddle(["token", "set", "--file", `${dir}/b`], env)).toEqual({ stdout: `token ${b} (${b.slice(0, 8)})\n`, stderr: "", code: 0 });
+  expect(await meddle(["token", "add", "--label", "again", "--file", `${dir}/a`], env)).toEqual({ stdout: `token ${a} (again)\n`, stderr: "", code: 0 });
+
+  const listed = await meddle(["token", "list"], env);
+  expect(listed.code).toBe(0);
+  expect(listed.stderr).toBe("");
+  const lines = listed.stdout.trimEnd().split("\n");
+  expect(lines).toHaveLength(3);
+  expect(lines[0]).toMatch(new RegExp(`^${a}  again  ok  expires \\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z$`));
+  expect(lines[1]).toMatch(new RegExp(`^${b}  ${b.slice(0, 8)}  ok  expires \\S+$`));
+  expect(lines[2]).toBe(`active: ${a}`);
+  expect(await meddle(["token", "status"], env)).toEqual(listed);
+  for (const out of [listed.stdout]) expect(out).not.toMatch(/tok-[ab]/);
+
+  // A token marked exhausted shows its time, and is skipped; enable clears it.
+  const db = openDb(`${dir}/d/meddle.sqlite`);
+  markToken(db, a, "exhausted", "2999-01-01T00:00:00.000Z", "five_hour");
+  db.close();
+  const exhausted = (await meddle(["token", "list"], env)).stdout.split("\n");
+  expect(exhausted[0]).toMatch(new RegExp(`^${a}  again  exhausted until 2999-01-01T00:00:00.000Z \\(five_hour\\)  expires \\S+$`));
+  expect(exhausted).toContain(`active: ${b}`);
+  expect(await meddle(["token", "enable", "again"], env)).toEqual({ stdout: `enabled ${a} (again)\n`, stderr: "", code: 0 });
+  expect((await meddle(["token", "list"], env)).stdout).toEndWith(`active: ${a}\n`);
+
+  expect(await meddle(["token", "remove", "again"], env)).toEqual({ stdout: `removed ${a} (again)\n`, stderr: "", code: 0 });
+  expect(existsSync(`${dir}/d/secrets/tokens/${a}`)).toBe(false);
+  const after = (await meddle(["token", "list"], env)).stdout.trimEnd().split("\n");
+  expect(after).toHaveLength(2);
+  expect(after[1]).toBe(`active: ${b}`);
+  expect(await meddle(["token", "remove", "again"], env)).toEqual({ stdout: "", stderr: "meddle: no such token: again\n", code: 1 });
+  expect(await meddle(["token", "remove", b.slice(0, 8)], env)).toEqual({ stdout: `removed ${b} (${b.slice(0, 8)})\n`, stderr: "", code: 0 });
+  expect(await meddle(["token", "list"], env)).toEqual({ stdout: "active: none\n", stderr: "", code: 0 });
+}, 30_000);
+
+test("token add tells a running node, whose pool lists the token as active", async () => {
+  const { A, close } = await twoPoolNodes({ nodes: [{ token: null }, { token: null }] });
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  const linked = linkClient(A.host);
+  try {
+    const pool = await linked.client.get(PoolObject, {});
+    if (pool.variant !== "default") throw new Error("expected the default variant");
+    expect(pool.activeTokenId.value).toBeNull();
+    const port = new URL(dashboard.url).port;
+    const env = { HOME: A.home, MEDDLE_DATA_DIR: A.cfg.dataDir, MEDDLE_TASK_ROOT: A.cfg.taskRoot, MEDDLE_PORT: port };
+    await writeFile(`${A.home}/tok`, "tok-a\n");
+    const id = tokenId("tok-a");
+    expect(await meddle(["token", "add", "--file", `${A.home}/tok`, "--label", "work"], env)).toEqual({ stdout: `token ${id} (work)\n`, stderr: "", code: 0 });
+    const deadline = Date.now() + 10_000;
+    while (pool.activeTokenId.value !== id) {
+      if (Date.now() > deadline) throw new Error("the running node never listed the token");
+      await Bun.sleep(20);
+    }
+    expect(pool.tokens.value.map((t) => [t.id, t.label])).toEqual([[id, "work"]]);
+    pool.release();
+  } finally {
+    await linked.close();
+    await dashboard.stop();
+    await close();
+  }
+}, 30_000);
+
+test("the usage text lists the token subcommands", async () => {
+  const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
+  expect(out.code).toBe(2);
+  expect(out.stderr).toContain("meddle token add [--file <path>] [--label <l>] | meddle token set [--file <path>] [--label <l>]");
+  expect(out.stderr).toContain("meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>");
 });

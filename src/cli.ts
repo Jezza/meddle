@@ -28,7 +28,7 @@ import { openDb } from "./store/db";
 import { listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
-import { setToken, tokenStatus } from "./token";
+import { addToken, enableToken, listTokens, migrateLegacyToken, pickToken, removeToken, type TokenMeta } from "./token";
 import { claudeCodeVersion, VERSION } from "./version";
 
 const USAGE = `usage: meddle --version
@@ -37,7 +37,8 @@ const USAGE = `usage: meddle --version
        meddle invite
        meddle join <ticket>
        meddle pool
-       meddle token set [--file <path>] | meddle token status
+       meddle token add [--file <path>] [--label <l>] | meddle token set [--file <path>] [--label <l>]
+       meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
        meddle project add <path-or-url> [--name <n>] | meddle project list
        meddle task new --title <t> --project <id>... | meddle task prompt <id> <text> | meddle task retry <id>
@@ -105,6 +106,8 @@ async function serve(): Promise<number> {
   const node: OpenNode = {};
   try {
     const db = (node.db = openDb(paths(cfg).db));
+    // The single token of an older meddle becomes the first of the list, once.
+    await migrateLegacyToken(cfg, db, (await loadOrCreateIdentity(cfg)).id);
     // The pool and git first: the Harness reruns unfinished turns as it opens, and their turn ends push to homes.
     const pool = (node.pool = await startPool(cfg, db, {
       version: VERSION,
@@ -170,28 +173,41 @@ function runnerDeps(env = process.env): RunnerDeps {
 async function status(): Promise<number> {
   const cfg = loadConfig();
   const root = await checkTaskRoot(cfg);
-  const token = await tokenStatus(cfg);
+  const token = await readDb(cfg, async (db) => {
+    const active = await activeToken(cfg, db);
+    return active === null ? null : listTokens(db).find((t) => t.id === active)?.expiresAt ?? null;
+  });
   console.log(`meddle ${VERSION}`);
   console.log(`claude code ${claudeCodeVersion()}`);
   console.log(`data dir ${cfg.dataDir}`);
   console.log(root.ok ? `task root ${cfg.taskRoot} ok` : root.reason);
-  console.log(`token ${token.present ? `present expires ${token.expiresAt}` : "absent"}`);
-  console.log(`tasks ${readDb(cfg, (db) => listLiveTasks(db).length) ?? 0}`);
+  console.log(`token ${token === null ? "absent" : `present expires ${token}`}`);
+  console.log(`tasks ${(await readDb(cfg, (db) => listLiveTasks(db).length)) ?? 0}`);
   console.log(`node ${existsSync(paths(cfg).irohKey) ? (await loadOrCreateIdentity(cfg)).id : "(none yet)"}`);
-  console.log(readDb(cfg, poolLine) ?? "pool (none yet)");
+  console.log((await readDb(cfg, poolLine)) ?? "pool (none yet)");
   return 0;
 }
 
 /** `read` over the database opened read-only, or null when there is none yet. */
-function readDb<T>(cfg: NodeConfig, read: (db: Database) => T): T | null {
+async function readDb<T>(cfg: NodeConfig, read: (db: Database) => T | Promise<T>): Promise<T | null> {
   const file = paths(cfg).db;
   if (!existsSync(file)) return null;
   const db = new Database(file, { readonly: true });
   try {
-    return read(db);
+    return await read(db);
   } finally {
     db.close();
   }
+}
+
+/** The database has a `tokens` table: a node of this meddle has opened it. */
+function hasTokens(db: Database): boolean {
+  return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tokens'").get() !== null;
+}
+
+/** The id of the token a turn starting now would use, or null. */
+async function activeToken(cfg: NodeConfig, db: Database): Promise<string | null> {
+  return hasTokens(db) ? (await pickToken(cfg, db))?.id ?? null : null;
 }
 
 /** `pool <poolId> members <n>`, or null before this node first served (no pool table, or no pool in it). */
@@ -202,16 +218,8 @@ function poolLine(db: Database): string | null {
   return `pool ${store.pool().poolId} members ${store.members().length}`;
 }
 
-/**
- * Writes the token file here, set by this node, then tells the running node (if any) so it tells the pool. The value
- * never goes over the socket: other nodes pull it from this one.
- */
-async function tokenSet(file: string | undefined): Promise<number> {
-  const input = file !== undefined ? await Bun.file(file).text() : await Bun.stdin.text();
-  const cfg = loadConfig();
-  await ensureDataDirs(cfg);
-  const identity = await loadOrCreateIdentity(cfg);
-  await setToken(cfg, input, { setBy: identity.id });
+/** Tells the running node, if any, that the tokens changed, so that it tells the pool. */
+async function tokensChanged(): Promise<void> {
   try {
     await withPool(async (pool) => {
       await pool.tokenChanged({});
@@ -220,17 +228,71 @@ async function tokenSet(file: string | undefined): Promise<number> {
   } catch (err) {
     if (!(err instanceof NoNode)) throw err;
   }
-  console.log("token set");
+}
+
+/** Runs `use` over this node's database, opened (and created) for writing, then closes it. */
+async function withDb<T>(cfg: NodeConfig, use: (db: Database) => Promise<T> | T): Promise<T> {
+  const db = openDb(paths(cfg).db);
+  try {
+    return await use(db);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Adds a token from `file` (stdin otherwise) here, set by this node: its value file, then its row, written directly,
+ * then tells the running node (if any) so it tells the pool. The value never goes over the socket: other nodes pull it
+ * from this one.
+ */
+async function tokenAdd(file: string | undefined, label: string | undefined): Promise<number> {
+  const input = file !== undefined ? await Bun.file(file).text() : await Bun.stdin.text();
+  const cfg = loadConfig();
+  await ensureDataDirs(cfg);
+  const identity = await loadOrCreateIdentity(cfg);
+  const added = await withDb(cfg, (db) => addToken(cfg, db, input, { setBy: identity.id, ...(label === undefined ? {} : { label }) }));
+  await tokensChanged();
+  console.log(`token ${added.id} (${added.label})`);
   return 0;
 }
 
-async function tokenShow(): Promise<number> {
-  const s = await tokenStatus(loadConfig());
-  console.log(`present: ${s.present}`);
-  if (s.present) {
-    console.log(`setAt: ${s.setAt}`);
-    console.log(`expiresAt: ${s.expiresAt}`);
-  }
+/** Removes a token (its full id or its label) here, its value file last, and tells the running node. */
+async function tokenRemove(idOrLabel: string): Promise<number> {
+  const cfg = loadConfig();
+  if (!existsSync(paths(cfg).db)) throw new Error(`no such token: ${idOrLabel}`);
+  const removed = await withDb(cfg, (db) => removeToken(cfg, db, idOrLabel));
+  await tokensChanged();
+  console.log(`removed ${removed.id} (${removed.label})`);
+  return 0;
+}
+
+/** Makes a token (its full id or its label) usable again here, and tells the running node. */
+async function tokenEnable(idOrLabel: string): Promise<number> {
+  const cfg = loadConfig();
+  if (!existsSync(paths(cfg).db)) throw new Error(`no such token: ${idOrLabel}`);
+  const enabled = await withDb(cfg, (db) => enableToken(db, idOrLabel));
+  await tokensChanged();
+  console.log(`enabled ${enabled.id} (${enabled.label})`);
+  return 0;
+}
+
+/** `ok`, `exhausted until <time> (<detail>)`, `disabled (<detail>)`. */
+function statusText(t: TokenMeta): string {
+  return `${t.status}${t.until === null ? "" : ` until ${t.until}`}${t.detail === null ? "" : ` (${t.detail})`}`;
+}
+
+/**
+ * One line per token in order (id, label, status, expiry), then `active: <id|none>`: the database read read-only, so
+ * it works without a node and creates nothing.
+ */
+async function tokenList(): Promise<number> {
+  const cfg = loadConfig();
+  const lines = await readDb(cfg, async (db) => {
+    if (!hasTokens(db)) return ["active: none"];
+    const rows = listTokens(db).map((t) => `${t.id}  ${t.label}  ${statusText(t)}  expires ${t.expiresAt}`);
+    return [...rows, `active: ${(await activeToken(cfg, db)) ?? "none"}`];
+  });
+  for (const line of lines ?? ["active: none"]) console.log(line);
   return 0;
 }
 
@@ -508,6 +570,19 @@ async function serviceInstall(dryRun: boolean): Promise<number> {
   return 0;
 }
 
+/** `[--file <path>] [--label <l>]`, in either order, each at most once. */
+function tokenAddArgs(args: string[]): { file?: string; label?: string } | null {
+  const out: { file?: string; label?: string } = {};
+  for (let i = 0; i < args.length; i += 2) {
+    const value = args[i + 1];
+    if (value === undefined) return null;
+    if (args[i] === "--file" && out.file === undefined) out.file = value;
+    else if (args[i] === "--label" && out.label === undefined) out.label = value;
+    else return null;
+  }
+  return out;
+}
+
 /** `--title <t>` and `--project <id>...` (one or more ids, the flag repeatable). */
 function taskNewArgs(args: string[]): { title: string; projectIds: string[] } | null {
   let title: string | undefined;
@@ -552,9 +627,13 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (args.length === 1 && command === "invite") return poolInvite;
   if (args.length === 2 && command === "join") return () => poolJoin(sub!);
   if (args.length === 1 && command === "pool") return poolList;
-  if (command === "token" && sub === "set" && rest.length === 0) return () => tokenSet(undefined);
-  if (command === "token" && sub === "set" && rest.length === 2 && rest[0] === "--file") return () => tokenSet(rest[1]);
-  if (command === "token" && sub === "status" && rest.length === 0) return tokenShow;
+  if (command === "token" && (sub === "add" || sub === "set")) {
+    const parsed = tokenAddArgs(rest);
+    return parsed === null ? null : () => tokenAdd(parsed.file, parsed.label);
+  }
+  if (command === "token" && (sub === "list" || sub === "status") && rest.length === 0) return tokenList;
+  if (command === "token" && sub === "remove" && rest.length === 1) return () => tokenRemove(rest[0]!);
+  if (command === "token" && sub === "enable" && rest.length === 1) return () => tokenEnable(rest[0]!);
   if (command === "config" && sub === "set" && rest.length === 2) return () => configSet(rest[0]!, rest[1]!);
   if (command === "config" && sub === "unset" && rest.length === 1) return () => configUnset(rest[0]!);
   if (command === "config" && sub === "list" && rest.length === 0) return configList;

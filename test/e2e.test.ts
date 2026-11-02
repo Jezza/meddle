@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { initColocated } from "../src/jj";
 import { shortId } from "../src/pool/ids";
+import { tokenId } from "../src/token";
 import { closedPort, errorResultFixture, meddle, replay, startServe } from "./helpers";
 import { POOL_ENV } from "./pool-helpers";
 
@@ -132,11 +133,11 @@ test("task prompt fails fast when the turn fails", async () => {
     expect(prompted.code).toBe(1);
     expect(prompted.stderr).toMatch(/meddle\/turn_failed\nmeddle: the turn failed: ReferenceError: Claude Code native binary not found at \S+\/no-such-claude\. .*\n$/);
 
-    // no token: the turn fails before Claude Code starts, and still logs why
-    await rm(`${dir}/d/secrets/claude-token`);
+    // no usable token: the turn fails before Claude Code starts, and still logs why
+    await rm(`${dir}/d/secrets/tokens`, { recursive: true });
     const tokenless = await meddle(["task", "prompt", taskId, "hi"], client);
     expect(tokenless.code).toBe(1);
-    expect(tokenless.stderr).toBe("meddle/turn_failed\nmeddle: the turn failed: Error: no token set\n");
+    expect(tokenless.stderr).toBe("meddle/turn_failed\nmeddle: the turn failed: Error: no usable token\n");
   } finally {
     await node.stop();
   }
@@ -170,4 +171,22 @@ test("serve exits 1 when its port is taken", async () => {
   } finally {
     await taken.stop(true);
   }
+}, 30_000);
+
+test("serve imports the single token of an older meddle as the token labelled default, once", async () => {
+  const { dir, env } = await home();
+  await mkdir(`${dir}/d/secrets`, { recursive: true, mode: 0o700 });
+  await writeFile(`${dir}/d/secrets/claude-token`, "tok-legacy\n", { mode: 0o600 });
+  await writeFile(`${dir}/d/secrets/claude-token.meta.json`, JSON.stringify({ setAt: "2026-10-31T10:00:00.000Z", setBy: null }), { mode: 0o600 });
+  const node = await startServe({ ...env, MEDDLE_PORT: "0" });
+  const id = tokenId("tok-legacy");
+  try {
+    const listed = await meddle(["token", "list"], env);
+    expect(listed).toEqual({ stdout: `${id}  default  ok  expires 2027-10-31T10:00:00.000Z\nactive: ${id}\n`, stderr: "", code: 0 });
+    expect(existsSync(`${dir}/d/secrets/claude-token`)).toBe(false);
+    expect(existsSync(`${dir}/d/secrets/claude-token.migrated`)).toBe(true);
+  } finally {
+    expect(await node.stop()).toBe(0);
+  }
+  expect(node.stderr()).toBe("");
 }, 30_000);
