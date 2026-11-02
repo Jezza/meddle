@@ -358,9 +358,11 @@ not backed up and stay behind on a move.
 
 At the end of every completed turn meddle points the task's project bookmark at its workspace's working copy, and a
 node that is not the project's home pushes the whole namespace to the home. That push is the backup: the home never
-fetches a task's bookmarks itself. The node holding the task wins: its positions replace the home's, sideways or
-backwards too. The home refuses deletions, so a side bookmark deleted here comes back from the home's copy at the
-next turn end. A push that fails (the home offline, no jj identity: see [Install](#install), a bookmark git refuses)
+fetches a task's bookmarks itself. What the node holding the task changed since its last push wins: its positions
+replace the home's, sideways or backwards too. A bookmark it did not change follows the home: one deleted or moved
+in the home's repo is deleted or moved on the holder at the next turn end, so a side bookmark is deleted on the home.
+The home refuses deletions pushed to it, so a side bookmark deleted on the holder comes back from the home's copy at
+the next turn end. A push that fails (the home offline, no jj identity: see [Install](#install), a bookmark git refuses)
 does not fail the turn: it is logged as `meddle: push: meddle/task/<task id>/* to <short id> failed: …` (each
 distinct line at most once a minute, so a missing identity does not fill the log), and the next turn end pushes
 again. When the home refuses one bookmark, the others still land. A turn that fails pushes nothing; the next

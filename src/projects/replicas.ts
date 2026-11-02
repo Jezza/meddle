@@ -4,13 +4,13 @@ import { rm } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { paths, type NodeConfig } from "../config";
 import { repoName, type Repo } from "../git/wire";
-import { bookmarkList, bookmarkSet, cloneColocated, fetch, gitImport, isJjRepo, jj, JjError, push, remoteAdd, remoteList, track } from "../jj";
+import { bookmarkList, bookmarkRefs, bookmarkSet, cloneColocated, fetch, gitImport, isJjRepo, jj, JjError, push, remoteAdd, remoteList, track, type BookmarkRef } from "../jj";
 import { cloneMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
 import { repoKey, serialised } from "../serial";
 import type { PoolRuntime } from "../pool/runtime";
 import { PeerObject } from "../state/contracts";
-import { taskGlob, taskNamespace } from "../tasks/manifest";
+import { taskGlob } from "../tasks/manifest";
 import { getProject, registerReplica, type Project } from "./project";
 
 export type ReplicaDeps = { cfg: NodeConfig; db: Database; pool: PoolRuntime };
@@ -167,41 +167,62 @@ function jjFailure(err: unknown): unknown {
 /**
  * Pushes every bookmark under task `taskId`'s namespace in `replica` to the project's home `home` (spec 21.5; the
  * home never fetches, so this push is the backup), first pointing the task's project bookmark `primary` at its change
- * when given. Under the repo lock: fetch the namespace from the home (nothing there is fine: a task's first push),
- * track it there, put back what the fetch and track changed of this node's own bookmarks (this node holds the task:
- * its positions win, sideways or backwards too), restore from the home's copy a bookmark deleted here (the home refuses
- * deletions, so pushing one would fail every time), then push the namespace. Rejects on a failed fetch or push with
- * jj's error line; when the home refuses one bookmark, the ones it accepted have still landed.
+ * when given. Under the repo lock:
+ * 1. Notes what this node changed since its last push: each local bookmark of the namespace whose commit differs from
+ *    its tracked `<name>@<home>` entry, or that tracks no such entry, and `primary`.
+ * 2. Fetches the namespace from the home (nothing there is fine: a task's first push) and tracks it there.
+ * 3. Puts back what it noted, by commit id (a commit the fetch hid still resolves by it): this node's changes win,
+ *    sideways or backwards too. A bookmark it did not change keeps what the fetch made of it: deleted or moved on the
+ *    home, it is deleted or moved here.
+ * 4. Restores, at the home's commit, a bookmark the home has that is deleted or conflicted here (deleted here and
+ *    moved on the home): the home refuses deletions, and jj refuses to push a conflicted bookmark, so either would
+ *    fail every push.
+ * 5. Pushes the namespace.
+ * Rejects on a failed fetch or push with jj's error line; when the home refuses one bookmark, the ones it accepted
+ * have still landed.
  */
 export async function pushNamespace(
   cfg: NodeConfig, replica: string, home: string, taskId: string, primary: { name: string; changeId: string } | null,
 ): Promise<void> {
   const remote = shortId(home);
   const glob = taskGlob(taskId);
-  const ns = taskNamespace(taskId);
   await serialised(repoKey(replica), async () => {
     try {
-      const want = new Map<string, string>();
-      for (const b of await bookmarkList(replica, cfg)) {
-        if (b.remote === null && b.name.startsWith(ns) && !b.conflicted) want.set(b.name, b.changeId);
+      const before = await bookmarkRefs(replica, glob, cfg);
+      const atHome = (refs: BookmarkRef[], name: string) => refs.find((r) => r.name === name && r.remote === remote);
+      const changed = new Map<string, string>();
+      for (const b of before) {
+        if (b.remote !== null || b.conflicted) continue;
+        const h = atHome(before, b.name);
+        if (h === undefined || !h.tracked || h.conflicted || h.commitId !== b.commitId) changed.set(b.name, b.commitId);
       }
-      if (primary !== null) want.set(primary.name, primary.changeId);
+      if (primary !== null) changed.set(primary.name, await commitOf(cfg, replica, primary.changeId));
       await fetchBookmarks(cfg, replica, home, [glob], { requireMatch: false });
       await track(replica, glob, remote, cfg);
-      const now = (await bookmarkList(replica, cfg)).filter((b) => b.name.startsWith(ns));
-      const local = new Map(now.filter((b) => b.remote === null).map((b) => [b.name, b]));
-      for (const b of now) {
-        if (b.remote === remote && !local.has(b.name) && !want.has(b.name) && !b.conflicted) want.set(b.name, b.changeId);
+      const after = await bookmarkRefs(replica, glob, cfg);
+      const local = new Map(after.filter((b) => b.remote === null).map((b) => [b.name, b]));
+      const want = new Map(changed);
+      for (const h of after) {
+        if (h.remote !== remote || h.conflicted || want.has(h.name)) continue;
+        const here = local.get(h.name);
+        if (here === undefined || here.conflicted) want.set(h.name, h.commitId);
       }
-      for (const [name, change] of want) {
+      for (const [name, commit] of want) {
         const here = local.get(name);
-        if (here === undefined || here.conflicted || here.changeId !== change) await bookmarkSet(replica, name, change, cfg);
+        if (here === undefined || here.conflicted || here.commitId !== commit) {
+          await bookmarkSet(replica, name, commit, cfg, { ignoreWorkingCopy: true });
+        }
       }
       await push(replica, remote, glob, cfg);
     } catch (err) {
       throw jjFailure(err);
     }
   });
+}
+
+/** The commit id change `changeId` resolves to in `repo`, without snapshotting the working copy. */
+async function commitOf(cfg: NodeConfig, repo: string, changeId: string): Promise<string> {
+  return (await jj(["log", "--ignore-working-copy", "-r", changeId, "--no-graph", "-T", "commit_id"], repo, cfg)).trim();
 }
 
 /** The remote bookmarks `replica` knows, with the change each points at ("" and `conflicted` when conflicted). */

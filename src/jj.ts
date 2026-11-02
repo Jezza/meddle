@@ -170,9 +170,10 @@ export async function fetch(repo: string, remote: string, bookmarks: string[], c
 }
 
 /**
- * Pushes the tracked bookmarks `pattern` (a jj string pattern, `exact:` or `glob:`) selects to `remote`; limited to
+ * Pushes the bookmarks `pattern` (a jj string pattern, `exact:` or `glob:`) selects to `remote`: the ones tracking it,
+ * and a local one with no entry there yet, which the push creates there and tracks (jj 0.45). Limited to
  * `cfg.jjNetworkTimeoutMs`. Nothing to push is no error; when the remote refuses one bookmark, the ones it accepted
- * still land and this rejects.
+ * still land and this rejects; one conflicted bookmark among them fails the whole push.
  */
 export async function push(repo: string, remote: string, pattern: string, cfg?: NodeConfig): Promise<void> {
   // A task bookmark points at its workspace's working copy, which is usually not described yet.
@@ -189,6 +190,29 @@ export async function track(repo: string, pattern: string, remote: string, cfg?:
 }
 
 export type Bookmark = { name: string; remote: string | null; changeId: string; conflicted: boolean };
+
+/** A bookmark entry by commit: local (`remote` null) or a remote's, its commit ("" when conflicted), tracked or not. */
+export type BookmarkRef = { name: string; remote: string | null; commitId: string; conflicted: boolean; tracked: boolean };
+
+const REF_TEMPLATE = 'if(present, name ++ "\\t" ++ remote ++ "\\t" ++ if(normal_target, normal_target.commit_id(), "") ++ "\\t" ++ conflict ++ "\\t" ++ tracked ++ "\\n")';
+
+/**
+ * The present local and remote entries (not the colocated `git` remote) of the bookmarks `pattern` selects, by commit
+ * id: a commit that an operation hid still resolves by its id, where its change id may not. Imports git's refs first
+ * and never snapshots the working copy, like `bookmarkList`.
+ */
+export async function bookmarkRefs(repo: string, pattern: string, cfg?: NodeConfig): Promise<BookmarkRef[]> {
+  await gitImport(repo, cfg);
+  const out = await jj(["bookmark", "list", "--ignore-working-copy", "--all-remotes", "-T", REF_TEMPLATE, pattern], repo, cfg);
+  const refs: BookmarkRef[] = [];
+  for (const line of out.split("\n")) {
+    if (line === "") continue;
+    const [name = "", remote = "", commit = "", conflict = "", tracked = ""] = line.split("\t");
+    if (remote === "git") continue;
+    refs.push({ name, remote: remote === "" ? null : remote, commitId: commit, conflicted: conflict === "true", tracked: tracked === "true" });
+  }
+  return refs;
+}
 
 /** One line per present bookmark: name, remote, the change it points at ("" when conflicted), the conflict flag. */
 const BOOKMARK_TEMPLATE = 'if(present, name ++ "\\t" ++ remote ++ "\\t" ++ if(normal_target, normal_target.change_id(), "") ++ "\\t" ++ conflict ++ "\\n")';

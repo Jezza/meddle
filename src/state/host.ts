@@ -20,7 +20,6 @@ import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, ty
 import { claimHomelessProjects, getTask, getTaskSettings, listLiveTasks, listTasks } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
 import { taskNamespace, type TaskManifest } from "../tasks/manifest";
-import { repoKey, serialised } from "../serial";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
@@ -547,7 +546,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   /**
    * Every local bookmark under task `taskId`'s namespace in each of its projects' replicas (the manifest's order); a
-   * replica jj cannot list contributes none.
+   * replica jj cannot list contributes none. Read without the repo lock, so a `TaskObject` never waits on a push.
    */
   async function taskBookmarksNow(taskId: string): Promise<Array<{ project: string; name: string; changeId: string }>> {
     const row = getTask(db, taskId);
@@ -558,7 +557,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const replica = getProject(db, p.id)?.replica;
       if (replica === undefined) continue;
       try {
-        for (const b of await serialised(repoKey(replica), () => bookmarkList(replica, cfg))) {
+        // Not under the repo lock (held across a push's network round trips), like `heads`: the listing never
+        // snapshots, and what it catches mid-push the next trigger corrects.
+        for (const b of await bookmarkList(replica, cfg)) {
           if (b.remote === null && b.name.startsWith(ns)) found.push({ project: p.id, name: b.name, changeId: b.changeId });
         }
       } catch {

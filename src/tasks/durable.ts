@@ -694,7 +694,8 @@ export class TaskRunner {
         if (b.remote !== remote || !b.name.startsWith(ns) || b.name === bookmark || b.conflicted || b.changeId === "") continue;
         const here = listed.find((l) => l.name === b.name && l.remote === null);
         if (here !== undefined && !here.conflicted && here.changeId === b.changeId) continue;
-        await bookmarkSet(project.replica, b.name, b.changeId, this.#cfg);
+        // Without a snapshot: on the home, the replica is the user's own checkout.
+        await bookmarkSet(project.replica, b.name, b.changeId, this.#cfg, { ignoreWorkingCopy: true });
         if (here === undefined) created.push(b.name);
       }
       return { change: found.changeId, created };

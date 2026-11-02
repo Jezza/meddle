@@ -5,6 +5,7 @@ import { claudeCodeVersion } from "../src/version";
 import { appendEvent } from "../src/store/events";
 import { errorResultFixture } from "./helpers";
 import { linkClient, startPoolNode } from "./pool-helpers";
+import { repoKey, serialised } from "../src/serial";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -212,6 +213,35 @@ test("a project's heads list its replica's bookmarks and follow a turn's end of 
     const head = heads.find((h) => h.name === bookmark)!;
     expect(head).toMatchObject({ remote: null, conflicted: false });
     expect(head.changeId).toMatch(/^[k-z]+$/);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a task's bookmarks are listed without waiting for a push holding its replica's lock", async () => {
+  const { client, project, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projectIds: [project.id] });
+    let release = () => {};
+    const held = new Promise<void>((res) => { release = res; });
+    let locked = () => {};
+    const entered = new Promise<void>((res) => { locked = res; });
+    const holder = serialised(repoKey(project.replica), async () => { locked(); await held; });
+    await entered;
+    try {
+      const started = Date.now();
+      const task = await client.get(TaskObject, { id: manifest.id });
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(task.bookmarks.value).toEqual([
+        { project: project.id, name: `meddle/task/${manifest.id}/${project.name}`, changeId: expect.stringMatching(/^[k-z]+$/) },
+      ]);
+      task.release();
+    } finally {
+      release();
+      await holder;
+    }
+    node.release();
   } finally {
     await close();
   }

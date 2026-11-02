@@ -239,3 +239,38 @@ test("pushNamespace with no primary pushes nothing for a task without bookmarks 
     await close();
   }
 }, 15_000);
+
+test("pushNamespace: a side bookmark this node did not touch follows the home (deleted or moved there); a local delete beside a home move takes the home's", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const trunk = await makeMain(A);
+    await peerReady(B, A);
+    const project = await ensureReplica(depsOf(B), A.project.id);
+    const repo = project.replica;
+    const home = A.project.replica;
+    const local = async (node: GitPoolNode, r: string) =>
+      Object.fromEntries((await bookmarkList(r, node.cfg)).filter((b) => b.remote === null && b.name.startsWith("meddle/task/t1/")).map((b) => [b.name, b.changeId]));
+
+    const first = await commitOn(B, repo, trunk, "one");
+    for (const label of ["x", "y", "z"]) await jj(["bookmark", "set", `meddle/task/t1/a.${label}`, "-r", first], repo, B.cfg);
+    await pushNamespace(B.cfg, repo, A.id, "t1", { name: "meddle/task/t1/a", changeId: first });
+    expect(Object.keys(await local(A, home)).sort()).toEqual(["meddle/task/t1/a", "meddle/task/t1/a.x", "meddle/task/t1/a.y", "meddle/task/t1/a.z"]);
+
+    // On the home: a.x deleted, a.y and a.z moved. On B: a.z deleted; a.x and a.y untouched.
+    const moved = await commitOn(A, home, first, "moved");
+    await jj(["bookmark", "delete", "exact:meddle/task/t1/a.x"], home, A.cfg);
+    await jj(["bookmark", "set", "meddle/task/t1/a.y", "meddle/task/t1/a.z", "-r", moved], home, A.cfg);
+    await jj(["bookmark", "delete", "exact:meddle/task/t1/a.z"], repo, B.cfg);
+    const second = await commitOn(B, repo, first, "two");
+
+    // The next turn end's push succeeds and carries the primary.
+    await pushNamespace(B.cfg, repo, A.id, "t1", { name: "meddle/task/t1/a", changeId: second });
+    expect(await local(B, repo)).toEqual({ "meddle/task/t1/a": second, "meddle/task/t1/a.y": moved, "meddle/task/t1/a.z": moved });
+    expect(await local(A, home)).toEqual({ "meddle/task/t1/a": second, "meddle/task/t1/a.y": moved, "meddle/task/t1/a.z": moved });
+    expect((await bookmarkList(repo, B.cfg)).filter((b) => b.conflicted)).toEqual([]);
+    // And the one after, with nothing changed, too.
+    await pushNamespace(B.cfg, repo, A.id, "t1", { name: "meddle/task/t1/a", changeId: second });
+  } finally {
+    await close();
+  }
+}, 15_000);
