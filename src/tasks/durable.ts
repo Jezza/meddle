@@ -657,22 +657,49 @@ export class TaskRunner {
   }
 
   /**
-   * Makes each task whose row says `moving` with no `meddle.move` of it left in the Harness (one that faulted, or a
-   * rollback that could not finish) live here again: `idle`, its queued prompts started.
+   * Makes each task whose row says `moving` live here again when no move of it can go on: there is no `meddle.move` of
+   * it left in the Harness (one that faulted, or a rollback that could not finish), or its move was parked by the
+   * restart limit before the receipt (`prepare`, `handoff`), which is then aborted as well. The task gets the state the
+   * Harness gives it (a turn rerunning keeps it `running`, never `idle`) and its queued prompts start. A move parked in
+   * `commit` is left alone: the target may have the task.
    */
   async reconcileMoves(): Promise<void> {
     const rows = listTasks(this.#db).filter((t) => t.state === "moving");
     if (rows.length === 0) return;
     const { tasks } = await this.#harness.inspect(BACKGROUND_CONTEXT);
-    const moving = new Set(tasks.filter((t) => t.record.kind === MeddleMove.definition.name).map((t) => (t.record.input as MoveInput).taskId));
+    const moves = new Map<string, TaskInspection>();
+    for (const t of tasks) if (t.record.kind === MeddleMove.definition.name) moves.set((t.record.input as MoveInput).taskId, t);
     for (const row of rows) {
-      if (moving.has(row.id) || this.#moving.has(row.id) || getTask(this.#db, row.id)?.state !== "moving") continue;
-      this.#setState(row.id, "idle");
-      this.#log(`meddle: move: ${row.id} was left moving with no move in progress; it is live here again`);
-      await this.startQueued(row.id).catch((err: unknown) => {
-        this.#log(`meddle: move: task ${row.id}'s next queued prompt did not start a turn: ${messageOf(err)}`);
+      await serialised(taskKey(row.id), async () => {
+        if (this.#moving.has(row.id) || getTask(this.#db, row.id)?.state !== "moving") return;
+        const move = moves.get(row.id);
+        if (move === undefined) {
+          await this.#release(row.id, `meddle: move: ${row.id} was left moving with no move in progress; it is live here again`);
+          return;
+        }
+        const phase = (move.record.state as { checkpoint?: { phase?: string } }).checkpoint?.phase;
+        if (!isParked(move) || (phase !== "prepare" && phase !== "handoff")) return;
+        const { to } = move.record.input as MoveInput;
+        await this.#release(row.id, `meddle: move: ${row.id} to ${shortId(to)} at ${phase} parked; released`);
+        // Its abort finds the task live here again and only drops what the target may hold of it.
+        await this.#harness.abortTask(move.record.id, BACKGROUND_CONTEXT);
       });
     }
+  }
+
+  /** Makes a task left `moving` live here again: its state as the Harness has it, `line` logged, its queue started. */
+  async #release(taskId: string, line: string): Promise<void> {
+    try {
+      await this.#restoreState(taskId);
+    } catch (err) {
+      // Never left `moving` with no move behind it.
+      this.#log(`meddle: move: could not tell whether ${taskId} has a turn running: ${messageOf(err)}`);
+      this.#setState(taskId, this.#knownState(taskId));
+    }
+    this.#log(line);
+    await this.startQueued(taskId).catch((err: unknown) => {
+      this.#log(`meddle: move: task ${taskId}'s next queued prompt did not start a turn: ${messageOf(err)}`);
+    });
   }
 
   /** The task's row when it is being received from `from`; otherwise refused `forbidden`. */
@@ -778,6 +805,19 @@ export class TaskRunner {
     return { cfg: this.#cfg, db: this.#db, pool: this.#pool, log: this.#log, callMs: this.#deps.hooks?.callMs };
   }
 
+  /**
+   * Throws `task is no longer moving` unless the task's row says `moving`: a step of a move that was already rolled back
+   * here (its own end never recorded) must not hand the task over or activate it.
+   */
+  requireMoving(taskId: string): void {
+    if (this.#row(taskId).state !== "moving") throw new Error("task is no longer moving");
+  }
+
+  /** Whether the task is moving here: a step of its move holds it, or its row says so. */
+  isMovingHere(taskId: string): boolean {
+    return this.#isMoving(this.#row(taskId));
+  }
+
   /** The move of the task to `to` is at `phase`: held here, the row says `moving`, and both are told. */
   enterMove(taskId: string, to: string, phase: string): void {
     this.#moving.set(taskId, { to, phase, error: null });
@@ -848,10 +888,11 @@ export class TaskRunner {
    * meanwhile run, and the failure is logged once and told (`onMove` with the error, then null).
    */
   async failMove(taskId: string, to: string, phase: string, error: string): Promise<void> {
-    // First, before anything that can throw: the row must never be left `moving` with no move behind it.
+    // First, before anything that can throw: the row must never be left `moving` with no move behind it (nor be written
+    // `idle` over a turn this runner knows is live).
     const row = getTask(this.#db, taskId);
     const restore = row !== null && row.state !== "moved";
-    if (restore) updateTask(this.#db, taskId, { state: "idle" });
+    if (restore) updateTask(this.#db, taskId, { state: this.#knownState(taskId) });
     this.#moving.set(taskId, { to, phase, error });
     this.#emitMove(taskId);
     this.#moving.delete(taskId);
@@ -861,7 +902,7 @@ export class TaskRunner {
         await this.#restoreState(taskId);
       } catch (err) {
         this.#log(`meddle: move: could not tell whether ${taskId} has a turn running: ${messageOf(err)}`);
-        this.#emitState(taskId, "idle");
+        this.#emitState(taskId, this.#row(taskId).state as TaskState);
       }
     }
     this.#emitMove(taskId);
@@ -869,6 +910,11 @@ export class TaskRunner {
     this.startQueued(taskId).catch((err: unknown) => {
       this.#log(`meddle: move: task ${taskId}'s next queued prompt did not start a turn: ${messageOf(err)}`);
     });
+  }
+
+  /** The state of the task's turn as this runner alone knows it (live or pending), without asking the Harness. */
+  #knownState(taskId: string): "idle" | "running" | "waiting" {
+    return this.#live.get(taskId)?.state ?? (this.#pending.has(taskId) ? "running" : "idle");
   }
 
   /** Writes the state the task's turn has, if any (`running` for one between its phases), else `idle`. */

@@ -69,8 +69,10 @@ function stopping(runtime: MoveRuntime, context: Context): boolean {
  * fails rolls the move back itself (pi-durable faults a throwing phase and runs `abort` only after an abort mark) and
  * ends `failed`. Once the receipt is recorded, only a definite answer from the target rolls back (`activateTask`
  * answering `ok: false` or `forbidden`); without an answer, `commit` keeps asking (2 s doubling to 30 s) while the task
- * stays `moving`, and a restart asks again from the checkpoint. `abort` (an explicit request; nothing in meddle sends
- * one) rolls back unless the target says it has the task, and ends `aborted`.
+ * stays `moving`, and a restart asks again from the checkpoint. `handoff` and `commit` go on only while the task's row
+ * says `moving` (a rerun after a rollback whose end was lost rolls back again). `abort` rolls back unless the target
+ * says it has the task, and ends `aborted`; the runner sends one for a move parked before the receipt, once it has
+ * made the task live here again, and then `abort` only drops the target's copy.
  */
 export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHooks>({
   name: "meddle.move",
@@ -88,7 +90,11 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
     handoff: (task, runtime, context) => step("handoff", task.input, runtime, context, async (runner) => {
       const { taskId, to } = task.input;
       const { cfg, db, pool } = runner.moveDeps();
+      // A rerun after this move was rolled back here (its end never recorded) finds the task live again: it stops.
+      runner.requireMoving(taskId);
       runner.enterMove(taskId, to, "handoff");
+      // Nothing is set or sent under a turn: one that is running here ends first.
+      await runner.awaitTurnEnd(taskId, false, context, async () => {});
       const manifest = JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest;
       await runner.setTaskBookmarks(manifest);
       // A rerun of this step finds its partial copy there: the target replaces it.
@@ -106,6 +112,12 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       // A rerun after the task was recorded as moved: only the cleanup is left.
       if (getTask(db, taskId)?.state !== "moved") {
         // The receipt is recorded: from here on, only a definite answer from the target rolls the move back.
+        // A rerun after this move was rolled back here (its end never recorded): the task is live here again, so the
+        // target must not activate it; only the rollback's end is left.
+        if (getTask(db, taskId)?.state !== "moving") {
+          await rollback(runner, runtime, context, task.input, "commit", "task is no longer moving");
+          return;
+        }
         let refusal: string | null = null;
         try {
           runner.enterMove(taskId, to, "commit");
@@ -164,7 +176,11 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
     const { taskId, to } = task.input;
     const { db, pool } = runner.moveDeps();
     const phase = task.state.checkpoint.phase;
-    if (getTask(db, taskId)?.state !== "moved") {
+    const row = getTask(db, taskId);
+    if (row !== null && row.state !== "moved" && !runner.isMovingHere(taskId)) {
+      // Released here already (a move parked before the receipt): only the target's partial copy is left to drop.
+      if (phase !== "prepare") await abandonOnTarget(pool, to, taskId);
+    } else if (row?.state !== "moved") {
       const where = phase === "prepare" ? "abandoned" : await abandonOnTarget(pool, to, taskId);
       if (phase === "commit" && where === "active") runner.completeMove(taskId, to);
       else await runner.failMove(taskId, to, phase, "the move was aborted");
