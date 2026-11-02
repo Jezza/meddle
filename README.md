@@ -167,7 +167,7 @@ with `(this node)` after this node's line.
 | `MEDDLE_DISCOVERY_POLL_MS` | `10000` | How often a node looks its pool's topic up; at least `500`. |
 | `MEDDLE_IROH_PRESET` | `n0` | iroh's `n0` preset (number 0's public relays and address lookup), or `minimal`: no relays and no address lookup, so nodes reach each other only at direct addresses (loopback setups and tests). |
 | `MEDDLE_IROH_BIND` | iroh's default | The address iroh's UDP socket binds, as `<ip>:<port>`. |
-| `MEDDLE_JJ_NETWORK_TIMEOUT_MS` | `120000` | How long a jj fetch, push or clone with another node may take before meddle kills it (with its git processes) and fails it as `jj <args> timed out after <ms> ms`. |
+| `MEDDLE_JJ_NETWORK_TIMEOUT_MS` | `120000` | How long a jj fetch or push with another node may take before meddle kills it (with its git processes) and fails it as `jj <args> timed out after <ms> ms`. A clone (from a peer or from an upstream) may take ten times as long. |
 
 ## Projects and tasks
 
@@ -281,7 +281,9 @@ whatever another node, or a model pushing from inside a task, sends it. While th
 node refuses every push, logging `meddle: git: update hook missing; refusing receive-pack` (`serve` writes it again
 at start). A push it took is imported into jj without snapshotting the repo's working copy, and a fetch of a project
 homed here moves `trunk` the same way: your edits in a folder project are never recorded by another node's fetch or
-push.
+push. One consequence: if your own `@` on the home is built on a running task's bookmark and the task's next push
+rewrites that commit, jj reports your working copy as stale at your next command; `jj workspace update-stale`
+brings it back.
 
 What a member can push: the whole `refs/heads/meddle/task/*` namespace of every project repo and `refs/heads/memory`
 of every memory repo, on any node that holds them. So a model inside any task on any node can push over another

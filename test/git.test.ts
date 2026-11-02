@@ -5,7 +5,7 @@ import { runRemoteHelper } from "../src/git/helper";
 import { writeHelperWrapper, writeUpdateHook } from "../src/git/scripts";
 import { GitSocket } from "../src/git/socket";
 import { parseGitHeader, parseMeddleUrl, parseRepo, repoName } from "../src/git/wire";
-import { bookmarkList, cloneColocated, fetch, initColocated, jj, JjError, push, remoteAdd, remoteList, track } from "../src/jj";
+import { bookmarkList, CLONE_TIMEOUT_FACTOR, cloneColocated, fetch, initColocated, jj, JjError, push, remoteAdd, remoteList, track } from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import type { PeerStream, PoolNet } from "../src/pool/net";
 import { pushBookmark } from "../src/projects/replicas";
@@ -343,6 +343,15 @@ test("a fetch or push whose peer never answers times out, takes its git processe
     await expect(push(repo, shortA, bookmark, cfg)).rejects.toThrow("timed out after 1000 ms");
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(claimed).toHaveLength(2);
+
+    // A clone moves a whole repo once: it gets CLONE_TIMEOUT_FACTOR times the fetch/push limit.
+    const quick = { ...B.cfg, jjNetworkTimeoutMs: 100 };
+    started = Date.now();
+    await expect(cloneColocated(urlOf(A), `${B.home}/stalled-clone`, quick, shortA))
+      .rejects.toThrow(`timed out after ${100 * CLONE_TIMEOUT_FACTOR} ms`);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1_000);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(claimed).toHaveLength(3);
   } finally {
     off();
     await close();

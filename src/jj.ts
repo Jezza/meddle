@@ -99,11 +99,19 @@ export async function initColocated(dir: string, cfg?: NodeConfig): Promise<void
   await jj(["git", "init", "--colocate"], dir, cfg);
 }
 
-/** Clones `url` into `dir` as a colocated repo whose remote is named `remote`; limited to `cfg.jjNetworkTimeoutMs`. */
+/** A clone moves a whole repo once, so it may take `CLONE_TIMEOUT_FACTOR` times the fetch/push limit. */
+export const CLONE_TIMEOUT_FACTOR = 10;
+
+/**
+ * Clones `url` into `dir` as a colocated repo whose remote is named `remote`; limited to
+ * `CLONE_TIMEOUT_FACTOR * cfg.jjNetworkTimeoutMs` (20 minutes by default), whether `url` is a peer or an upstream.
+ */
 export async function cloneColocated(url: string, dir: string, cfg?: NodeConfig, remote = "origin"): Promise<void> {
   const parent = dirname(dir);
   await mkdir(parent, { recursive: true });
-  await jj(["git", "clone", "--colocate", "--remote", remote, url, dir], parent, cfg, { timeoutMs: networkMs(cfg) });
+  await jj(["git", "clone", "--colocate", "--remote", remote, url, dir], parent, cfg, {
+    timeoutMs: networkMs(cfg) * CLONE_TIMEOUT_FACTOR,
+  });
 }
 
 export async function workspaceAdd(repo: string, name: string, path: string, revision: string, cfg?: NodeConfig): Promise<void> {
