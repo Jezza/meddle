@@ -14,6 +14,9 @@ one command. A project's repo and memory follow its tasks to whichever node they
 with its workspaces, conversation and queued prompts, and an idle task can be archived off its node and restored on
 any node. Moving a project's home to another node is not here yet (see [Known limits](#known-limits)).
 
+New here? The [user guide](docs/user-guide.md) says what has to run, how to set the first machine and the pool
+up, and where things are; the sections below are the reference.
+
 ## Install
 
 Requires [bun](https://bun.sh), [jj](https://jj-vcs.github.io/jj/) and git.
@@ -37,7 +40,8 @@ Every node of the pool then runs jj and every task with that identity. Without o
 jj user config on the node) jj refuses to push the commits, so every push to a project's home fails and each turn end
 logs a `meddle: git: …` line saying so (see [Projects across the pool](#projects-across-the-pool)).
 
-The commands below run from the checkout as `bun run src/cli.ts <command>`. `bun run build` also produces a compiled
+The commands below run from the checkout as `bun run src/cli.ts <command>`; `bin/meddle` runs the same CLI from
+anywhere once linked onto your `PATH` (`ln -s $PWD/bin/meddle ~/.local/bin/meddle`). `bun run build` also produces a compiled
 `dist/meddle` for `status` and the `token` commands; the service itself runs from the checkout. The compiled binary embeds
 iroh's native modules (two `.node` files, its glibc and musl builds), which make it about 40 MB larger (147 MB on
 linux-x64). It carries no `node_modules`, so it reports its Claude Code version as `unknown`. A node served from it
@@ -712,6 +716,7 @@ and `systemctl --user enable --now meddle.service`, and prints the task-root com
 
 ## Links
 
+- [User guide](docs/user-guide.md)
 - [Design](docs/superpowers/specs/2026-10-30-meddle-design.md)
 - [Plan 1: single node](docs/superpowers/plans/2026-10-30-meddle-single-node.md)
 - [Plan 2: pool over iroh](docs/superpowers/plans/2026-10-31-meddle-pool.md)
