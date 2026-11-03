@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
-import { mkdir, stat } from "node:fs/promises";
-import { homedir, userInfo } from "node:os";
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import { homedir, hostname, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
@@ -15,8 +15,9 @@ import { JANITOR_INTERVAL_MS, runJanitor, sweepArchiveTemps } from "./tasks/arch
 import { acceptBlobStreams } from "./tasks/blob";
 import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
-import { loadOrCreateIdentity, shortId } from "./pool/identity";
+import { isNodeId, loadOrCreateIdentity, shortId } from "./pool/identity";
 import { resolveNodeId } from "./pool/ids";
+import { DEFAULT_POOL_NAME, generateSecret, poolNameProblem, poolSecretProblem } from "./pool/secret";
 import { poolProjects, projectLine, resolveProject } from "./pool/projects";
 import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
@@ -38,9 +39,9 @@ import { claudeCodeVersion, VERSION } from "./version";
 const USAGE = `usage: meddle --version
        meddle serve
        meddle status
-       meddle invite
-       meddle join <ticket>
        meddle pool
+       meddle pool secret [--file <path> | --generate <path>] [--name <name>]
+       meddle pool peer <node id> | meddle pool remove <id|prefix> | meddle pool allow <id|prefix>
        meddle token add [--file <path>] [--label <l>] | meddle token set [--file <path>] [--label <l>]
        meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
@@ -224,12 +225,28 @@ async function activeToken(cfg: NodeConfig, db: Database): Promise<string | null
   return hasTokens(db) ? (await pickToken(cfg, db))?.id ?? null : null;
 }
 
-/** `pool <poolId> members <n>`, or null before this node first served (no pool table, or no pool in it). */
+/**
+ * `pool <poolId> (<name>) members <n>`, `pool (no secret set)` before `meddle pool secret`, or null before this node
+ * first served (no pool table, or no pool in it).
+ */
 function poolLine(db: Database): string | null {
   if (db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pool'").get() === null) return null;
   if (db.query("SELECT 1 FROM pool").get() === null) return null;
   const store = new PoolStore(db);
-  return `pool ${store.pool().poolId} members ${store.members().length}`;
+  const pool = store.pool();
+  return pool.poolSecret === "" ? "pool (no secret set)" : `pool ${pool.poolId} (${pool.poolName}) members ${store.members().length}`;
+}
+
+/** Tells the running node, if any, that the pool row or the roster changed under it. */
+async function poolChanged(): Promise<void> {
+  try {
+    await withPool(async (pool) => {
+      await pool.poolChanged({});
+      return 0;
+    });
+  } catch (err) {
+    if (!(err instanceof NoNode)) throw err;
+  }
 }
 
 /** Tells the running node, if any, that the tokens changed, so that it tells the pool. */
@@ -352,19 +369,70 @@ function withPool(use: (pool: Awaited<ReturnType<typeof poolView>>) => Promise<n
   });
 }
 
-/** Prints a ticket another node joins this pool with. */
-function poolInvite(): Promise<number> {
+/**
+ * Sets the pool's secret from `file` (stdin otherwise; never an argument), or a generated one written to `generate`
+ * (a new file, mode 600, to copy to the other nodes), and its name (default `default`), written to the node's
+ * database directly, then tells the running node (if any): it re-keys and starts its roster over with itself alone.
+ * Every node given the same name and secret is in the same pool. The secret is never printed.
+ */
+async function poolSecret(file: string | undefined, generate: string | undefined, name: string | undefined): Promise<number> {
+  let secret: string;
+  if (generate !== undefined) {
+    secret = generateSecret();
+    await writeFile(generate, `${secret}\n`, { flag: "wx", mode: 0o600 });
+  } else {
+    secret = (file !== undefined ? await Bun.file(file).text() : await Bun.stdin.text()).trim();
+  }
+  const poolName = name ?? DEFAULT_POOL_NAME;
+  const problem = poolNameProblem(poolName) ?? poolSecretProblem(secret);
+  if (problem !== null) throw new Error(problem);
+  const cfg = loadConfig();
+  await ensureDataDirs(cfg);
+  const identity = await loadOrCreateIdentity(cfg);
+  const pool = await withDb(cfg, (db) => new PoolStore(db).setSecret({ nodeId: identity.id, hostname: hostname() }, poolName, secret));
+  await poolChanged();
+  console.log(`pool ${shortId(pool.poolId)} (${pool.poolName})`);
+  if (generate !== undefined) console.log(`secret written to ${generate}; copy it to the other nodes (meddle pool secret --file <path>)`);
+  return 0;
+}
+
+/**
+ * Records a node (its full id) as a member here and tells the running node, which dials it when it is the one to
+ * dial (iroh resolves the id): the way into a pool that uses no lighthouse. The node still has to prove the secret.
+ */
+async function poolPeer(nodeId: string): Promise<number> {
+  if (!isNodeId(nodeId)) throw new Error(`not a node id: ${nodeId}`);
+  const cfg = loadConfig();
+  await ensureDataDirs(cfg);
+  const identity = await loadOrCreateIdentity(cfg);
+  if (nodeId === identity.id) throw new Error("that is this node");
+  const status = await withDb(cfg, (db) => {
+    const store = new PoolStore(db);
+    store.ensurePool({ nodeId: identity.id, hostname: hostname() });
+    return store.ensureMember(nodeId, identity.id);
+  });
+  if (status === "removed") throw new Error(`${shortId(nodeId)} was removed from the pool; use pool allow`);
+  await poolChanged();
+  console.log(`peer ${shortId(nodeId)}`);
+  return 0;
+}
+
+/** Removes the node `text` names (its id or a unique prefix) from the pool. */
+function poolRemove(text: string): Promise<number> {
   return withPool(async (pool) => {
-    console.log((await pool.invite({})).ticket);
+    const nodeId = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), text);
+    await pool.remove({ nodeId });
+    console.log(`removed ${shortId(nodeId)}`);
     return 0;
   });
 }
 
-/** Joins the pool a ticket from one of its members names. */
-function poolJoin(ticket: string): Promise<number> {
+/** Makes the removed node `text` names (its id or a unique prefix) a member again. */
+function poolAllow(text: string): Promise<number> {
   return withPool(async (pool) => {
-    const joined = await pool.join({ ticket });
-    console.log(`joined pool ${shortId(joined.poolId)} with ${joined.members} nodes`);
+    const nodeId = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), text);
+    await pool.allow({ nodeId });
+    console.log(`allowed ${shortId(nodeId)}`);
     return 0;
   });
 }
@@ -692,13 +760,17 @@ async function serviceInstall(dryRun: boolean): Promise<number> {
 
 /** `[--file <path>] [--label <l>]`, in either order, each at most once. */
 function tokenAddArgs(args: string[]): { file?: string; label?: string } | null {
-  const out: { file?: string; label?: string } = {};
+  return pairArgs(args, ["file", "label"]);
+}
+
+/** `--<name> <value>` pairs for the given names, in any order, each at most once; null for anything else. */
+function pairArgs(args: string[], names: string[]): Record<string, string> | null {
+  const out: Record<string, string> = {};
   for (let i = 0; i < args.length; i += 2) {
     const value = args[i + 1];
-    if (value === undefined) return null;
-    if (args[i] === "--file" && out.file === undefined) out.file = value;
-    else if (args[i] === "--label" && out.label === undefined) out.label = value;
-    else return null;
+    const name = names.find((n) => args[i] === `--${n}`);
+    if (value === undefined || name === undefined || name in out) return null;
+    out[name] = value;
   }
   return out;
 }
@@ -774,9 +846,15 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (args.length === 1 && command === "--version") return async () => (console.log(`meddle ${VERSION}`), 0);
   if (args.length === 1 && command === "serve") return serve;
   if (args.length === 1 && command === "status") return status;
-  if (args.length === 1 && command === "invite") return poolInvite;
-  if (args.length === 2 && command === "join") return () => poolJoin(sub!);
   if (args.length === 1 && command === "pool") return poolList;
+  if (command === "pool" && sub === "secret") {
+    const parsed = pairArgs(rest, ["file", "generate", "name"]);
+    if (parsed === null || (parsed.file !== undefined && parsed.generate !== undefined)) return null;
+    return () => poolSecret(parsed.file, parsed.generate, parsed.name);
+  }
+  if (command === "pool" && sub === "peer" && rest.length === 1) return () => poolPeer(rest[0]!);
+  if (command === "pool" && sub === "remove" && rest.length === 1) return () => poolRemove(rest[0]!);
+  if (command === "pool" && sub === "allow" && rest.length === 1) return () => poolAllow(rest[0]!);
   if (command === "token" && (sub === "add" || sub === "set")) {
     const parsed = tokenAddArgs(rest);
     return parsed === null ? null : () => tokenAdd(parsed.file, parsed.label);

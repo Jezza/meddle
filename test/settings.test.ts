@@ -156,15 +156,15 @@ test("lighthouse.url applies live unless the node's env is explicit", () => {
   expect(discoveryLighthouseUrl(explicit.cfg, explicit.settings)).toBe("https://mine.example.invalid");
 });
 
-test("joining another pool drops the old pool's settings", () => {
+test("setting the pool secret keeps this node's settings: they merge with the pool's like any member's", () => {
   const db = openDb(":memory:");
   const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
   const settings = new PoolSettings(db, cfg, SELF);
   const store = new PoolStore(db);
   store.ensurePool({ nodeId: SELF, hostname: "h" });
-  settings.set("jj.user", "Old pool");
-  store.replacePool({ poolId: "p2", poolSecret: "s2", createdAt: "2026-01-01T00:00:00.000Z" }, store.roster());
-  expect(settings.rows()).toEqual([]);
+  settings.set("jj.user", "Set before the secret");
+  store.setSecret({ nodeId: SELF, hostname: "h" }, "default", "s2-secret-long-enough", "2026-01-01T00:00:00.000Z");
+  expect(settings.get("jj.user")).toBe("Set before the secret");
 });
 
 test("settings replicate between two nodes and jj commits on the other node carry the identity", async () => {

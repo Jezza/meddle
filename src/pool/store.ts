@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
-import { randomBytes } from "node:crypto";
+import { shortId } from "./ids";
+import { DEFAULT_POOL_NAME, poolKey } from "./secret";
 
 /** A project a node holds (its own or a replica), as the rest of the pool sees it. */
 export type NodeProject = { id: string; name: string; home: string };
@@ -37,16 +38,24 @@ export type RosterRow = {
 /** A roster row as a peer may send it (its summary perhaps an older meddle's). */
 export type WireRosterRow = Omit<RosterRow, "summary"> & { summary: WireSummary | null };
 
-export type PoolIdentity = { poolId: string; poolSecret: string; createdAt: string };
+/**
+ * The pool this node is in: `poolId` is the topic public key `poolName` and `poolSecret` derive (`poolKey`), and both it
+ * and the secret are empty until `meddle pool secret` set one. `createdAt` is when the secret was set here.
+ */
+export type PoolIdentity = { poolId: string; poolName: string; poolSecret: string; createdAt: string };
 
-type PoolRecord = { pool_id: string; pool_secret: string; created_at: string };
+type PoolRecord = { pool_id: string; pool_secret: string | null; created_at: string | null; name: string | null };
+
+/**
+ * The `updatedAt` of the row a node gets here when it proved the secret before anything was heard of it: older than
+ * any row the node sends of itself, so that one wins the merge and fills in its hostname.
+ */
+export const PROVISIONAL_AT = "1970-01-01T00:00:00.000Z";
 
 type RosterRecord = {
   node_id: string; hostname: string; status: RosterRow["status"]; updated_at: string; added_by: string;
   summary: string | null; last_seen_at: string | null; last_addr: string | null;
 };
-
-const INVITE_TTL_MS = 24 * 3600_000;
 
 function toRow(r: RosterRecord): RosterRow {
   return {
@@ -61,35 +70,117 @@ function toRow(r: RosterRecord): RosterRow {
   };
 }
 
+/** A pool row of an older meddle (no name) reads as an empty pool: its random id and secret derive nothing. */
 function toPool(r: PoolRecord): PoolIdentity {
-  return { poolId: r.pool_id, poolSecret: r.pool_secret, createdAt: r.created_at };
+  if (r.name === null) return { poolId: "", poolName: DEFAULT_POOL_NAME, poolSecret: "", createdAt: r.created_at ?? "" };
+  return { poolId: r.pool_id, poolName: r.name, poolSecret: r.pool_secret ?? "", createdAt: r.created_at ?? "" };
 }
 
-/** The pool's identity, its roster and its outstanding invites, in `meddle.sqlite`. */
+/** The pool's identity (name, secret, id) and its roster, in `meddle.sqlite`. */
 export class PoolStore {
   constructor(private readonly db: Database) {}
 
-  /** Creates a pool of one (this node) when there is none; returns the pool either way. */
+  /**
+   * Makes sure there is a pool row (empty: no secret yet) and a member row for this node; returns the pool. A pool row
+   * of an older meddle (no name: a random id and secret that derive nothing) is reset to empty.
+   */
   ensurePool(self: { nodeId: string; hostname: string }, now: string = new Date().toISOString()): PoolIdentity {
     return this.db.transaction(() => {
-      if (this.db.query("SELECT 1 FROM pool").get() === null) {
-        this.db.query("INSERT INTO pool (pool_id, pool_secret, created_at) VALUES (?, ?, ?)")
-          .run(randomBytes(16).toString("hex"), randomBytes(32).toString("hex"), now);
+      const r = this.db.query<PoolRecord, []>("SELECT * FROM pool").get();
+      if (r === null) {
+        this.db.query("INSERT INTO pool (pool_id, pool_secret, created_at, name) VALUES ('', '', ?, ?)").run(now, DEFAULT_POOL_NAME);
+      } else if (r.name === null) {
+        this.db.query("UPDATE pool SET pool_id = '', pool_secret = '', created_at = ?, name = ?").run(now, DEFAULT_POOL_NAME);
       }
-      if (this.row(self.nodeId) === null) {
-        this.upsert({
-          nodeId: self.nodeId, hostname: self.hostname, status: "member", updatedAt: now, addedBy: self.nodeId,
-          summary: null, lastSeenAt: null, lastAddr: null,
-        });
-      }
+      this.ensureSelf(self, now);
       return this.pool();
     })();
+  }
+
+  private ensureSelf(self: { nodeId: string; hostname: string }, now: string): void {
+    if (this.row(self.nodeId) === null) {
+      this.upsert({
+        nodeId: self.nodeId, hostname: self.hostname, status: "member", updatedAt: now, addedBy: self.nodeId,
+        summary: null, lastSeenAt: null, lastAddr: null,
+      });
+    }
   }
 
   pool(): PoolIdentity {
     const r = this.db.query<PoolRecord, []>("SELECT * FROM pool").get();
     if (r === null) throw new Error("no pool");
     return toPool(r);
+  }
+
+  /** Whether a pool secret is set here. */
+  hasSecret(): boolean {
+    return this.pool().poolSecret !== "";
+  }
+
+  /**
+   * Sets the pool's name and secret (its id follows from them) and, when that is another pool than before, starts the
+   * roster over with this node alone (`resetRoster`): the nodes of the old pool, or of no pool, are not this pool's
+   * members until they prove the new secret. The same name and secret again change nothing. The settings and the
+   * tokens stay: they are this node's, and merge with the pool's as any member's do.
+   */
+  setSecret(self: { nodeId: string; hostname: string }, name: string, secret: string, now: string = new Date().toISOString()): PoolIdentity {
+    const { id } = poolKey(name, secret);
+    return this.db.transaction(() => {
+      const before = this.db.query("SELECT 1 FROM pool").get() === null ? null : this.pool();
+      if (before?.poolId === id) return before;
+      if (before === null) {
+        this.db.query("INSERT INTO pool (pool_id, pool_secret, created_at, name) VALUES (?, ?, ?, ?)").run(id, secret, now, name);
+      } else {
+        this.db.query("UPDATE pool SET pool_id = ?, pool_secret = ?, created_at = ?, name = ?").run(id, secret, now, name);
+      }
+      this.resetRoster(self, now);
+      return this.pool();
+    })();
+  }
+
+  /** Starts the roster over with this node alone, as a member from `now` (whatever its old row said of it). */
+  resetRoster(self: { nodeId: string; hostname: string }, now: string = new Date().toISOString()): void {
+    this.db.transaction(() => {
+      this.db.exec("DELETE FROM roster");
+      this.ensureSelf(self, now);
+    })();
+  }
+
+  /**
+   * The status of `nodeId`'s row after making sure it has one: a node that proved the secret and was never heard of
+   * gets a provisional member row (named by its short id, `updatedAt` PROVISIONAL_AT, added by `by`, at `addr` when
+   * one is known), which the row it sends of itself replaces at the first sync.
+   */
+  ensureMember(nodeId: string, by: string, addr: WireAddr | null = null): RosterRow["status"] {
+    return this.db.transaction(() => {
+      const row = this.row(nodeId);
+      if (row !== null) return row.status;
+      this.upsert({
+        nodeId, hostname: shortId(nodeId), status: "member", updatedAt: PROVISIONAL_AT, addedBy: by,
+        summary: null, lastSeenAt: null, lastAddr: addr,
+      });
+      return "member";
+    })();
+  }
+
+  /**
+   * Makes a removed node a member again, at `now` or 1 ms after its row's `updatedAt` when that is later, as `remove`
+   * dates its change; false when the node has no row here.
+   */
+  allow(nodeId: string, now: string = new Date().toISOString()): boolean {
+    return this.db.transaction(() => {
+      const row = this.row(nodeId);
+      if (row === null) return false;
+      this.db.query("UPDATE roster SET status = 'member', updated_at = ? WHERE node_id = ?").run(this.after(row, now), nodeId);
+      return true;
+    })();
+  }
+
+  /** `now`, or 1 ms after the row's `updatedAt` when that is later (another node's clock may be ahead of this one's). */
+  private after(row: RosterRow, now: string): string {
+    const at = Date.parse(row.updatedAt);
+    const floor = Number.isFinite(at) ? new Date(at + 1).toISOString() : now;
+    return floor > now ? floor : now;
   }
 
   roster(): RosterRow[] {
@@ -166,9 +257,7 @@ export class PoolStore {
     this.db.transaction(() => {
       const row = this.row(nodeId);
       if (row === null) return;
-      const after = Date.parse(row.updatedAt);
-      const floor = Number.isFinite(after) ? new Date(after + 1).toISOString() : now;
-      this.db.query("UPDATE roster SET status = 'removed', updated_at = ? WHERE node_id = ?").run(floor > now ? floor : now, nodeId);
+      this.db.query("UPDATE roster SET status = 'removed', updated_at = ? WHERE node_id = ?").run(this.after(row, now), nodeId);
     })();
   }
 
@@ -177,40 +266,5 @@ export class PoolStore {
     this.db.query("UPDATE roster SET summary = ?, last_seen_at = ?, last_addr = ? WHERE node_id = ?").run(
       summary === null ? null : JSON.stringify(summary), at, addr === null ? null : JSON.stringify(addr), nodeId,
     );
-  }
-
-  /**
-   * Replaces this node's pool and roster with another pool's, as when it joins that pool; drops outstanding invites and
-   * the old pool's settings (the new pool's arrive by sync).
-   */
-  replacePool(pool: PoolIdentity, roster: WireRosterRow[]): void {
-    this.db.transaction(() => {
-      this.db.exec("DELETE FROM pool");
-      this.db.exec("DELETE FROM roster");
-      // An invite issued for the old pool must not admit anyone into the new one.
-      this.db.exec("DELETE FROM invites");
-      // The old pool's settings, newer than the new pool's, would otherwise win its merge and spread through it.
-      this.db.exec("DELETE FROM settings");
-      this.db.query("INSERT INTO pool (pool_id, pool_secret, created_at) VALUES (?, ?, ?)")
-        .run(pool.poolId, pool.poolSecret, pool.createdAt);
-      for (const row of roster) this.upsert(row);
-    })();
-  }
-
-  /** A single-use invite code, valid for 24 hours. */
-  createInvite(now: Date = new Date()): { code: string; expiresAt: string } {
-    const code = randomBytes(32).toString("base64url");
-    const expiresAt = new Date(now.getTime() + INVITE_TTL_MS).toISOString();
-    this.db.query("INSERT INTO invites (code, created_at, expires_at, used_at) VALUES (?, ?, ?, NULL)")
-      .run(code, now.toISOString(), expiresAt);
-    return { code, expiresAt };
-  }
-
-  /** Marks `code` used; true only when it exists, is unused and has not expired. */
-  consumeInvite(code: string, now: Date = new Date()): boolean {
-    const at = now.toISOString();
-    const result = this.db.query("UPDATE invites SET used_at = ? WHERE code = ? AND used_at IS NULL AND expires_at > ?")
-      .run(at, code, at);
-    return result.changes === 1;
   }
 }

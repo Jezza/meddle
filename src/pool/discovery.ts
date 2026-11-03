@@ -1,20 +1,15 @@
 import type { Endpoint, WatchHandle } from "@number0/iroh";
-import { Lighthouse, NodeKey, Topic, type EndpointAddr as LighthouseEndpointAddr, type Peer } from "iroh-lighthouse";
+import { Lighthouse, NodeKey, type Topic, type EndpointAddr as LighthouseEndpointAddr, type Peer } from "iroh-lighthouse";
 import { isNodeId, type Identity } from "./identity";
 import { fromEndpoint } from "./net";
 import { dedupe } from "./report";
-import type { PoolIdentity, WireAddr } from "./store";
+import type { WireAddr } from "./store";
 
 export const ANNOUNCE_TTL_SECS = 300;
 export const REQUEST_TIMEOUT_MS = 10_000;
 /** The most `stop()` and `restart()` wait to unregister from a topic. */
 const LEAVE_CAP_MS = 2000;
 const MIN_REANNOUNCE_MS = 1000;
-
-/** The lighthouse topic of a pool: only holders of the pool secret can announce on it or look it up. */
-export function topicFor(pool: Pick<PoolIdentity, "poolId" | "poolSecret">): Topic {
-  return Topic.withSecret(`meddle/${pool.poolId}`, pool.poolSecret);
-}
 
 export function toLighthouseAddr(addr: WireAddr): LighthouseEndpointAddr {
   return {
@@ -36,7 +31,8 @@ export function fromLighthouseAddr(addr: LighthouseEndpointAddr): WireAddr {
 export type DiscoveryDeps = {
   endpoint: Endpoint;
   identity: Identity;
-  pool: PoolIdentity;
+  /** The pool's topic (`poolKey(...).topic`): only holders of the pool secret can announce on it or look it up. */
+  topic: Topic;
   /** Read at every request, so a test can swap it. */
   lighthouseUrl(): string;
   /** How often a joined node looks the topic up. */
@@ -65,7 +61,7 @@ export class Discovery {
   private readonly key: NodeKey;
   private readonly backoff: { initialMs: number; maxMs: number };
   private readonly requestTimeoutMs: number;
-  private pool: PoolIdentity;
+  private topic: Topic;
   private running = false;
   /** Bumped by every halt, so that the work of a previous run drops its results. */
   private generation = 0;
@@ -88,7 +84,7 @@ export class Discovery {
     this.key = NodeKey.fromBytes(deps.identity.secret);
     this.backoff = deps.backoff ?? { initialMs: 1000, maxMs: 60_000 };
     this.requestTimeoutMs = deps.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
-    this.pool = deps.pool;
+    this.topic = deps.topic;
     this.delay = this.backoff.initialMs;
   }
 
@@ -110,13 +106,13 @@ export class Discovery {
     this.schedulePoll(gen);
   }
 
-  /** Leaves the old pool's topic (best effort), then starts on the new one. */
-  async restart(pool: PoolIdentity): Promise<void> {
-    const old = this.pool;
+  /** Leaves the old topic (best effort), then starts on `topic`. */
+  async restart(topic: Topic): Promise<void> {
+    const old = this.topic;
     const wasRunning = this.running;
     const { inflight } = await this.halt();
     if (wasRunning) await this.leave(old, inflight);
-    this.pool = pool;
+    this.topic = topic;
     this.start();
   }
 
@@ -124,7 +120,7 @@ export class Discovery {
   async stop(): Promise<void> {
     if (!this.running) return;
     const { inflight } = await this.halt();
-    await this.leave(this.pool, inflight);
+    await this.leave(this.topic, inflight);
   }
 
   /** Ends the current run; `inflight` is the announce it may still have in flight. */
@@ -147,12 +143,12 @@ export class Discovery {
     return { inflight };
   }
 
-  /** A TTL-0 announce on `pool`'s topic once `after` settled; best effort and capped at 2 s overall. */
-  private async leave(pool: PoolIdentity, after: Promise<void>): Promise<void> {
+  /** A TTL-0 announce on `topic` once `after` settled; best effort and capped at 2 s overall. */
+  private async leave(topic: Topic, after: Promise<void>): Promise<void> {
     const timeoutMs = Math.min(this.requestTimeoutMs, LEAVE_CAP_MS);
     const addr = { id: this.deps.identity.id, relay: null, direct: [] };
     const attempt = after
-      .then(() => this.lighthouse(timeoutMs).announce(this.key, topicFor(pool), toLighthouseAddr(addr), 0))
+      .then(() => this.lighthouse(timeoutMs).announce(this.key, topic, toLighthouseAddr(addr), 0))
       .then(() => {}, () => {});
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([attempt, new Promise<void>((resolve) => { timer = setTimeout(resolve, LEAVE_CAP_MS); })]);
@@ -211,7 +207,7 @@ export class Discovery {
       const url = this.deps.lighthouseUrl();
       let granted: { ttlSecs: number; peers: Peer[] };
       try {
-        granted = await this.lighthouse().announce(this.key, topicFor(this.pool), toLighthouseAddr(addr), ANNOUNCE_TTL_SECS);
+        granted = await this.lighthouse().announce(this.key, this.topic, toLighthouseAddr(addr), ANNOUNCE_TTL_SECS);
       } catch (err) {
         throw new Error(`announcing on ${url}: ${messageOf(err)}`);
       }
@@ -240,7 +236,7 @@ export class Discovery {
   private async poll(gen: number): Promise<void> {
     if (this.joinedNow) {
       try {
-        const peers = await this.lighthouse().lookup(topicFor(this.pool));
+        const peers = await this.lighthouse().lookup(this.topic);
         if (gen === this.generation) this.publish(peers);
       } catch {
         // The next announce or poll tries again.

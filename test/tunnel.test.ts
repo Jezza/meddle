@@ -6,7 +6,7 @@ import { startDashboard, type Dashboard } from "../src/dashboard/server";
 import { IrohSocketShim, acceptDashboardStreams, bridgeSocket } from "../src/dashboard/tunnel";
 import { BunSocketShim } from "../src/dashboard/ws-shim";
 import { NodeObject, PoolObject } from "../src/state/contracts";
-import { linkClient, startPoolNode, twoNodes } from "./pool-helpers";
+import { linkClient, linkNodes, startPoolNode, twoNodes } from "./pool-helpers";
 
 type Node = Awaited<ReturnType<typeof startPoolNode>>;
 
@@ -37,23 +37,10 @@ async function withNodes(count: number, run: (nodes: Node[]) => Promise<void>): 
   }
 }
 
-/** `joiner` joins the pool of `inviter` (through their PoolObjects, as a dashboard does) and both see each other online. */
-async function join(inviter: Node, joiner: Node): Promise<void> {
-  const a = linkClient(inviter.host);
-  const b = linkClient(joiner.host);
-  try {
-    const poolA = await a.client.get(PoolObject, {});
-    const poolB = await b.client.get(PoolObject, {});
-    if (poolA.variant !== "default" || poolB.variant !== "default") throw new Error("expected the default variant");
-    const { ticket } = await poolA.invite({});
-    await poolB.join({ ticket });
-    poolA.release();
-    poolB.release();
-  } finally {
-    await a.close();
-    await b.close();
-  }
-  await eventually(() => inviter.net.isOnline(joiner.id) && joiner.net.isOnline(inviter.id));
+/** Links the two nodes (both have the test pool's secret) and waits until each sees the other online. */
+async function join(a: Node, b: Node): Promise<void> {
+  await linkNodes(a, b);
+  await eventually(() => a.net.isOnline(b.id) && b.net.isOnline(a.id));
 }
 
 /** A chord client host over a browser socket to `url`. */

@@ -20,10 +20,11 @@ a second machine joins the pool and runs the same process.
 
 Outside the node:
 
-- **A lighthouse**, so nodes can find each other's current addresses. By default the hosted one at
+- **A lighthouse**, so nodes with the same pool secret can find each other. By default the hosted one at
   `https://iroh.ichor.io`; set `lighthouse.url` to your own [iroh-lighthouse](https://github.com/Jezza/iroh-lighthouse)
-  instead, or turn discovery off with `MEDDLE_LIGHTHOUSE_URL=` (empty) and nodes use the addresses in the roster. A
-  node runs without it; it only affects whether nodes reach each other after an address changes.
+  instead, or turn discovery off with `MEDDLE_LIGHTHOUSE_URL=` (empty) and tell each node the others' ids with
+  `meddle pool peer`. A node runs without it, and the lighthouse is only ever a hint: a node it lists still has to
+  prove the secret.
 - **iroh's relays**, when two nodes have no direct path. Nothing to set up.
 - **Your browser**, on any node's dashboard. The dashboard binds to localhost only; for a remote machine, tunnel it
   (`ssh -L 7777:127.0.0.1:7777 <host>`, the same port at both ends: the node accepts a browser only on its own port)
@@ -88,7 +89,7 @@ names another), and in it, some at that start and some on first use:
 
 | Path | What |
 | --- | --- |
-| `meddle.sqlite`, `durable.sqlite` | The node's state: tasks, projects, event logs, transcripts, the roster, and the turns in flight. |
+| `meddle.sqlite`, `durable.sqlite` | The node's state: tasks, projects, event logs, transcripts, the pool secret and roster, and the turns in flight. |
 | `secrets/iroh.key` | The node's identity; its node id is this key's public half. Keep it; a new key is a new node. |
 | `secrets/tokens/<id>` | The login tokens' values, one file each (from the first `token add`). |
 | `profile/` | A jj repo seeded from this machine's `~/.claude` (`CLAUDE.md`, `settings.json`, `skills`, `agents`, `commands`, `hooks`): the user layer every task's Claude Code sees. See [Profile](#profile-the-user-layer). |
@@ -97,7 +98,8 @@ names another), and in it, some at that start and some on first use:
 | `bin/git-remote-meddle`, `git-hooks/update`, `git.sock` | The git plumbing other nodes fetch and push through. |
 | `archives/`, `moved/` | Archived tasks, and what a task that moved away left (kept seven days); made by the first archive and the first move. |
 
-It also creates a pool with this node as its only member. There is no pool to create by hand.
+Until a pool secret is set (see [The second machine](#the-second-machine)) the node is alone: its dashboard and tasks
+work, it just talks to nobody.
 
 ### 4. Add a login
 
@@ -168,17 +170,25 @@ A node running as a service and one started by hand in a terminal cannot run at 
 Repeat steps 1 to 3 there: clone at the same commit, `bun install`, link `bin/meddle`, create the task root, start
 `serve` (or install the service straight away). Do not add tokens or settings again: they come with the pool.
 
-With both nodes running:
+A pool is a secret. Generate one on the first machine, copy the file to the second, and give it to that node too;
+never pass it as an argument:
 
 ```sh
-meddle invite          # on the first machine: prints a ticket, meddle1…
-meddle join <ticket>   # on the second: prints "joined pool <short id> with 2 nodes"
-meddle pool            # on either: one line per node, online or offline
+meddle pool secret --generate ~/pool-secret   # first machine: writes the file (mode 600) and sets it; prints "pool <short id> (default)"
+scp ~/pool-secret gem:                        # or however you copy a file between the two
+meddle pool secret --file ~/pool-secret       # second machine: prints the same pool id
+meddle pool                                   # on either: one line per node, online or offline
 ```
 
-A ticket admits one node once and expires after 24 hours; the dashboard's Settings view makes and takes tickets
-too. Joining gives up the second node's own one-member pool. A node that already shares a pool with others cannot
-join another pool; remove the others from its Settings view first ([Invite and join](../README.md#invite-and-join)).
+The pool id is public (the lighthouse sees it), so a secret of your own must not be guessable from it: the generated
+one is 32 random bytes; a chosen one is accepted from 16 characters and is stretched with scrypt before use.
+
+The two nodes announce themselves on a topic derived from the secret, find each other through the lighthouse, and
+prove the secret to each other when they connect; nothing else admits a node. The command works with or without the
+node running, and a running node takes the new secret at once. A node you want out of the pool is removed in the
+dashboard's Settings view or with `meddle pool remove <id>`, and allowed back with Allow again or `meddle pool allow
+<id>`; a removed node still knows the secret and the login tokens it pulled, so to shut it out for good give the
+nodes you keep a new secret and reissue the logins ([The pool secret](../README.md#the-pool-secret)).
 
 What follows on its own:
 
@@ -190,7 +200,9 @@ What follows on its own:
 - placement: `spawn` and `task new` without `--node` now pick between the two, preferring the project's home, then
   the node holding the project, then the one with fewer turns running. `--here` or `--node <short id>` chooses.
 
-What does not follow: the profile (see below), and the checkout itself. Both machines must run the same meddle
+What does not follow: the profile (see below), and the checkout itself. A node given the secret before the first
+node had set its settings merges its own settings with the pool's, newest value winning, so set the secret on the
+first machine before its settings when you can, or check `config list` afterwards. Both machines must run the same meddle
 commit: a newer node cannot create a task on an older one or move a task to it ([Where a new task
 runs](../README.md#where-a-new-task-runs)).
 
@@ -274,6 +286,8 @@ directory and the task root carry over.
 | You see | It means | Do |
 | --- | --- | --- |
 | `start "meddle serve" first` | The command needs the node and found nothing on port 7777 (or `MEDDLE_PORT`). | Start the node or the service; check your shell's `MEDDLE_PORT` matches the service's. |
+| `pool (no secret set)` in `status`; the other node never shows up | This node has no pool secret, so it announces nothing and admits nobody. | `meddle pool secret` on it, with the pool's secret. |
+| `… refused the connection: closed by peer: bad proof` or `… did not prove the pool secret` in the log | The two nodes have different secrets (or pool names). | Set the same secret with the same name on both. |
 | `no usable token` | No token is `ok` (or its value is not on this node yet). | `meddle token list`; add one, or `token enable` a disabled one. |
 | `this node has no task root` / `no online node hosts tasks` | The task root is missing or not writable on every candidate. | Create it (step 2) and restart the node. |
 | `meddle: push: meddle/task/… to <short id> failed: …` or `meddle: git: …` in the log | A turn end could not push the task's bookmarks or memory to the project's home: no jj identity, or the home offline. | `meddle config set jj.user …` and `jj.email`; check `meddle pool`. The next turn end pushes again. |

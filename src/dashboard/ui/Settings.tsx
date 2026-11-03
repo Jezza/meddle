@@ -1,8 +1,7 @@
-// Settings: the pool (this node, its members, invites and joining), the pool's settings and its login tokens.
+// Settings: the pool (this node, its secret and its members), the pool's settings and its login tokens.
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { useAction, useValue } from "./hooks";
-import { joinStateOf, type JoinState } from "./join-state";
 import { tokenText, type PoolRef } from "./Pool";
 
 export function Settings({ pool }: { pool: PoolRef }) {
@@ -18,20 +17,26 @@ export function Settings({ pool }: { pool: PoolRef }) {
 
 function PoolSection({ pool }: { pool: PoolRef }) {
   const poolId = useValue(pool.poolId);
+  const poolName = useValue(pool.poolName);
   const selfId = useValue(pool.self);
   const nodes = useValue(pool.nodes);
   const self = nodes.find((n) => n.nodeId === selfId);
-  const joinState = joinStateOf(nodes, selfId);
-  const remove = useAction();
+  const action = useAction();
   return (
     <>
       <h3>Pool</h3>
       <dl>
         <dt>This node</dt><dd title={selfId}>{shortId(selfId)} ({self?.hostname ?? "?"})</dd>
-        <dt>Pool id</dt><dd><code>{poolId}</code></dd>
+        <dt>Pool</dt>
+        <dd>{poolId === "" ? <span class="error">no secret set</span> : <>{poolName} <code>{poolId}</code></>}</dd>
       </dl>
+      <p class="muted">
+        {poolId === ""
+          ? <>This node is alone until a pool secret is set on it: run <code>meddle pool secret</code> there, with the same secret as on the other nodes.</>
+          : <>Every node given this pool's name and secret (<code>meddle pool secret</code>) finds the others through the lighthouse and is a member once it proves the secret to them. The secret itself never passes through the dashboard.</>}
+      </p>
       <h3>Members</h3>
-      {remove.error !== null && <p class="error">{remove.error}</p>}
+      {action.error !== null && <p class="error">{action.error}</p>}
       <table>
         <thead><tr><th>Node id</th><th>Hostname</th><th>Status</th><th></th></tr></thead>
         <tbody>
@@ -43,55 +48,26 @@ function PoolSection({ pool }: { pool: PoolRef }) {
               <td>
                 {n.status === "member" && n.nodeId !== selfId && (
                   <button
-                    disabled={remove.busy}
+                    disabled={action.busy}
                     onClick={() => {
-                      if (confirm(`Remove ${n.hostname} (${shortId(n.nodeId)}) from the pool?`)) void remove.run(() => pool.remove({ nodeId: n.nodeId }));
+                      if (confirm(`Remove ${n.hostname} (${shortId(n.nodeId)}) from the pool? It keeps the secret: rotate it to shut the node out for good.`)) {
+                        void action.run(() => pool.remove({ nodeId: n.nodeId }));
+                      }
                     }}
                   >Remove</button>
+                )}
+                {n.status === "removed" && n.nodeId !== selfId && (
+                  <button
+                    disabled={action.busy}
+                    title="Make it a member again, for the whole pool"
+                    onClick={() => void action.run(() => pool.allow({ nodeId: n.nodeId }))}
+                  >Allow again</button>
                 )}
               </td>
             </tr>
           ))}
         </tbody>
       </table>
-      <Invite pool={pool} />
-      <Join pool={pool} state={joinState} />
-    </>
-  );
-}
-
-function Invite({ pool }: { pool: PoolRef }) {
-  const [ticket, setTicket] = useState<string | null>(null);
-  const action = useAction();
-  const invite = () => action.run(async () => { setTicket((await pool.invite({})).ticket); });
-  return (
-    <>
-      <h3>Invite</h3>
-      <p class="muted">A ticket lets one node join this pool, once, within 24 hours.</p>
-      <button disabled={action.busy} onClick={invite}>Create a ticket</button>
-      {action.error !== null && <p class="error">{action.error}</p>}
-      {ticket !== null && <textarea readOnly rows={3} value={ticket} onFocus={(e) => e.currentTarget.select()} />}
-    </>
-  );
-}
-
-function Join({ pool, state }: { pool: PoolRef; state: JoinState }) {
-  const [ticket, setTicket] = useState("");
-  const [joined, setJoined] = useState<string | null>(null);
-  const action = useAction();
-  const join = () => action.run(async () => {
-    const result = await pool.join({ ticket: ticket.trim() });
-    setJoined(`Joined pool ${result.poolId} (${result.members} members).`);
-    setTicket("");
-  });
-  return (
-    <>
-      <h3>Join another pool</h3>
-      {state.hint !== null && <p class="muted">{state.hint}</p>}
-      <textarea rows={3} value={ticket} disabled={state.blocked} placeholder="meddle1…" onInput={(e) => setTicket(e.currentTarget.value)} />
-      <button disabled={state.blocked || action.busy || ticket.trim() === ""} onClick={join}>Join</button>
-      {action.error !== null && <p class="error">{action.error}</p>}
-      {joined !== null && <p>{joined}</p>}
     </>
   );
 }

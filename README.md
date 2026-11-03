@@ -6,8 +6,8 @@ Claude Code session running in auto mode, which you watch, approve, interrupt an
 the fidelity of sitting at that machine's terminal. The services find each other and form one pool, sharing one
 set of Claude logins and each project's memory, and a task can move between machines without losing its conversation.
 
-Status: Plan 4, settings, tokens, placement, archive and spawn. Nodes form a pool over iroh: they find each other
-through a lighthouse, share their settings and an ordered list of login tokens (a turn whose login hits a limit
+Status: Plan 4, settings, tokens, placement, archive and spawn. Nodes given one pool secret form a pool over iroh:
+they find each other through a lighthouse and prove the secret to each other, share their settings and an ordered list of login tokens (a turn whose login hits a limit
 switches to the next), and the dashboard of any node shows every node and opens its tasks. meddle places a new task
 on a node unless you name one, a task may have no project, and `spawn` creates a task and sends its first prompt in
 one command. A project's repo and memory follow its tasks to whichever node they run on, a task moves between nodes
@@ -127,8 +127,9 @@ leave in `secrets/tokens`: a half-written `*.tmp` and the value of a removed tok
 
 ## Pool
 
-Every node is in a pool. On its first `serve` a node creates a pool of its own; other nodes join it with an invite
-ticket.
+A pool is a name and a secret. Every node given the same name and secret (`meddle pool secret`, below) is in the same
+pool: it finds the others through the lighthouse and proves the secret to each of them. Until a secret is set a node
+is alone: it dials nobody and admits nobody, and its dashboard and tasks work on their own.
 
 ### Node ids
 
@@ -141,56 +142,84 @@ node <node id>
 dashboard at http://127.0.0.1:7777/
 ```
 
-`status` prints `node <node id>`, or `node (none yet)` before the key exists, and `pool <pool id> members <n>`, or
-`pool (none yet)` before the node first served. It creates neither the key nor the database.
+`status` prints `node <node id>`, or `node (none yet)` before the key exists, and `pool <pool id> (<name>) members
+<n>`, `pool (no secret set)` before `pool secret` ran, or `pool (none yet)` before the node first served. It creates
+neither the key nor the database.
 
-### Invite and join
-
-With both nodes running:
+### The pool secret
 
 ```sh
-bun run src/cli.ts invite          # on a node in the pool: prints a ticket, meddle1…
-bun run src/cli.ts join <ticket>   # on the new node: prints "joined pool <short id> with <n> nodes"
+bun run src/cli.ts pool secret --generate <path>   # a new secret, written to that file (mode 600) and set here
+bun run src/cli.ts pool secret --file <path>       # the same file, copied to each other node
+bun run src/cli.ts pool secret [--name <name>]     # or a secret of your own, pasted on stdin, then Ctrl-D
 ```
 
-A ticket is valid for 24 hours and admits one node, once. It carries only a one-time code and the inviting node's
-address, never the pool secret: the joining node connects to the inviter over iroh, and the pool id, the pool secret
-and the roster come back in the inviter's reply, inside that encrypted connection.
+prints `pool <short id> (<name>)`. The secret and the name (`default` unless given; 1 to 64 letters, digits, `.`, `_`
+or `-`) derive the pool: the secret, stretched with scrypt (128 MiB, about a quarter of a second) under the versioned
+topic name, derives the lighthouse topic, an ed25519 keypair, and its public key is the pool id, which `status`, the
+dashboard and the pool's topic show and which is safe to log. That id is public, so the secret must not be guessable
+from it: use the generated one (32 random bytes), or at least 16 characters of your own (no control characters, at
+most 4096). The same name and secret give the same id on every machine; never pass the secret as an argument. Run
+it on each node, with or without the node running: the command writes the node's database directly (the secret
+never crosses the node's socket, as a token never does) and tells the running node, which re-keys at once: every
+connection is closed (whoever is in the new pool proves its secret afresh), the roster starts over with this node
+alone, and discovery moves to the new topic. The same secret again changes nothing. The node's settings and tokens
+stay, and merge with the pool's like any member's. A new secret on the nodes you keep is how a node is shut out of
+the pool for good; Remove (below) is for the meantime, and neither takes back the login tokens the node pulled while
+it was a member: revoke or reissue those too (`claude setup-token` again, `token remove` the old one).
 
-A node that shares its pool with other members cannot join another; remove them first. A node alone in its pool (as
-after its first start) gives that pool up when it joins, along with any tickets it issued for it. The dashboard's
-Settings view creates tickets and joins with one too.
+Two nodes with the secret find each other through the lighthouse (below). Without one, tell the node with the
+smaller id the other's id (or both nodes each other's): `pool peer <node id>` records it here as a member at once,
+listed and counted as one, with or without the node running, so that this node dials it when it is the one to dial
+(iroh resolves an id by DNS under the `n0` preset; not under `minimal`). The other node still has to prove the
+secret before anything passes between them.
 
 ### Discovery
 
-Members find each other's current addresses through an iroh-lighthouse, the hosted `https://iroh.ichor.io` by
-default (`MEDDLE_LIGHTHOUSE_URL` names another). Each node announces itself on a topic derived from the pool id and
-the pool secret, so only holders of the secret can announce on it or look it up. An announce asks for 300 s and is
-renewed at half the time the lighthouse grants; a node looks the topic up every `MEDDLE_DISCOVERY_POLL_MS`. Only
-addresses of nodes the roster lists as members are used.
+Nodes find each other through an iroh-lighthouse, the hosted `https://iroh.ichor.io` by default
+(`MEDDLE_LIGHTHOUSE_URL` names another). Each node announces itself on the pool's topic, signed with the topic key,
+and looks the topic up: only holders of the secret can do either, so every node the lighthouse lists is dialled (by
+the one of the two with the smaller id) and is a member once the two have proved the secret to each other; a node
+the roster has as removed is left alone, and one that leaves the topic before it proved anything is dropped again.
+An announce asks for 300 s and is renewed at half the time the lighthouse grants; a node looks the topic up every
+`MEDDLE_DISCOVERY_POLL_MS`. The lighthouse is only ever a hint: a node it lists that does not prove the secret is
+refused, so a lighthouse of someone else's cannot add a member.
 
 If the lighthouse is unreachable the node still starts; it retries with backoff and logs each distinct error at most
 once a minute. Set `MEDDLE_LIGHTHOUSE_URL=` (empty) to turn discovery off: nodes then reach each other at the
-addresses recorded in the roster, and a joining node at the address in its ticket.
+addresses recorded in the roster, and a new node is told of with `pool peer`.
 
 ### Connections and removal
 
-Nodes talk over iroh: QUIC, encrypted end to end, through iroh's relays when there is no direct path. A node accepts
-pool connections only from nodes its roster lists as members, and closes any other before reading from it. Of two
-members, the one with the smaller node id dials and the other accepts. When a node cannot reach a member (a dial
-fails or is not answered, the member keeps refusing it, or it cannot read the member's pool state) it logs why, as
-`meddle: pool: …`, each distinct message at most once a minute; a healthy pool logs nothing.
+Nodes talk over iroh: QUIC, encrypted end to end, through iroh's relays when there is no direct path. A connection
+opens with a proof of the pool secret each way, one line on a one-way stream: the dialer's first, then the
+acceptor's, each the topic key's signature over the two node ids (iroh authenticates the ids, so a proof is good for
+that pair, that way, and nothing else). The acceptor refuses, before reading anything else, a dialer that sends no
+proof or another pool's (`bad proof`), any dialer while it has no secret itself (`no pool secret`), and a node its
+roster has as removed (`removed <time>`); the dialer closes an acceptor that does not prove the secret and logs
+`<short id> did not prove the pool secret`. The acceptor proves itself before it gives a verdict, and a dialer takes
+a refusal as the peer's word only from a peer that proved the secret (one closed before proving is logged as a
+failed dial); a removal dated more than five minutes ahead of this node's clock is ignored. A node that proves the
+secret and was never heard of becomes a member here on the spot, named by its short id until its own row arrives
+with the first sync. Of two members, the one with
+the smaller node id dials and the other accepts. When a node cannot reach a member (a dial fails or is not answered,
+the member keeps refusing it, or it cannot read the member's pool state) it logs why, as `meddle: pool: …`, each
+distinct message at most once a minute; a healthy pool logs nothing.
 
-A member is removed from the dashboard's Settings view (a node cannot remove itself). The removal is a roster change
-every member merges, and every member enforces it: each one closes its connection to the removed node, and refuses
-it when it dials, with the reason `removed <time>`. The removed node learns it was removed from the roster when it is
-connected at the time, or else from that refusal; it then closes its connections, stops announcing, and can be
-invited again. The pool secret is not rotated on removal, so a removed node still knows it.
+A member is removed from the dashboard's Settings view or with `pool remove <id|prefix>` (a node cannot remove
+itself). The removal is a roster change every member merges, and every member enforces it: each one closes its
+connection to the removed node, and refuses it when it dials, with the reason `removed <time>`. The removed node
+learns it was removed from the roster when it is connected at the time, or else from that refusal; it then closes its
+connections and keeps knocking at the members it dials (refused each time, quietly), so that allowing it again (Allow
+again in Settings, or `pool allow <id|prefix>`) takes effect without a restart: the next knock is admitted, and the
+sync over it tells the node it is a member once more. Removal is bookkeeping, not security: a removed node still holds
+the secret, can look the topic up, and with a new node key is simply a new node that proves the secret. A new secret
+on the nodes you keep is the only real revocation.
 
 One known limit: a node removed while it is unreachable learns of it only when it next dials a member, and a node
 dials only members whose ids sort after its own. If its id sorts after every remaining member's, nobody dials it and
-it dials nobody, so it keeps showing itself as a member with every other node offline; it is connected to no one. To
-bring it back, remove the other nodes from its own Settings view, then join it with a new ticket.
+it dials nobody, so it keeps showing itself as a member with every other node offline. Allowing it again brings it
+back all the same: the members then dial it.
 
 ### Tokens
 
@@ -200,14 +229,13 @@ of each token it lists but lacks, by id, from the member that listed it, and del
 removed. A pull that fails (that member has not pulled the value yet, or is unreachable) is tried again at the node's
 next self refresh, every 15 seconds, from an online member that lists the token. A value crosses the network only as the answer to a request from a current member for a token the answering
 node lists, over the encrypted iroh connection. It never goes over the node's localhost socket (the CLI's and the
-dashboard's), and never into a ticket, the roster, the pool's replicated state or a log. A node drops a replicated row
+dashboard's), and never into the roster, the pool's replicated state or a log. A node drops a replicated row
 whose id is not 16 hex characters, whose label is empty, longer than 64 characters or holds control characters, or
 whose status or times are malformed, and logs `meddle: tokens: ignored replicated token "<id>"` once per id. A token
 added while no node is running reaches the pool once that node serves.
 
-Tokens are the logins of the people who added them, not the pool's: a node that joins another pool keeps its tokens,
-and they replicate to the new pool like any member's. The join itself carries none; the joiner pulls the pool's
-tokens like every other member.
+Tokens are the logins of the people who added them, not the pool's: a node given a new pool secret keeps its tokens,
+and they replicate to the new pool like any member's; it pulls the pool's tokens like every other member.
 
 ### Pool settings
 
@@ -240,8 +268,9 @@ meddle sets them itself or because they would let a member take over another nod
 `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_DIR`, `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`, `XDG_CONFIG_HOME`,
 `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `NODE_OPTIONS`, `BASH_ENV`, and every name starting `MEDDLE_`,
 `GIT_CONFIG_KEY_` or `GIT_CONFIG_VALUE_`. `config set` refuses them and any value it cannot take; a node ignores such
-a setting from a peer, logging `meddle: settings: ignored replicated key "<key>"` once per key. A node that joins
-another pool drops its old pool's settings and takes the new pool's.
+a setting from a peer, logging `meddle: settings: ignored replicated key "<key>"` once per key. A node given a new
+pool secret keeps its settings, and they merge with the new pool's by the same rule: on a new pool's first node, set
+the secret first and the settings after, and know that the newest value wins where two nodes set the same key alone.
 
 ### `meddle pool`
 
@@ -634,6 +663,13 @@ refused for a task that is not archived or moved (`task is idle`, …). The book
 
 ## Known limits
 
+- A removed node still holds the pool secret: it can look the pool's topic up and see the members' addresses, it
+  keeps knocking, and with a fresh node key it is a new node that proves the secret. A new secret on the nodes you
+  keep (`pool secret` on each) is the only real revocation, and the login tokens it pulled meanwhile must be revoked
+  or reissued separately.
+- The lighthouse cannot admit anyone, but it chooses whom a node dials and with what address: one that lies can keep
+  a node from reaching members it is not already connected to, and learns which nodes hold the secret, since the
+  dialer's proof goes first.
 - A project's home cannot be moved to another node yet (left for a later plan). While the home is offline, other nodes
   cannot clone its projects, and create tasks of them only from the `trunk` they fetched last; their tasks' turns still run, and their pushes and memory syncs
   are logged and retried at the next turn end.
@@ -694,7 +730,8 @@ Another node's tasks open through the pool: the browser opens `/ws/node/<node id
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an
 offline member 503.
 
-Settings shows this node's id, the pool id, the members (with Remove), invites and joining another pool; then the
+Settings shows this node's id, the pool's name and id (or that no secret is set), the members (with Remove, and
+Allow again on a removed one); then the
 pool settings, as a table of key, value and the node that set it, each with Unset, and a form that sets a key picked
 from `jj.user`, `jj.email`, `lighthouse.url`, `limits.running` or `env.<NAME>` (see [Pool settings](#pool-settings)),
 under a note that every member and its dashboard see these values, so none is for a secret; then the tokens in

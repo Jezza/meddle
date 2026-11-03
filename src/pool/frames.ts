@@ -13,10 +13,8 @@ import type { RecvStream, SendStream } from "@number0/iroh";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** The ALPN of member-to-member connections: bytes of "meddle/0". */
-export const ALPN_POOL: number[] = Array.from(encoder.encode("meddle/0"));
-/** The ALPN of join requests: bytes of "meddle/join/0". */
-export const ALPN_JOIN: number[] = Array.from(encoder.encode("meddle/join/0"));
+/** The ALPN of member-to-member connections: bytes of "meddle/1" (1: the connection opens with proofs of the pool secret). */
+export const ALPN_POOL: number[] = Array.from(encoder.encode("meddle/1"));
 /** The longest line (header or otherwise) a reader accepts, in bytes, without its terminator. */
 export const MAX_LINE = 65_536;
 /** The largest frame payload, in bytes. */

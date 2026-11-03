@@ -74,12 +74,13 @@ test("a task moves from one node to another through the CLI and resumes there", 
     const atB = { ...b.env, MEDDLE_PORT: String(B.port) };
 
     // a pool of two, with a token that reaches B
-    const invited = await meddle(["invite"], atA);
-    expect(invited.code).toBe(0);
-    await until(["status"], atA, /^pool [0-9a-f]+ members 1$/m);
-    const joined = await meddle(["join", invited.stdout.trim()], atB);
-    expect(joined.stderr).toBe("");
-    expect(joined.code).toBe(0);
+    await writeFile(`${a.dir}/secret`, "move-e2e-secret-2026\n");
+    await writeFile(`${b.dir}/secret`, "move-e2e-secret-2026\n");
+    for (const [env, dir] of [[atA, a.dir], [atB, b.dir]] as const) {
+      const set = await meddle(["pool", "secret", "--file", `${dir}/secret`], env);
+      expect(set.stderr).toBe("");
+      expect(set.code).toBe(0);
+    }
     await until(["pool"], atA, new RegExp(`^${shortId(B.id)} \\S+ online `, "m"));
     await writeFile(`${a.dir}/token`, "tok\n");
     expect((await meddle(["token", "set", "--file", `${a.dir}/token`], atA)).code).toBe(0);

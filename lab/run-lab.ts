@@ -182,19 +182,17 @@ async function s1() {
 async function s2() {
   const scn = "s2";
   const m = await mark();
-  const inv1 = await meddle("a", "invite");
-  const ticket = JSON.parse(Buffer.from(inv1.out.replace(/^meddle1/, ""), "base64url").toString());
-  info(scn, "a's ticket address", JSON.stringify(ticket.inviter.direct));
-  const j1 = await meddle("b", "join", inv1.out);
-  check(scn, "b joins via a's ticket", j1.code === 0, `${j1.out || j1.err} (${j1.ms} ms)`);
-  const inv2 = await meddle("b", "invite");
-  const j2 = await meddle("c", "join", inv2.out);
-  check(scn, "c joins via b's ticket", j2.code === 0, `${j2.out || j2.err} (${j2.ms} ms)`);
+  // One secret on every node: each finds the others through the lighthouse and proves the secret to them.
+  for (const n of MEDDLE) {
+    await writeFile(`${S}/nodes/${n}/secret.txt`, "lab-pool-secret-2026\n");
+    const r = await meddle(n, "pool", "secret", "--file", `${S}/nodes/${n}/secret.txt`);
+    check(scn, `${n} takes the pool secret`, r.code === 0, `${r.out || r.err} (${r.ms} ms)`);
+  }
   const ms = await waitFor(async () => {
     for (const n of MEDDLE) if (Object.values(await poolView(n)).filter((s) => s === "online").length !== 3) return false;
     return true;
   }, 30_000);
-  check(scn, "every pool lists the others online", ms !== null, `${secs(ms)} after c joined`);
+  check(scn, "every pool lists the others online", ms !== null, `${secs(ms)} after the last secret was set`);
   for (const n of MEDDLE) info(scn, `pool on ${n}`, (await meddle(n, "pool")).out.replace(/\n/g, " | "));
   const sorted = [...MEDDLE].sort((x, y) => ids[x]!.localeCompare(ids[y]!));
   info(scn, "dial direction (smaller id dials)", `a-c: ${ids.a! < ids.c! ? "a dials c" : "c dials a"}; order ${sorted.join("<")}`);
@@ -238,9 +236,10 @@ async function s4() {
   const add = await meddle("a", "project", "add", repo, "--name", "repo");
   P = add.out;
   check(scn, "project add on a", add.code === 0 && /^[0-9a-f]+$/.test(P), P || add.err);
-  const nt = await meddle("a", "task", "new", "--title", "lab", "--project", P);
-  TID = nt.out;
-  check(scn, "task new on a", nt.code === 0 && /^[0-9a-f]+$/.test(TID), TID || nt.err);
+  // `task <id> on <short id>`: placed on a, the project's home.
+  const nt = await meddle("a", "task", "new", "--title", "lab", "--project", P, "--here");
+  TID = /^task ([0-9a-f]+) on /.exec(nt.out)?.[1] ?? "";
+  check(scn, "task new on a", nt.code === 0 && /^[0-9a-f]+$/.test(TID), nt.out || nt.err);
   await writeFile(`${S}/ids.env`, `P=${P}\nTID=${TID}\n`);
   const t = await turn("a", TID, scn);
   check(scn, "one turn on a", t.ok, `${lastLine(t)} in ${t.ms} ms`);
@@ -604,7 +603,10 @@ async function main() {
   await mkdir(LOGS, { recursive: true });
   await mkdir(`${S}/nodes`, { recursive: true });
   try {
+    // `LAB_SCENARIOS=s1,s2` runs only those (s1 always runs: it brings the lab up).
+    const only = (process.env.LAB_SCENARIOS ?? "").split(",").map((x) => x.trim()).filter(Boolean);
     for (const [name, fn] of [["s1", s1], ["s2", s2], ["s3", s3], ["s4", s4], ["s5", s5], ["s6", s6], ["s7", s7], ["s8", s8], ["s9", s9], ["s10", s10], ["s10b", s10b], ["s11", s11], ["s11b", s11b], ["s12", s12], ["s13", s13]] as const) {
+      if (only.length > 0 && name !== "s1" && !only.includes(name)) continue;
       try {
         await fn();
       } catch (err) {

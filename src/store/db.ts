@@ -43,7 +43,7 @@ const MIGRATIONS = [
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS transcript_uuid
     ON transcript (project_key, session_id, subpath, uuid) WHERE uuid IS NOT NULL`,
-  // The pool this node belongs to: one row.
+  // The pool this node belongs to: one row; pool_id and pool_secret are empty until `meddle pool secret` sets them.
   `CREATE TABLE IF NOT EXISTS pool (
     pool_id TEXT PRIMARY KEY,
     pool_secret TEXT,
@@ -79,12 +79,6 @@ const MIGRATIONS = [
     updated_at TEXT NOT NULL,
     removed INTEGER NOT NULL DEFAULT 0
   )`,
-  `CREATE TABLE IF NOT EXISTS invites (
-    code TEXT PRIMARY KEY,
-    created_at TEXT,
-    expires_at TEXT,
-    used_at TEXT
-  )`,
 ];
 
 /** Columns added to a table after its first release: each is added to a database that lacks it. */
@@ -102,6 +96,8 @@ const ADDED_COLUMNS = [
   // The node an `archived` task was archived on, and when.
   { table: "tasks", column: "archived_on", type: "TEXT" },
   { table: "tasks", column: "archived_at", type: "TEXT" },
+  // The pool's name, which with the secret derives its id; NULL marks a pool of an older meddle (reset at the next start).
+  { table: "pool", column: "name", type: "TEXT" },
 ];
 
 export function openDb(path: string): Database {

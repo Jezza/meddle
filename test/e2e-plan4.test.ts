@@ -121,11 +121,13 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     const atB = { ...b.env, MEDDLE_PORT: String(B.port) };
 
     // a pool of two
-    const invited = await meddle(["invite"], atA);
-    expect(invited.code).toBe(0);
-    const joined = await meddle(["join", invited.stdout.trim()], atB);
-    expect(joined.stderr).toBe("");
-    expect(joined.code).toBe(0);
+    await writeFile(`${a.dir}/secret`, "plan4-e2e-secret\n");
+    await writeFile(`${b.dir}/secret`, "plan4-e2e-secret\n");
+    for (const [env, dir] of [[atA, a.dir], [atB, b.dir]] as const) {
+      const set = await meddle(["pool", "secret", "--file", `${dir}/secret`], env);
+      expect(set.stderr).toBe("");
+      expect(set.code).toBe(0);
+    }
     await until(["pool"], atA, new RegExp(`^${shortId(B.id)} \\S+ online `, "m"));
     await until(["pool"], atB, new RegExp(`^${shortId(A.id)} \\S+ online `, "m"));
 

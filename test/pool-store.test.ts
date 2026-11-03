@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb } from "../src/store/db";
-import { PoolStore, type NodeSummary, type RosterRow, type WireAddr } from "../src/pool/store";
+import { poolKey } from "../src/pool/secret";
+import { PROVISIONAL_AT, PoolStore, type NodeSummary, type RosterRow, type WireAddr } from "../src/pool/store";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -19,14 +20,95 @@ function summary(hostname: string, taskCount: number): NodeSummary {
   return { hostname, version: "0.1.0", claudeCodeVersion: "2.1.0", hostsTasks: true, taskCount, running: 0, limit: 0, projects: [] };
 }
 
-test("ensurePool makes a pool of one and is idempotent", () => {
+test("ensurePool makes an empty pool (no secret) with this node alone, and is idempotent", () => {
   const store = new PoolStore(openDb(":memory:"));
-  const pool = store.ensurePool({ nodeId: A, hostname: "alpha" });
-  expect(pool.poolId).toMatch(/^[0-9a-f]{32}$/);
-  expect(pool.poolSecret).toMatch(/^[0-9a-f]{64}$/);
-  expect(store.ensurePool({ nodeId: A, hostname: "alpha" })).toEqual(pool);
+  const pool = store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  expect(pool).toEqual({ poolId: "", poolName: "default", poolSecret: "", createdAt: t1 });
+  expect(store.hasSecret()).toBe(false);
+  expect(store.ensurePool({ nodeId: A, hostname: "alpha" }, t2)).toEqual(pool);
   expect(store.members().map((r) => r.nodeId)).toEqual([A]);
-  expect(store.row(A)).toMatchObject({ hostname: "alpha", status: "member", addedBy: A });
+  expect(store.row(A)).toMatchObject({ hostname: "alpha", status: "member", addedBy: A, updatedAt: t1 });
+});
+
+test("a pool row of an older meddle (no name) is reset to an empty pool", () => {
+  const db = openDb(":memory:");
+  db.query("INSERT INTO pool (pool_id, pool_secret, created_at) VALUES ('0123', 'old-secret', ?)").run(t1);
+  const store = new PoolStore(db);
+  expect(store.ensurePool({ nodeId: A, hostname: "alpha" }, t2)).toEqual({ poolId: "", poolName: "default", poolSecret: "", createdAt: t2 });
+});
+
+const SECRET = "correct-horse-battery-staple";
+
+test("setSecret derives the pool id from the name and the secret and starts the roster over with this node", () => {
+  const store = new PoolStore(openDb(":memory:"));
+  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  store.upsert(row(B, "member", t1));
+  store.upsert(row(C, "removed", t1));
+  // Even this node's own row starts over: it is a member of the new pool from now, whatever the old pool said.
+  store.remove(A, t1);
+  const pool = store.setSecret({ nodeId: A, hostname: "alpha" }, "lab", SECRET, t2);
+  expect(pool).toEqual({ poolId: poolKey("lab", SECRET).id, poolName: "lab", poolSecret: SECRET, createdAt: t2 });
+  expect(pool.poolId).toMatch(/^[0-9a-f]{64}$/);
+  expect(store.hasSecret()).toBe(true);
+  expect(store.roster().map((r) => r.nodeId)).toEqual([A]);
+  expect(store.row(A)).toMatchObject({ hostname: "alpha", status: "member", updatedAt: t2, addedBy: A });
+  // The same name and secret give the same id anywhere; another secret another id.
+  expect(new PoolStore(openDb(":memory:")).setSecret({ nodeId: B, hostname: "beta" }, "lab", SECRET, t3).poolId).toBe(pool.poolId);
+  // The same secret again changes nothing: the roster stays.
+  store.upsert(row(B, "member", t3));
+  expect(store.setSecret({ nodeId: A, hostname: "alpha" }, "lab", SECRET, t4)).toEqual(pool);
+  expect(store.roster().map((r) => r.nodeId)).toEqual([A, B]);
+  expect(store.setSecret({ nodeId: A, hostname: "alpha" }, "lab", "other-secret-of-sixteen", t3).poolId).not.toBe(pool.poolId);
+  expect(store.roster().map((r) => r.nodeId)).toEqual([A]);
+  // On a database with no pool row yet (the CLI before the first serve), setSecret makes one.
+  const fresh = new PoolStore(openDb(":memory:"));
+  expect(fresh.setSecret({ nodeId: A, hostname: "alpha" }, "lab", SECRET, t2)).toEqual(pool);
+  expect(fresh.row(A)).toMatchObject({ status: "member", updatedAt: t2 });
+});
+
+test("resetRoster leaves this node alone, a member from now; an older meddle's pool row reads as no secret", () => {
+  const db = openDb(":memory:");
+  const store = new PoolStore(db);
+  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  store.upsert(row(B, "member", t1));
+  store.remove(A, t2);
+  store.resetRoster({ nodeId: A, hostname: "alpha" }, t3);
+  expect(store.roster()).toEqual([{ ...row(A, "member", t3), hostname: "alpha" }]);
+  const old = openDb(":memory:");
+  old.query("INSERT INTO pool (pool_id, pool_secret, created_at) VALUES ('0123', 'old-secret', ?)").run(t1);
+  expect(new PoolStore(old).pool()).toEqual({ poolId: "", poolName: "default", poolSecret: "", createdAt: t1 });
+  expect(new PoolStore(old).hasSecret()).toBe(false);
+});
+
+test("ensureMember gives an unknown node a provisional member row that any row it sends of itself replaces", () => {
+  const store = new PoolStore(openDb(":memory:"));
+  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  expect(store.ensureMember(B, A)).toBe("member");
+  expect(store.row(B)).toEqual({
+    nodeId: B, hostname: B.slice(0, 10), status: "member", updatedAt: PROVISIONAL_AT, addedBy: A,
+    summary: null, lastSeenAt: null, lastAddr: null,
+  });
+  expect(store.ensureMember(B, A)).toBe("member");
+  expect(store.merge([row(B, "member", t1, { hostname: "beta" })])).toBe(true);
+  expect(store.row(B)).toMatchObject({ hostname: "beta", updatedAt: t1 });
+  store.remove(B, t2);
+  expect(store.ensureMember(B, A)).toBe("removed");
+  expect(store.row(B)!.status).toBe("removed");
+});
+
+test("allow makes a removed node a member again, never older than its removal", () => {
+  const store = new PoolStore(openDb(":memory:"));
+  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  expect(store.allow(B, t2)).toBe(false);
+  store.upsert(row(B, "member", t1));
+  store.remove(B, t3);
+  expect(store.allow(B, t2)).toBe(true);
+  expect(store.row(B)).toMatchObject({ status: "member", updatedAt: "2026-10-31T03:00:00.001Z" });
+  // The removal row, sent back by a peer, cannot undo it.
+  expect(store.merge([row(B, "removed", t3)])).toBe(false);
+  expect(store.isMember(B)).toBe(true);
+  expect(store.allow(B, t4)).toBe(true);
+  expect(store.row(B)!.updatedAt).toBe(t4);
 });
 
 test("merge is last-writer-wins per node and never resurrects a removed node", () => {
@@ -82,29 +164,4 @@ test("seen updates summary, lastSeenAt and lastAddr without touching updatedAt; 
   expect(store.row(B)).toEqual(before);
   expect(store.merge([{ ...before, lastSeenAt: t4, summary: summary("beta", 9), lastAddr: null }])).toBe(true);
   expect(store.row(B)).toEqual({ ...before, lastSeenAt: t4, summary: summary("beta", 9), lastAddr: null });
-});
-
-test("replacePool swaps the identity and the roster wholesale", () => {
-  const store = new PoolStore(openDb(":memory:"));
-  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
-  store.upsert(row(C, "member", t1));
-  const stale = store.createInvite();
-  store.replacePool({ poolId: "p2", poolSecret: "s2", createdAt: t2 }, [row(A, "member", t2), row(B, "member", t2)]);
-  expect(store.pool()).toEqual({ poolId: "p2", poolSecret: "s2", createdAt: t2 });
-  expect(store.pool().poolId).toBe("p2");
-  expect(store.roster()).toHaveLength(2);
-  expect(store.row(C)).toBeNull();
-  expect(store.consumeInvite(stale.code)).toBe(false);
-});
-
-test("invites are single use and expire after 24 hours", () => {
-  const store = new PoolStore(openDb(":memory:"));
-  const { code, expiresAt } = store.createInvite(new Date("2026-10-31T00:00:00Z"));
-  expect(code).toMatch(/^[A-Za-z0-9_-]{43}$/);
-  expect(expiresAt).toBe("2026-11-01T00:00:00.000Z");
-  expect(store.consumeInvite(code, new Date("2026-10-31T01:00:00Z"))).toBe(true);
-  expect(store.consumeInvite(code, new Date("2026-10-31T01:00:00Z"))).toBe(false);
-  const late = store.createInvite(new Date("2026-10-31T00:00:00Z"));
-  expect(store.consumeInvite(late.code, new Date("2026-11-01T00:00:01Z"))).toBe(false);
-  expect(store.consumeInvite("nope")).toBe(false);
 });

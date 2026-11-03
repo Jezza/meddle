@@ -1,7 +1,7 @@
 // test/pool-e2e.test.ts — two `meddle serve` processes form a pool through the CLI, finding each other only through a
 // (fake) lighthouse.
 import { test, expect } from "bun:test";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { createHost, webSocketLink } from "@earendil-works/chord";
 import { Database } from "bun:sqlite";
 import { shortId } from "../src/pool/identity";
@@ -43,7 +43,7 @@ async function until(args: string[], env: Record<string, string>, pattern: RegEx
   throw new Error(`meddle ${args.join(" ")} never matched ${pattern}; last output:\n${last}`);
 }
 
-test("two nodes form a pool: invite, join, replicate a token, and tunnel a dashboard link", async () => {
+test("two nodes given one secret form a pool through the lighthouse, replicate a token, and tunnel a dashboard link", async () => {
   const lighthouse = await startFakeLighthouse();
   const a = await home(lighthouse.url);
   const b = await home(lighthouse.url);
@@ -56,22 +56,23 @@ test("two nodes form a pool: invite, join, replicate a token, and tunnel a dashb
     const atA = { ...a.env, MEDDLE_PORT: String(A.port) };
     const atB = { ...b.env, MEDDLE_PORT: String(B.port) };
 
-    const invited = await meddle(["invite"], atA);
-    expect(invited.stderr).toBe("");
-    expect(invited.code).toBe(0);
-    expect(invited.stdout).toMatch(/^meddle1\S+\n$/);
-
-    const poolId = (await until(["status"], atA, /^pool ([0-9a-f]+) members 1$/m))[1]!;
-    const joined = await meddle(["join", invited.stdout.trim()], atB);
-    expect(joined.stderr).toBe("");
-    expect(joined.code).toBe(0);
-    expect(joined.stdout).toBe(`joined pool ${shortId(poolId)} with 2 nodes\n`);
+    expect((await meddle(["status"], atA)).stdout).toContain("pool (no secret set)\n");
+    await writeFile(`${a.dir}/secret`, "e2e-pool-secret-2026\n");
+    await writeFile(`${b.dir}/secret`, "e2e-pool-secret-2026\n");
+    const setA = await meddle(["pool", "secret", "--file", `${a.dir}/secret`], atA);
+    expect(setA.stderr).toBe("");
+    expect(setA.code).toBe(0);
+    const poolId = (await until(["status"], atA, /^pool ([0-9a-f]{64}) \(default\) members 1$/m))[1]!;
+    expect(setA.stdout).toBe(`pool ${shortId(poolId)} (default)\n`);
+    // The same secret on B puts it in the same pool: same id, found through the lighthouse, proved to each other.
+    const setB = await meddle(["pool", "secret", "--file", `${b.dir}/secret`], atB);
+    expect(setB).toEqual({ stdout: `pool ${shortId(poolId)} (default)\n`, stderr: "", code: 0 });
 
     const listing = await until(["pool"], atA, new RegExp(`^${shortId(B.id)} \\S+ online meddle \\S+ claude \\S+ tasks 0$`, "m"));
     const lines = listing.input.trim().split("\n");
     expect(lines).toHaveLength(2);
     expect(lines).toContainEqual(expect.stringMatching(new RegExp(`^${shortId(A.id)} \\S+ online meddle \\S+ claude \\S+ tasks 0 \\(this node\\)$`)));
-    await until(["status"], atB, new RegExp(`^pool ${poolId} members 2$`, "m"));
+    await until(["status"], atB, new RegExp(`^pool ${poolId} \\(default\\) members 2$`, "m"));
     // both announce the pool's topic
     for (let i = 0; ![...lighthouse.topics().values()].some((t) => t.has(A.id) && t.has(B.id)); i++) {
       if (i === 80) throw new Error("the nodes never announced one topic");
@@ -105,6 +106,34 @@ test("two nodes form a pool: invite, join, replicate a token, and tunnel a dashb
     for (const s of stopped) expect(s).toEqual({ code: 0, stderr: "" });
   }
 }, 60_000);
+
+test("pool secret --generate writes a new 600 file and sets the pool; --file elsewhere gives the same id; a short secret is refused", async () => {
+  const { dir, env } = await home("");
+  const offline = { ...env, MEDDLE_PORT: String(await closedPort()) };
+  const generated = await meddle(["pool", "secret", "--generate", `${dir}/pool-secret`], offline);
+  expect(generated.stderr).toBe("");
+  expect(generated.code).toBe(0);
+  const [, short] = /^pool ([0-9a-f]{10}) \(default\)\nsecret written to \S+; copy it to the other nodes \(meddle pool secret --file <path>\)\n$/.exec(generated.stdout) ?? [];
+  expect(short).toBeDefined();
+  const file = await readFile(`${dir}/pool-secret`, "utf8");
+  expect(file).toMatch(/^[A-Za-z0-9_-]{43}\n$/);
+  expect((await stat(`${dir}/pool-secret`)).mode & 0o777).toBe(0o600);
+  expect(generated.stdout).not.toContain(file.trim());
+  // Never over an existing file.
+  const again = await meddle(["pool", "secret", "--generate", `${dir}/pool-secret`], offline);
+  expect(again.code).toBe(1);
+  expect(again.stderr).toContain("EEXIST");
+  // The same file on another node: the same pool.
+  const other = await home("");
+  const set = await meddle(["pool", "secret", "--file", `${dir}/pool-secret`], { ...other.env, MEDDLE_PORT: offline.MEDDLE_PORT });
+  expect(set).toEqual({ stdout: `pool ${short} (default)\n`, stderr: "", code: 0 });
+  const status = await meddle(["status"], other.env);
+  expect(status.stdout).toMatch(new RegExp(`^pool ${short}[0-9a-f]{54} \\(default\\) members 1$`, "m"));
+  // A short one, or one as an argument, is refused.
+  await writeFile(`${dir}/weak`, "hunter2\n");
+  expect(await meddle(["pool", "secret", "--file", `${dir}/weak`], offline)).toEqual({ stdout: "", stderr: "meddle: the secret is shorter than 16 characters (use --generate)\n", code: 1 });
+  expect((await meddle(["pool", "secret", "this-is-a-long-enough-secret"], offline)).code).toBe(2);
+});
 
 test("token set without a running node writes the token and says so", async () => {
   const { dir, env } = await home("");

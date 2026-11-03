@@ -139,11 +139,16 @@ Data flows:
 **Identity.** Each node has an iroh secret key persisted in its data
 directory. Its endpoint id is its name in the pool.
 
-**Membership is closed and explicit.** A pool starts with one node. Another
-node joins with a ticket produced by a member (`meddle invite` prints an
-iroh ticket; `meddle join <ticket>` on the newcomer). The member admits the
-newcomer's endpoint id to the roster, and the roster replicates. A node
-accepts streams only from roster members. Removal is an edit to the roster.
+**Membership is the secret.** (Revised 2026-11-03; the first version admitted
+nodes by invite ticket, which duplicated what the lighthouse's topic key
+already proves.) A pool is a name and a secret, set on each node with
+`meddle pool secret`. Both derive the lighthouse topic's keypair; the topic's
+public key is the pool id. A connection between two nodes opens with a proof
+of the secret each way, the topic key's signature over the two endpoint ids,
+and a node that proves it is a member: its row joins the roster, which
+replicates. A node accepts streams only from nodes that proved the secret
+and are not removed. Removal is an edit to the roster, for the meantime; the
+real revocation is a new secret on the nodes that stay.
 
 **Discovery** is the author's own iroh-lighthouse
 (https://github.com/Jezza/iroh-lighthouse): a rendezvous server where a node
@@ -157,8 +162,10 @@ against the author's hosted instance by default and a self-hosted one by
 configuration. Dialing then uses iroh's n0 preset, relays and DNS, so a node
 is reachable by id from anywhere and directly on a LAN.
 
-The lighthouse tells a node who is on the topic; the roster says who is
-allowed in. Both must agree before a stream is accepted.
+The lighthouse tells a node who is on the topic, and is only a hint: every
+node it lists is dialled, and counts only once it proved the secret, so a
+lighthouse of someone else's cannot add a member. The roster records who
+proved it and who was removed.
 
 **Transport.** Three ALPNs on the one endpoint, names illustrative:
 
@@ -632,7 +639,7 @@ are the cost and no rewrite helps.
 
 ## 15. Security
 
-- Peers: closed roster by endpoint id, invitation by ticket, iroh encryption
+- Peers: a shared secret proved on every connection (the topic key's signature over both endpoint ids), a roster of the nodes that proved it, removal in the roster, iroh encryption
   in transit.
 - Token: as section 11.
 - Transcripts hold everything a tool printed, credentials included, in
@@ -717,7 +724,7 @@ Reasonable defaults, stated so they can be rejected:
 - Dashboard framework and transcript renderer; how diffs are produced for
   Claude Code's `Edit` and `Write` results.
 - Metrics collection and threshold configuration.
-- CLI surface: `meddle serve`, `invite`, `join`, `project add`, `task new`,
+- CLI surface: `meddle serve`, `pool secret`, `project add`, `task new`,
   `token set`, `status`; packaging as a single `bun build --compile` binary
   and a systemd unit.
 - Test strategy: real Claude Code sessions on Haiku for the engine seam,

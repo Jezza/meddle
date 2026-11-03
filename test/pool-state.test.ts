@@ -1,10 +1,9 @@
-// test/pool-state.test.ts — the pool runtime behind a node host: PoolObject, joining, the tokens and removal.
+// test/pool-state.test.ts — the pool runtime behind a node host: PoolObject, linking up, the tokens, removal and allowing again.
 import { test, expect } from "bun:test";
 import { hostname } from "node:os";
 import { SecretKey } from "@number0/iroh";
 import type { Host } from "@earendil-works/chord";
 import { hexOf, shortId } from "../src/pool/identity";
-import { decodeTicket, joinPool } from "../src/pool/invite";
 import { PeerClosed, PoolNet } from "../src/pool/net";
 import { fromEndpoint, openEndpoint } from "../src/pool/net";
 import { PoolStore } from "../src/pool/store";
@@ -15,7 +14,7 @@ import { addToken, markToken, removeToken, tokenId, tokenValue } from "../src/to
 import { VERSION } from "../src/version";
 import { initColocated } from "../src/jj";
 import { addProjectFromFolder } from "../src/projects/project";
-import { linkClient, peerReady, poolSummaryOf, startPoolNode, testNode, twoPoolNodes } from "./pool-helpers";
+import { POOL_KEY, linkClient, linkNodes, peerReady, poolSummaryOf, proofDeps, startPoolNode, testNode, twoPoolNodes } from "./pool-helpers";
 import { join as joinPath } from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
 import { paths } from "../src/config";
@@ -85,10 +84,9 @@ async function withNodes(count: number, run: (nodes: Viewed[]) => Promise<void>)
   }
 }
 
-/** `joiner` joins the pool of `inviter` through their PoolObjects. */
-async function join(inviter: Viewed, joiner: Viewed): Promise<{ poolId: string; members: number }> {
-  const { ticket } = await inviter.pool.invite({});
-  return joiner.pool.join({ ticket });
+/** Gives each node the other as a member with its address (both hold the test pool's secret). */
+function join(a: Viewed, b: Viewed): Promise<void> {
+  return linkNodes(a.node, b.node);
 }
 
 /** A `removed <updatedAt>` close or refusal from `peer`. */
@@ -101,7 +99,7 @@ function onlineOn(viewer: Viewed, other: Viewed): Promise<unknown> {
   return until(viewer.pool.nodes, (rows) => rows.some((r) => r.nodeId === other.node.id && r.online));
 }
 
-test("PoolObject shows a pool of one, invites, and a joined node appears online on both", async () => {
+test("PoolObject shows a pool of one, and a linked node that proved the secret appears online on both", async () => {
   await withNodes(2, async ([a, b]) => {
     const A = a!.node;
     const B = b!.node;
@@ -115,11 +113,16 @@ test("PoolObject shows a pool of one, invites, and a joined node appears online 
     const nodeA = await a!.client.get(NodeObject, {});
     expect(nodeA.nodeId.value).toBe(A.identity.id);
 
-    expect(await join(a!, b!)).toEqual({ poolId: poolA.poolId.value, members: 2 });
+    expect(poolA.poolId.value).toBe(POOL_KEY.id);
+    expect(poolA.poolName.value).toBe("default");
+    await join(a!, b!);
     await onlineOn(a!, b!);
     await onlineOn(b!, a!);
     expect(A.store.pool().poolSecret).toBe(B.store.pool().poolSecret);
     expect(b!.pool.poolId.value).toBe(poolA.poolId.value);
+    // Each learnt the other's hostname from the row it sends of itself.
+    await until(poolA.nodes, (rows) => rows.some((r) => r.nodeId === B.id && r.hostname === hostname() && r.status === "member"));
+    expect(A.store.row(B.id)).toMatchObject({ addedBy: B.id });
     expect(poolA.mixedVersions.value).toBe(false);
     // A healthy pool logs nothing.
     expect([...A.logs, ...B.logs]).toEqual([]);
@@ -212,11 +215,11 @@ test("the dashboard's settings show who set each one", async () => {
   });
 }, 15_000);
 
-test("a removed node is cut off, sees itself removed, and may join again", async () => {
+test("a removed node is cut off, sees itself removed, and comes back once it is allowed again", async () => {
   await withNodes(3, async ([a, b, c]) => {
     const [A, B, C] = [a!.node, b!.node, c!.node];
     await join(a!, b!);
-    expect(await join(a!, c!)).toEqual({ poolId: a!.pool.poolId.value, members: 3 });
+    await join(a!, c!);
     const all = [A, B, C];
     const fullyLinked = () => all.every((n) => all.every((m) => m === n || n.net.isOnline(m.id)));
     await eventually(fullyLinked);
@@ -227,14 +230,14 @@ test("a removed node is cut off, sees itself removed, and may join again", async
     await eventually(() => B.store.row(C.id)?.status === "removed" && !B.net.isOnline(C.id) && !C.net.isOnline(B.id));
     await until(c!.pool.nodes, (rows) => rows.some((r) => r.nodeId === C.id && r.status === "removed"));
     expect(C.net.online()).toEqual([]);
-    // A removed node has no pool to invite anyone into.
-    expect(() => C.pool.invite()).toThrow("this node is not a member of a pool");
     // B was not removed: it still counts itself a member and keeps its link with A.
     expect(B.store.isMember(B.id)).toBe(true);
     expect(B.net.isOnline(A.id)).toBe(true);
 
-    expect(await join(a!, c!)).toEqual({ poolId: a!.pool.poolId.value, members: 3 });
-    await eventually(() => B.store.isMember(C.id) && fullyLinked());
+    await a!.pool.allow({ nodeId: C.id });
+    await eventually(() => B.store.isMember(C.id) && C.store.isMember(C.id) && fullyLinked());
+    await expect(a!.pool.allow({ nodeId: A.id })).rejects.toThrow("a node cannot allow itself");
+    await expect(a!.pool.allow({ nodeId: "d".repeat(64) })).rejects.toThrow("is not in this pool");
   });
 }, 15_000);
 
@@ -262,14 +265,21 @@ test("a node removed while it was offline learns it from the refusal when it com
       const refusals = () => errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === A.id);
       await eventually(() => B.store.row(B.id)?.status === "removed");
       expect(back.net.online()).toEqual([]);
-      expect(refusals()).toHaveLength(1);
+      // Learnt from the first refusal; the knock after it may have been refused already.
+      expect(refusals().length).toBeGreaterThanOrEqual(1);
       expect(refusals()[0]!.reason).toMatch(/^closed by peer: removed \S+ \(code 1\)$/);
       expect(logs).toEqual([`meddle: pool: ${shortId(A.id)} says this node was removed from the pool at ${B.store.row(B.id)!.updatedAt}; it has left the pool`]);
-      // Past the 1 s and 2 s redial delays: B stopped dialing A.
+      // Past the 1 s and 2 s redial delays: B keeps knocking, and nothing more is logged.
       await Bun.sleep(2500);
-      expect(refusals()).toHaveLength(1);
+      expect(refusals().length).toBeGreaterThanOrEqual(2);
+      expect(logs).toHaveLength(1);
       expect(A.net.isOnline(B.id)).toBe(false);
       expect(A.store.isMember(A.id)).toBe(true);
+
+      // Allowed again on A, B's next knock is admitted and the sync tells it so.
+      await a.pool.allow({ nodeId: B.id });
+      await eventually(() => back!.net.isOnline(A.id) && B.store.isMember(B.id));
+      expect(logs).toHaveLength(1);
     } finally {
       await back?.stop();
     }
@@ -283,25 +293,21 @@ test("a member that did not do the removing closes the removed node's live conne
     await onlineOn(a!, b!);
     await onlineOn(b!, a!);
 
-    // C joins through A but is only a bare connection manager: it never syncs, so it can neither learn its removal
-    // nor leave on its own, and only the members can close its connections.
+    // C holds the secret and is linked to A and B, but is only a bare connection manager: it never syncs, so it can
+    // neither learn its removal nor leave on its own, and only the members can close its connections.
     const c = await testNode();
     const C = c.identity.id;
-    const store = new PoolStore(openDb(":memory:"));
-    store.ensurePool({ nodeId: C, hostname: "bare-c" });
     const errors: unknown[] = [];
     const net = new PoolNet({
-      endpoint: c.endpoint, selfId: C, isMember: () => true, onJoin: async (conn) => conn.close(0n, []),
+      endpoint: c.endpoint, selfId: C, ...proofDeps(C),
       onError: (err) => errors.push(err), backoff: { initialMs: 50, maxMs: 200 },
     });
     try {
-      const { ticket } = await a!.pool.invite({});
-      const joined = await joinPool(decodeTicket(ticket), {
-        endpoint: c.endpoint, store, identity: c.identity,
-        summary: () => ({ hostname: "bare-c", version: VERSION, claudeCodeVersion: "2.1.314", hostsTasks: false, taskCount: 0, running: 0, limit: 0, projects: [] }),
-      });
+      await A.pool.addPeer(fromEndpoint(c.endpoint));
+      await B.pool.addPeer(fromEndpoint(c.endpoint));
       net.start();
-      for (const addr of joined.addrs) net.offerAddress(addr);
+      net.offerAddress(fromEndpoint(A.pool.endpoint));
+      net.offerAddress(fromEndpoint(B.pool.endpoint));
       net.watch(A.id);
       net.watch(B.id);
       await eventually(() => net.isOnline(A.id) && net.isOnline(B.id) && B.net.isOnline(C));
@@ -317,7 +323,7 @@ test("a member that did not do the removing closes the removed node's live conne
   });
 }, 15_000);
 
-test("a re-joined node refused as removed by a member that has not merged the re-join stays a member", async () => {
+test("a node allowed again, refused as removed by a member that has not merged that, stays a member", async () => {
   await withNodes(3, async ([a, x, y]) => {
     // C dials B (the smaller id dials), so C's dial can reach B before B hears of the re-join.
     const [c, b] = [x!, y!].sort((p, q) => (p.node.id < q.node.id ? -1 : 1)) as [Viewed, Viewed];
@@ -330,21 +336,23 @@ test("a re-joined node refused as removed by a member that has not merged the re
     await a!.pool.remove({ nodeId: C.id });
     await eventually(() => B.store.row(C.id)?.status === "removed" && !C.store.isMember(C.id) && C.net.online().length === 0);
 
-    // B stops merging rosters, so it keeps C as removed while C re-joins through A.
+    // B stops merging rosters, so it keeps C as removed while A allows C again.
     const merge = B.store.merge.bind(B.store);
     let paused = true;
     B.store.merge = (rows) => (paused ? false : merge(rows));
     const refusedByB = () => removedBy(C.errors, B.id, "refused").length;
+    await a!.pool.allow({ nodeId: C.id });
+    // C learns it is allowed again from A (its knock admitted, or A's dial), and is a member once more.
+    await eventually(() => C.store.isMember(C.id) && C.net.isOnline(A.id));
     const before = refusedByB();
-    expect(await join(a!, c)).toEqual({ poolId: a!.pool.poolId.value, members: 3 });
     await eventually(() => refusedByB() > before);
-    // The refusal names a removal older than C's re-join: C stays a member and keeps its link with A.
+    // The refusal names a removal older than C's being allowed again: C stays a member and keeps its link with A.
     expect(C.store.isMember(C.id)).toBe(true);
-    await eventually(() => C.net.isOnline(A.id));
+    expect(C.net.isOnline(A.id)).toBe(true);
     expect(B.store.row(C.id)?.status).toBe("removed");
 
     paused = false;
-    // A's refreshed row changes its roster, which B now merges, re-join included; C's next dial is admitted.
+    // A's refreshed row changes its roster, which B now merges, the allowing included; C's next dial is admitted.
     await a!.pool.tokenChanged({});
     await eventually(() => B.store.isMember(C.id) && B.net.isOnline(C.id) && C.net.isOnline(B.id));
     expect(C.store.isMember(C.id)).toBe(true);
@@ -355,12 +363,19 @@ test("a removal refusal whose time is not an ISO time does not mark the node rem
   const B = await startPoolNode();
   const x = await testNode();
   const X = x.identity.id;
-  // X closes or refuses B as `removed zzz`, which sorts after any ISO time; whichever of them dials.
+  // X closes or refuses B as `removed zzz`, which sorts after any ISO time, and then as removed at a date far ahead
+  // of B's clock; whichever of them dials.
+  let reason: `removed ${string}` = "removed zzz";
   const net = new PoolNet({
-    endpoint: x.endpoint, selfId: X, isMember: () => false, refusalReason: () => "removed zzz",
-    onJoin: async (conn) => conn.close(0n, []), backoff: { initialMs: 50, maxMs: 200 },
+    endpoint: x.endpoint, selfId: X, ...proofDeps(X), admit: () => false, refusalReason: () => reason,
+    backoff: { initialMs: 50, maxMs: 200 },
   });
-  net.onPeer((id, online) => { if (online) net.unwatch(id, "removed zzz"); });
+  // When X is the dialer: it closes B with the reason, then dials again a little later (unwatch stops the dial loop).
+  net.onPeer((id, online) => {
+    if (!online) return;
+    net.unwatch(id, reason);
+    setTimeout(() => net.watch(id), 200);
+  });
   try {
     const now = new Date().toISOString();
     B.store.upsert({
@@ -372,8 +387,11 @@ test("a removal refusal whose time is not an ISO time does not mark the node rem
     net.watch(B.id);
     // Refreshing B's self row makes B follow X.
     await B.pool.tokenChanged();
-    const refusals = () => B.errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === X && e.reason.includes("removed zzz"));
-    await eventually(() => refusals().length > 0);
+    const refusals = (text: string) => B.errors.filter((e): e is PeerClosed => e instanceof PeerClosed && e.peerId === X && e.reason.includes(text));
+    await eventually(() => refusals("removed zzz").length > 0);
+    expect(B.store.isMember(B.id)).toBe(true);
+    reason = "removed 2999-01-01T00:00:00.000Z";
+    await eventually(() => refusals("removed 2999").length > 0);
     expect(B.store.isMember(B.id)).toBe(true);
   } finally {
     await net.stop();
@@ -413,7 +431,7 @@ test("a member that keeps refusing this node is logged once the refusal persists
   const identity = { id: hexOf(key.public()), secret: Uint8Array.from(key.toBytes()) };
   const x = { identity, endpoint: await openEndpoint({ irohPreset: "minimal", irohBind: "127.0.0.1:0" }, identity) };
   const X = identity.id;
-  const net = new PoolNet({ endpoint: x.endpoint, selfId: X, isMember: () => false, onJoin: async (conn) => conn.close(0n, []) });
+  const net = new PoolNet({ endpoint: x.endpoint, selfId: X, ...proofDeps(X), admit: () => false });
   try {
     net.start();
     const now = new Date().toISOString();

@@ -1,9 +1,10 @@
 import { test, expect } from "bun:test";
 import { randomBytes } from "node:crypto";
 import type { Connection } from "@number0/iroh";
-import { ALPN_POOL, writeLine } from "../src/pool/frames";
+import { ALPN_POOL, StreamReader, writeLine } from "../src/pool/frames";
 import { PeerClosed, PoolNet, fromEndpoint, toEndpointAddr, type NetDeps, type PeerStream } from "../src/pool/net";
-import { endpointPair, type TestNode } from "./pool-helpers";
+import { poolKey, proofFor, verifyProof } from "../src/pool/secret";
+import { POOL_KEY, endpointPair, proofDeps, type TestNode } from "./pool-helpers";
 
 const fast = { initialMs: 50, maxMs: 200 };
 
@@ -22,7 +23,7 @@ function netOf(node: TestNode, deps: Partial<NetDeps> = {}, claims: (s: PeerStre
   const errors: string[] = [];
   const raw: unknown[] = [];
   const net = new PoolNet({
-    endpoint: node.endpoint, selfId: node.identity.id, isMember: () => true, onJoin: async () => {},
+    endpoint: node.endpoint, selfId: node.identity.id, ...proofDeps(node.identity.id),
     onError: (err) => { raw.push(err); errors.push(String(err)); }, backoff: fast, ...deps,
   });
   net.onPeer((id, online) => peers.push([id, online]));
@@ -35,11 +36,11 @@ function netOf(node: TestNode, deps: Partial<NetDeps> = {}, claims: (s: PeerStre
 }
 
 /** Both ends of a pair as PoolNets, `lo` the one with the smaller id (the dialer). */
-async function poolPair(isMember: { lo?: (id: string) => boolean; hi?: (id: string) => boolean } = {}, claims?: (s: PeerStream) => boolean) {
+async function poolPair(admit: { lo?: (id: string) => boolean; hi?: (id: string) => boolean } = {}, claims?: (s: PeerStream) => boolean) {
   const pair = await endpointPair();
   const [loNode, hiNode] = pair.a.identity.id < pair.b.identity.id ? [pair.a, pair.b] : [pair.b, pair.a];
-  const lo = netOf(loNode, isMember.lo ? { isMember: isMember.lo } : {}, claims);
-  const hi = netOf(hiNode, isMember.hi ? { isMember: isMember.hi } : {}, claims);
+  const lo = netOf(loNode, admit.lo ? { admit: admit.lo } : {}, claims);
+  const hi = netOf(hiNode, admit.hi ? { admit: admit.hi } : {}, claims);
   lo.net.start();
   hi.net.start();
   lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
@@ -89,16 +90,24 @@ test("a member connects, the smaller id dials, streams carry headers both ways",
   }
 });
 
-test("a non-member is refused before any stream is read", async () => {
+test("a dialer that proved the secret but is not admitted gets the acceptor's proof and the verdict, and no stream is read", async () => {
   const pair = await endpointPair();
-  const b = netOf(pair.b, { isMember: (id) => id !== pair.a.identity.id });
+  const b = netOf(pair.b, { admit: (id) => id !== pair.a.identity.id });
   b.net.start();
   try {
     const conn = await pair.a.endpoint.connect(toEndpointAddr(fromEndpoint(pair.b.endpoint)), ALPN_POOL);
+    const proof = await conn.openUni();
+    await writeLine(proof, proofFor(POOL_KEY, pair.a.identity.id, pair.b.identity.id));
+    await proof.finish();
     await conn.openBi().then((s) => writeLine(s.send, '{"stream":"x"}')).catch(() => {});
-    const reason = await conn.closed();
-    expect(reason).toContain("not a member");
-    expect(reason).toContain("(code 1)");
+    const answer = new StreamReader(await conn.acceptUni());
+    const theirs = await answer.readLine();
+    expect(verifyProof(POOL_KEY.id, pair.b.identity.id, pair.a.identity.id, theirs ?? "")).toBe(true);
+    expect(await answer.readLine()).toBe("not a member");
+    // The acceptor waits for the dialer's close before its own, so that the verdict is read.
+    await Bun.sleep(100);
+    expect(b.net.online()).toEqual([]);
+    conn.close(0n, Array.from(new TextEncoder().encode("bye")));
     await Bun.sleep(50);
     expect(b.peers).toEqual([]);
     expect(b.streams).toEqual([]);
@@ -106,6 +115,54 @@ test("a non-member is refused before any stream is read", async () => {
   } finally {
     await b.net.stop();
     await pair.close();
+  }
+});
+
+test("a dialer that sends no proof, or another pool's, is refused as bad proof; so is an acceptor of another pool", async () => {
+  const pair = await endpointPair();
+  const b = netOf(pair.b, { admitTimeoutMs: 300 });
+  b.net.start();
+  try {
+    // No proof at all: refused once the bound passes.
+    const silent = await pair.a.endpoint.connect(toEndpointAddr(fromEndpoint(pair.b.endpoint)), ALPN_POOL);
+    expect(await silent.closed()).toBe("closed by peer: bad proof (code 1)");
+
+    // A proof of another pool's secret.
+    const other = poolKey("default", "another-pool-secret");
+    const wrong = await pair.a.endpoint.connect(toEndpointAddr(fromEndpoint(pair.b.endpoint)), ALPN_POOL);
+    const proof = await wrong.openUni();
+    await writeLine(proof, proofFor(other, pair.a.identity.id, pair.b.identity.id));
+    await proof.finish();
+    expect(await wrong.closed()).toBe("closed by peer: bad proof (code 1)");
+    expect(b.peers).toEqual([]);
+    expect(b.net.online()).toEqual([]);
+  } finally {
+    await b.net.stop();
+    await pair.close();
+  }
+
+  // The dialer checks the acceptor too: one that admits anyone but proves another pool's secret is closed `bad proof`
+  // and reported, and never online on the dialer's side.
+  const pair2 = await endpointPair();
+  const [loNode, hiNode] = ordered(pair2);
+  const lo = netOf(loNode, { admitTimeoutMs: 300 });
+  const other = poolKey("default", "another-pool-secret");
+  const hi = netOf(hiNode, { prove: (peer) => proofFor(other, hiNode.identity.id, peer), verify: () => true, admitTimeoutMs: 300 });
+  lo.net.start();
+  hi.net.start();
+  try {
+    lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
+    lo.net.watch(hi.id);
+    await until(() => lo.errors.filter((e) => e.includes("did not prove the pool secret")).length >= 2);
+    expect(lo.peers).toEqual([]);
+    expect(lo.net.isOnline(hi.id)).toBe(false);
+    // The acceptor had admitted the dialer and seen it go: its close carries the dialer's verdict.
+    await until(() => hi.peers.length >= 2);
+    expect(hi.peers.slice(0, 2)).toEqual([[lo.id, true], [lo.id, false]]);
+    expect(hi.net.isOnline(lo.id)).toBe(false);
+  } finally {
+    await Promise.all([lo.net.stop(), hi.net.stop()]);
+    await pair2.close();
   }
 });
 
@@ -182,11 +239,32 @@ function ordered(pair: { a: TestNode; b: TestNode }): [TestNode, TestNode] {
   return pair.a.identity.id < pair.b.identity.id ? [pair.a, pair.b] : [pair.b, pair.a];
 }
 
-test("an isMember that throws closes the connection and the dialer stays offline", async () => {
+test("a dialer refused before the acceptor proved itself reports a failed dial, never the peer's word", async () => {
+  // A node that holds no secret (it cannot prove itself) refuses every dial with `no pool secret`.
+  const pair = await endpointPair();
+  const [loNode, hiNode] = ordered(pair);
+  const lo = netOf(loNode, { admitTimeoutMs: 300 });
+  const hi = netOf(hiNode, { prove: () => null });
+  lo.net.start();
+  hi.net.start();
+  try {
+    lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
+    lo.net.watch(hi.id);
+    await until(() => lo.errors.filter((e) => e.includes("before proving the pool secret")).length >= 2);
+    expect(lo.raw.some((e) => e instanceof PeerClosed)).toBe(false);
+    expect(lo.errors[0]).toContain("closed by peer: no pool secret (code 1)");
+    expect(lo.peers).toEqual([]);
+  } finally {
+    await Promise.all([lo.net.stop(), hi.net.stop()]);
+    await pair.close();
+  }
+});
+
+test("an admit that throws closes the connection and the dialer stays offline", async () => {
   const pair = await endpointPair();
   const [loNode, hiNode] = ordered(pair);
   const lo = netOf(loNode);
-  const hi = netOf(hiNode, { isMember: () => { throw new Error("roster unavailable"); } });
+  const hi = netOf(hiNode, { admit: () => { throw new Error("roster unavailable"); } });
   lo.net.start();
   hi.net.start();
   try {

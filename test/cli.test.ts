@@ -26,9 +26,9 @@ test("the usage text lists the pool subcommands", async () => {
   const [err, code] = await Promise.all([new Response(p.stderr).text(), p.exited]);
   expect(code).toBe(2);
   const lines = err.split("\n").map((l) => l.trim());
-  expect(lines).toContain("meddle invite");
-  expect(lines).toContain("meddle join <ticket>");
   expect(lines).toContain("meddle pool");
+  expect(lines).toContain("meddle pool secret [--file <path> | --generate <path>] [--name <name>]");
+  expect(lines).toContain("meddle pool peer <node id> | meddle pool remove <id|prefix> | meddle pool allow <id|prefix>");
   expect(lines).toContain("meddle task move <id> <node> [--now]");
 });
 

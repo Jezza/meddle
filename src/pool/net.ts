@@ -3,13 +3,13 @@ import {
   type BiStream, type Connection, type Incoming,
 } from "@number0/iroh";
 import type { NodeConfig } from "../config";
-import { ALPN_JOIN, ALPN_POOL, StreamReader, parseHeader, writeLine, type StreamHeader } from "./frames";
+import { ALPN_POOL, StreamReader, parseHeader, writeLine, type StreamHeader } from "./frames";
 import { endpointIdOf, hexOf, shortId, type Identity } from "./identity";
 import type { WireAddr } from "./store";
 
 let logLevelSet = false;
 
-/** Binds this node's iroh endpoint, accepting the pool and join ALPNs. */
+/** Binds this node's iroh endpoint, accepting the pool ALPN. */
 export async function openEndpoint(cfg: Pick<NodeConfig, "irohPreset" | "irohBind">, identity: Identity): Promise<Endpoint> {
   if (!logLevelSet) {
     setLogLevel(LogLevel.Warn);
@@ -19,7 +19,7 @@ export async function openEndpoint(cfg: Pick<NodeConfig, "irohPreset" | "irohBin
   if (cfg.irohPreset === "n0") presetN0(builder);
   else presetMinimal(builder);
   builder.secretKey(Array.from(identity.secret));
-  builder.alpns([ALPN_POOL, ALPN_JOIN]);
+  builder.alpns([ALPN_POOL]);
   if (cfg.irohBind !== null) builder.bindAddr(cfg.irohBind);
   return builder.bind();
 }
@@ -49,15 +49,21 @@ export type PeerStream = {
 export type NetDeps = {
   endpoint: Endpoint;
   selfId: string;
-  isMember(id: string): boolean;
-  /** A connection on ALPN_JOIN. */
-  onJoin(conn: Connection): Promise<void>;
+  /** This node's proof of the pool secret to `peerId`, or null when it has no secret: it then neither dials nor admits. */
+  prove(peerId: string): string | null;
+  /** Whether `proof` is `peerId`'s proof of this node's pool secret. */
+  verify(peerId: string, proof: string): boolean;
+  /**
+   * Whether a dialer that proved the secret is let in (a removed node is not); a node not heard of before is recorded
+   * as a member here. Consulted only after a valid proof.
+   */
+  admit(id: string): boolean;
   onError?(err: unknown): void;
   /** Redial delays, doubling from `initialMs` up to `maxMs`; default 1000 / 30000. */
   backoff?: { initialMs: number; maxMs: number };
-  /** How long a dialer waits for the acceptor to admit or refuse a connection before giving up on it; default 5000. */
+  /** How long each side waits for the other's proof before giving the connection up; default 5000. */
   admitTimeoutMs?: number;
-  /** The close reason a dialer that is not a member is refused with (consulted only then); default `not a member`. */
+  /** The close reason a dialer that proved the secret but is not admitted is refused with; default `not a member`. */
   refusalReason?(id: string): RefusalReason;
 };
 
@@ -78,14 +84,30 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const bytes = (text: string) => Array.from(encoder.encode(text));
 const POOL = decoder.decode(Uint8Array.from(ALPN_POOL));
-const JOIN = decoder.decode(Uint8Array.from(ALPN_JOIN));
 /** What `closed()` resolves to when the peer closed with code 1: it refused or removed this node. */
 const REFUSED = /^closed by peer: .* \(code 1\)$/;
+/** The longest proof or verdict line either side reads, in bytes (a proof is 86 characters). */
+const MAX_PROOF_LINE = 256;
+/** The acceptor's verdict line after its proof when the dialer is let in; anything else is the refusal reason. */
+const ADMITTED = "admitted";
+/** How long a refusing acceptor waits for the dialer to close, so that its proof and verdict are read before the close. */
+const LINGER_MS = 5000;
+/** Text a peer chose (a close reason, a verdict), as it may appear in a log line: no control characters, bounded. */
+function clean(text: string): string {
+  return text.replace(/[\x00-\x1f\x7f-\x9f]/g, "?").slice(0, 200);
+}
 
-/** Why a peer is refused or cut off (code 1): `removed` may carry when, as `removed <updatedAt>`. */
-export type RefusalReason = "not a member" | "removed" | `removed ${string}`;
+/**
+ * Why a peer is refused or cut off (code 1): `no pool secret` (this node has none), `bad proof` (the peer did not prove
+ * this node's secret), `not a member`, or `removed`, which may carry when, as `removed <updatedAt>`.
+ */
+export type RefusalReason = "not a member" | "no pool secret" | "bad proof" | "removed" | `removed ${string}`;
 
-/** Reported when a peer closed a connection, or refused a dial: `reason` is what `closed()` resolved to. */
+/**
+ * Reported when a peer that proved the pool secret closed a connection, or refused a dial: `reason` is what `closed()`
+ * resolved to, or the refusal in that form (`closed by peer: <verdict> (code 1)`). Only a proved peer's word counts:
+ * a connection closed before the peer proved itself is a `DialFailed`.
+ */
 export class PeerClosed extends Error {
   constructor(readonly peerId: string, readonly reason: string, message: string) {
     super(message);
@@ -111,10 +133,13 @@ async function resetStream(stream: BiStream): Promise<void> {
 
 /**
  * Keeps one connection per member over ALPN_POOL and hands out streams on it. Of two members the one with the smaller
- * id dials (with backoff); the other only accepts. The acceptor admits a dialer by opening a uni stream and finishing
- * it, so a dialer counts as online only once admitted, never for a connection about to be refused. Every bidirectional
- * stream starts with a header line, and goes to the `onStream` listener that takes its kind (reset when none does).
- * Never logs: errors go to `deps.onError`.
+ * id dials (with backoff); the other only accepts. Each connection opens with proofs of the pool secret on a uni
+ * stream each way: the dialer sends its proof first; the acceptor checks it (a dialer that proves nothing is closed
+ * at once and told nothing), then answers with its own proof and a verdict, `admitted` (`deps.admit`) or the refusal
+ * reason, and the dialer checks the proof before it believes the verdict: it counts the peer as online on `admitted`,
+ * and reports a refusal as the peer's word (`PeerClosed`) only because the peer proved the secret first. A connection
+ * about to be refused is never online on either side. Every bidirectional stream starts with a header line, and goes
+ * to the `onStream` listener that takes its kind (reset when none does). Never logs: errors go to `deps.onError`.
  */
 export class PoolNet {
   readonly endpoint: Endpoint;
@@ -277,7 +302,12 @@ export class PoolNet {
     }
   }
 
-  /** Completes one inbound handshake and routes it by ALPN; pool connections from non-members are closed at once. */
+  /**
+   * Completes one inbound handshake: reads the dialer's proof (a dialer that proves nothing, or when this node has no
+   * secret, is closed at once with `bad proof` or `no pool secret`), then answers with this node's proof and its
+   * verdict: `admitted`, with the dialer online here from that moment, or the refusal reason, after which this node
+   * waits for the dialer to close (at most 5 s, so that the verdict is read) and closes with that reason.
+   */
   private async admit(incoming: Incoming): Promise<void> {
     let conn: Connection;
     try {
@@ -291,31 +321,71 @@ export class PoolNet {
       return;
     }
     const alpn = decoder.decode(Uint8Array.from(conn.alpn()));
-    if (alpn === JOIN) {
-      Promise.resolve().then(() => this.deps.onJoin(conn)).catch((err) => this.report(err));
+    const id = hexOf(conn.remoteId());
+    const proof = alpn === POOL ? this.deps.prove(id) : null;
+    const proved = proof !== null && (await this.dialerProved(conn, id));
+    if (this.stopped) {
+      conn.close(0n, bytes("bye"));
       return;
     }
-    const id = hexOf(conn.remoteId());
-    let member = false;
-    let refusal: RefusalReason = "not a member";
+    if (!proved) {
+      conn.close(1n, bytes(proof === null ? "no pool secret" : "bad proof"));
+      return;
+    }
+    const refusal = this.verdict(id);
+    if (refusal === null) this.register(id, conn);
     try {
-      member = alpn === POOL && this.deps.isMember(id);
-      if (!member && alpn === POOL) refusal = this.deps.refusalReason?.(id) ?? "not a member";
+      const answer = await conn.openUni();
+      await writeLine(answer, proof);
+      await writeLine(answer, refusal ?? ADMITTED);
+      await answer.finish();
+    } catch {
+      // The connection closed first; an admitted one's close is reported where it is tracked.
+    }
+    if (refusal === null) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      conn.closed().then(() => {}, () => {}),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, LINGER_MS); }),
+    ]);
+    clearTimeout(timer);
+    conn.close(1n, bytes(refusal));
+  }
+
+  /** Whether the dialer's proof (one line on its first uni stream, within the bound) is good. */
+  private async dialerProved(conn: Connection, id: string): Promise<boolean> {
+    const line = await this.readProof(conn);
+    if (line === null) return false;
+    try {
+      return this.deps.verify(id, line);
+    } catch (err) {
+      this.report(err);
+      return false;
+    }
+  }
+
+  /** The refusal a dialer that proved the secret gets, or null when it is admitted. */
+  private verdict(id: string): RefusalReason | null {
+    try {
+      if (this.deps.admit(id)) return null;
     } catch (err) {
       // Membership could not be checked: refuse rather than leave the dialer waiting for an admission.
       this.report(err);
+      return "not a member";
     }
-    if (!member) {
-      conn.close(1n, bytes(refusal));
-      return;
-    }
-    this.register(id, conn);
-    try {
-      const admitted = await conn.openUni();
-      await admitted.finish();
-    } catch {
-      // The connection closed first; its close is reported where it is tracked.
-    }
+    return this.deps.refusalReason?.(id) ?? "not a member";
+  }
+
+  /** The first line of the connection's first uni stream, or null when none came within the bound or it closed. */
+  private async readProof(conn: Connection): Promise<string | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const line = await Promise.race([
+      conn.acceptUni().then((recv) => new StreamReader(recv).readLine(MAX_PROOF_LINE)).catch(() => null),
+      conn.closed().then(() => null, () => null),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), this.admitTimeoutMs); }),
+    ]);
+    clearTimeout(timer);
+    return line;
   }
 
   /** Makes `conn` the peer's connection, replacing (code 0, `duplicate`) any it had. */
@@ -334,7 +404,7 @@ export class PoolNet {
   }
 
   private async untilClosed(id: string, link: Link): Promise<void> {
-    const reason = await link.closed.catch(messageOf);
+    const reason = clean(await link.closed.catch(messageOf));
     if (REFUSED.test(reason)) this.report(new PeerClosed(id, reason, `${shortId(id)} closed the connection: ${reason}`));
     if (this.links.get(id) !== link) return;
     this.links.delete(id);
@@ -428,10 +498,18 @@ export class PoolNet {
   }
 
   /**
-   * One dial attempt: the connection once the peer admitted it, or null (reported) when it failed, was refused, or
-   * was neither admitted nor refused within `admitTimeoutMs` (then it is closed `0 bye`).
+   * One dial attempt: the connection once this node's proof was sent and the peer's proof and verdict read, the proof
+   * checked and the verdict `admitted`; or null (reported) when the dial failed, the peer's proof was bad (closed
+   * `1 bad proof`, a `DialFailed`), no answer came within `admitTimeoutMs` (closed `0 bye`), the peer closed before
+   * proving itself (a `DialFailed`: its reason is not its word), or the proved peer's verdict was a refusal (closed
+   * `0 bye`, reported as a `PeerClosed` with the verdict).
    */
   private async connect(id: string): Promise<Connection | null> {
+    const proof = this.deps.prove(id);
+    if (proof === null) {
+      this.report(new DialFailed(id, `dialing ${shortId(id)}: no pool secret`));
+      return null;
+    }
     let conn: Connection;
     try {
       conn = await this.endpoint.connect(toEndpointAddr(this.addrs.get(id) ?? { id, relay: null, direct: [] }), ALPN_POOL);
@@ -439,9 +517,32 @@ export class PoolNet {
       this.report(new DialFailed(id, `dialing ${shortId(id)}: ${messageOf(err)}`));
       return null;
     }
+    try {
+      const mine = await conn.openUni();
+      await writeLine(mine, proof);
+      await mine.finish();
+    } catch (err) {
+      conn.close(0n, bytes("bye"));
+      this.report(new DialFailed(id, `sending the proof to ${shortId(id)}: ${messageOf(err)}`));
+      return null;
+    }
+    /** The peer's proof and verdict lines, checked: the verdict only once the proof is good. */
+    const answered = async (): Promise<"admitted" | "unproved" | { refusal: string }> => {
+      const reader = new StreamReader(await conn.acceptUni());
+      const proofLine = await reader.readLine(MAX_PROOF_LINE);
+      let proved = false;
+      try {
+        proved = proofLine !== null && this.deps.verify(id, proofLine);
+      } catch (err) {
+        this.report(err);
+      }
+      if (!proved) return "unproved";
+      const verdict = await reader.readLine(MAX_PROOF_LINE);
+      return verdict === ADMITTED ? "admitted" : { refusal: verdict ?? "no verdict" };
+    };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const outcome = await Promise.race([
-      conn.acceptUni().then(() => "admitted" as const, () => "closed" as const),
+      answered().catch(() => "closed" as const),
       conn.closed().then(() => "closed" as const, () => "closed" as const),
       new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), this.admitTimeoutMs); }),
     ]);
@@ -452,7 +553,18 @@ export class PoolNet {
       this.report(new DialFailed(id, `${shortId(id)} did not admit the connection within ${this.admitTimeoutMs} ms`));
       return null;
     }
-    const reason = await conn.closed().catch(messageOf);
+    if (outcome === "unproved") {
+      conn.close(1n, bytes("bad proof"));
+      this.report(new DialFailed(id, `${shortId(id)} did not prove the pool secret`));
+      return null;
+    }
+    if (outcome === "closed") {
+      const reason = await conn.closed().catch(messageOf);
+      this.report(new DialFailed(id, `${shortId(id)} closed the connection before proving the pool secret: ${clean(reason)}`));
+      return null;
+    }
+    conn.close(0n, bytes("bye"));
+    const reason = `closed by peer: ${clean(outcome.refusal)} (code 1)`;
     this.report(new PeerClosed(id, reason, `${shortId(id)} refused the connection: ${reason}`));
     return null;
   }

@@ -32,7 +32,9 @@ tpo down
 `lab/nodes/<node>`, port 7777 inside the node's own network namespace, and the iroh socket bound to the
 node's lab address.
 
-Scenarios: up; join through discovery; token replication; project and task; a move over a degraded
+`LAB_SCENARIOS=s2,s3 bun run lab/run-lab.ts` runs only those scenarios (s1 always runs).
+
+Scenarios: up; one secret on every node, found through discovery; token replication; project and task; a move over a degraded
 link; a partition before a move; a partition during a move (several phases); a crash mid-receive; a
 lighthouse outage; node isolation; restarts; memory across three nodes; resources. The results of the
 first run are in `REPORT-2026-11-02.md`.

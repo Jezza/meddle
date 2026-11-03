@@ -416,7 +416,9 @@ export const PoolObject = remote("meddle.pool", {
     /** Dashboards and the CLI (principal `local`, `cli`, …). */
     default: {
       state: {
+        /** The pool's id (the public key its name and secret derive), or "" while this node has no pool secret. */
         poolId: Type.String(),
+        poolName: Type.String(),
         self: Type.String(),
         nodes: Type.Array(PoolNodeSchema),
         /** The login tokens in the order turns try them, removed ones left out. */
@@ -431,9 +433,12 @@ export const PoolObject = remote("meddle.pool", {
         ),
       },
       methods: {
-        invite: method(Type.Object({}), Type.Object({ ticket: Type.String() })),
-        join: method(Type.Object({ ticket: Type.String() }), Type.Object({ poolId: Type.String(), members: Type.Number() })),
+        /** The pool row or the roster changed on this node (the CLI wrote it): re-read it and act on it. */
+        poolChanged: method(Type.Object({})),
+        /** Removes a node from the pool: every member cuts it off and refuses it until it is allowed again. */
         remove: method(Type.Object({ nodeId: Type.String() })),
+        /** Makes a removed node a member again, for the whole pool. */
+        allow: method(Type.Object({ nodeId: Type.String() })),
         /** The tokens changed on this node (written by the CLI); re-read them and tell the pool. */
         tokenChanged: method(Type.Object({})),
         /**

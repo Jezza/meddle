@@ -19,9 +19,11 @@ export type PoolObjectDeps = {
   isOnline(nodeId: string): boolean;
   /** This node's current summary, for its own row. */
   liveSummary(): NodeSummary | Promise<NodeSummary>;
-  invite(): string;
-  join(ticket: string): Promise<{ poolId: string; members: number }>;
+  /** The pool row or the roster changed under the node (the CLI wrote it): re-read it. */
+  poolChanged(): Promise<void>;
   remove(nodeId: string): Promise<void>;
+  /** Makes a removed node a member again. */
+  allow(nodeId: string): Promise<void>;
   tokenChanged(): Promise<void>;
   /** The pool's settings, read by both variants. */
   settings: PoolSettings;
@@ -132,6 +134,7 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     const live = self.state("live", LiveSchema, { init: liveNow });
     const online = self.state("online", Type.Array(Type.String()), { init: onlineNow });
     const poolId = self.state("poolId", defaultState.poolId, { init: () => store.pool().poolId });
+    const poolName = self.state("poolName", defaultState.poolName, { init: () => store.pool().poolName });
     /** The settings with a value, as the dashboard lists them: who set each, and when. */
     const withValue = () => settings.rows()
       .flatMap(({ key, value, setBy, updatedAt }) => (value === null ? [] : [{ key, value, setBy, updatedAt }]));
@@ -142,20 +145,22 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       tokens.replace(ctx, listTokens(db));
       online.replace(ctx, onlineNow());
       poolId.replace(ctx, store.pool().poolId);
+      poolName.replace(ctx, store.pool().poolName);
       await Promise.all([refreshActive(ctx), liveNow().then((l) => { if (!ctx.signal.aborted) live.replace(ctx, l); })]);
     });
     return {
       variant: "default",
       poolId,
+      poolName,
       self: self.state("self", defaultState.self, selfId),
       nodes: self.derive([roster, live, online], (rows, l, on) => rows.map((r) => nodeOf(r, selfId, l, on))),
       tokens,
       activeTokenId: active,
       mixedVersions: self.derive([roster, live], (rows, l) => mixed(rows, selfId, l)),
       settings: listed,
-      invite: async () => ({ ticket: deps.invite() }),
-      join: ({ ticket }) => deps.join(ticket),
+      poolChanged: () => deps.poolChanged(),
       remove: ({ nodeId }) => deps.remove(nodeId),
+      allow: ({ nodeId }) => deps.allow(nodeId),
       tokenChanged: () => deps.tokenChanged(),
       enableToken: async ({ id }) => {
         // Only a full id the table lists (a label is the CLI's convenience; the dashboard always has the id).

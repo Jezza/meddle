@@ -1,5 +1,5 @@
-// The pool runtime: this node's identity, endpoint, roster, peer connections, sync and discovery, composed, with
-// membership enforced after every roster change.
+// The pool runtime: this node's identity, endpoint, pool secret, roster, peer connections, sync and discovery,
+// composed, with membership enforced after every roster change.
 import { hostname } from "node:os";
 import type { Database } from "bun:sqlite";
 import type { Endpoint } from "@number0/iroh";
@@ -7,12 +7,12 @@ import type { AnyContract, InputOf, Ref, Subscribable } from "@earendil-works/ch
 import type { NodeConfig } from "../config";
 import { Discovery } from "./discovery";
 import { loadOrCreateIdentity, shortId, type Identity } from "./identity";
-import { createInvite, decodeTicket, handleJoin, joinPool } from "./invite";
 import { DialFailed, PeerClosed, PoolNet, fromEndpoint, openEndpoint, type RefusalReason } from "./net";
 import type { PoolObjectDeps } from "./object";
 import { dedupe } from "./report";
+import { poolKey, proofFor, verifyProof, type PoolKey } from "./secret";
 import { PoolSettings, discoveryLighthouseUrl } from "./settings";
-import { PoolStore, type NodeProject, type NodeSummary, type WireAddr } from "./store";
+import { PoolStore, type NodeProject, type NodeSummary, type PoolIdentity, type WireAddr } from "./store";
 import { HoldFailed, PoolSync } from "./sync";
 
 export type PoolRuntime = {
@@ -24,11 +24,21 @@ export type PoolRuntime = {
   readonly settings: PoolSettings;
   /** What `servePool` needs; `createNodeHost` passes it on. */
   readonly objectDeps: PoolObjectDeps;
-  /** A new invite ticket; throws "this node is not a member of a pool" once this node was removed. */
-  invite(): string;
-  join(ticket: string): Promise<{ poolId: string; members: number }>;
+  /**
+   * The pool row or the roster changed under this node (the CLI set the secret, or added a peer): re-reads them. A new
+   * secret re-keys the node: every connection is closed (every peer must prove the new secret), the roster is what the
+   * CLI left (this node alone) and discovery moves to the new topic. Never rejects.
+   */
+  poolChanged(): Promise<void>;
+  /**
+   * Records `addr`'s node as a member here (unless it is removed: rejects) and dials it when this node is the one to
+   * dial: the way in without a lighthouse.
+   */
+  addPeer(addr: WireAddr): Promise<void>;
   /** Removes a node from the pool and cuts it off; rejects "a node cannot remove itself". */
   remove(nodeId: string): Promise<void>;
+  /** Makes a removed node a member again and tells the pool; rejects for this node, or one not in the roster. */
+  allow(nodeId: string): Promise<void>;
   /** The tokens changed on this node (the CLI wrote them, or a turn marked one): tell the pool. */
   tokenChanged(): Promise<void>;
   /** Sets a pool setting here (rejects what `PoolSettings.set` refuses), applies it and tells the pool. */
@@ -76,14 +86,23 @@ const REMOVAL_GRACE_MS = 1000;
  * time as the store writes it: anything else (`removed zzz`) is not a removal this node can date, and is ignored.
  */
 const REMOVED_AT = /^closed by peer: removed (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) \(code 1\)$/;
+/** How far ahead of this node's clock a removal's time may be and still count: beyond that it is not a date but a weapon. */
+const MAX_REMOVAL_AHEAD_MS = 5 * 60_000;
+
+/** The pool's key, or null while no secret is set. */
+function keyOf(pool: PoolIdentity): PoolKey | null {
+  return pool.poolSecret === "" ? null : poolKey(pool.poolName, pool.poolSecret);
+}
 
 /**
- * Starts this node's part in its pool (a pool of one on first start): identity, endpoint, roster, settings (applied to
- * `cfg.poolEnv` before anything runs), the connection to every member, sync, and lighthouse discovery unless
- * `cfg.lighthouseUrl` is empty (the pool's `lighthouse.url` applies live unless `MEDDLE_LIGHTHOUSE_URL` is set). Logs (`meddle: discovery: …`
- * and `meddle: pool: …`, each distinct message at most once a minute) discovery errors and why a member cannot be
- * reached: dial failures, admission timeouts, refusals that persist, a removal learned from a refusal, and a peer's
- * PoolObject that could not be held. A healthy pool logs nothing.
+ * Starts this node's part in its pool: identity, endpoint, settings (applied to `cfg.poolEnv` before anything runs),
+ * the pool secret (set with `meddle pool secret`; until then the node is alone: it dials nobody and admits nobody),
+ * the connection to every member and to every node the lighthouse lists on the pool's topic (each proves the secret
+ * to the other before it counts), sync, and lighthouse discovery unless `cfg.lighthouseUrl` is empty (the pool's
+ * `lighthouse.url` applies live unless `MEDDLE_LIGHTHOUSE_URL` is set). Logs (`meddle: discovery: …` and
+ * `meddle: pool: …`, each distinct message at most once a minute) discovery errors and why a member cannot be reached:
+ * dial failures, admission timeouts, a peer that did not prove the secret, refusals that persist, a removal learned
+ * from a refusal, and a peer's PoolObject that could not be held. A healthy pool logs nothing.
  */
 export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSummaryDeps, hooks: PoolHooks = {}): Promise<PoolRuntime> {
   const identity = await loadOrCreateIdentity(cfg);
@@ -104,8 +123,9 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     limit: settings.runningLimit(),
     projects: summary.projects(),
   });
+  let key: PoolKey | null;
   try {
-    store.ensurePool({ nodeId: selfId, hostname: hostname() });
+    key = keyOf(store.ensurePool({ nodeId: selfId, hostname: hostname() }));
     store.seen(selfId, new Date().toISOString(), await liveSummary(), fromEndpoint(endpoint));
   } catch (err) {
     await endpoint.close();
@@ -134,29 +154,33 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   /** The members this node keeps a connection with, and the address it last offered for each. */
   const followed = new Map<string, string | null>();
-  let leftPool = false;
+  /** Nodes the lighthouse lists on the pool's topic that are not members here yet: dialled so that they prove the secret. */
+  const discovered = new Set<string>();
+  /** Whether this node counted itself a member at the last `enforce`: the moment that changes, it drops its connections. */
+  let wasMember = store.isMember(selfId);
   let discovery: Discovery | null = null;
 
-  /** A removed node accepts no pool connection at all. */
-  const admits = (id: string) => store.isMember(selfId) && store.isMember(id);
   /** `removed <updatedAt>` for a node the roster has as removed: the refused node can tell how recent that is. */
   const removalOf = (id: string): RefusalReason | null => {
     const row = store.row(id);
     return row?.status === "removed" ? `removed ${row.updatedAt}` : null;
   };
-  /** A dialer this (member) node has as removed is told so; it learns its removal from that refusal. */
-  const refusalReason = (id: string): RefusalReason => (store.isMember(selfId) ? removalOf(id) : null) ?? "not a member";
+  /**
+   * A dialer that proved the secret is let in unless this roster has it as removed; one never heard of becomes a
+   * member here (its own row replaces the provisional one at the first sync). A node removed from the pool still admits
+   * a member that dials it: that member's roster has it allowed again, and the sync over that connection is how it
+   * learns so.
+   */
+  const admits = (id: string): boolean => key !== null && store.ensureMember(id, selfId) === "member";
+  /** A dialer this node has as removed is told so; it learns its removal from that refusal. */
+  const refusalReason = (id: string): RefusalReason => (key === null ? "no pool secret" : removalOf(id) ?? "not a member");
 
   const net = new PoolNet({
-    endpoint, selfId, isMember: admits, refusalReason,
-    onJoin: (conn) => handleJoin(conn, {
-      store, selfId, endpoint,
-      // The new member's row (with the address it joined from) is in the roster now: follow it.
-      onAdmitted: () => {
-        enforce();
-        notify();
-      },
-    }),
+    endpoint, selfId,
+    prove: (peer) => (key === null ? null : proofFor(key, selfId, peer)),
+    verify: (peer, proof) => key !== null && verifyProof(key.id, peer, selfId, proof),
+    admit: admits,
+    refusalReason,
     onError: (err) => {
       if (err instanceof PeerClosed) refused(err);
       else if (err instanceof DialFailed) {
@@ -168,32 +192,40 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     },
   });
   net.onPeer((id, online) => {
-    if (online) refusals.delete(id);
+    if (online) {
+      refusals.delete(id);
+      // A node this node dialled on the lighthouse's word proved the secret: it is a member here from now on.
+      if (key !== null) store.ensureMember(id, selfId);
+      enforce();
+    }
     notify();
   });
 
   /**
-   * A member closed or refused this node's connection with code 1. A removal newer than this node's join makes it
+   * A member closed or refused this node's connection with code 1. A removal newer than this node's row makes it
    * leave. Any other refusal is logged once it persists past a redial: the first may come from a member that has not
-   * yet heard of this node's join. One from a node this roster does not have as a member is not logged at all.
+   * yet heard of this node. One from a node this roster does not have as a member is not logged at all, nor any
+   * while this node knows itself removed: it keeps knocking (see `enforce`), and the members refuse it by design.
    */
   function refused(err: PeerClosed): void {
-    if (learnRemoval(err) || !store.isMember(err.peerId)) return;
+    if (learnRemoval(err) || !store.isMember(err.peerId) || !store.isMember(selfId)) return;
     const count = (refusals.get(err.peerId) ?? 0) + 1;
     refusals.set(err.peerId, count);
     if (count >= 2) diagnose(err.message);
   }
 
   /**
-   * Another member closed or refused this node as removed: this node was removed while it could not hear of it. Only
-   * a removal newer than this node's own row (its latest join) counts; an older one is a member that has not yet
-   * merged this node's re-join, and the refused dial is simply retried. True when this node learned its removal.
+   * Another member (one that proved the secret: a `PeerClosed` comes from no other) closed or refused this node as
+   * removed: this node was removed while it could not hear of it. Only a removal newer than this node's own row
+   * counts, and none dated more than five minutes ahead of this node's clock; an older one is a member that has not
+   * yet merged this node's being allowed again, and the refused dial is simply retried. True when this node learned
+   * its removal.
    */
   function learnRemoval(err: PeerClosed): boolean {
     const removedAt = REMOVED_AT.exec(err.reason)?.[1];
     const self = store.row(selfId);
     if (removedAt === undefined || self?.status !== "member" || !store.isMember(err.peerId)) return false;
-    if (!(removedAt > self.updatedAt)) return false;
+    if (!(removedAt > self.updatedAt) || removedAt > new Date(Date.now() + MAX_REMOVAL_AHEAD_MS).toISOString()) return false;
     store.remove(selfId, removedAt);
     diagnose(`${shortId(err.peerId)} says this node was removed from the pool at ${removedAt}; it has left the pool`);
     enforce();
@@ -215,20 +247,34 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   /**
    * Makes the connections follow the roster: every member (other than this node) is watched and offered its latest
-   * known address; every other node is cut off (`removed`, or `not a member` when it is not in the roster at all).
-   * When this node itself is not a member it leaves: every connection is closed (`bye`) and discovery stops.
+   * known address; a member no longer (removed, or gone with a new secret) is cut off, with `removed <updatedAt>`
+   * when this roster has it removed. A node that knows itself removed keeps watching the members all the same: they
+   * refuse it (quietly, see `refused`) until one allows it again, and that member's admission is how it learns so
+   * without a restart. Without a secret nothing is watched.
    */
   function enforce(): void {
     if (stopped) return;
-    const member = store.isMember(selfId);
     const rows = store.roster();
-    const keep = new Map(member ? rows.filter((r) => r.status === "member" && r.nodeId !== selfId).map((r) => [r.nodeId, r]) : []);
-    const cut = new Set([...followed.keys(), ...net.online(), ...rows.filter((r) => r.status !== "member").map((r) => r.nodeId)]);
-    for (const id of cut) {
-      if (id === selfId || keep.has(id)) continue;
+    const keep = new Map(key !== null ? rows.filter((r) => r.status === "member" && r.nodeId !== selfId).map((r) => [r.nodeId, r]) : []);
+    for (const id of [...followed.keys()]) {
+      if (keep.has(id)) continue;
       followed.delete(id);
-      net.unwatch(id, !member ? "bye" : removalOf(id) ?? "not a member");
+      net.unwatch(id, removalOf(id) ?? "bye");
     }
+    const member = store.isMember(selfId);
+    if (wasMember && !member) {
+      // Just learnt of its removal: it leaves every member now (they would cut it anyway), then knocks again.
+      for (const id of [...followed.keys()]) {
+        followed.delete(id);
+        net.unwatch(id, "bye");
+      }
+    }
+    wasMember = member;
+    if (key === null) {
+      for (const id of discovered) net.unwatch(id, "bye");
+      discovered.clear();
+    }
+    for (const row of rows) if (row.status === "removed" && row.nodeId !== selfId) net.unwatch(row.nodeId, `removed ${row.updatedAt}`);
     for (const [id, row] of keep) {
       const addr = row.lastAddr === null ? null : JSON.stringify(row.lastAddr);
       // The address goes first, so that the first dial to a newly watched member already has it.
@@ -236,23 +282,42 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       if (!followed.has(id)) net.watch(id);
       followed.set(id, addr ?? followed.get(id) ?? null);
     }
-    if (!member && !leftPool) {
-      leftPool = true;
-      discovery?.stop().catch(() => {});
+  }
+
+  /**
+   * The nodes the lighthouse lists on the pool's topic: each gets its address offered, and one that is not a member
+   * here yet is dialled (when this node dials it), so that the two prove the secret to each other; one that left the
+   * topic before it proved anything is dropped again. A node this roster has as removed is left alone.
+   */
+  function onPeers(peers: WireAddr[]): void {
+    if (stopped || key === null) return;
+    const listed = new Set(peers.map((p) => p.id));
+    for (const id of [...discovered]) {
+      if (listed.has(id)) continue;
+      discovered.delete(id);
+      if (!followed.has(id)) net.unwatch(id, "bye");
+    }
+    for (const p of peers) {
+      if (p.id === selfId || store.row(p.id)?.status === "removed") continue;
+      // A connected member's address is the one that works; the lighthouse's word is for reaching the others.
+      if (!net.isOnline(p.id)) net.offerAddress(p);
+      if (followed.has(p.id) || discovered.has(p.id)) continue;
+      discovered.add(p.id);
+      net.watch(p.id);
     }
   }
 
-  if (cfg.lighthouseUrl !== "") {
+  /** Starts discovery on the pool's topic, once there is a secret and a lighthouse to use. */
+  function startDiscovery(): void {
+    if (stopped || discovery !== null || key === null || cfg.lighthouseUrl === "") return;
     discovery = new Discovery({
-      endpoint, identity, pool: store.pool(),
+      endpoint, identity, topic: key.topic,
       lighthouseUrl: () => discoveryLighthouseUrl(cfg, settings),
       pollMs: cfg.discoveryPollMs,
-      onPeers: (peers: WireAddr[]) => {
-        if (!store.isMember(selfId)) return;
-        for (const p of peers) if (p.id !== selfId && store.isMember(p.id)) net.offerAddress(p);
-      },
+      onPeers,
       onError: (message) => { if (!stopped) log(`meddle: discovery: ${message}`); },
     });
+    discovery.start();
   }
 
   /** Resolves once `id` is offline, or after `ms`. */
@@ -272,29 +337,41 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   enforce();
   net.start();
   sync.start();
-  if (!leftPool) discovery?.start();
+  startDiscovery();
 
-  /** A ticket into this node's pool; a node removed from its pool has none to give. */
-  const invite = () => {
-    if (!store.isMember(selfId)) throw new Error("this node is not a member of a pool");
-    return createInvite(store, endpoint);
-  };
-
-  async function join(ticket: string): Promise<{ poolId: string; members: number }> {
-    const joined = await joinPool(decodeTicket(ticket), { endpoint, store, identity, summary: liveSummary });
-    // Joining dropped the old pool's settings; the new pool's arrive by sync. The tokens stay: they are this node's
-    // logins, and replicate to the new pool like any member's.
-    settings.apply();
-    leftPool = false;
-    if (discovery !== null) await discovery.restart(store.pool());
-    // The addresses first (offering one does not dial a node not yet watched), so the first dials have them.
-    for (const addr of joined.addrs) net.offerAddress(addr);
+  async function poolChanged(): Promise<void> {
+    if (stopped) return;
+    const next = keyOf(store.pool());
+    if ((next?.id ?? null) !== (key?.id ?? null)) {
+      key = next;
+      // Every connection goes: whoever is in the new pool proves its secret afresh.
+      for (const id of new Set([...followed.keys(), ...discovered, ...net.online()])) net.unwatch(id, "bye");
+      followed.clear();
+      discovered.clear();
+      refusals.clear();
+      // The roster again, now that no old connection can merge the old pool's rows back into it.
+      store.resetRoster({ nodeId: selfId, hostname: hostname() });
+      if (key === null) {
+        const old = discovery;
+        discovery = null;
+        await old?.stop();
+      } else if (discovery !== null) {
+        await discovery.restart(key.topic);
+      } else {
+        startDiscovery();
+      }
+    }
     enforce();
     notify();
-    // The admitting node recorded this one as hosting no tasks (it cannot tell); the pool hears the truth now, not at
-    // the next periodic refresh: a move to this node is refused until then.
     await refresh();
-    return { poolId: joined.poolId, members: joined.members };
+  }
+
+  async function addPeer(addr: WireAddr): Promise<void> {
+    if (addr.id === selfId) throw new Error("that is this node");
+    if (store.ensureMember(addr.id, selfId, addr) === "removed") throw new Error(`${shortId(addr.id)} was removed from the pool; allow it first`);
+    net.offerAddress(addr);
+    enforce();
+    notify();
   }
 
   async function remove(nodeId: string): Promise<void> {
@@ -306,6 +383,14 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     await offline(nodeId, REMOVAL_GRACE_MS);
     // ... and the connection is cut once it closed it, or after the grace period.
     enforce();
+  }
+
+  async function allow(nodeId: string): Promise<void> {
+    if (nodeId === selfId) throw new Error("a node cannot allow itself");
+    if (!store.allow(nodeId)) throw new Error(`${shortId(nodeId)} is not in this pool`);
+    refusals.delete(nodeId);
+    enforce();
+    notify();
   }
 
   async function tokenChanged(): Promise<void> {
@@ -351,17 +436,18 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       store, db, cfg, selfId, settings,
       isOnline: (id) => net.isOnline(id),
       liveSummary,
-      invite,
-      join,
+      poolChanged,
       remove,
+      allow,
       tokenChanged,
       setSetting,
       unsetSetting,
       changes,
     },
-    invite,
-    join,
+    poolChanged,
+    addPeer,
     remove,
+    allow,
     tokenChanged,
     setSetting,
     unsetSetting,

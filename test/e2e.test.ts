@@ -97,7 +97,7 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     expect(lines[4]).toMatch(/^token present expires \d{4}-\d\d-\d\dT[\d:.]+Z$/);
     expect(lines[5]).toBe("tasks 1");
     expect(lines[6]).toBe(`node ${node.id}`);
-    expect(lines[7]).toMatch(/^pool [0-9a-f]+ members 1$/);
+    expect(lines[7]).toBe("pool (no secret set)");
     expect(lines).toHaveLength(8);
   } finally {
     if (!stopped) await node.stop();
