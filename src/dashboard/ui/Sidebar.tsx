@@ -3,7 +3,7 @@
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { useAction, useValue } from "./hooks";
-import { type Anchor, MenuItem, MoveMenu, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
+import { type Anchor, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
 import { projectChoices } from "./pool-model";
 import { hashOf, type View } from "./routes";
 import { groupTasks, nodeLineText, waitsOnYou } from "./sidebar-model";
@@ -94,7 +94,7 @@ function NodeRow({ row, index, selected, self }: { row: PoolNode; index: PoolInd
   const ref = index.nodes.get(row.nodeId);
   return (
     <a class={`node-row${selected ? " sel" : ""}`} href={hashOf({ name: "node", nodeId: row.nodeId })} title={`${row.nodeId}${self ? " (this node)" : ""}`}>
-      <span class={`dot ${row.online ? (row.running > 0 ? "run" : "idle") : "off"}`} />
+      <span class={nodeDot(row)} />
       <span class={row.online ? "" : "muted"}>{row.hostname}</span>
       {ref === undefined ? <span class="meta">{nodeLineText(row, null, Date.now())}</span> : <NodeLoad row={row} node={ref} />}
     </a>

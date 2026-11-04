@@ -25,9 +25,11 @@ import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
 import {
   HeadSchema,
+  isProgress,
   NodeObject,
   NodeStore,
   PeerObject,
+  PROGRESS_KINDS,
   ProjectObject,
   ProjectViewSchema,
   SessionObject,
@@ -567,7 +569,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       init: () => {
         runner.state(taskId); // an unknown task fails the activation
         // The window's events, then the stream deltas after the newest of them, which make up `live`.
-        const tail = listEventsTail(db, taskId, { limit: WINDOW_SIZE, excludeTypes: ["stream_event"] });
+        const tail = listEventsTail(db, taskId, { limit: WINDOW_SIZE, excludeTypes: [...PROGRESS_KINDS] });
         const streaming = listEvents(db, taskId, { fromSeq: (tail.at(-1)?.seq ?? 0) + 1 });
         return foldSession(EMPTY_SESSION, [...tail, ...streaming]);
       },
@@ -586,7 +588,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       live: self.derive([view], (v) => v.live),
       loadEarlier: async ({ beforeSeq, limit }) => {
         if (beforeSeq <= 1 || limit <= 0) return [];
-        return listEventsTail(db, taskId, { beforeSeq, limit, excludeTypes: ["stream_event"] });
+        return listEventsTail(db, taskId, { beforeSeq, limit, excludeTypes: [...PROGRESS_KINDS] });
       },
     };
   });
@@ -709,7 +711,7 @@ function isStreamEvent(e: EventRecord): boolean {
 }
 
 /**
- * Appends events to the window (the newest `WINDOW_SIZE`, `stream_event`s left out). A `stream_event`'s text or
+ * Appends events to the window (the newest `WINDOW_SIZE`, progress frames left out). A `stream_event`'s text or
  * thinking delta goes to `live` instead, which the next other event clears.
  */
 function foldSession(view: SessionView, events: EventRecord[]): SessionView {
@@ -718,6 +720,7 @@ function foldSession(view: SessionView, events: EventRecord[]): SessionView {
   const added: SessionView["window"] = [];
   for (const e of events) {
     if (!isStreamEvent(e)) {
+      if (isProgress(e.message as Message)) continue;
       added.push(e);
       live = null;
       continue;

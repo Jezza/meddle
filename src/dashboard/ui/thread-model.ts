@@ -1,4 +1,5 @@
 // The thread a task's event log renders as: pure, so it is tested without a DOM or a link.
+import { isProgress } from "../../state/contracts";
 
 export type ThreadItem =
   | { kind: "user"; text: string }
@@ -24,8 +25,8 @@ type Block = { type?: unknown; [key: string]: unknown };
 type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
 
 /**
- * Builds the thread from events in seq order. `stream_event`s are left out (the session's `live` cell covers
- * them); an assistant message streamed as several events with one id becomes one item; a `tool_result` attaches
+ * Builds the thread from events in seq order. Progress frames (`PROGRESS_KINDS`) are left out (the session's
+ * `live` cell covers `stream_event`s), and so is a status that only says a request went out or the session went idle; an assistant message streamed as several events with one id becomes one item; a `tool_result` attaches
  * to its `tool_use`; a message with a `parent_tool_use_id` nests under that call.
  */
 export function buildThread(events: Array<{ seq: number; message: unknown }>): ThreadItem[] {
@@ -42,9 +43,8 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
 
   for (const { message } of events) {
     const m = (message ?? {}) as Message;
+    if (isProgress(m)) continue;
     switch (m.type) {
-      case "stream_event":
-        break;
       case "rate_limit_event": {
         // Every turn reports its rate limit; only one that is not plainly allowed says something.
         const info = (m.rate_limit_info ?? {}) as { status?: unknown; rateLimitType?: unknown };
@@ -138,11 +138,12 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         return;
       case "status": {
         const parts = [];
-        if (m.status !== null && m.status !== undefined) parts.push(String(m.status));
+        if (m.status !== null && m.status !== undefined && m.status !== "requesting") parts.push(String(m.status));
         if (typeof m.permissionMode === "string") parts.push(`permission mode ${m.permissionMode}`);
         if (typeof m.compact_result === "string") parts.push(`compaction ${m.compact_result}`);
         if (typeof m.compact_error === "string") parts.push(m.compact_error);
-        top.push({ kind: "status", text: `Status: ${parts.join(", ") || "idle"}` });
+        // Every API request reports "requesting", and every turn's end idle: neither says anything.
+        if (parts.length > 0) top.push({ kind: "status", text: `Status: ${parts.join(", ")}` });
         return;
       }
       case "compact_boundary": {
@@ -152,7 +153,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         return;
       }
       case "init":
-        top.push({ kind: "status", text: `Session started: model ${str(m.model)}, permission mode ${str(m.permissionMode)}` });
+        // The bar beneath the thread shows the model and permission mode.
         return;
       default:
         top.push(unknown(m));
@@ -162,7 +163,8 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
   function addMeddle(m: Message) {
     switch (m.subtype) {
       case "turn_started":
-        top.push({ kind: "status", text: m.resume === true ? "Turn started (resumed)" : "Turn started" });
+        // The prompt that follows says a turn started; only a resumed one is worth a line.
+        if (m.resume === true) top.push({ kind: "status", text: "Turn resumed" });
         return;
       case "turn_aborted":
         top.push({ kind: "status", text: "Turn aborted" });
@@ -238,19 +240,40 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/** A thread item as the view shows it: a run of consecutive tool calls folds into one `tools` line. */
-export type ShownItem = Exclude<ThreadItem, ToolItem> | { kind: "tools"; tools: ToolItem[] };
+type UnknownItem = Extract<ThreadItem, { kind: "unknown" }>;
 
-/** Folds each run of consecutive tool calls into one `tools` item; every other item stays as it is. */
-export function foldTools(items: readonly ThreadItem[]): ShownItem[] {
+/** What happens between Claude's prose: a tool call, thinking with no text, or a message the thread does not know. */
+export type Step = ToolItem | AssistantItem | UnknownItem;
+
+/**
+ * A thread item as the view shows it: a run of steps (tool calls, thinking with no text, unknown messages) folds
+ * into one `steps` line, which names its tool calls.
+ */
+export type ShownItem =
+  | Exclude<ThreadItem, ToolItem | UnknownItem>
+  | { kind: "steps"; steps: Step[]; tools: ToolItem[] };
+
+function isStep(item: ThreadItem): item is Step {
+  return item.kind === "tool" || item.kind === "unknown" || (item.kind === "assistant" && item.text === "");
+}
+
+/** Folds each run of consecutive steps into one item; the rest stay as they are. */
+export function foldSteps(items: readonly ThreadItem[]): ShownItem[] {
   const shown: ShownItem[] = [];
   for (const item of items) {
-    if (item.kind !== "tool") shown.push(item);
-    else {
-      const last = shown.at(-1);
-      if (last?.kind === "tools") last.tools.push(item);
-      else shown.push({ kind: "tools", tools: [item] });
+    if (!isStep(item)) {
+      shown.push(item as ShownItem);
+      continue;
     }
+    // Thinking whose text the API left out says nothing.
+    if (item.kind === "assistant" && (item.thinking ?? "") === "") continue;
+    let last = shown.at(-1);
+    if (last?.kind !== "steps") {
+      last = { kind: "steps", steps: [], tools: [] };
+      shown.push(last);
+    }
+    last.steps.push(item);
+    if (item.kind === "tool") last.tools.push(item);
   }
   return shown;
 }

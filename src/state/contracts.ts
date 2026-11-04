@@ -258,6 +258,24 @@ export const TaskObject = remote("meddle.task", {
   },
 });
 
+/**
+ * Progress frames, as `type` or `type:subtype`: a stream delta, a spinner's thinking estimate, a tool's elapsed time,
+ * the session going busy and idle. A session's window and the thread leave them out.
+ */
+export const PROGRESS_KINDS: readonly string[] = [
+  "stream_event",
+  "tool_progress",
+  "system:thinking_tokens",
+  "system:hook_progress",
+  "system:task_progress",
+  "system:session_state_changed",
+];
+
+/** Whether a message is one of the `PROGRESS_KINDS`. */
+export function isProgress(m: { type?: unknown; subtype?: unknown }): boolean {
+  return PROGRESS_KINDS.includes(typeof m.subtype === "string" ? `${String(m.type)}:${m.subtype}` : String(m.type));
+}
+
 export const SessionObject = remote("meddle.session", {
   version: 1,
   input: Type.Object({ taskId: Type.String() }),
@@ -265,7 +283,7 @@ export const SessionObject = remote("meddle.session", {
   variants: {
     default: {
       state: {
-        /** The newest 200 events, `stream_event`s left out. */
+        /** The newest 200 events, progress frames (`PROGRESS_KINDS`) left out. */
         window: Type.Array(EventSchema),
         /** The seq of the window's oldest event; 0 when it is empty. */
         fromSeq: Type.Number(),
@@ -273,7 +291,7 @@ export const SessionObject = remote("meddle.session", {
         live: Nullable(Type.Object({ text: Type.String(), thinking: Type.String() })),
       },
       methods: {
-        /** The newest `limit` events (no `stream_event`s) before `beforeSeq`, oldest first. */
+        /** The newest `limit` events (no progress frames) before `beforeSeq`, oldest first. */
         loadEarlier: method(Type.Object({ beforeSeq: Type.Number(), limit: Type.Number() }), Type.Array(EventSchema)),
       },
     },

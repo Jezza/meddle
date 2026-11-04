@@ -57,10 +57,19 @@ export function listEventsTail(
     where.push("seq < ?");
     params.push(opts.beforeSeq);
   }
-  const excluded = opts.excludeTypes ?? [];
-  // `type IS NULL` keeps messages without a type, which `NOT IN` alone would drop.
-  if (excluded.length > 0) where.push(`(type IS NULL OR type NOT IN (${excluded.map(() => "?").join(", ")}))`);
-  params.push(...excluded, opts.limit);
+  // An entry `type` leaves out every message of that type, `type:subtype` only those with that subtype too.
+  // `IS NOT` keeps messages without a type or subtype, which `NOT IN` and `<>` would drop.
+  for (const kind of opts.excludeTypes ?? []) {
+    const at = kind.indexOf(":");
+    if (at < 0) {
+      where.push("type IS NOT ?");
+      params.push(kind);
+    } else {
+      where.push("NOT (type IS ? AND subtype IS ?)");
+      params.push(kind.slice(0, at), kind.slice(at + 1));
+    }
+  }
+  params.push(opts.limit);
   const rows = db
     .query<{ seq: number; json: string }, Array<string | number>>(
       `SELECT seq, json FROM events WHERE ${where.join(" AND ")} ORDER BY seq DESC LIMIT ?`,

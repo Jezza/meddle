@@ -11,7 +11,7 @@ import { type Anchor, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { usageShort } from "./sidebar-model";
-import { buildThread, foldTools, toolsLine, toolSummary, type ShownItem, type ThreadItem } from "./thread-model";
+import { buildThread, foldSteps, toolsLine, toolSummary, type ShownItem, type Step, type ThreadItem } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
 type TaskRef = Ref<typeof TaskObject>;
@@ -207,7 +207,7 @@ function Thread({ session, readOnly, after }: { session: SessionRef; readOnly: b
   useEffect(() => setSeen((prev) => merged(prev, window)), [window]);
 
   const events = useMemo(() => [...merged(seen, window).values()].sort((a, b) => a.seq - b.seq), [seen, window]);
-  const blocks = useMemo(() => blocksOf(foldTools(buildThread(events))), [events]);
+  const blocks = useMemo(() => blocksOf(foldSteps(buildThread(events))), [events]);
   const oldest = events[0]?.seq;
 
   // Kept at the bottom while you are there; left alone while you read further up.
@@ -291,12 +291,12 @@ function ShownView({ item }: { item: ShownItem }) {
     case "assistant":
       return (
         <>
-          {item.thinking !== undefined && <details class="thinking"><summary>thinking</summary><div class="thinking-text">{item.thinking}</div></details>}
+          {item.thinking !== undefined && <Thinking text={item.thinking} />}
           {item.text !== "" && <Markdown text={item.text} />}
         </>
       );
-    case "tools":
-      return <Tools tools={item.tools} />;
+    case "steps":
+      return <Steps steps={item.steps} tools={item.tools} />;
     case "question":
       return (
         <div class="asked">
@@ -314,16 +314,35 @@ function ShownView({ item }: { item: ShownItem }) {
       );
     case "status":
       return <div class={`status${/^(Turn failed|Turn aborted|Turn ended|Token |No usable token|Rate limit rejected)/.test(item.text) ? " bad" : ""}`}>{item.text}</div>;
-    case "unknown":
-      return <details class="unknown muted"><summary>{item.type}</summary><pre>{json(item.raw)}</pre></details>;
   }
 }
 
-/** A run of tool calls as one line; open while one of them still runs. A lone call is its own line. */
-function Tools({ tools }: { tools: ToolItem[] }) {
-  if (tools.length === 1) return <div class="tools single"><Tool tool={tools[0]!} /></div>;
+function Thinking({ text }: { text: string }) {
+  return <details class="thinking"><summary>thinking</summary><div class="thinking-text">{text}</div></details>;
+}
+
+function StepView({ step }: { step: Step }) {
+  switch (step.kind) {
+    case "tool":
+      return <Tool tool={step} />;
+    case "assistant":
+      return <Thinking text={step.thinking ?? ""} />;
+    case "unknown":
+      return <details class="unknown muted"><summary>{step.type}</summary><pre>{json(step.raw)}</pre></details>;
+  }
+}
+
+/**
+ * What Claude did between its prose, as one line naming the tool calls; open while one of them still runs. A lone
+ * call or a lone thinking is its own line.
+ */
+function Steps({ steps, tools }: { steps: Step[]; tools: ToolItem[] }) {
+  const only = steps.length === 1 ? steps[0]! : undefined;
+  if (only?.kind === "tool") return <div class="tools single"><Tool tool={only} /></div>;
+  if (only?.kind === "assistant") return <Thinking text={only.thinking ?? ""} />;
   const running = tools.some((t) => t.result === undefined);
   const failed = tools.filter((t) => t.result?.isError === true).length;
+  const others = steps.filter((s) => s.kind === "unknown").length;
   const { named, more } = toolsLine(tools);
   return (
     <details class="tools" open={running}>
@@ -331,23 +350,27 @@ function Tools({ tools }: { tools: ToolItem[] }) {
         {named.map((n, i) => <span key={i}>{i > 0 && " · "}<b>{n.name}</b> {n.summary}</span>)}
         {more > 0 && <span> · {more} more</span>}
         {tools.length > 1 && <span class="muted"> · {tools.length} calls</span>}
+        {tools.length === 0 && (others === 0 ? "thinking" : `${others} event${others === 1 ? "" : "s"}`)}
         {running && <span class="muted"> · running…</span>}
         {failed > 0 && <span class="error"> · {failed} failed</span>}
       </summary>
-      <div class="tool-list">{tools.map((t) => <Tool key={t.toolUseId} tool={t} />)}</div>
+      <div class="tool-list">{steps.map((s, i) => <StepView key={s.kind === "tool" ? s.toolUseId : i} step={s} />)}</div>
     </details>
   );
 }
 
 function Tool({ tool }: { tool: ToolItem }) {
-  const shown = useMemo(() => foldTools(tool.children), [tool.children]);
+  const shown = useMemo(() => foldSteps(tool.children), [tool.children]);
+  const input = tool.input as { command?: unknown; description?: unknown } | null;
   return (
     <details class="tool">
       <summary>
         <b>{tool.name}</b> <span class="muted">{toolSummary(tool.input)}</span>
         {tool.result === undefined ? <span class="muted"> · running</span> : tool.result.isError && <span class="error"> · error</span>}
       </summary>
-      <pre>{json(tool.input)}</pre>
+      {typeof input?.command === "string"
+        ? <>{typeof input.description === "string" && <p class="tool-note muted">{input.description}</p>}<pre>{input.command}</pre></>
+        : <pre>{json(tool.input)}</pre>}
       {shown.length > 0 && (
         <div class="children">
           {tool.agentId !== undefined && <p class="muted">agent {tool.agentId}</p>}
@@ -478,6 +501,14 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 function Composer({ task, running, disabled }: { task: TaskRef; running: boolean; disabled: boolean }) {
   const [text, setText] = useState("");
   const action = useAction();
+  // Grows with what is typed, up to the stylesheet's max-height, instead of a drag handle.
+  const box = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (el === null) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight + 2}px`;
+  }, [text]);
   const send = async () => {
     if (disabled || text.trim() === "") return;
     if (await action.run(() => task.prompt({ text }))) setText("");
@@ -485,7 +516,8 @@ function Composer({ task, running, disabled }: { task: TaskRef; running: boolean
   return (
     <div class="composer">
       <textarea
-        rows={2}
+        ref={box}
+        rows={1}
         disabled={disabled}
         value={text}
         placeholder={disabled ? "Moving: prompts wait until it lands" : running ? "Steer the running turn…" : "Reply…"}

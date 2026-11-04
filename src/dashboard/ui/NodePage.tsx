@@ -4,7 +4,7 @@ import type { Host, Ref } from "@earendil-works/chord";
 import { NodeObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useObject, useValue } from "./hooks";
-import { mb, PaneHead, type PoolNode, type PoolRef, StateDot, tokenText, Unavailable } from "./common";
+import { mb, nodeDot, PaneHead, type PoolNode, type PoolRef, StateDot, tokenText, Unavailable } from "./common";
 import { hashOf } from "./routes";
 import { nodeLineText, waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
@@ -22,7 +22,7 @@ export function NodePage({ hosts, pool, index, nodeId }: { hosts: Hosts; pool: P
   return (
     <>
       <PaneHead>
-        <span class={`dot ${row.online ? (row.running > 0 ? "run" : "idle") : "off"}`} />
+        <span class={nodeDot(row)} />
         <strong>{row.hostname}</strong>
         <span class="muted id" title={row.nodeId}>{shortId(row.nodeId)}</span>
         <span class="muted">{row.status === "removed" ? "removed from the pool" : nodeLineText(row, null, Date.now())}{nodeId === selfId && " · this node"}</span>

@@ -74,3 +74,9 @@ test("openDb adds the tasks settings column to an older database, once", async (
   expect(db.query("SELECT title, settings FROM tasks").get()).toEqual({ title: "old", settings: null });
   db.close();
 });
+
+test("listEventsTail leaves out a type:subtype entry without dropping messages missing either", () => {
+  const db = openDb(":memory:");
+  for (const m of [{ type: "system", subtype: "thinking_tokens" }, { type: "system", subtype: "init" }, { type: "system" }, { foo: 1 }, { type: "tool_progress" }]) appendEvent(db, "t", m);
+  expect(listEventsTail(db, "t", { limit: 10, excludeTypes: ["system:thinking_tokens", "tool_progress"] }).map(e => e.seq)).toEqual([2, 3, 4]);
+});

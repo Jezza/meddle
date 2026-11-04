@@ -33,6 +33,11 @@ export function Unavailable({ status }: { status: HostStatus }) {
   return <p class="muted">Connecting…</p>;
 }
 
+/** A node's dot class: green online, green with a halo while it runs tasks, grey offline. */
+export function nodeDot(node: { online: boolean; running: number }): string {
+  return `dot ${!node.online ? "off" : node.running > 0 ? "busy" : "ok"}`;
+}
+
 /** A task's state as a dot: running, waiting on you, idle, moving, archived. */
 export function StateDot({ state, waiting }: { state: string; waiting: boolean }) {
   const kind = waiting || state === "waiting" ? "wait" : state === "running" ? "run" : state === "moving" || state === "receiving" ? "move" : state === "archived" ? "off" : "idle";
@@ -123,7 +128,7 @@ export function MoveMenu({ task, nodes, from, anchor, onClose }: {
       {choices.map(({ node, reason }) => (
         <MenuItem key={node.nodeId} disabled={reason !== null || action.busy} title={node.nodeId} onClick={() => void move(node.nodeId)}
           meta={reason ?? nodeMeta(node)}>
-          <span class={`dot ${node.online ? (node.running > 0 ? "run" : "idle") : "off"}`} /> {node.hostname}
+          <span class={nodeDot(node)} /> {node.hostname}
         </MenuItem>
       ))}
       <div class="menu-sep" />
@@ -161,13 +166,13 @@ export function RestoreMenu({ task, nodes, holder, anchor, onClose, onRestored }
       <MenuItem disabled={action.busy} onClick={() => void restore(null)} meta="placement picks">Automatic</MenuItem>
       {self !== undefined && (
         <MenuItem disabled={action.busy} title={self.nodeId} onClick={() => void restore(self.nodeId)} meta="holds its archive">
-          <span class={`dot ${self.online ? "idle" : "off"}`} /> {self.hostname}
+          <span class={nodeDot(self)} /> {self.hostname}
         </MenuItem>
       )}
       {choices.map(({ node, reason }) => (
         <MenuItem key={node.nodeId} disabled={reason !== null || action.busy} title={node.nodeId} onClick={() => void restore(node.nodeId)}
           meta={reason ?? nodeMeta(node)}>
-          <span class={`dot ${node.online ? (node.running > 0 ? "run" : "idle") : "off"}`} /> {node.hostname}
+          <span class={nodeDot(node)} /> {node.hostname}
         </MenuItem>
       ))}
       {action.error !== null && <div class="menu-note error">{action.error}</div>}
