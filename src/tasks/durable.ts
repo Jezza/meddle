@@ -42,7 +42,7 @@ import { markToken, pickToken } from "../token";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
 import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
-import { readManifest, taskGlob, taskNamespace, transcriptPath, type TaskManifest } from "./manifest";
+import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type TaskManifest } from "./manifest";
 import { MeddleMove, releaseFolder, type MoveInput } from "./move";
 import { checkReceivedManifest, provisionFromManifest, provisionTask } from "./provision";
 import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
@@ -216,6 +216,7 @@ export class TaskRunner {
   /** Tasks whose move is being aborted because it was cancelled (`cancelMove`), not because it failed. */
   #cancelling = new Set<string>();
   #moveListeners = new Set<(taskId: string, move: MoveState | null) => void>();
+  #manifestListeners = new Set<(taskId: string, manifest: TaskManifest) => void>();
   /** Woken whenever a turn of the task ends (completed, failed or aborted): a move waits for it. */
   #turnWaiters = new Map<string, Set<() => void>>();
   /** Tasks being archived: until the row says `archived`, no turn or move of them starts. */
@@ -447,6 +448,26 @@ export class TaskRunner {
     this.#refuseElsewhere(taskId);
     await this.liveQuery(taskId)?.setModel(model);
     updateTaskSettings(this.#db, taskId, { model });
+  }
+
+  /**
+   * Renames the task: its row (title and manifest) and the manifest in its folder. Refused while it is not live here
+   * (moving, moved, being received or archived) and for a blank title. Answers the new manifest.
+   */
+  async rename(taskId: string, title: string): Promise<TaskManifest> {
+    const trimmed = title.trim();
+    if (trimmed === "") throw new Error("a task's title cannot be blank");
+    this.#refuseElsewhere(taskId);
+    const manifest: TaskManifest = { ...(JSON.parse(this.#row(taskId).manifest) as TaskManifest), title: trimmed };
+    await writeManifest(this.#cfg, manifest);
+    updateTask(this.#db, taskId, { title: trimmed, manifest: JSON.stringify(manifest) });
+    notify(this.#manifestListeners, (cb) => cb(taskId, manifest));
+    return manifest;
+  }
+
+  onManifest(cb: (taskId: string, manifest: TaskManifest) => void): () => void {
+    this.#manifestListeners.add(cb);
+    return () => { this.#manifestListeners.delete(cb); };
   }
 
   /** Effort for the task's later turns; a live turn keeps its own. */

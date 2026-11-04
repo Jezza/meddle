@@ -97,7 +97,7 @@ export function getTask(db: Database, id: string): TaskRow | null {
 }
 
 const TASK_PATCH_COLUMNS = [
-  "state", "started", "turns", "session_id", "manifest", "settings", "queued", "moved_to", "receiving_from", "archived_on", "archived_at",
+  "title", "state", "started", "turns", "session_id", "manifest", "settings", "queued", "moved_to", "receiving_from", "archived_on", "archived_at",
 ] as const;
 
 /** Sets the given columns of a task row (`null` clears a nullable one; `undefined` leaves it). */

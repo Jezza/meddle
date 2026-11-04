@@ -212,9 +212,13 @@ export const TaskObject = remote("meddle.task", {
          * state, and every 60 s.
          */
         bookmarks: Type.Array(TaskBookmarkSchema),
+        /** When the task's row last changed (ISO): its state, settings or title; what the dashboard sorts by. */
+        activityAt: Type.String(),
       },
       methods: {
         prompt: method(Type.Object({ text: Type.String() })),
+        /** Renames the task; refused for a blank title and while it is not live here (moving, moved, archived). */
+        rename: method(Type.Object({ title: Type.String() })),
         interrupt: method(Type.Object({})),
         /** Runs the task's turn again after repeated crashes parked it; rejects when no turn is parked. */
         retry: method(Type.Object({})),

@@ -595,8 +595,8 @@ protected from each other.
 
 ## Moving a task
 
-A task moves to another node of the pool from its view in the dashboard (Move to, with an optional "move now") or
-from the CLI:
+A task moves to another node of the pool from the dashboard (its node in the task's bar, or Move to… on its sidebar
+row, choosing whether to wait for the turn or move now) or from the CLI:
 
 ```sh
 bun run src/cli.ts task move <task-id> <node>         # waits for the running turn, if any, to end
@@ -828,17 +828,30 @@ bun run src/cli.ts serve
 
 Then open <http://127.0.0.1:7777/> (`MEDDLE_PORT` changes the port). The dashboard binds to localhost only.
 
-The dashboard of any node shows the whole pool: a card per node with its state (online, offline or removed); the
-notifications of every online node; and a form for a new task, placed by meddle (the node select's Automatic, the
-default) or on a chosen online node that hosts tasks (see [Where a new task runs](#where-a-new-task-runs)), with any
-of the pool's projects or none, and an optional first prompt that starts the task's first turn. An online node's
-card shows its meddle and Claude Code versions, token, task root, resources and tasks. An offline member's card shows
-what the roster last recorded of it (its versions, whether it hosts tasks and how many tasks it has) and when it was
-last seen; a removed node's card says only that it was removed. It flags a pool whose members run different meddle
-or Claude Code versions. The Projects view lists every project of the pool (see
-[Homes and replicas](#homes-and-replicas)), and a task's view moves it (see [Moving a task](#moving-a-task)) or
-archives it (see [Archiving a task](#archiving-a-task)); the pool view lists every online node's archived tasks in
-one "Archived" list naming the node that holds each, and Restore offers a node select (Automatic by default).
+The dashboard of any node shows the whole pool. Its sidebar lists the pool's projects, each with the tasks that work
+in it alone and a New task row; then Tasks, the tasks with no project or several (each marked with how many); then
+Archived, collapsed, every online node's archived tasks; and at its foot Nodes, every member with what runs on it and
+its load, or since when it has been offline. A task's row shows its state (a dot: running, waiting on you, idle), how
+many approvals and questions wait on you, and the node it runs on (`from → to` while it moves); its ⋯ menu (or a
+right click) renames it, moves it, archives it, or for an archived task restores or deletes it. Within a project,
+tasks are listed by latest activity. The sidebar hides (◧), and on a narrow screen it is a drawer. Opening the
+dashboard shows the task that waits on you most recently, else a new task. Failed turns, moves and token trouble show
+as notices in the top right until dismissed. It flags a pool whose members run different meddle or Claude Code
+versions in the Nodes header.
+
+A task opens beside the sidebar: its title (✎ renames it), state and actions (Interrupt, Retry, Archive; Restore and
+Delete for an archived one), its thread with the assistant's text as Markdown and each run of tool calls folded into
+one line, what waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the composer,
+and a bar with its projects, its node, its bookmark, the latest turn's tokens, and its permission mode, effort and
+model. The node in the bar opens the move menu: every other member, those that cannot take the task greyed with why,
+and whether the move waits for the running turn or interrupts it (see [Moving a task](#moving-a-task)); a task that
+moved is followed to its new node. New task opens an empty composer: its projects (the one it was opened under, more
+added with ＋ project), the node (Automatic, the default, or a chosen online node that hosts tasks; see
+[Where a new task runs](#where-a-new-task-runs)) and its first prompt; Start creates it and opens it. A project's page
+(its name in the sidebar) shows its home, the nodes holding a copy with their bookmarks (see
+[Homes and replicas](#homes-and-replicas)) and its tasks; ＋ beside Projects adds one from a folder on this node or a
+URL. A node's page (from Nodes) shows its meddle and Claude Code versions, token, task root, resources and tasks while
+it is online, and what the roster last recorded of it (and when it was last seen) while it is not.
 
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an

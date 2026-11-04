@@ -1,6 +1,6 @@
 // test/thread-model.test.ts
 import { test, expect } from "bun:test";
-import { buildThread } from "../src/dashboard/ui/thread-model";
+import { buildThread, foldTools, toolsLine, toolSummary, type ThreadItem } from "../src/dashboard/ui/thread-model";
 test("tool calls get their results and subagent messages nest", () => {
   const items = buildThread([
     { seq: 1, message: { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } }] }, parent_tool_use_id: null } },
@@ -58,4 +58,31 @@ test("a token fault renders as a status line", () => {
     { kind: "status", text: "No usable token" },
     { kind: "status", text: "Token a exhausted until 2100-01-01T00:00:00.000Z; already switched login once" },
   ]);
+});
+
+test("foldTools folds each run of consecutive tool calls into one line", () => {
+  const tool = (name: string, input: unknown): ThreadItem => ({ kind: "tool", name, input, toolUseId: name, children: [] });
+  const items: ThreadItem[] = [
+    { kind: "user", text: "hi" },
+    tool("Read", { file_path: "a.rs" }),
+    tool("Grep", { pattern: "take_event" }),
+    tool("Read", { file_path: "b.rs" }),
+    { kind: "assistant", text: "found it" },
+    tool("Bash", { command: "cargo check\n--all" }),
+  ];
+  const shown = foldTools(items);
+  expect(shown.map((i) => i.kind)).toEqual(["user", "tools", "assistant", "tools"]);
+  const run = shown[1] as Extract<typeof shown[number], { kind: "tools" }>;
+  expect(run.tools.length).toBe(3);
+  expect(toolsLine(run.tools)).toEqual({ named: [{ name: "Read", summary: "a.rs" }, { name: "Grep", summary: "take_event" }], more: 1 });
+  expect(toolSummary({ command: "cargo check\n--all" })).toBe("cargo check");
+  expect(toolSummary({ prompt: "x".repeat(10) }, 4)).toBe("xxxx…");
+});
+
+test("a rate limit event says something only when the limit is not plainly allowed", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "rate_limit_event", rate_limit_info: { status: "allowed" } } },
+    { seq: 2, message: { type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour" } } },
+  ]);
+  expect(items).toEqual([{ kind: "status", text: "Rate limit allowed_warning (five_hour)" }]);
 });

@@ -2,16 +2,18 @@
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { useAction, useValue } from "./hooks";
-import { tokenText, type PoolRef } from "./Pool";
+import { PaneHead, tokenText, type PoolRef } from "./common";
 
 export function Settings({ pool }: { pool: PoolRef }) {
   return (
-    <section>
-      <h2>Settings</h2>
-      <PoolSection pool={pool} />
-      <PoolSettings pool={pool} />
-      <TokenSection pool={pool} />
-    </section>
+    <>
+      <PaneHead><strong>Settings</strong></PaneHead>
+      <div class="page">
+        <PoolSection pool={pool} />
+        <PoolSettings pool={pool} />
+        <TokenSection pool={pool} />
+      </div>
+    </>
   );
 }
 

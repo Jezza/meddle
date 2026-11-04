@@ -1,33 +1,63 @@
-// One task: its thread from the session's event log, what waits on you, the controls and the composer.
+// One task: its head (title, state, actions), the thread from the session's event log with what waits on you inline,
+// the composer, and the bar beneath (project, node, bookmark, the latest turn's tokens, mode, effort, model).
 import type { EffortLevel, PermissionMode } from "@anthropic-ai/claude-agent-sdk";
 import type { Host, Ref } from "@earendil-works/chord";
-import { useEffect, useMemo, useState } from "preact/hooks";
+import DOMPurify from "dompurify";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
-import { useAction, useObject, useValue } from "./hooks";
-import type { PoolRef } from "./Pool";
-import { moveTargets } from "./pool-model";
+import { type Hosts, useAction, useObject, useValue } from "./hooks";
+import { type Anchor, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
-import { buildThread, type ThreadItem } from "./thread-model";
+import { usageShort } from "./sidebar-model";
+import { buildThread, foldTools, toolsLine, toolSummary, type ShownItem, type ThreadItem } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
 type TaskRef = Ref<typeof TaskObject>;
 type SessionRef = Ref<typeof SessionObject>;
 type Pending = TaskRef["pending"]["value"][number];
 type LogEvent = SessionRef["window"]["value"][number];
+type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
 
 const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"];
 const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 const EARLIER_PAGE = 200;
 const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
 
-export function Task({ host, node, pool, taskId }: { host: Host; node: NodeRef; pool: PoolRef; taskId: string }) {
+// Links in the model's text open in a new tab, never in place of the dashboard.
+DOMPurify.addHook("afterSanitizeAttributes", (el) => {
+  if (el.tagName === "A") {
+    el.setAttribute("target", "_blank");
+    el.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
+/** A task on any member: through that node's host while it is online. */
+export function TaskView({ hosts, pool, nodeId, taskId }: { hosts: Hosts; pool: PoolRef; nodeId: string; taskId: string }) {
+  const row = useValue(pool.nodes).find((n) => n.nodeId === nodeId);
+  const message = (text: string, cls = "muted") => <><PaneHead><span class="muted">Task</span></PaneHead><p class={`pane-note ${cls}`}>{text}</p></>;
+  // This node's own tasks are always reachable over /ws.
+  if (nodeId !== hosts.selfId) {
+    if (row === undefined) return message(`Node ${shortId(nodeId)} is not in this pool.`, "error");
+    if (row.status === "removed") return message(`${row.hostname} (${shortId(nodeId)}) was removed from the pool.`, "error");
+    if (!row.online) return message(`${row.hostname} (${shortId(nodeId)}) is offline; the task shows again once it is back.`);
+  }
+  const host = hosts.for(nodeId);
+  if (host === undefined) return <><PaneHead><span class="muted">Task</span></PaneHead><div class="pane-note"><Unavailable status={hosts.status(nodeId)} /></div></>;
+  return <TaskOnline host={host} pool={pool} taskId={taskId} />;
+}
+
+function TaskOnline({ host, pool, taskId }: { host: Host; pool: PoolRef; taskId: string }) {
+  const node = useObject(host, NodeObject, {});
   const task = useObject(host, TaskObject, { id: taskId });
   const session = useObject(host, SessionObject, { taskId });
-  const error = task.error ?? session.error;
-  if (error !== undefined) return <p class="error">{error}</p>;
-  if (task.ref === undefined || session.ref === undefined) return <p class="muted">Loading task…</p>;
-  return <TaskLoaded node={node} pool={pool} task={task.ref} session={session.ref} />;
+  const error = node.error ?? task.error ?? session.error;
+  if (error !== undefined) return <><PaneHead><span class="muted">Task</span></PaneHead><p class="pane-note error">{error}</p></>;
+  if (node.ref === undefined || task.ref === undefined || session.ref === undefined) {
+    return <><PaneHead><span class="muted">Loading task…</span></PaneHead></>;
+  }
+  return <TaskLoaded node={node.ref} pool={pool} task={task.ref} session={session.ref} />;
 }
 
 function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRef; task: TaskRef; session: SessionRef }) {
@@ -37,58 +67,82 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const move = useValue(task.move);
   const movedTo = useValue(task.movedTo);
   const archivedOn = useValue(task.archivedOn);
-  const bookmarks = useValue(task.bookmarks);
+  const nodeId = useValue(node.nodeId);
   const nodes = useValue(pool.nodes);
-  const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
-  const head = (
-    <header class="task-head">
-      <h2>{manifest.title} <span class={`state ${state}`}>{state}</span></h2>
-      <p class="muted">
-        {manifest.projects.length === 0 ? "no project" : manifest.projects.map((p) => `${p.name} (${p.workspace})`).join(", ")} · session {manifest.sessionId}
-      </p>
-      {bookmarks.length > 0 && (
-        <p class="muted">
-          bookmarks:{" "}
-          {bookmarks.map((b, i) => (
-            <span key={`${b.project} ${b.name}`} class={b.changeId === "" ? "flag" : ""} title={b.name}>
-              {i > 0 && ", "}{bookmarkText(manifest.id, b)}
-            </span>
-          ))}
-        </p>
-      )}
-    </header>
-  );
-  // Nothing of a moved task is left here but its row: no thread, no controls, a link to it where it went.
-  if (state === "moved") {
-    return (
-      <>
-        {head}
-        {movedTo === null ? <p>Moved to another node.</p> : (
-          <p>Moved to <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })} title={movedTo}>{nameOf(movedTo)}</a>.</p>
-        )}
-      </>
-    );
-  }
-  // An archived task has its rows here and no folder: its thread, read-only, with Restore and Delete.
-  if (state === "archived") {
-    return (
-      <>
-        {head}
-        <ArchivedControls node={node} pool={pool} task={task} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} />
-        <Thread session={session} readOnly />
-      </>
-    );
-  }
+  const nameOf = (id: string) => nodes.find((n) => n.nodeId === id)?.hostname ?? shortId(id);
+
+  // A task that moved on is followed to where it went.
+  useEffect(() => {
+    if (state === "moved" && movedTo !== null) location.replace(hashOf({ name: "task", nodeId: movedTo, id: manifest.id }));
+  }, [state, movedTo, manifest.id]);
+  useEffect(() => { document.title = `${manifest.title} · meddle`; return () => { document.title = "meddle"; }; }, [manifest.title]);
+
+  const archived = state === "archived";
   const moving = state === "moving" || move !== null;
+  const live = state === "running" || state === "waiting";
   return (
-    <>
-      {head}
+    <div class="task">
+      <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving} />
       {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
-      <Controls node={node} pool={pool} task={task} disabled={moving} />
-      <Thread session={session} />
-      {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
-      <Composer task={task} running={state === "running" || state === "waiting"} disabled={moving} />
-    </>
+      {state === "moved" ? (
+        <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
+      ) : (
+        <Thread session={session} readOnly={archived} after={pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)} />
+      )}
+      {!archived && state !== "moved" && <Composer task={task} running={live} disabled={moving} />}
+      <BottomBar task={task} pool={pool} node={node} nodeId={nodeId} archived={archived} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} moving={moving} />
+    </div>
+  );
+}
+
+// ─── the head ───
+
+function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving }: {
+  task: TaskRef; nodes: PoolRef["nodes"]["value"]; nodeId: string; title: string; state: string; pendingCount: number; moving: boolean;
+}) {
+  const [renaming, setRenaming] = useState(false);
+  const [restoreAt, setRestoreAt] = useState<Anchor | null>(null);
+  const action = useAction();
+  const archived = state === "archived";
+  const live = state === "running" || state === "waiting";
+  const stateText = pendingCount > 0 ? "waiting on you" : state;
+  const remove = () => action.run(async () => {
+    if (!confirm(`Delete "${title}", its log and its archive? This cannot be undone.`)) return;
+    await task.delete({});
+    location.hash = hashOf({ name: "home" });
+  });
+  return (
+    <PaneHead>
+      <div class="task-title">
+        {renaming
+          ? <RenameInput value={title} onDone={() => setRenaming(false)} onSave={(t) => action.run(() => task.rename({ title: t }))} />
+          : <>
+            <strong title={title}>{title}</strong>
+            {!archived && !moving && state !== "moved" && <button class="icon" title="Rename" onClick={() => setRenaming(true)}>✎</button>}
+          </>}
+        <StateDot state={state} waiting={pendingCount > 0} />
+        <span class="muted state-text">{stateText}</span>
+      </div>
+      <div class="head-actions">
+        {action.error !== null && <span class="error" title={action.error}>{action.error}</span>}
+        {live && <button disabled={moving || action.busy} onClick={() => action.run(() => task.interrupt({}))}>■ Interrupt</button>}
+        {/* A turn that crashed the node too often is parked; retry says so when none is. */}
+        {live && pendingCount === 0 && <button disabled={moving || action.busy} title="Runs a parked turn again" onClick={() => action.run(() => task.retry({}))}>↻ Retry</button>}
+        {/* Only an idle task archives; the node says why it refuses one (queued prompts, a home offline, …). */}
+        {state === "idle" && !moving && (
+          <button disabled={action.busy} title="Removes the task's folder from this node and keeps its log; Restore brings it back"
+            onClick={() => action.run(() => task.archive({}))}>▣ Archive</button>
+        )}
+        {archived && <>
+          <button disabled={action.busy} onClick={(e) => setRestoreAt({ el: e.currentTarget })}>Restore ▾</button>
+          <button disabled={action.busy} onClick={remove}>Delete</button>
+        </>}
+      </div>
+      {restoreAt !== null && (
+        <RestoreMenu task={task} nodes={nodes} holder={nodeId} anchor={restoreAt} onClose={() => setRestoreAt(null)}
+          onRestored={(to) => { location.hash = hashOf({ name: "task", nodeId: to, id: task.manifest.value.id }); }} />
+      )}
+    </PaneHead>
   );
 }
 
@@ -112,35 +166,38 @@ function MoveBanner({ task, move, to }: { task: TaskRef; move: { to: string; pha
   const waiting = move.phase === "prepare";
   const cancellable = waiting || move.phase === "handoff";
   return (
-    <section class="moving">
-      <p class="flag">{moveText(move.phase, to)}</p>
-      {(cancellable || waiting) && (
-        <div class="row">
-          {waiting && (
-            <button disabled={action.busy} title={MOVE_NOW_WARNING} onClick={() => action.run(() => task.moveNow({}))}>Move now</button>
-          )}
-          {cancellable && (
-            <button disabled={action.busy} title="Calls the move off: the task stays on this node, its turn untouched"
-              onClick={() => action.run(() => task.cancelMove({}))}>Cancel move</button>
-          )}
-        </div>
-      )}
-      {move.error !== null && <p class="error">{move.error}</p>}
-      {action.error !== null && <p class="error">{action.error}</p>}
-    </section>
+    <div class="banner">
+      <span>⇄ {moveText(move.phase, to)}</span>
+      {move.error !== null && <span class="error">{move.error}</span>}
+      {action.error !== null && <span class="error">{action.error}</span>}
+      <span class="banner-actions">
+        {waiting && <button disabled={action.busy} title={MOVE_NOW_WARNING} onClick={() => action.run(() => task.moveNow({}))}>Move now</button>}
+        {cancellable && (
+          <button disabled={action.busy} title="Calls the move off: the task stays on this node, its turn untouched"
+            onClick={() => action.run(() => task.cancelMove({}))}>Cancel</button>
+        )}
+      </span>
+    </div>
   );
-}
-
-/** A task bookmark as the header lists it: its name after `meddle/task/<id>/`, then its change (or "conflicted"). */
-function bookmarkText(taskId: string, b: { name: string; changeId: string }): string {
-  const prefix = `meddle/task/${taskId}/`;
-  const name = b.name.startsWith(prefix) ? b.name.slice(prefix.length) : b.name;
-  return b.changeId === "" ? `${name} (conflicted)` : `${name} ${b.changeId.slice(0, 8)}`;
 }
 
 // ─── the thread ───
 
-function Thread({ session, readOnly = false }: { session: SessionRef; readOnly?: boolean }) {
+type Block = { who: "user" | "claude" | "status"; items: ShownItem[] };
+
+/** The shown items in blocks: each user message alone, Claude's run of items under one avatar, status lines apart. */
+function blocksOf(items: readonly ShownItem[]): Block[] {
+  const out: Block[] = [];
+  for (const item of items) {
+    const who = item.kind === "user" ? "user" : item.kind === "status" ? "status" : "claude";
+    const last = out.at(-1);
+    if (last !== undefined && last.who === who && who !== "user") last.items.push(item);
+    else out.push({ who, items: [item] });
+  }
+  return out;
+}
+
+function Thread({ session, readOnly, after }: { session: SessionRef; readOnly: boolean; after: preact.ComponentChildren }) {
   const window = useValue(session.window);
   const live = useValue(session.live);
   /** Every event seen since the view opened: the window slides past events, and "load earlier" adds older ones. */
@@ -150,31 +207,44 @@ function Thread({ session, readOnly = false }: { session: SessionRef; readOnly?:
   useEffect(() => setSeen((prev) => merged(prev, window)), [window]);
 
   const events = useMemo(() => [...merged(seen, window).values()].sort((a, b) => a.seq - b.seq), [seen, window]);
-  const items = useMemo(() => buildThread(events), [events]);
+  const blocks = useMemo(() => blocksOf(foldTools(buildThread(events))), [events]);
   const oldest = events[0]?.seq;
+
+  // Kept at the bottom while you are there; left alone while you read further up.
+  const scroller = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (el !== null && stick.current) el.scrollTop = el.scrollHeight;
+  });
 
   const loadEarlier = () => action.run(async () => {
     if (oldest === undefined) return;
     const earlier = await session.loadEarlier({ beforeSeq: oldest, limit: EARLIER_PAGE });
     if (earlier.length < EARLIER_PAGE) setNoneEarlier(true);
+    stick.current = false;
     setSeen((prev) => merged(prev, earlier));
   });
 
+  const lastClaude = blocks.at(-1)?.who === "claude";
   return (
-    <section class="thread">
-      {oldest !== undefined && oldest > 1 && !noneEarlier && (
-        <button disabled={action.busy} onClick={loadEarlier}>Load earlier</button>
-      )}
-      {action.error !== null && <p class="error">{action.error}</p>}
-      {items.length === 0 && live === null && <p class="muted">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
-      {items.map((item, i) => <Item key={i} item={item} />)}
-      {live !== null && (
-        <div class="item assistant live">
-          {live.thinking !== "" && <details open><summary>thinking</summary><pre>{live.thinking}</pre></details>}
-          <div class="text">{live.text}</div>
-        </div>
-      )}
-    </section>
+    <div class="thread-scroll" ref={scroller}
+      onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
+      <div class="thread">
+        {oldest !== undefined && oldest > 1 && !noneEarlier && (
+          <button class="earlier" disabled={action.busy} onClick={loadEarlier}>Load earlier</button>
+        )}
+        {action.error !== null && <p class="error">{action.error}</p>}
+        {blocks.length === 0 && live === null && <p class="muted empty">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
+        {blocks.map((b, i) => (
+          <BlockView key={i} block={b}>
+            {i === blocks.length - 1 && live !== null && <Live live={live} />}
+          </BlockView>
+        ))}
+        {live !== null && !lastClaude && <BlockView block={{ who: "claude", items: [] }}><Live live={live} /></BlockView>}
+        {after}
+      </div>
+    </div>
   );
 }
 
@@ -185,65 +255,108 @@ function merged(into: Map<number, LogEvent>, events: readonly LogEvent[]): Map<n
   return next;
 }
 
-function Item({ item }: { item: ThreadItem }) {
+function BlockView({ block, children }: { block: Block; children?: preact.ComponentChildren }) {
+  if (block.who === "status") {
+    return <div class="status-block">{block.items.map((item, i) => <ShownView key={i} item={item} />)}{children}</div>;
+  }
+  return (
+    <div class={`msg ${block.who}`}>
+      <div class={`avatar ${block.who}`} title={block.who === "user" ? "you" : "Claude"}>{block.who === "user" ? "" : "✻"}</div>
+      <div class="msg-body">
+        {block.items.map((item, i) => <ShownView key={i} item={item} />)}
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Live({ live }: { live: { text: string; thinking: string } }) {
+  return (
+    <div class="live">
+      {live.thinking !== "" && <details class="thinking" open><summary>thinking</summary><div class="thinking-text">{live.thinking}</div></details>}
+      {live.text !== "" ? <Markdown text={live.text} /> : live.thinking === "" && <span class="muted">…</span>}
+    </div>
+  );
+}
+
+function Markdown({ text }: { text: string }) {
+  const html = useMemo(() => DOMPurify.sanitize(renderMarkdown(text)), [text]);
+  return <div class="md" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
     case "user":
-      return <div class="item user"><div class="text">{item.text}</div></div>;
+      return <div class="user-text">{item.text}</div>;
     case "assistant":
       return (
-        <div class="item assistant">
-          {item.thinking !== undefined && <details><summary>thinking</summary><pre>{item.thinking}</pre></details>}
-          {item.text !== "" && <div class="text">{item.text}</div>}
-        </div>
+        <>
+          {item.thinking !== undefined && <details class="thinking"><summary>thinking</summary><div class="thinking-text">{item.thinking}</div></details>}
+          {item.text !== "" && <Markdown text={item.text} />}
+        </>
       );
-    case "tool":
-      return (
-        <details class="item tool" open={item.result === undefined}>
-          <summary>
-            <strong>{item.name}</strong> <span class="muted">{toolSummary(item.input)}</span>
-            {item.result === undefined ? <span class="muted"> · running</span> : item.result.isError && <span class="error"> · error</span>}
-          </summary>
-          <pre>{json(item.input)}</pre>
-          {item.children.length > 0 && (
-            <div class="children">
-              {item.agentId !== undefined && <p class="muted">agent {item.agentId}</p>}
-              {item.children.map((child, i) => <Item key={i} item={child} />)}
-            </div>
-          )}
-          {item.result !== undefined && <pre class={item.result.isError ? "result error" : "result"}>{item.result.text}</pre>}
-        </details>
-      );
+    case "tools":
+      return <Tools tools={item.tools} />;
     case "question":
       return (
-        <div class="item question">
-          <strong>Question</strong>
+        <div class="asked">
+          <strong>Asked</strong>
           {questionsOf(item.questions).map((q) => <p key={q.question}>{q.question} <span class="muted">({q.options.map((o) => o.label).join(" / ")})</span></p>)}
         </div>
       );
     case "denied":
       return (
-        <div class="item denied">
+        <div class="denied">
           Denied <strong>{item.toolName}</strong>
           {item.reason !== undefined && `: ${item.reason}`}
           {item.reasonType !== undefined && <span class="muted"> ({item.reasonType})</span>}
         </div>
       );
     case "status":
-      return <div class="item status muted">{item.text}</div>;
+      return <div class={`status${/^(Turn failed|Turn aborted|Turn ended|Token |No usable token|Rate limit rejected)/.test(item.text) ? " bad" : ""}`}>{item.text}</div>;
     case "unknown":
-      return <details class="item unknown muted"><summary>{item.type}</summary><pre>{json(item.raw)}</pre></details>;
+      return <details class="unknown muted"><summary>{item.type}</summary><pre>{json(item.raw)}</pre></details>;
   }
 }
 
-/** The input field that says most about a call, for its one-line summary. */
-function toolSummary(input: unknown): string {
-  if (input === null || typeof input !== "object") return "";
-  const fields = input as Record<string, unknown>;
-  for (const key of ["command", "file_path", "path", "pattern", "url", "query", "description", "prompt"]) {
-    const value = fields[key];
-    if (typeof value === "string") return value.length > 120 ? `${value.slice(0, 120)}…` : value;
-  }
-  return "";
+/** A run of tool calls as one line; open while one of them still runs. A lone call is its own line. */
+function Tools({ tools }: { tools: ToolItem[] }) {
+  if (tools.length === 1) return <div class="tools single"><Tool tool={tools[0]!} /></div>;
+  const running = tools.some((t) => t.result === undefined);
+  const failed = tools.filter((t) => t.result?.isError === true).length;
+  const { named, more } = toolsLine(tools);
+  return (
+    <details class="tools" open={running}>
+      <summary>
+        {named.map((n, i) => <span key={i}>{i > 0 && " · "}<b>{n.name}</b> {n.summary}</span>)}
+        {more > 0 && <span> · {more} more</span>}
+        {tools.length > 1 && <span class="muted"> · {tools.length} calls</span>}
+        {running && <span class="muted"> · running…</span>}
+        {failed > 0 && <span class="error"> · {failed} failed</span>}
+      </summary>
+      <div class="tool-list">{tools.map((t) => <Tool key={t.toolUseId} tool={t} />)}</div>
+    </details>
+  );
+}
+
+function Tool({ tool }: { tool: ToolItem }) {
+  const shown = useMemo(() => foldTools(tool.children), [tool.children]);
+  return (
+    <details class="tool">
+      <summary>
+        <b>{tool.name}</b> <span class="muted">{toolSummary(tool.input)}</span>
+        {tool.result === undefined ? <span class="muted"> · running</span> : tool.result.isError && <span class="error"> · error</span>}
+      </summary>
+      <pre>{json(tool.input)}</pre>
+      {shown.length > 0 && (
+        <div class="children">
+          {tool.agentId !== undefined && <p class="muted">agent {tool.agentId}</p>}
+          {shown.map((child, i) => <ShownView key={i} item={child} />)}
+        </div>
+      )}
+      {tool.result !== undefined && <pre class={tool.result.isError ? "result error" : "result"}>{tool.result.text}</pre>}
+    </details>
+  );
 }
 
 function json(value: unknown): string {
@@ -261,9 +374,11 @@ function PendingPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 function ApprovalPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
   const action = useAction();
   const [editing, setEditing] = useState(false);
+  const [denying, setDenying] = useState(false);
   const [edited, setEdited] = useState(() => json(pending.input));
   const [message, setMessage] = useState("Denied from the dashboard");
   const { requestId } = pending;
+  const summary = toolSummary(pending.input, 400);
 
   const allowEdited = () => action.run(async () => {
     const updatedInput: unknown = JSON.parse(edited);
@@ -274,20 +389,29 @@ function ApprovalPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
   });
 
   return (
-    <section class="pending">
-      <h3>{pending.toolName} needs approval</h3>
+    <section class="ask">
+      <h4>{pending.toolName} needs approval</h4>
       {pending.decisionReason !== undefined && <p class="muted">{pending.decisionReason}</p>}
       {editing
         ? <textarea rows={8} value={edited} onInput={(e) => setEdited(e.currentTarget.value)} />
+        : summary !== "" && !summary.endsWith("…") ? <><pre>{summary}</pre><details><summary class="muted">full input</summary><pre>{json(pending.input)}</pre></details></>
         : <pre>{json(pending.input)}</pre>}
-      <div class="row">
-        <button disabled={action.busy} onClick={() => action.run(() => task.approve({ requestId }))}>Allow</button>
-        {editing
-          ? <button disabled={action.busy} onClick={allowEdited}>Allow with this input</button>
-          : <button disabled={action.busy} onClick={() => setEditing(true)}>Allow with edited input…</button>}
-        <label>Deny message <input value={message} onInput={(e) => setMessage(e.currentTarget.value)} /></label>
-        <button disabled={action.busy} onClick={() => action.run(() => task.deny({ requestId, message }))}>Deny</button>
-        <button disabled={action.busy} onClick={() => action.run(() => task.deny({ requestId, message, interrupt: true }))}>Deny and interrupt</button>
+      {denying && (
+        <label class="deny-message">Message to Claude <input value={message} onInput={(e) => setMessage(e.currentTarget.value)} /></label>
+      )}
+      <div class="ask-actions">
+        {denying ? <>
+          <button disabled={action.busy} onClick={() => action.run(() => task.deny({ requestId, message }))}>Deny</button>
+          <button disabled={action.busy} onClick={() => action.run(() => task.deny({ requestId, message, interrupt: true }))}>Deny &amp; interrupt</button>
+          <button disabled={action.busy} onClick={() => setDenying(false)}>Back</button>
+        </> : <>
+          <button class="primary" disabled={action.busy} onClick={() => action.run(() => editing ? allowEdited() : task.approve({ requestId }))}>
+            {editing ? "Allow with this input" : "Allow"}
+          </button>
+          {!editing && <button disabled={action.busy} onClick={() => setEditing(true)}>Edit &amp; allow…</button>}
+          <button disabled={action.busy} onClick={() => setDenying(true)}>Deny…</button>
+          <button disabled={action.busy} onClick={() => action.run(() => task.deny({ requestId, message, interrupt: true }))}>Deny &amp; interrupt</button>
+        </>}
       </div>
       {action.error !== null && <p class="error">{action.error}</p>}
     </section>
@@ -321,12 +445,11 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
     task.answerQuestion({ requestId: pending.requestId, answers: Object.fromEntries(questions.map((q) => [q.question, answerOf(q)])) }));
 
   return (
-    <section class="pending">
-      <h3>Claude asks</h3>
+    <section class="ask">
+      <h4>Claude asks</h4>
       {questions.map((q) => (
-        <fieldset key={q.question}>
-          <legend>{q.header}</legend>
-          <p>{q.question}</p>
+        <div class="question" key={q.question}>
+          <div class="question-head"><span class="chip">{q.header}</span> {q.question}</div>
           {q.options.map((o) => (
             <label key={o.label} class="option">
               <input
@@ -339,10 +462,10 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
             </label>
           ))}
           <label class="option">Other: <input value={other[q.question] ?? ""} onInput={(e) => setOther({ ...other, [q.question]: e.currentTarget.value })} /></label>
-        </fieldset>
+        </div>
       ))}
-      <div class="row">
-        <button disabled={action.busy || !complete} onClick={submit}>Answer</button>
+      <div class="ask-actions">
+        <button class="primary" disabled={action.busy || !complete} onClick={submit}>Answer</button>
         <button disabled={action.busy} onClick={() => action.run(() => task.deny({ requestId: pending.requestId, message: "The user declined to answer" }))}>Decline</button>
       </div>
       {action.error !== null && <p class="error">{action.error}</p>}
@@ -350,157 +473,7 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
   );
 }
 
-// ─── controls and composer ───
-
-/** The restore select's value for `Automatic` (placement picks the node). */
-const AUTOMATIC = "";
-
-/**
- * An archived task's only controls: restore it (on the node chosen: this one, another that can take it, or
- * `Automatic`, where placement picks), or delete it with its archive.
- */
-function ArchivedControls({ node, pool, task, archivedOn }: { node: NodeRef; pool: PoolRef; task: TaskRef; archivedOn: string | null }) {
-  const nodes = useValue(pool.nodes);
-  const selfId = useValue(node.nodeId);
-  const version = useValue(node.claudeCodeVersion);
-  const self = nodes.find((n) => n.nodeId === selfId);
-  const targets = [...(self === undefined ? [] : [self]), ...moveTargets(nodes, selfId, version)];
-  const [picked, setPicked] = useState(AUTOMATIC);
-  // A node that went offline since it was picked falls back to Automatic.
-  const where = targets.some((n) => n.nodeId === picked) ? picked : AUTOMATIC;
-  const action = useAction();
-  const remove = () => action.run(async () => {
-    if (!confirm("Delete this task, its log and its archive? This cannot be undone.")) return;
-    await task.delete({});
-    location.hash = hashOf({ name: "pool" });
-  });
-  return (
-    <section class="controls">
-      <p class="muted">Archived{archivedOn === null ? "" : ` on ${archivedOn}`}: its folder is gone, its log is kept. Restore it to carry on.</p>
-      <div class="row">
-        <label>Restore on{" "}
-          <select disabled={action.busy} value={where} onChange={(e) => setPicked(e.currentTarget.value)}>
-            <option value={AUTOMATIC}>Automatic</option>
-            {targets.map((n) => (
-              <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)}){n.nodeId === selfId ? ", here" : ""}</option>
-            ))}
-          </select>
-        </label>
-        <button disabled={action.busy} onClick={() => action.run(() => task.restore({ node: where === AUTOMATIC ? null : where }))}>Restore</button>
-        <button disabled={action.busy} onClick={remove}>Delete</button>
-      </div>
-      {action.error !== null && <p class="error">{action.error}</p>}
-    </section>
-  );
-}
-
-/** The task's controls; all of them `disabled` while it moves. */
-function Controls({ node, pool, task, disabled }: { node: NodeRef; pool: PoolRef; task: TaskRef; disabled: boolean }) {
-  const state = useValue(task.state);
-  const pending = useValue(task.pending);
-  const models = useValue(node.models);
-  const permissionMode = useValue(task.permissionMode);
-  const model = useValue(task.model);
-  const effort = useValue(task.effort);
-  const contextUsage = useValue(task.contextUsage);
-  const action = useAction();
-  const modelOptions = model !== null && !models.includes(model) ? [model, ...models] : models;
-  const off = disabled || action.busy;
-
-  return (
-    <section class="controls">
-      <div class="row">
-        <button disabled={off} onClick={() => action.run(() => task.interrupt({}))}>Interrupt</button>
-        {/* A turn that crashed the node too often is parked; retry says so when none is. */}
-        {(state === "running" || state === "waiting") && pending.length === 0 && (
-          <button disabled={off} onClick={() => action.run(() => task.retry({}))}>Retry turn</button>
-        )}
-        {/* Only an idle task archives; the node says why it refuses one (queued prompts, a home offline, …). */}
-        {state === "idle" && (
-          <button disabled={off} title="Removes the task's folder from this node and keeps its log; Restore brings it back"
-            onClick={() => action.run(() => task.archive({}))}>Archive</button>
-        )}
-        <label>Permission mode{" "}
-          <select disabled={disabled} value={permissionMode ?? ""} onChange={(e) => {
-            const mode = e.currentTarget.value as PermissionMode;
-            void action.run(() => task.setPermissionMode({ mode }));
-          }}>
-            {permissionMode === null && <option value="">(not known yet)</option>}
-            {PERMISSION_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
-          </select>
-        </label>
-        <label>Model{" "}
-          <select disabled={disabled} value={model ?? ""} onChange={(e) => {
-            const value = e.currentTarget.value;
-            void action.run(() => task.setModel(value === "" ? {} : { model: value }));
-          }}>
-            <option value="">(default)</option>
-            {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
-          </select>
-        </label>
-        <label>Effort{" "}
-          <select disabled={disabled} value={effort ?? ""} onChange={(e) => {
-            const value = e.currentTarget.value;
-            void action.run(() => task.setEffort({ effort: value }));
-          }}>
-            {effort === null && <option value="">(default)</option>}
-            {EFFORT_LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
-          </select>
-        </label>
-      </div>
-      <MoveControl node={node} pool={pool} task={task} disabled={disabled} />
-      <p class="muted">{contextText(contextUsage)}</p>
-      {action.error !== null && <p class="error">{action.error}</p>}
-    </section>
-  );
-}
-
-/** Moves the task to another node that can take it (online, hosts tasks, the same known Claude Code version). */
-function MoveControl({ node, pool, task, disabled }: { node: NodeRef; pool: PoolRef; task: TaskRef; disabled: boolean }) {
-  const nodes = useValue(pool.nodes);
-  const selfId = useValue(node.nodeId);
-  const version = useValue(node.claudeCodeVersion);
-  const targets = moveTargets(nodes, selfId, version);
-  const [picked, setPicked] = useState<string | null>(null);
-  const [now, setNow] = useState(false);
-  const action = useAction();
-  const target = targets.find((n) => n.nodeId === picked) ?? targets[0];
-  const off = disabled || action.busy;
-  return (
-    <div class="row move">
-      <label>Move to{" "}
-        <select disabled={off || target === undefined} value={target?.nodeId ?? ""} onChange={(e) => setPicked(e.currentTarget.value)}>
-          {target === undefined && <option value="">(no node can take it)</option>}
-          {targets.map((n) => <option key={n.nodeId} value={n.nodeId} title={n.nodeId}>{n.hostname} ({shortId(n.nodeId)})</option>)}
-        </select>
-      </label>
-      <label class="option">
-        <input type="checkbox" disabled={off} checked={now} onChange={(e) => setNow(e.currentTarget.checked)} /> move now{" "}
-        <span class="muted">({MOVE_NOW_WARNING})</span>
-      </label>
-      <button
-        disabled={off || target === undefined}
-        onClick={() => target !== undefined && action.run(() => task.moveTo({ nodeId: target.nodeId, now }))}
-      >Move</button>
-      {action.error !== null && <p class="error">{action.error}</p>}
-    </div>
-  );
-}
-
-type Usage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
-
-/** The latest `result`'s usage (summed over the turn's API calls) and its models' context windows. */
-function contextText(value: unknown): string {
-  const { usage, modelUsage } = (value ?? {}) as { usage?: Usage | null; modelUsage?: Record<string, { contextWindow?: number }> | null };
-  if (usage === undefined || usage === null) return "Context usage: no turn finished yet";
-  const input = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
-  const windows = Object.entries(modelUsage ?? {})
-    .filter(([, m]) => typeof m.contextWindow === "number")
-    .map(([name, m]) => `${name} ${m.contextWindow!.toLocaleString()}`);
-  return `Latest turn: ${input.toLocaleString()} input tokens (${(usage.cache_read_input_tokens ?? 0).toLocaleString()} cached), `
-    + `${(usage.output_tokens ?? 0).toLocaleString()} output tokens`
-    + (windows.length > 0 ? ` · context window ${windows.join(", ")}` : "");
-}
+// ─── the composer and the bar ───
 
 function Composer({ task, running, disabled }: { task: TaskRef; running: boolean; disabled: boolean }) {
   const [text, setText] = useState("");
@@ -510,17 +483,97 @@ function Composer({ task, running, disabled }: { task: TaskRef; running: boolean
     if (await action.run(() => task.prompt({ text }))) setText("");
   };
   return (
-    <section class="composer">
+    <div class="composer">
       <textarea
-        rows={3}
+        rows={2}
         disabled={disabled}
         value={text}
-        placeholder={running ? "Steer the running turn… (Ctrl+Enter sends)" : "Prompt… (Ctrl+Enter sends)"}
+        placeholder={disabled ? "Moving: prompts wait until it lands" : running ? "Steer the running turn…" : "Reply…"}
         onInput={(e) => setText(e.currentTarget.value)}
         onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); } }}
       />
-      <button disabled={disabled || action.busy || text.trim() === ""} onClick={send}>{running ? "Steer" : "Send"}</button>
-      {action.error !== null && <p class="error">{action.error}</p>}
-    </section>
+      <div class="composer-row">
+        {action.error !== null ? <span class="error">{action.error}</span> : <span class="muted">Ctrl+Enter sends</span>}
+        <button class="primary" disabled={disabled || action.busy || text.trim() === ""} onClick={send}>{running ? "Steer" : "Send"}</button>
+      </div>
+    </div>
+  );
+}
+
+/** A task bookmark as the bar shows it: its name after `meddle/task/<id>/`, then its change (or "conflicted"). */
+function bookmarkText(taskId: string, b: { name: string; changeId: string }): string {
+  const prefix = `meddle/task/${taskId}/`;
+  const name = b.name.startsWith(prefix) ? b.name.slice(prefix.length) : b.name;
+  return b.changeId === "" ? `${name} (conflicted)` : `${name} ${b.changeId.slice(0, 8)}`;
+}
+
+function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
+  task: TaskRef; pool: PoolRef; node: NodeRef; nodeId: string; archived: boolean; archivedOn: string | null; moving: boolean;
+}) {
+  const manifest = useValue(task.manifest);
+  const bookmarks = useValue(task.bookmarks);
+  const contextUsage = useValue(task.contextUsage);
+  const nodes = useValue(pool.nodes);
+  const hostname = useValue(node.hostname);
+  const [moveAt, setMoveAt] = useState<Anchor | null>(null);
+  const usage = usageShort(contextUsage);
+  const projects = manifest.projects;
+  const own = bookmarks.find((b) => b.name === `meddle/task/${manifest.id}/${projects[0]?.name ?? ""}`) ?? bookmarks[0];
+  return (
+    <footer class="bar">
+      <span class="bar-item bar-project" title={projects.map((p) => `${p.name} (${p.workspace})`).join("\n") || "no project"}>
+        ◉ {projects.length === 0 ? "no project" : projects.length === 1 ? projects[0]!.name : `${projects[0]!.name} +${projects.length - 1}`}
+      </span>
+      {archived ? (
+        <span class="bar-item" title={nodeId}>⌂ archived on {archivedOn ?? hostname}</span>
+      ) : (
+        <button class="pill" disabled={moving} title={`${nodeId}\nMove to another node`} onClick={(e) => setMoveAt({ el: e.currentTarget, above: true })}>⌂ {hostname} ▾</button>
+      )}
+      {own !== undefined && (
+        <span class={`bar-item${own.changeId === "" ? " flag" : ""}`} title={bookmarks.map((b) => bookmarkText(manifest.id, b)).join("\n")}>
+          {bookmarkText(manifest.id, own)}{bookmarks.length > 1 && ` +${bookmarks.length - 1}`}
+        </span>
+      )}
+      {usage !== null && <span class="bar-item" title="The latest turn's tokens, summed over its API calls">{usage}</span>}
+      <span class="bar-gap" />
+      {!archived && <Settings task={task} node={node} disabled={moving} />}
+      {moveAt !== null && <MoveMenu task={task} nodes={nodes} from={nodeId} anchor={moveAt} onClose={() => setMoveAt(null)} />}
+    </footer>
+  );
+}
+
+/** The task's permission mode, effort and model, as small selects. */
+function Settings({ task, node, disabled }: { task: TaskRef; node: NodeRef; disabled: boolean }) {
+  const models = useValue(node.models);
+  const permissionMode = useValue(task.permissionMode);
+  const model = useValue(task.model);
+  const effort = useValue(task.effort);
+  const action = useAction();
+  const modelOptions = model !== null && !models.includes(model) ? [model, ...models] : models;
+  return (
+    <>
+      {action.error !== null && <span class="error" title={action.error}>!</span>}
+      <select class="pill" title="Permission mode" disabled={disabled} value={permissionMode ?? ""} onChange={(e) => {
+        const mode = e.currentTarget.value as PermissionMode;
+        void action.run(() => task.setPermissionMode({ mode }));
+      }}>
+        {permissionMode === null && <option value="">mode</option>}
+        {PERMISSION_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+      </select>
+      <select class="pill" title="Effort" disabled={disabled} value={effort ?? ""} onChange={(e) => {
+        const value = e.currentTarget.value;
+        void action.run(() => task.setEffort({ effort: value }));
+      }}>
+        {effort === null && <option value="">effort</option>}
+        {EFFORT_LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
+      </select>
+      <select class="pill" title="Model" disabled={disabled} value={model ?? ""} onChange={(e) => {
+        const value = e.currentTarget.value;
+        void action.run(() => task.setModel(value === "" ? {} : { model: value }));
+      }}>
+        <option value="">default model</option>
+        {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
+      </select>
+    </>
   );
 }

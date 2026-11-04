@@ -169,6 +169,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const states: Subscribable<{ taskId: string; state: TaskState }> = {
     subscribe: (cb) => runner.onState((taskId, state) => cb({ taskId, state })),
   };
+  const manifests: Subscribable<{ taskId: string }> = {
+    subscribe: (cb) => runner.onManifest((taskId) => cb({ taskId })),
+  };
   const moves: Subscribable<{ taskId: string; move: MoveState | null }> = {
     subscribe: (cb) => runner.onMove((taskId, move) => cb({ taskId, move })),
   };
@@ -467,6 +470,14 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
+    const activityAt = self.state("activityAt", members.activityAt, { init: () => getTask(db, id)?.updated_at ?? "" });
+    /** Brings the manifest and the activity time up to the row (a rename, a restore). */
+    const refreshRow = (ctx: Ctx) => {
+      const row = getTask(db, id);
+      if (row === null) return;
+      if (row.manifest !== JSON.stringify(manifest.value)) manifest.replace(ctx, JSON.parse(row.manifest) as TaskManifest);
+      if (row.updated_at !== activityAt.value) activityAt.replace(ctx, row.updated_at);
+    };
     const refreshBookmarks = latest(() => taskBookmarksNow(id), bookmarks);
 
     /** Brings the cells up to the runner, the approvals and the event log. */
@@ -482,9 +493,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (to !== movedTo.value) movedTo.replace(ctx, to);
       const on = archivedOnNow(id);
       if (on !== archivedOn.value) archivedOn.replace(ctx, on);
+      refreshRow(ctx);
       // A turn's end set (and pushed) them; a move fetched or forgot them.
       return refreshBookmarks(ctx);
     });
+    self.on("manifests", manifests, (event, ctx) => { if (event.taskId === id) refreshRow(ctx); });
     self.on("projects", projectChanges, (_event, ctx) => refreshBookmarks(ctx));
     // What the agent bookmarks during a turn, or the user by hand, tells nothing: a slow re-read catches it.
     self.on("ticks", headTicks, (_event, ctx) => refreshBookmarks(ctx));
@@ -497,6 +510,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       movedTo.replace(ctx, getTask(db, id)?.moved_to ?? null);
       archivedOn.replace(ctx, archivedOnNow(id));
       pending.replace(ctx, approvals.pending(id));
+      refreshRow(ctx);
       catchUpLog(ctx);
     });
 
@@ -520,7 +534,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       movedTo,
       archivedOn,
       bookmarks,
+      activityAt,
       prompt: ({ text }) => runner.prompt(id, text),
+      rename: async ({ title }) => { await runner.rename(id, title); },
       interrupt: () => runner.interrupt(id),
       retry: () => runner.retry(id),
       approve: async ({ requestId, updatedInput }) => {

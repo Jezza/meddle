@@ -45,6 +45,15 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
     switch (m.type) {
       case "stream_event":
         break;
+      case "rate_limit_event": {
+        // Every turn reports its rate limit; only one that is not plainly allowed says something.
+        const info = (m.rate_limit_info ?? {}) as { status?: unknown; rateLimitType?: unknown };
+        if (info.status !== "allowed") {
+          const kind = typeof info.rateLimitType === "string" ? ` (${info.rateLimitType})` : "";
+          top.push({ kind: "status", text: `Rate limit ${String(info.status)}${kind}` });
+        }
+        break;
+      }
       case "assistant":
         addAssistant(m, listFor(m.parent_tool_use_id));
         break;
@@ -227,4 +236,41 @@ function contentText(content: unknown): string {
 
 function str(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/** A thread item as the view shows it: a run of consecutive tool calls folds into one `tools` line. */
+export type ShownItem = Exclude<ThreadItem, ToolItem> | { kind: "tools"; tools: ToolItem[] };
+
+/** Folds each run of consecutive tool calls into one `tools` item; every other item stays as it is. */
+export function foldTools(items: readonly ThreadItem[]): ShownItem[] {
+  const shown: ShownItem[] = [];
+  for (const item of items) {
+    if (item.kind !== "tool") shown.push(item);
+    else {
+      const last = shown.at(-1);
+      if (last?.kind === "tools") last.tools.push(item);
+      else shown.push({ kind: "tools", tools: [item] });
+    }
+  }
+  return shown;
+}
+
+/** The input field that says most about a call, for its one-line summary. */
+export function toolSummary(input: unknown, max = 120): string {
+  if (input === null || typeof input !== "object") return "";
+  const fields = input as Record<string, unknown>;
+  for (const key of ["command", "file_path", "path", "pattern", "url", "query", "description", "prompt"]) {
+    const value = fields[key];
+    if (typeof value === "string") {
+      const line = value.split("\n")[0]!;
+      return line.length > max ? `${line.slice(0, max)}…` : line;
+    }
+  }
+  return "";
+}
+
+/** A run of calls in one line: the first two named with their summary, then how many more. */
+export function toolsLine(tools: readonly ToolItem[]): { named: Array<{ name: string; summary: string }>; more: number } {
+  const named = tools.slice(0, 2).map((t) => ({ name: t.name, summary: toolSummary(t.input, 60) }));
+  return { named, more: tools.length - named.length };
 }

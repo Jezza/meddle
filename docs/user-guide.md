@@ -222,17 +222,18 @@ otherwise. Nothing needs opening in a firewall for that. If you want a fixed UDP
 
 ## Day to day
 
-**Starting work.** `meddle task new "<prompt>" [--project <name>]...` from any machine, or the dashboard's new-task
-form (title, projects, node, first prompt). Without a prompt `task new` creates a task that waits idle;
+**Starting work.** `meddle task new "<prompt>" [--project <name>]...` from any machine, or New task in the
+dashboard's sidebar (under a project, or under Tasks for none or several): the composer takes the projects, the node
+and the first prompt. Without a prompt `task new` creates a task that waits idle;
 `meddle task prompt <id> "<text>"` sends one and waits for the turn to end, so it is the command for scripts.
 `meddle task list` lists every task of the pool with its state and node.
 
-**Watching.** Any node's dashboard shows the whole pool: every node's card with its tasks, versions, token and load,
-every task's thread wherever it runs, and the notifications (a failed turn, a login out of tokens, a move that
-rolled back). A node's own tasks and another node's open the same way; the page's node relays the other's over the
+**Watching.** Any node's dashboard shows the whole pool: a sidebar of projects and their tasks (each with its state,
+what waits on you and the node it runs on), the nodes with their load at its foot, every task's thread wherever it
+runs, and notices for a failed turn, a login out of tokens or a move that rolled back. A node's own tasks and another node's open the same way; the page's node relays the other's over the
 pool.
 
-**Moving a task.** From the task's view (Move to) or `meddle task move <id> <short id>`, with `--now` to interrupt a
+**Moving a task.** From the dashboard (the node in the task's bar, or Move to… on its sidebar row) or `meddle task move <id> <short id>`, with `--now` to interrupt a
 running turn instead of waiting for it. The workspaces, the conversation and queued prompts travel; the background
 shells of an interrupted turn do not ([Moving a task](../README.md#moving-a-task)).
 

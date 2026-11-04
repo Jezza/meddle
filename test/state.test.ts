@@ -6,6 +6,8 @@ import { appendEvent } from "../src/store/events";
 import { errorResultFixture } from "./helpers";
 import { linkClient, startPoolNode } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
+import { getTask } from "../src/store/records";
+import { readManifest } from "../src/tasks/manifest";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -90,6 +92,28 @@ test("a client follows a task through a prompted turn over a link", async () => 
     await expect(task.retry({})).rejects.toThrow(`no parked turn for task ${manifest.id}`);
     task.release();
     session.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("renaming a task updates its manifest for every client, its row and its folder's manifest", async () => {
+  const { client, project, cfg, db, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "before", projectIds: [project.id] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    const other = await client.get(TaskObject, { id: manifest.id });
+    expect(task.activityAt.value).not.toBe("");
+    await task.rename({ title: "  after  " });
+    await until(task.manifest, (m) => m.title === "after");
+    await until(other.manifest, (m) => m.title === "after");
+    expect(getTask(db, manifest.id)!.title).toBe("after");
+    expect((await readManifest(cfg, manifest.id)).title).toBe("after");
+    await expect(task.rename({ title: "   " })).rejects.toThrow("a task's title cannot be blank");
+    task.release();
+    other.release();
     node.release();
   } finally {
     await close();
