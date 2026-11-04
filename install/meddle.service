@@ -4,6 +4,8 @@ Description=meddle node
 [Service]
 ExecStart={{exec}}
 WorkingDirectory={{dir}}
+# The PATH of the shell that ran `meddle service install`: tasks run jj and git from it (run it again after changing it).
+Environment={{path}}
 Restart=on-failure
 RestartSec=2
 # The pool's iroh endpoint binds a UDP socket on iroh's default address; to pin it (for a firewall rule), add

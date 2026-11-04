@@ -320,7 +320,10 @@ test("a receive is refused for another Claude Code version, an unknown one, an u
       expect(await ref.receiveTask({ manifest, claudeCodeVersion: "unknown" })).toEqual({ ok: false, reason: `claude code ${ours} here, unknown there` });
       expect(await ref.receiveTask({ manifest: { ...manifest, id: "../x" }, claudeCodeVersion: ours })).toEqual({ ok: false, reason: "invalid task id: ../x" });
       await rm(B.cfg.taskRoot, { recursive: true, force: true });
-      expect(await ref.receiveTask({ manifest, claudeCodeVersion: ours })).toEqual({ ok: false, reason: "this node does not host tasks" });
+      expect(await ref.receiveTask({ manifest, claudeCodeVersion: ours })).toEqual({
+        ok: false,
+        reason: `this node does not host tasks: task root ${B.cfg.taskRoot} does not exist`,
+      });
       await until("the peer's hostsTasks", () => ref.hostsTasks.value, false);
       // Each metrics sample re-reads the task root, for peers and for the dashboard: it can go and come back.
       const owner = linkClient(B.host);
@@ -329,9 +332,12 @@ test("a receive is refused for another Claude Code version, an unknown one, an u
         const sample = () => { B.metrics.stop(); B.metrics.start(); };
         sample();
         await until("the node's hostsTasks", () => node.hostsTasks.value, false);
+        // The dashboard shows why.
+        expect(node.hostingProblem.value).toBe(`task root ${B.cfg.taskRoot} does not exist`);
         await mkdir(B.cfg.taskRoot, { recursive: true });
         sample();
         await until("the node's hostsTasks", () => node.hostsTasks.value, true);
+        expect(node.hostingProblem.value).toBeNull();
         await until("the peer's hostsTasks", () => ref.hostsTasks.value, true);
         node.release();
       } finally {
@@ -570,6 +576,76 @@ test("a move without `now` waits for the running turn; prompts sent meanwhile ru
       "start", "user:first while moving", "result", "start", "user:second while moving", "result",
     ]);
     expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", queued: null, turns: 3 });
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a move waiting for the turn is cancelled: the task stays here, its turn untouched, and nothing is left on the target", async () => {
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ fixture: "approval.jsonl" }, {}] });
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    await peerReady(A, B);
+    await expect(A.runner.cancelMove(m.id)).rejects.toThrow("task is not moving");
+    expect(() => A.runner.hurryMove(m.id)).toThrow("task is not moving");
+    const waiting = stateOn(A, m.id, "waiting");
+    await A.runner.prompt(m.id, "Run: echo hi");
+    await waiting;
+    const moves: ({ phase: string; error: string | null } | null)[] = [];
+    A.runner.onMove((id, move) => { if (id === m.id) moves.push(move === null ? null : { phase: move.phase, error: move.error }); });
+    await A.runner.moveTo(m.id, B.id, false);
+    await until("A's row", () => getTask(A.db, m.id)!.state, "moving");
+    await A.runner.prompt(m.id, "sent while moving");
+
+    await A.runner.cancelMove(m.id);
+    await moveSettled(A.harness.harness);
+    // Live here again in the state its turn has: still waiting for the approval, never interrupted.
+    expect(getTask(A.db, m.id)!.state).toBe("waiting");
+    expect(A.runner.liveQuery(m.id)).not.toBeNull();
+    expect(A.runner.moveState(m.id)).toBeNull();
+    expect(getTask(B.db, m.id)).toBeNull();
+    // Ended without an error (no failure to report), and logged as cancelled.
+    expect(moves.some((mv) => mv !== null && mv.error !== null)).toBe(false);
+    expect(moves.at(-1)).toBeNull();
+    expect(A.logs).toContain(`meddle: move: ${m.id} to ${shortId(B.id)} cancelled at prepare`);
+    expect(A.logs.some((l) => l.includes("failed at"))).toBe(false);
+
+    // The turn finishes here, then the prompt sent during the move runs here too.
+    for (const q of A.runner.approvals.pending(m.id)) A.runner.approvals.answer(q.requestId, { behavior: "allow", updatedInput: q.input });
+    const prompts = () => turnMarks(listEvents(A.db, m.id)).filter((t) => t.startsWith("user:")).join(" | ");
+    await until("A's prompts", prompts, "user:Run: echo hi | user:sent while moving");
+    // The recording asks for an approval in every turn: answer the second turn's too, and it ends.
+    await until("A's row", () => getTask(A.db, m.id)!.state, "waiting");
+    for (const q of A.runner.approvals.pending(m.id)) A.runner.approvals.answer(q.requestId, { behavior: "allow", updatedInput: q.input });
+    await until("A's row", () => getTask(A.db, m.id)!.state, "idle");
+    // And it can move again afterwards.
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)!.state).toBe("moved");
+  } finally {
+    await close();
+  }
+}, 20_000);
+
+test("a move waiting for the turn is told to move now: it interrupts the turn and the target carries on", async () => {
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }, {}] });
+  try {
+    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    await peerReady(A, B);
+    const initialised = new Promise<void>((res) => A.runner.onEvent((id, _s, msg) => { if (id === m.id && msg.type === "system" && msg.subtype === "init") res(); }));
+    await A.runner.prompt(m.id, "Reply with the single word ok.");
+    await initialised;
+    await A.runner.moveTo(m.id, B.id, false);
+    await until("A's row", () => getTask(A.db, m.id)!.state, "moving");
+    await Bun.sleep(300);
+    // Waiting: the stalled turn runs on.
+    expect(A.runner.liveQuery(m.id)).not.toBeNull();
+    const { done } = watchTurns(B, m.id, 1);
+    A.runner.hurryMove(m.id);
+    await moveSettled(A.harness.harness);
+    await done;
+    expect(getTask(A.db, m.id)!.state).toBe("moved");
+    expect(turnMarks(listEvents(B.db, m.id))).toEqual(["start", "user:Reply with the single word ok.", "result", "start", `user:${MOVE_NOW_FOLLOW_UP}`, "result"]);
   } finally {
     await close();
   }

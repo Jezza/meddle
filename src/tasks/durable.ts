@@ -211,6 +211,10 @@ export class TaskRunner {
    * queued and the rest is refused; its row says `moving` for a restart and the dashboard.
    */
   #moving = new Map<string, MoveState>();
+  /** Tasks whose move waiting for the turn was told to interrupt it (`hurryMove`). */
+  #hurried = new Set<string>();
+  /** Tasks whose move is being aborted because it was cancelled (`cancelMove`), not because it failed. */
+  #cancelling = new Set<string>();
   #moveListeners = new Set<(taskId: string, move: MoveState | null) => void>();
   /** Woken whenever a turn of the task ends (completed, failed or aborted): a move waits for it. */
   #turnWaiters = new Map<string, Set<() => void>>();
@@ -648,7 +652,8 @@ export class TaskRunner {
   async receiveTask(manifest: TaskManifest, from: string, version: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const ours = claudeCodeVersion();
     if (version !== ours || ours === "unknown" || version === "unknown") return { ok: false, reason: `claude code ${ours} here, ${version} there` };
-    if (!(await checkTaskRoot(this.#cfg)).ok) return { ok: false, reason: "this node does not host tasks" };
+    const hosting = await checkTaskRoot(this.#cfg);
+    if (!hosting.ok) return { ok: false, reason: `this node does not host tasks: ${hosting.reason}` };
     const deps = this.#replicaDeps();
     if (deps === null) return { ok: false, reason: "this node has no pool" };
     try {
@@ -1304,7 +1309,8 @@ export class TaskRunner {
       const turn = busy ? undefined : await this.#durableTurn(taskId);
       if (!busy && turn === undefined) return;
       if (turn !== undefined && isParked(turn)) throw new Error("the task's turn is parked");
-      if (interrupt && live !== undefined && (cutting === live.query || !live.queue.ended)) {
+      // `hurryMove` turns a move that waits into a "move now" while it waits.
+      if ((interrupt || this.#hurried.has(taskId)) && live !== undefined && (cutting === live.query || !live.queue.ended)) {
         if (cutting !== live.query) {
           cutting = live.query;
           cutAt = Date.now();
@@ -1337,12 +1343,57 @@ export class TaskRunner {
   }
 
   /**
+   * Cancels the task's move, which then ends with the task live here (or archived here again, for a restore-move), its
+   * turn untouched, and anything sent to the target dropped there. Only while the move waits for the turn or hands the
+   * task over: once the target holds the whole task (`commit`) it is refused, and a move that got there meanwhile
+   * completes (refused afterwards with where the task went).
+   */
+  async cancelMove(taskId: string): Promise<void> {
+    const move = this.#moving.get(taskId);
+    if (move === undefined) throw new Error("task is not moving");
+    if (move.phase !== "prepare" && move.phase !== "handoff") {
+      throw new Error(`too late to cancel: ${shortId(move.to)} has the task and is taking it over`);
+    }
+    const { tasks } = await this.#harness.inspect(BACKGROUND_CONTEXT);
+    const record = tasks.find(
+      (t) => t.record.kind === MeddleMove.definition.name && (t.record.input as MoveInput).taskId === taskId && t.record.state.status !== "terminal",
+    );
+    if (record === undefined) throw new Error("task is not moving");
+    this.#cancelling.add(taskId);
+    try {
+      await this.#harness.abortTask(record.record.id, BACKGROUND_CONTEXT);
+    } catch (err) {
+      this.#cancelling.delete(taskId);
+      throw err;
+    }
+    if (getTask(this.#db, taskId)?.state === "moved") throw new Error(`too late to cancel: the task moved to ${shortId(move.to)}`);
+  }
+
+  /** Whether the move being aborted was cancelled (`cancelMove`); forgets it. For `meddle.move`'s `abort`. */
+  takeCancel(taskId: string): boolean {
+    return this.#cancelling.delete(taskId);
+  }
+
+  /**
+   * Makes the task's move, while it waits for the running turn to end, interrupt that turn instead ("move now"):
+   * refused once the move is past waiting.
+   */
+  hurryMove(taskId: string): void {
+    const move = this.#moving.get(taskId);
+    if (move === undefined) throw new Error("task is not moving");
+    if (move.phase !== "prepare") throw new Error("the move is no longer waiting for the turn");
+    this.#hurried.add(taskId);
+  }
+
+  /**
    * The task now lives on `to`: its row says `moved` and where (its queue went with it), it is no longer moving, and
    * that is told.
    */
   completeMove(taskId: string, to: string): void {
     updateTask(this.#db, taskId, { state: "moved", moved_to: to, queued: null });
     this.#moving.delete(taskId);
+    this.#hurried.delete(taskId);
+    this.#cancelling.delete(taskId);
     this.#emitState(taskId, "moved");
     this.#emitMove(taskId);
   }
@@ -1352,7 +1403,7 @@ export class TaskRunner {
    * meanwhile run, and the failure is logged once and told (`onMove` with the error, then null). A restore-move's task
    * is archived here again instead, its staged bookmarks forgotten off its projects' homes.
    */
-  async failMove(taskId: string, to: string, phase: string, error: string): Promise<void> {
+  async failMove(taskId: string, to: string, phase: string, error: string | null): Promise<void> {
     // First, before anything that can throw: the row must never be left `moving` with no move behind it (nor be written
     // `idle` over a turn this runner knows is live).
     const row = getTask(this.#db, taskId);
@@ -1372,7 +1423,8 @@ export class TaskRunner {
       await this.#unstage(taskId);
     }
     this.#emitMove(taskId);
-    this.#log(`meddle: move: ${taskId} failed at ${phase}: ${error}`);
+    this.#hurried.delete(taskId);
+    this.#log(error === null ? `meddle: move: ${taskId} to ${shortId(to)} cancelled at ${phase}` : `meddle: move: ${taskId} failed at ${phase}: ${error}`);
     this.startQueued(taskId).catch((err: unknown) => {
       this.#log(`meddle: move: task ${taskId}'s next queued prompt did not start a turn: ${messageOf(err)}`);
     });

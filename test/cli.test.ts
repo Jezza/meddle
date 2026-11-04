@@ -29,7 +29,7 @@ test("the usage text lists the pool subcommands", async () => {
   expect(lines).toContain("meddle pool [-v]");
   expect(lines).toContain("meddle pool secret [--file <path> | --generate <path>] [--name <name>]");
   expect(lines).toContain("meddle pool peer <node id> | meddle pool remove <id|prefix> | meddle pool allow <id|prefix>");
-  expect(lines).toContain("meddle task move <id> <node> [--now]");
+  expect(lines).toContain("meddle task move <id> <node> [--now] | meddle task move <id> --now | meddle task move <id> --cancel");
 });
 
 test("a node is named by its full id or a unique prefix of one", () => {

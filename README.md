@@ -91,6 +91,11 @@ sudo install -d -o $USER -g $(id -gn) -m 755 /opt/meddle/tasks
 
 To use a different root, set `MEDDLE_TASK_ROOT` to it in the environment of every meddle command.
 
+A node hosts tasks only while its task root is a writable directory and `jj` and `git` are on its `PATH`; otherwise
+`serve` logs why (`meddle: jj is not on this node's PATH (<PATH>); this node will not host tasks`), `status` prints
+it, the pool sees the node as hosting no tasks, and a move to it is refused before it starts with that reason. A
+service runs with the `PATH` written into its unit (see [Service](#service)), not your login shell's.
+
 ## Login tokens
 
 meddle keeps an ordered list of tokens from `claude setup-token`, one per login. Add one by piping it in on stdin or
@@ -640,13 +645,24 @@ While a task moves, its view shows `Moving to <node>: <step>` and disables its c
 
 ### "Move now"
 
-A move waits for a running turn to end. "Move now" (`--now`) interrupts the turn instead, and closes it if it has not
-ended 15 seconds later. Background shells and subagents that the turn started stop and do not travel; the dashboard
+A move waits for a running turn to end: `task move` then says `moving <id> to <node> once its turn ends`, and the
+dashboard `Moving to <host> once the current turn ends`. "Move now" (`--now`) interrupts the turn instead, and closes
+it if it has not ended 15 seconds later. A move already waiting can be hurried the same way: `task move <id> --now`,
+or Move now in the dashboard's banner. Background shells and subagents that the turn started stop and do not travel; the dashboard
 warns of this but cannot list them (the Agent SDK has no way to). When a turn was cut short, the task's first turn
 on the target starts with:
 
 > The previous turn was interrupted to move this task to another machine. Background shells and subagents that were
 > running were stopped and did not travel. Carry on from where you were; do not redo work that is already done.
+
+### Cancelling a move
+
+`task move <id> --cancel` (or Cancel move in the dashboard's banner) calls a move off while it waits for the turn or
+hands the task over: the task stays on this node, live again in the state its turn has (a waiting or running turn is
+never touched), the prompts queued meanwhile run here, and whatever the target had received is dropped there. The move
+ends without an error: it is logged as `meddle: move: <id> to <short id> cancelled at <step>`, and no notification is
+raised. Once the target holds the whole task and is taking it over, it is too late: `too late to cancel: <short id>
+has the task and is taking it over`; move it back afterwards instead.
 
 ### Prompts during a move
 
@@ -849,7 +865,10 @@ It prints the unit and the task-root command. From a checkout the unit runs `Exe
 with `WorkingDirectory=` this checkout; from the single binary, `ExecStart=<the binary> serve` with
 `WorkingDirectory=%h` (your home), so put the binary where it will stay before installing, and run `service install`
 again after moving it. Without `--dry-run` it writes `~/.config/systemd/user/meddle.service`, runs `systemctl --user daemon-reload`
-and `systemctl --user enable --now meddle.service`, and prints the task-root command to run once.
+and `systemctl --user enable --now meddle.service`, and prints the task-root command to run once. The unit sets
+`Environment=PATH=…` to the `PATH` of the shell you ran it from (less what `bun run` adds), because a user service
+otherwise runs with systemd's own, which often lacks `~/.cargo/bin` or wherever `jj` lives; run `service install`
+again after installing `jj` or `git` somewhere new.
 
 ## Links
 

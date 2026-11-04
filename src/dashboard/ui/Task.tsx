@@ -83,17 +83,51 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   return (
     <>
       {head}
-      {move !== null && (
-        <section class="moving">
-          <p class="flag">Moving to {nameOf(move.to)}: {move.phase}</p>
-          {move.error !== null && <p class="error">{move.error}</p>}
-        </section>
-      )}
+      {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
       <Controls node={node} pool={pool} task={task} disabled={moving} />
       <Thread session={session} />
       {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
       <Composer task={task} running={state === "running" || state === "waiting"} disabled={moving} />
     </>
+  );
+}
+
+/** What a move is doing at each step, in words. */
+function moveText(phase: string, to: string): string {
+  switch (phase) {
+    case "prepare": return `Moving to ${to} once the current turn ends`;
+    case "handoff": return `Moving to ${to}: sending the task`;
+    case "commit": return `Moving to ${to}: ${to} is taking over`;
+    case "cleanup": return `Moved to ${to}: cleaning up here`;
+    default: return `Moving to ${to}`;
+  }
+}
+
+/**
+ * A move in progress: what it is doing, and while it can still be called off, Cancel (the task stays here, its turn
+ * untouched); while it waits for the turn, Move now (interrupts the turn).
+ */
+function MoveBanner({ task, move, to }: { task: TaskRef; move: { to: string; phase: string; error: string | null }; to: string }) {
+  const action = useAction();
+  const waiting = move.phase === "prepare";
+  const cancellable = waiting || move.phase === "handoff";
+  return (
+    <section class="moving">
+      <p class="flag">{moveText(move.phase, to)}</p>
+      {(cancellable || waiting) && (
+        <div class="row">
+          {waiting && (
+            <button disabled={action.busy} title={MOVE_NOW_WARNING} onClick={() => action.run(() => task.moveNow({}))}>Move now</button>
+          )}
+          {cancellable && (
+            <button disabled={action.busy} title="Calls the move off: the task stays on this node, its turn untouched"
+              onClick={() => action.run(() => task.cancelMove({}))}>Cancel move</button>
+          )}
+        </div>
+      )}
+      {move.error !== null && <p class="error">{move.error}</p>}
+      {action.error !== null && <p class="error">{action.error}</p>}
+    </section>
   );
 }
 

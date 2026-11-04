@@ -57,6 +57,13 @@ export async function ensureDataDirs(cfg: NodeConfig): Promise<void> {
   await ensurePrivateDir(p.secrets);
 }
 
+/** The programs a task's workspaces and moves run, which must be on the node's PATH. */
+const TASK_TOOLS = ["jj", "git"] as const;
+
+/**
+ * Whether this node can host tasks: its task root is a writable directory, and jj and git are on its PATH (a service
+ * may run with another PATH than a login shell: the reason names the PATH it looked on).
+ */
 export async function checkTaskRoot(cfg: NodeConfig): Promise<{ ok: true } | { ok: false; reason: string }> {
   const root = cfg.taskRoot;
   try {
@@ -69,6 +76,9 @@ export async function checkTaskRoot(cfg: NodeConfig): Promise<{ ok: true } | { o
     await access(root, constants.W_OK);
   } catch {
     return { ok: false, reason: `task root ${root} is not writable` };
+  }
+  for (const tool of TASK_TOOLS) {
+    if (Bun.which(tool, { PATH: process.env.PATH ?? "" }) === null) return { ok: false, reason: `${tool} is not on this node's PATH (${process.env.PATH ?? ""})` };
   }
   return { ok: true };
 }

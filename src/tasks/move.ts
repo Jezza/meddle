@@ -87,7 +87,7 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
   version: 1,
   initial: () => ({ phase: "prepare" }),
   phases: {
-    prepare: (task, runtime, context) => step("prepare", task.input, runtime, context, async (runner) => {
+    prepare: (task, runtime, phaseContext) => step("prepare", task.input, runtime, phaseContext, async (runner, context) => {
       const { taskId, to, now } = task.input;
       const fromArchive = task.input.fromArchive ?? false;
       runner.checkMove(taskRow(runner, taskId), to, true, fromArchive);
@@ -97,7 +97,7 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       if (!fromArchive) await runner.awaitTurnEnd(taskId, now, context, async () => { await runtime.memo(CUT_MEMO, true, context); });
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "handoff" } }), context);
     }),
-    handoff: (task, runtime, context) => step("handoff", task.input, runtime, context, async (runner) => {
+    handoff: (task, runtime, phaseContext) => step("handoff", task.input, runtime, phaseContext, async (runner, context) => {
       const { taskId, to } = task.input;
       const { cfg, db, pool } = runner.moveDeps();
       // A rerun after this move was rolled back here (its end never recorded) finds the task live again: it stops.
@@ -204,7 +204,8 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
     } else if (row?.state !== "moved") {
       const where = phase === "prepare" ? "abandoned" : await abandonOnTarget(pool, to, taskId);
       if (phase === "commit" && where === "active") runner.completeMove(taskId, to);
-      else await runner.failMove(taskId, to, phase, "the move was aborted");
+      // Cancelled (`task move --cancel`): the task stays here, which is no failure.
+      else await runner.failMove(taskId, to, phase, runner.takeCancel(taskId) ? null : "the move was aborted");
     }
     await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context);
   },
@@ -212,18 +213,21 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
 
 /**
  * Runs one step that may roll back: a failure (other than the Harness closing or an abort, which leave the step to run
- * again or to `abort`) abandons the target's copy, makes the task live here again, and ends the move `failed`.
+ * again or to `abort`) abandons the target's copy, makes the task live here again, and ends the move `failed`. The
+ * body's context aborts with the run too (`abortTask`, a cancel), so that a wait for the turn or for the target stops.
  */
 async function step(
   phase: MoveCheckpoint["phase"],
   input: MoveInput,
   runtime: MoveRuntime,
-  context: Context,
-  body: (runner: TaskRunner) => Promise<void>,
+  phaseContext: Context,
+  body: (runner: TaskRunner, context: Context) => Promise<void>,
 ): Promise<void> {
+  const signals = phaseContext.abortSignal ? [phaseContext.abortSignal, runtime.signal] : [runtime.signal];
+  const context = withAbortSignal(AbortSignal.any(signals), phaseContext);
   const runner = await runnerFor(runtime, context);
   try {
-    await body(runner);
+    await body(runner, context);
   } catch (err) {
     if (stopping(runtime, context)) throw err;
     await rollback(runner, runtime, context, input, phase, messageOf(err));

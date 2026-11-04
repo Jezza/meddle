@@ -115,6 +115,7 @@ function LiveCard({ host, node, row, selfRow, open }: { host: Host; node: NodeRe
   const token = useValue(node.token);
   const metrics = useValue(node.metrics);
   const hostsTasks = useValue(node.hostsTasks);
+  const hostingProblem = useValue(node.hostingProblem);
   const taskRoot = useValue(node.taskRoot);
   const taskIds = useValue(node.taskIds);
   const openHere = (taskId: string) => open(row.nodeId, taskId);
@@ -125,7 +126,8 @@ function LiveCard({ host, node, row, selfRow, open }: { host: Host; node: NodeRe
         <dt>meddle</dt><dd><Version value={version} self={selfRow?.version} /></dd>
         <dt>Claude Code</dt><dd><Version value={claudeCodeVersion} self={selfRow?.claudeCodeVersion} /></dd>
         <dt>Token</dt><dd>{tokenText(token)}</dd>
-        <dt>Task root</dt><dd>{taskRoot} {hostsTasks ? "" : <span class="error">(not usable: this node hosts no tasks)</span>}</dd>
+        <dt>Task root</dt><dd>{taskRoot}</dd>
+        {!hostsTasks && <><dt>Tasks</dt><dd class="error">hosts none: {hostingProblem ?? "its task root is not usable"}</dd></>}
         {metrics === null ? <><dt>Resources</dt><dd class="muted">no sample yet</dd></> : (
           <>
             <dt>Cores</dt><dd>{metrics.cores}, load {metrics.load1.toFixed(2)}</dd>

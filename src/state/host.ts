@@ -209,6 +209,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const token = self.state("token", NodeStore.def.members.token, { init: () => tokenNow(cfg, db) });
     const metricsNow = self.state("metrics", NodeStore.def.members.metrics, { init: () => metrics.latest() });
     const hostsTasks = self.state("hostsTasks", NodeStore.def.members.hostsTasks, { init: async () => (await checkTaskRoot(cfg)).ok });
+    const hostingProblem = self.state("hostingProblem", NodeStore.def.members.hostingProblem, {
+      init: async () => {
+        const check = await checkTaskRoot(cfg);
+        return check.ok ? null : check.reason;
+      },
+    });
     const models = self.state("models", NodeStore.def.members.models, []);
     const notifications = self.state("notifications", NodeStore.def.members.notifications, []);
     const efforts = self.state("efforts", NodeStore.def.members.efforts, { init: effortsNow });
@@ -219,10 +225,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     /** Pending request ids already notified, so each request is announced once. */
     const announced = self.state("announced", Type.Array(Type.String()), []);
 
-    /** The task root can come and go while the node runs. */
+    /** The task root, jj and git can come and go while the node runs. */
     const refreshHostsTasks = async (ctx: Ctx) => {
-      const now = (await checkTaskRoot(cfg)).ok;
-      if (!ctx.signal.aborted && now !== hostsTasks.value) hostsTasks.replace(ctx, now);
+      const check = await checkTaskRoot(cfg);
+      if (ctx.signal.aborted) return;
+      if (check.ok !== hostsTasks.value) hostsTasks.replace(ctx, check.ok);
+      const problem = check.ok ? null : check.reason;
+      if (problem !== hostingProblem.value) hostingProblem.replace(ctx, problem);
     };
 
     const notify = (ctx: Ctx, n: Omit<Notification, "id" | "at">) => {
@@ -317,6 +326,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       claudeCodeVersion: self.state("claudeCodeVersion", NodeStore.def.members.claudeCodeVersion, deps.claudeCodeVersion),
       taskRoot: self.state("taskRoot", NodeStore.def.members.taskRoot, cfg.taskRoot),
       hostsTasks,
+      hostingProblem,
       metrics: metricsNow,
       token,
       taskIds,
@@ -384,6 +394,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       claudeCodeVersion: store.claudeCodeVersion,
       taskRoot: store.taskRoot,
       hostsTasks: store.hostsTasks,
+      hostingProblem: store.hostingProblem,
       metrics: store.metrics,
       token: store.token,
       taskIds: store.taskIds,
@@ -525,6 +536,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       setModel: ({ model }) => runner.setModel(id, model),
       setEffort: ({ effort }, ctx) => store.setEffort({ taskId: id, effort }, ctx),
       moveTo: ({ nodeId, now }) => runner.moveTo(id, nodeId, now),
+      cancelMove: () => runner.cancelMove(id),
+      moveNow: async () => runner.hurryMove(id),
       archive: () => runner.archive(id),
       // Here (`"here"`, this node's id), on another node through a move from the archive, or (null) where placement says.
       restore: ({ node }) => runner.restore(id, node),

@@ -492,7 +492,7 @@ test("a restore-move the target refuses leaves the task archived on the source w
     expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", archived_on: A.id, moved_to: null });
     expect(A.runner.moveState(m.id)).toBeNull();
     expect(A.logs.filter((l) => l.startsWith(`meddle: move: ${m.id} failed at handoff: `))).toEqual([
-      `meddle: move: ${m.id} failed at handoff: this node does not host tasks`,
+      `meddle: move: ${m.id} failed at handoff: this node does not host tasks: task root ${B.cfg.taskRoot} does not exist`,
     ]);
     expect((await readArchive(file)).events).toEqual(archived.events);
     expect(await namespace(A, replicaA, m.id)).toEqual({ local: [], remote: 0 });

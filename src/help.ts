@@ -226,12 +226,14 @@ const GROUPS: Group[] = [
       },
       {
         name: "task move",
-        usage: ["task move <id> <node> [--now]"],
-        summary: "Move a task, with its workspaces and conversation, to another node.",
+        usage: ["task move <id> <node> [--now]", "task move <id> --now", "task move <id> --cancel"],
+        summary: "Move a task, with its workspaces and conversation, to another node; or hurry or cancel its move.",
         details:
-          "<node> is a node id or a unique prefix of one. Waits for a running turn to end first; --now interrupts it " +
-          "instead. Prints `moving <id> to <short id>` once the move has started, and the node finishes it in the " +
-          "background, across restarts.",
+          "<node> is a node id or a unique prefix of one. A move waits for a running turn to end first (it says so); " +
+          "--now interrupts the turn instead. The node finishes the move in the background, across restarts. While a " +
+          "move waits, `task move <id> --now` interrupts the turn after all. `task move <id> --cancel` calls the move " +
+          "off while it waits or hands the task over: the task stays where it is, its turn untouched; once the target " +
+          "has the task it is too late.",
       },
       {
         name: "task archive",

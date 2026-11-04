@@ -101,6 +101,8 @@ const nodeState = {
   claudeCodeVersion: Type.String(),
   taskRoot: Type.String(),
   hostsTasks: Type.Boolean(),
+  /** Why this node hosts no tasks (its task root, or jj or git missing from its PATH); null while it does. */
+  hostingProblem: Nullable(Type.String()),
   metrics: Nullable(NodeMetricsSchema),
   /** Whether this node holds a usable token now (`pickToken`), and when that one expires. */
   token: Type.Object({ present: Type.Boolean(), expiresAt: Nullable(Type.String()) }),
@@ -227,6 +229,13 @@ export const TaskObject = remote("meddle.task", {
          * with the reason when the move is refused; resolves once it has started (`move` follows it).
          */
         moveTo: method(Type.Object({ nodeId: Type.String(), now: Type.Boolean() })),
+        /**
+         * Cancels the task's move while it waits for the turn or hands the task over: the task stays here, its turn
+         * untouched. Rejects once the target has the task (`too late to cancel: …`) or when it is not moving.
+         */
+        cancelMove: method(Type.Object({})),
+        /** Makes the task's move, while it waits for the running turn, interrupt the turn ("move now") instead. */
+        moveNow: method(Type.Object({})),
         /**
          * Archives the idle task on its node: its folder goes, its rows stay, and on a node that is not a project's
          * home the task's bookmarks are pushed to the home first. Rejects with the reason when refused.

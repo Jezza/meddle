@@ -53,7 +53,7 @@ const USAGE = `usage: meddle --version
        meddle task new [<prompt>] [--title <t>] [--project <id|name>]... [--node <id|prefix> | --here]
        meddle task list
        meddle task prompt <id> <text> | meddle task retry <id>
-       meddle task move <id> <node> [--now]
+       meddle task move <id> <node> [--now] | meddle task move <id> --now | meddle task move <id> --cancel
        meddle task archive <id> | meddle task delete <id>
        meddle task restore <id> [--node <id|prefix> | --here]
        meddle service install [--dry-run]
@@ -868,8 +868,31 @@ function taskMove(text: string, nodeText: string, now: boolean): Promise<number>
   return withTask(text, async (client, _socket, id, _holder, pt) => {
     const nodeId = resolveNodeId(pt.nodes.map((n) => n.nodeId), nodeText);
     const task = await client.get(TaskObject, { id });
+    const busy = task.state.value === "running" || task.state.value === "waiting";
     await task.moveTo({ nodeId, now });
-    console.log(`moving ${id} to ${nodeLabel(pt.nodes, nodeId)}`);
+    // Without --now, a turn in progress finishes first: say so, rather than leave the move looking stuck.
+    const when = busy && !now ? ` once its turn ends (task move ${id} --now to interrupt it, --cancel to stay)` : "";
+    console.log(`moving ${id} to ${nodeLabel(pt.nodes, nodeId)}${when}`);
+    return 0;
+  });
+}
+
+/** Cancels the task's move while it waits for the turn or hands the task over: the task stays where it is. */
+function taskMoveCancel(text: string): Promise<number> {
+  return withTask(text, async (client, _socket, id) => {
+    const task = await client.get(TaskObject, { id });
+    await task.cancelMove({});
+    console.log(`cancelled the move of ${id}`);
+    return 0;
+  });
+}
+
+/** Makes the task's move, waiting for the running turn, interrupt it instead. */
+function taskMoveNow(text: string): Promise<number> {
+  return withTask(text, async (client, _socket, id) => {
+    const task = await client.get(TaskObject, { id });
+    await task.moveNow({});
+    console.log(`interrupting the turn of ${id} to move it now`);
     return 0;
   });
 }
@@ -930,7 +953,7 @@ const CHECKOUT = resolve(import.meta.dir, "..");
 
 /**
  * The user unit from `install/meddle.service`: in the single binary, that binary serving from the home directory;
- * from a checkout, the running bun serving from it.
+ * from a checkout, the running bun serving from it; either way with this shell's PATH, where tasks find jj and git.
  */
 async function renderUnit(): Promise<string> {
   const packed = embedded();
@@ -938,7 +961,12 @@ async function renderUnit(): Promise<string> {
   const [exec, dir] = packed !== null
     ? [`${process.execPath} serve`, "%h"]
     : [`${process.execPath} run src/cli.ts serve`, CHECKOUT];
-  return template.replaceAll("{{exec}}", exec).replaceAll("{{dir}}", dir);
+  // systemd reads `%` as a specifier and splits on spaces: escape the one, quote the assignment for the other.
+  // Less what `bun run` (a checkout's CLI) adds in front: its temp directory and every node_modules/.bin up the tree.
+  const dirs = (process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin").split(":").filter((d) => !/\/node_modules\/\.bin$|^\/tmp\/bun-node-/.test(d));
+  const path = `PATH=${dirs.join(":").replaceAll("%", "%%")}`;
+  const quoted = /[\s"\\]/.test(path) ? `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"` : path;
+  return template.replaceAll("{{exec}}", exec).replaceAll("{{dir}}", dir).replaceAll("{{path}}", quoted);
 }
 
 /** The command that creates the task root, owned by the current user and their primary group. */
@@ -1082,7 +1110,9 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "task" && sub === "list" && rest.length === 0) return taskList;
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
   if (command === "task" && sub === "retry" && rest.length === 1) return () => taskRetry(rest[0]!);
-  if (command === "task" && sub === "move" && (rest.length === 2 || (rest.length === 3 && rest[2] === "--now"))) {
+  if (command === "task" && sub === "move" && rest.length === 2 && rest[1] === "--cancel") return () => taskMoveCancel(rest[0]!);
+  if (command === "task" && sub === "move" && rest.length === 2 && rest[1] === "--now") return () => taskMoveNow(rest[0]!);
+  if (command === "task" && sub === "move" && (rest.length === 2 || (rest.length === 3 && rest[2] === "--now")) && !rest[1]!.startsWith("--")) {
     return () => taskMove(rest[0]!, rest[1]!, rest.length === 3);
   }
   if (command === "task" && sub === "archive" && rest.length === 1) return () => taskArchive(rest[0]!);
