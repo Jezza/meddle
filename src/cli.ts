@@ -8,7 +8,7 @@ import { createRegistry } from "@earendil-works/pi-durable";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "./config";
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { acceptDashboardStreams } from "./dashboard/tunnel";
-import { runRemoteHelper } from "./git/helper";
+import { gitRemote } from "./git/remote-main";
 import { writeHelperWrapper, writeUpdateHook } from "./git/scripts";
 import { acceptGitStreams } from "./git/serve";
 import { JANITOR_INTERVAL_MS, runJanitor, sweepArchiveTemps } from "./tasks/archive";
@@ -1048,29 +1048,6 @@ function taskNewArgs(args: string[]): { prompt: string | null; title: string | u
   if (title !== undefined && title.trim() === "") return null;
   // No title: the node names the task (`taskTitle`).
   return { prompt, title, projects, where };
-}
-
-/**
- * git's remote helper for a `meddle://` remote, run by the `git-remote-meddle` wrapper: the protocol on stdio, piped
- * through the git socket `MEDDLE_GIT_SOCKET` (or this node's) names.
- */
-async function gitRemote(url: string): Promise<number> {
-  const writable = (sink: ReturnType<typeof Bun.stdout.writer>) => new WritableStream<Uint8Array>({
-    async write(chunk) {
-      sink.write(chunk);
-      await sink.flush();
-    },
-    async close() {
-      await sink.flush();
-    },
-  });
-  return runRemoteHelper({
-    url,
-    socketPath: paths(loadConfig()).gitSocket,
-    stdin: Bun.stdin.stream(),
-    stdout: writable(Bun.stdout.writer()),
-    stderr: writable(Bun.stderr.writer()),
-  });
 }
 
 /** The subcommand `args` names, or null for a usage error. */

@@ -22,12 +22,13 @@ async function writeScript(file: string, content: string): Promise<string> {
 
 /**
  * Writes `<data>/bin/git-remote-meddle`: a `#!/bin/sh` script that execs this meddle (this bun and the checkout's
- * `src/cli.ts`, or the compiled binary itself) with `git-remote "$@"`. Rewritten only when its content changed.
+ * `src/git/remote-main.ts`, which loads only the helper, or the compiled binary itself) with `git-remote "$@"`.
+ * Rewritten only when its content changed.
  */
 export async function writeHelperWrapper(cfg: NodeConfig): Promise<string> {
-  const cli = resolve(import.meta.dir, "../cli.ts");
+  const entry = resolve(import.meta.dir, "remote-main.ts");
   // Inside a compiled binary `import.meta.dir` names a virtual directory: the binary is the cli.
-  const command = existsSync(cli) ? `${shq(process.execPath)} ${shq(cli)}` : shq(process.execPath);
+  const command = existsSync(entry) ? `${shq(process.execPath)} ${shq(entry)}` : shq(process.execPath);
   return writeScript(paths(cfg).binHelper, `#!/bin/sh\n# Written by meddle: git's remote helper for meddle:// remotes.\nexec ${command} git-remote "$@"\n`);
 }
 
