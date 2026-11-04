@@ -339,8 +339,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       notifications,
       efforts,
       createTask: async ({ title: given, projectIds: ids, prompt, node }, ctx) => {
-        // Named here, before it goes anywhere, so that a peer of any version gets a title.
-        const title = taskTitle(given, prompt);
+        // Named here, before it goes anywhere, so that a peer of any version gets a title; Haiku names it from its
+        // prompt when it can.
+        const title = await taskTitle(given, prompt, (p) => runner.askTitle(p));
         const selfId = pool.identity.id;
         const target = node === "here" ? selfId : node ?? await placeTask(ids);
         if (target === selfId) {

@@ -11,6 +11,7 @@ import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
 import { promptEvent, resultError, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
+import { askTitle } from "../engine/title";
 import { bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceForget } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
@@ -273,6 +274,22 @@ export class TaskRunner {
     // The new task is live here: whoever lists this node's tasks hears of it, whichever node asked for it.
     this.#emitState(manifest.id, "idle");
     return manifest;
+  }
+
+  /**
+   * Haiku's title for a new task whose first prompt is `prompt` (`askTitle`), run with this node's first usable token
+   * and its Claude Code; null when no token is usable or the query failed. It does not mark the token: a turn will.
+   */
+  async askTitle(prompt: string): Promise<string | null> {
+    const picked = await pickToken(this.#cfg, this.#db);
+    if (picked === null) return null;
+    return askTitle(prompt, {
+      cfg: this.#cfg,
+      token: picked.value,
+      ...(this.#deps.claudePath === undefined ? {} : { claudePath: this.#deps.claudePath }),
+      ...(this.#deps.claudeRuntime === undefined ? {} : { claudeRuntime: this.#deps.claudeRuntime }),
+      ...(this.#deps.extraEnv === undefined ? {} : { extraEnv: this.#deps.extraEnv }),
+    });
   }
 
   /**

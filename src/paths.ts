@@ -38,6 +38,8 @@ export function paths(cfg: NodeConfig) {
     /** What a task that moved away left here (decision 18), kept seven days: mode 700, each file 600. */
     moved: join(data, "moved"),
     movedFile: (taskId: string) => join(data, "moved", `${taskId}.json.gz`),
+    /** The Claude Code config dir (and working directory) of the Haiku query that names a new task. */
+    titleConfig: join(data, "title"),
   };
 }
 

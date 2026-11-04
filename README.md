@@ -411,8 +411,9 @@ bun run src/cli.ts task delete <task-id>    # deletes an archived or moved task'
 [Where a new task runs](#where-a-new-task-runs) says. Given a prompt (the words that are not options), it sends it as
 the task's first turn, which starts on the node chosen, and prints `task <id> on <short id>` once the turn has
 started, not when it ends (follow it in the dashboard, or send the next prompt with `task prompt`); without one the
-task waits idle. The title defaults to the first 60 characters of the prompt's first line, or, with no prompt, to two
-adjectives and a noun (`quiet amber otter`). `--project` is repeatable, one project each, the first the primary; with
+task waits idle. Without `--title`, Claude Haiku names the task from its prompt (one short query with the node's token,
+before the task is created); when that fails or takes over 20 seconds, the title is the first 60 characters of the
+prompt's first line. With no prompt either, the task gets two adjectives and a noun (`quiet amber otter`). `--project` is repeatable, one project each, the first the primary; with
 none the task has no project.
 
 `task list` prints a table of every task of the pool, node by node (this node first), the archived ones after the

@@ -230,7 +230,7 @@ async function eventually(cond: () => boolean, what: () => string, ms = 15_000):
   }
 }
 
-test("task new with a prompt sends it as the first turn; the title defaults to the prompt's first line, or to two adjectives and a noun", async () => {
+test("task new with a prompt sends it as the first turn; Haiku names it from the prompt, or with no prompt it gets two adjectives and a noun", async () => {
   const { listEvents } = await import("../src/store/events");
   const { A, close } = await twoPoolNodes();
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
@@ -244,7 +244,8 @@ test("task new with a prompt sends it as the first turn; the title defaults to t
     expect(match?.[2]).toBe(shortId(A.id));
     const id = match![1]!;
     const row = getTask(A.db, id);
-    expect(row?.title).toBe("Say hello");
+    // The stand-in Claude Code replays a recording whose reply is `ok`: that is Haiku's title.
+    expect(row?.title).toBe("ok");
     expect(JSON.parse(row!.manifest).projects).toEqual([]);
     const prompts = () => listEvents(A.db, id)
       .map((e) => e.message as { type?: string; message?: { content?: unknown } })
@@ -253,10 +254,6 @@ test("task new with a prompt sends it as the first turn; the title defaults to t
     await eventually(() => prompts().length > 0, () => "the first prompt in the log");
     expect(prompts()).toEqual(["Say hello"]);
 
-    const long = `${"x".repeat(70)}\nsecond line`;
-    const titled = await run([long, "--here"]);
-    expect(titled.code).toBe(0);
-    expect(getTask(A.db, /^task (\S+) on/.exec(titled.stdout)![1]!)?.title).toBe("x".repeat(60));
     const named = await run(["Say hello", "--here", "--title", "Greeting"]);
     expect(getTask(A.db, /^task (\S+) on/.exec(named.stdout)![1]!)?.title).toBe("Greeting");
 

@@ -120,7 +120,7 @@ const nodeMethods = {
   /**
    * Creates a task on the node `node` names: absent or null, the one placement picks (`place`); `"here"`, this node;
    * else that node id, a member of the pool. `prompt`, when given, starts its first turn there. `title` absent or
-   * blank: the prompt's first line, or two adjectives and a noun (`taskTitle`). Answers the manifest and the node the
+   * blank: Haiku's title for the prompt, else its first line, or two adjectives and a noun (`taskTitle`). Answers the manifest and the node the
    * task is on.
    */
   createTask: method(

@@ -196,8 +196,9 @@ const GROUPS: Group[] = [
           "--project takes one project (an id, or a name one project of the pool has) and can be given again, the first " +
           "being the primary; with none the task has no project and works in a scratch folder. Each project gets a jj " +
           "workspace starting at the project's trunk. Without --node or --here meddle picks an online node that hosts " +
-          "tasks and has room, preferring the primary project's home. The title defaults to the first 60 characters of " +
-          "the prompt's first line, or with no prompt to two adjectives and a noun. With a prompt it returns once the " +
+          "tasks and has room, preferring the primary project's home. Without --title, Claude Haiku names the task from " +
+          "its prompt (the first 60 characters of the prompt's first line when it cannot), or with no prompt it gets " +
+          "two adjectives and a noun. With a prompt it returns once the " +
           "turn has started, not when it ends: follow it in the dashboard, or send the next prompt with `task prompt`. " +
           "Prints `task <id> on <short id>`.",
       },

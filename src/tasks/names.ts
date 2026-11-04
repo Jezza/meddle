@@ -1,4 +1,5 @@
-// src/tasks/names.ts — a new task's title when it is given none: from its prompt, or two adjectives and a noun.
+// src/tasks/names.ts — a new task's title when it is given none: from its prompt (named by a model, else its first
+// line), or two adjectives and a noun.
 import { randomInt } from "node:crypto";
 
 const ADJECTIVES = [
@@ -29,15 +30,45 @@ export function taskName(rand: (n: number) => number = randomInt): string {
   return `${first} ${second} ${pick(NOUNS, rand)}`;
 }
 
-/** How many characters of a prompt's first line a task's title takes when it is given none. */
+/** How many characters a task's title takes at most when it is given none. */
 const TITLE_CHARS = 60;
 
+/** At most `TITLE_CHARS` characters of `s`. */
+const clip = (s: string) => Array.from(s).slice(0, TITLE_CHARS).join("");
+
+/** A title wrapped in quotes, backticks or markdown emphasis: group 1 is what is inside. */
+const WRAPPED = /^["'`*_“‘](.*)["'`*_”’]$/;
+
 /**
- * A new task's title: `title` when it has one (not blank); else the first `TITLE_CHARS` characters of the prompt's
- * first line; else, with no prompt either, two adjectives and a noun (`taskName`).
+ * What a model's reply makes of a title: its first non-blank line, without the markdown heading marks, `Title:` label,
+ * wrapping quotes or trailing full stop a model may add anyway, at most `TITLE_CHARS` characters; null when nothing is
+ * left.
  */
-export function taskTitle(title: string | null | undefined, prompt: string | null | undefined): string {
+export function cleanTitle(reply: string | null | undefined): string | null {
+  let line = reply?.split("\n").map((l) => l.trim()).find((l) => l !== "") ?? "";
+  line = line.replace(/^#+\s*/, "").replace(/^title\s*:\s*/i, "").trim();
+  for (let m = WRAPPED.exec(line); m !== null; m = WRAPPED.exec(line)) line = m[1]!.trim();
+  line = line.replace(/\.$/, "").trim();
+  return line === "" ? null : clip(line);
+}
+
+/**
+ * A new task's title: `title` when it has one (not blank); else, with a prompt, what `ask` (a model asked to name the
+ * prompt, see `askTitle`) answers, cleaned (`cleanTitle`), or when it answers nothing usable or throws, the first
+ * `TITLE_CHARS` characters of the prompt's first line; else, with no prompt either, two adjectives and a noun
+ * (`taskName`).
+ */
+export async function taskTitle(
+  title: string | null | undefined,
+  prompt: string | null | undefined,
+  ask?: (prompt: string) => Promise<string | null>,
+): Promise<string> {
   if (title != null && title.trim() !== "") return title;
-  const first = prompt?.trim().split("\n")[0]!.trim() ?? "";
-  return first === "" ? taskName() : Array.from(first).slice(0, TITLE_CHARS).join("");
+  const text = prompt?.trim() ?? "";
+  if (text === "") return taskName();
+  if (ask !== undefined) {
+    const asked = cleanTitle(await ask(text).catch(() => null));
+    if (asked !== null) return asked;
+  }
+  return clip(text.split("\n")[0]!.trim());
 }
