@@ -13,7 +13,8 @@ const t3 = "2026-10-31T03:00:00.000Z";
 const t4 = "2026-10-31T04:00:00.000Z";
 
 function row(nodeId: string, status: RosterRow["status"], updatedAt: string, extra: Partial<RosterRow> = {}): RosterRow {
-  return { nodeId, hostname: `host-${nodeId[0]}`, status, updatedAt, addedBy: A, summary: null, lastSeenAt: null, lastAddr: null, ...extra };
+  return { nodeId, hostname: `host-${nodeId[0]}`, status, updatedAt, addedBy: A, summary: null, lastSeenAt: null, lastAddr: null,
+    reachedAt: null, reachedAddr: null, ...extra };
 }
 
 function summary(hostname: string, taskCount: number): NodeSummary {
@@ -86,7 +87,7 @@ test("ensureMember gives an unknown node a provisional member row that any row i
   expect(store.ensureMember(B, A)).toBe("member");
   expect(store.row(B)).toEqual({
     nodeId: B, hostname: B.slice(0, 10), status: "member", updatedAt: PROVISIONAL_AT, addedBy: A,
-    summary: null, lastSeenAt: null, lastAddr: null,
+    summary: null, lastSeenAt: null, lastAddr: null, reachedAt: null, reachedAddr: null,
   });
   expect(store.ensureMember(B, A)).toBe("member");
   expect(store.merge([row(B, "member", t1, { hostname: "beta" })])).toBe(true);

@@ -17,6 +17,12 @@ export type PoolObjectDeps = {
   cfg: NodeConfig;
   selfId: string;
   isOnline(nodeId: string): boolean;
+  /** Whether this node counts the member gone (not heard of for longer than `roster.forget`). */
+  isGone(nodeId: string): boolean;
+  /** The connection held with the member (`PoolNet.linkOf`), or null. */
+  linkOf?(nodeId: string): { dialer: string; session: string } | null;
+  /** This node's session (`PoolNet.session`). */
+  session?: string;
   /** This node's current summary, for its own row. */
   liveSummary(): NodeSummary | Promise<NodeSummary>;
   /** The pool row or the roster changed under the node (the CLI wrote it): re-read it. */
@@ -51,10 +57,16 @@ type PoolNode = Type.Static<typeof defaultState.nodes>[number];
 
 /**
  * One roster row as a dashboard sees it; this node's own row shows its live summary. A summary from an older meddle
- * (no `running`, `limit` or `projects`) shows 0, 0 and [], as placement reads it.
+ * (no `running`, `limit` or `projects`) shows 0, 0 and [], as placement reads it. `lastSeenAt` is the newer of the
+ * node's own last word and the newest report of a member connected to it.
  */
-export function nodeOf(row: WireRosterRow, selfId: string, live: Live, online: readonly string[]): PoolNode {
+export function nodeOf(
+  row: WireRosterRow, selfId: string, live: Live, online: readonly string[], gone: readonly string[] = [],
+  links: Readonly<Record<string, { dialer: string; session: string }>> = {},
+): PoolNode {
   const self = row.nodeId === selfId;
+  const reached = row.reachedAt ?? null;
+  const heard = reached !== null && (row.lastSeenAt === null || reached > row.lastSeenAt) ? reached : row.lastSeenAt;
   const summary = self ? live.summary : row.summary;
   return {
     nodeId: row.nodeId,
@@ -68,7 +80,9 @@ export function nodeOf(row: WireRosterRow, selfId: string, live: Live, online: r
     running: summary?.running ?? 0,
     limit: summary?.limit ?? 0,
     projects: summary?.projects ?? [],
-    lastSeenAt: self ? live.at : row.lastSeenAt,
+    lastSeenAt: self ? live.at : heard,
+    gone: !self && gone.includes(row.nodeId),
+    link: self ? null : links[row.nodeId] ?? null,
   };
 }
 
@@ -131,8 +145,18 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
 
     const liveNow = async (): Promise<Live> => ({ summary: await deps.liveSummary(), at: new Date().toISOString() });
     const onlineNow = () => store.roster().map((r) => r.nodeId).filter((id) => id !== selfId && deps.isOnline(id));
+    const goneNow = () => store.roster().map((r) => r.nodeId).filter((id) => id !== selfId && deps.isGone(id));
     const live = self.state("live", LiveSchema, { init: liveNow });
     const online = self.state("online", Type.Array(Type.String()), { init: onlineNow });
+    const goneIds = self.state("gone", Type.Array(Type.String()), { init: goneNow });
+    const LinkSchema = Type.Object({ dialer: Type.String(), session: Type.String() });
+    const linksNow = () => Object.fromEntries(
+      store.roster().flatMap((r) => {
+        const link = r.nodeId === selfId ? null : deps.linkOf?.(r.nodeId) ?? null;
+        return link === null ? [] : [[r.nodeId, link] as const];
+      }),
+    );
+    const links = self.state("links", Type.Record(Type.String(), LinkSchema), { init: linksNow });
     const poolId = self.state("poolId", defaultState.poolId, { init: () => store.pool().poolId });
     const poolName = self.state("poolName", defaultState.poolName, { init: () => store.pool().poolName });
     /** The settings with a value, as the dashboard lists them: who set each, and when. */
@@ -144,6 +168,8 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       listed.replace(ctx, withValue());
       tokens.replace(ctx, listTokens(db));
       online.replace(ctx, onlineNow());
+      goneIds.replace(ctx, goneNow());
+      links.replace(ctx, linksNow());
       poolId.replace(ctx, store.pool().poolId);
       poolName.replace(ctx, store.pool().poolName);
       await Promise.all([refreshActive(ctx), liveNow().then((l) => { if (!ctx.signal.aborted) live.replace(ctx, l); })]);
@@ -153,7 +179,8 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       poolId,
       poolName,
       self: self.state("self", defaultState.self, selfId),
-      nodes: self.derive([roster, live, online], (rows, l, on) => rows.map((r) => nodeOf(r, selfId, l, on))),
+      session: self.state("session", Type.String(), deps.session ?? ""),
+      nodes: self.derive([roster, live, online, goneIds, links], (rows, l, on, g, k) => rows.map((r) => nodeOf(r, selfId, l, on, g, k))),
       tokens,
       activeTokenId: active,
       mixedVersions: self.derive([roster, live], (rows, l) => mixed(rows, selfId, l)),

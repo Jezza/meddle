@@ -9,10 +9,11 @@ import { Discovery } from "./discovery";
 import { loadOrCreateIdentity, shortId, type Identity } from "./identity";
 import { DialFailed, PeerClosed, PoolNet, fromEndpoint, openEndpoint, type RefusalReason } from "./net";
 import type { PoolObjectDeps } from "./object";
+import { Presence } from "./presence";
 import { dedupe } from "./report";
 import { poolKey, proofFor, verifyProof, type PoolKey } from "./secret";
 import { PoolSettings, discoveryLighthouseUrl } from "./settings";
-import { PoolStore, type NodeProject, type NodeSummary, type PoolIdentity, type WireAddr } from "./store";
+import { PoolStore, newestAddr, type NodeProject, type NodeSummary, type PoolIdentity, type WireAddr } from "./store";
 import { HoldFailed, PoolSync } from "./sync";
 
 export type PoolRuntime = {
@@ -30,11 +31,13 @@ export type PoolRuntime = {
    * CLI left (this node alone) and discovery moves to the new topic. Never rejects.
    */
   poolChanged(): Promise<void>;
-  /**
-   * Records `addr`'s node as a member here (unless it is removed: rejects) and dials it when this node is the one to
-   * dial: the way in without a lighthouse.
-   */
+  /** Records `addr`'s node as a member here (unless it is removed: rejects) and dials it: the way in without a lighthouse. */
   addPeer(addr: WireAddr): Promise<void>;
+  /**
+   * Whether this node counts the member gone (see `Presence`): not heard of for longer than the pool's `roster.forget`,
+   * so not dialed, and its work lost to placement. As of the last roster change or self refresh.
+   */
+  isGone(nodeId: string): boolean;
   /** Removes a node from the pool and cuts it off; rejects "a node cannot remove itself". */
   remove(nodeId: string): Promise<void>;
   /** Makes a removed node a member again and tells the pool; rejects for this node, or one not in the roster. */
@@ -158,6 +161,9 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   const discovered = new Set<string>();
   /** Whether this node counted itself a member at the last `enforce`: the moment that changes, it drops its connections. */
   let wasMember = store.isMember(selfId);
+  /** When each member was last heard of; `gone` is its verdict at the last `enforce`. */
+  const presence = new Presence();
+  let gone = new Set<string>();
   let discovery: Discovery | null = null;
 
   /** `removed <updatedAt>` for a node the roster has as removed: the refused node can tell how recent that is. */
@@ -177,8 +183,8 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   const net = new PoolNet({
     endpoint, selfId,
-    prove: (peer) => (key === null ? null : proofFor(key, selfId, peer)),
-    verify: (peer, proof) => key !== null && verifyProof(key.id, peer, selfId, proof),
+    prove: (peer, session) => (key === null ? null : proofFor(key, selfId, peer, session)),
+    verify: (peer, session, proof) => key !== null && verifyProof(key.id, peer, selfId, session, proof),
     admit: admits,
     refusalReason,
     onError: (err) => {
@@ -197,6 +203,9 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       // A node this node dialled on the lighthouse's word proved the secret: it is a member here from now on.
       if (key !== null) store.ensureMember(id, selfId);
       enforce();
+      // The pool hears of the connection, and of the address this node sees the peer at, now rather than at the next
+      // self refresh: a node that came back at a new address needs to reach only one member to be found by all.
+      void sync.reportLinks([id]).then((changed) => { if (changed) notify(); }, (err: unknown) => hooks.onError?.(err));
     }
     notify();
   });
@@ -246,16 +255,29 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
   });
 
   /**
-   * Makes the connections follow the roster: every member (other than this node) is watched and offered its latest
-   * known address; a member no longer (removed, or gone with a new secret) is cut off, with `removed <updatedAt>`
-   * when this roster has it removed. A node that knows itself removed keeps watching the members all the same: they
-   * refuse it (quietly, see `refused`) until one allows it again, and that member's admission is how it learns so
-   * without a restart. Without a secret nothing is watched.
+   * Makes the connections follow the roster: every member (other than this node) that is not gone (`Presence`) is
+   * watched and offered its newest known address (`newestAddr`); a member no longer (removed, gone with a new secret,
+   * or not heard of for longer than `roster.forget`) is cut off, with `removed <updatedAt>` when this roster has it
+   * removed. A node that knows itself removed keeps watching the members all the same: they refuse it (quietly, see
+   * `refused`) until one allows it again, and that member's admission is how it learns so without a restart. Without a
+   * secret nothing is watched.
    */
   function enforce(): void {
     if (stopped) return;
     const rows = store.roster();
-    const keep = new Map(key !== null ? rows.filter((r) => r.status === "member" && r.nodeId !== selfId).map((r) => [r.nodeId, r]) : []);
+    presence.know(rows.map((r) => r.nodeId));
+    presence.tick(net.online().length > 0);
+    const threshold = settings.forgetAfterMs();
+    gone = new Set(
+      rows
+        .filter((r) => r.status === "member" && r.nodeId !== selfId && presence.gone(r, net.isOnline(r.nodeId), threshold))
+        .map((r) => r.nodeId),
+    );
+    const keep = new Map(
+      key !== null
+        ? rows.filter((r) => r.status === "member" && r.nodeId !== selfId && !gone.has(r.nodeId)).map((r) => [r.nodeId, r])
+        : [],
+    );
     for (const id of [...followed.keys()]) {
       if (keep.has(id)) continue;
       followed.delete(id);
@@ -276,9 +298,10 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     }
     for (const row of rows) if (row.status === "removed" && row.nodeId !== selfId) net.unwatch(row.nodeId, `removed ${row.updatedAt}`);
     for (const [id, row] of keep) {
-      const addr = row.lastAddr === null ? null : JSON.stringify(row.lastAddr);
+      const newest = newestAddr(row);
+      const addr = newest === null ? null : JSON.stringify(newest);
       // The address goes first, so that the first dial to a newly watched member already has it.
-      if (row.lastAddr !== null && followed.get(id) !== addr) net.offerAddress(row.lastAddr);
+      if (newest !== null && followed.get(id) !== addr) net.offerAddress(newest);
       if (!followed.has(id)) net.watch(id);
       followed.set(id, addr ?? followed.get(id) ?? null);
     }
@@ -286,8 +309,8 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
 
   /**
    * The nodes the lighthouse lists on the pool's topic: each gets its address offered, and one that is not a member
-   * here yet is dialled (when this node dials it), so that the two prove the secret to each other; one that left the
-   * topic before it proved anything is dropped again. A node this roster has as removed is left alone.
+   * here yet is dialled, so that the two prove the secret to each other; one that left the topic before it proved
+   * anything is dropped again. A node this roster has as removed is left alone.
    */
   function onPeers(peers: WireAddr[]): void {
     if (stopped || key === null) return;
@@ -315,6 +338,15 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       lighthouseUrl: () => discoveryLighthouseUrl(cfg, settings),
       pollMs: cfg.discoveryPollMs,
       onPeers,
+      onListed: (ids) => {
+        if (stopped) return;
+        presence.listedNow(ids);
+        // A member gone here that the lighthouse lists again is back in the address book (and dialled) at once.
+        if (ids.some((id) => gone.has(id))) {
+          enforce();
+          notify();
+        }
+      },
       onError: (message) => { if (!stopped) log(`meddle: discovery: ${message}`); },
     });
     discovery.start();
@@ -435,6 +467,9 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     objectDeps: {
       store, db, cfg, selfId, settings,
       isOnline: (id) => net.isOnline(id),
+      isGone: (id) => gone.has(id),
+      linkOf: (id) => net.linkOf(id),
+      session: net.session,
       liveSummary,
       poolChanged,
       remove,
@@ -446,6 +481,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     },
     poolChanged,
     addPeer,
+    isGone: (id) => gone.has(id),
     remove,
     allow,
     tokenChanged,

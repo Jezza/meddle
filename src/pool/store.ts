@@ -28,15 +28,35 @@ export type WireAddr = { id: string; relay: string | null; direct: string[] };
 
 /**
  * One node of the pool. `status`, `hostname`, `updatedAt` and `addedBy` are membership, merged
- * last-writer-wins on `updatedAt`; `summary`, `lastSeenAt` and `lastAddr` are presence, merged on `lastSeenAt`.
+ * last-writer-wins on `updatedAt`; `summary`, `lastSeenAt` and `lastAddr` are presence, the node's own word about
+ * itself, merged on `lastSeenAt`; `reachedAt` and `reachedAddr` are the newest report by any member of a connection
+ * with the node (a member reports each node it is connected to, with the address it sees), merged on `reachedAt`.
  */
 export type RosterRow = {
   nodeId: string; hostname: string; status: "member" | "removed"; updatedAt: string; addedBy: string;
   summary: NodeSummary | null; lastSeenAt: string | null; lastAddr: WireAddr | null;
+  reachedAt: string | null; reachedAddr: WireAddr | null;
 };
 
-/** A roster row as a peer may send it (its summary perhaps an older meddle's). */
-export type WireRosterRow = Omit<RosterRow, "summary"> & { summary: WireSummary | null };
+/** A roster row as a peer may send it (its summary perhaps an older meddle's, perhaps without link reports). */
+export type WireRosterRow = Omit<RosterRow, "summary" | "reachedAt" | "reachedAddr"> & {
+  summary: WireSummary | null; reachedAt?: string | null; reachedAddr?: WireAddr | null;
+};
+
+/** The one form a replicated time may take: what `new Date().toISOString()` prints. */
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+/** How far ahead of this node's clock a reported link may be dated and still count. */
+export const MAX_REPORT_AHEAD_MS = 5 * 60_000;
+
+/**
+ * The address to dial the node at: the newer of its own word (`lastAddr` at `lastSeenAt`) and the newest report of a
+ * member connected to it (`reachedAddr` at `reachedAt`); null when neither is known.
+ */
+export function newestAddr(row: Pick<RosterRow, "lastSeenAt" | "lastAddr" | "reachedAt" | "reachedAddr">): WireAddr | null {
+  if (row.reachedAddr === null) return row.lastAddr;
+  if (row.lastAddr === null) return row.reachedAddr;
+  return (row.reachedAt ?? "") > (row.lastSeenAt ?? "") ? row.reachedAddr : row.lastAddr;
+}
 
 /**
  * The pool this node is in: `poolId` is the topic public key `poolName` and `poolSecret` derive (`poolKey`), and both it
@@ -55,6 +75,7 @@ export const PROVISIONAL_AT = "1970-01-01T00:00:00.000Z";
 type RosterRecord = {
   node_id: string; hostname: string; status: RosterRow["status"]; updated_at: string; added_by: string;
   summary: string | null; last_seen_at: string | null; last_addr: string | null;
+  reached_at: string | null; reached_addr: string | null;
 };
 
 function toRow(r: RosterRecord): RosterRow {
@@ -67,6 +88,8 @@ function toRow(r: RosterRecord): RosterRow {
     summary: r.summary === null ? null : withSummaryDefaults(JSON.parse(r.summary) as WireSummary),
     lastSeenAt: r.last_seen_at,
     lastAddr: r.last_addr === null ? null : (JSON.parse(r.last_addr) as WireAddr),
+    reachedAt: r.reached_at,
+    reachedAddr: r.reached_addr === null ? null : (JSON.parse(r.reached_addr) as WireAddr),
   };
 }
 
@@ -101,7 +124,7 @@ export class PoolStore {
     if (this.row(self.nodeId) === null) {
       this.upsert({
         nodeId: self.nodeId, hostname: self.hostname, status: "member", updatedAt: now, addedBy: self.nodeId,
-        summary: null, lastSeenAt: null, lastAddr: null,
+        summary: null, lastSeenAt: null, lastAddr: null, reachedAt: null, reachedAddr: null,
       });
     }
   }
@@ -157,7 +180,7 @@ export class PoolStore {
       if (row !== null) return row.status;
       this.upsert({
         nodeId, hostname: shortId(nodeId), status: "member", updatedAt: PROVISIONAL_AT, addedBy: by,
-        summary: null, lastSeenAt: null, lastAddr: addr,
+        summary: null, lastSeenAt: null, lastAddr: addr, reachedAt: null, reachedAddr: null,
       });
       return "member";
     })();
@@ -201,27 +224,37 @@ export class PoolStore {
   }
 
   upsert(row: WireRosterRow): void {
+    const reachedAddr = row.reachedAddr ?? null;
     this.db.query(
-      `INSERT OR REPLACE INTO roster (node_id, hostname, status, updated_at, added_by, summary, last_seen_at, last_addr)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO roster
+         (node_id, hostname, status, updated_at, added_by, summary, last_seen_at, last_addr, reached_at, reached_addr)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       row.nodeId, row.hostname, row.status, row.updatedAt, row.addedBy,
       row.summary === null ? null : JSON.stringify(row.summary), row.lastSeenAt,
       row.lastAddr === null ? null : JSON.stringify(row.lastAddr),
+      row.reachedAt ?? null, reachedAddr === null ? null : JSON.stringify(reachedAddr),
     );
   }
 
   /**
-   * Folds a peer's roster into this one: membership fields when the remote `updatedAt` is newer,
-   * presence fields when the remote `lastSeenAt` is newer. Returns true when any row changed.
+   * Folds a peer's roster into this one: membership fields when the remote `updatedAt` is newer, presence fields when
+   * the remote `lastSeenAt` is newer, and the link report when the remote `reachedAt` is newer (a millisecond ISO time
+   * at most five minutes ahead of `now`; any other is dropped, so that no report outlives the node it names). Returns
+   * true when any row changed.
    */
-  merge(rows: WireRosterRow[]): boolean {
+  merge(rows: WireRosterRow[], now: number = Date.now()): boolean {
+    const latest = new Date(now + MAX_REPORT_AHEAD_MS).toISOString();
+    const report = (r: WireRosterRow) =>
+      typeof r.reachedAt === "string" && ISO_TIME.test(r.reachedAt) && r.reachedAt <= latest
+        ? { reachedAt: r.reachedAt, reachedAddr: r.reachedAddr ?? null }
+        : { reachedAt: null, reachedAddr: null };
     return this.db.transaction(() => {
       let changed = false;
       for (const remote of rows) {
         const local = this.row(remote.nodeId);
         if (local === null) {
-          this.upsert(remote);
+          this.upsert({ ...remote, ...report(remote) });
           changed = true;
           continue;
         }
@@ -238,6 +271,12 @@ export class PoolStore {
           next.summary = remote.summary;
           next.lastSeenAt = remote.lastSeenAt;
           next.lastAddr = remote.lastAddr;
+          rowChanged = true;
+        }
+        const reached = report(remote);
+        if (reached.reachedAt !== null && (local.reachedAt === null || reached.reachedAt > local.reachedAt)) {
+          next.reachedAt = reached.reachedAt;
+          next.reachedAddr = reached.reachedAddr ?? local.reachedAddr;
           rowChanged = true;
         }
         if (rowChanged) {
@@ -258,6 +297,21 @@ export class PoolStore {
       const row = this.row(nodeId);
       if (row === null) return;
       this.db.query("UPDATE roster SET status = 'removed', updated_at = ? WHERE node_id = ?").run(this.after(row, now), nodeId);
+    })();
+  }
+
+  /**
+   * Records that this node is connected to `nodeId` at `at`, as seen at `addr` (null: the address is not known, and
+   * the one reported before stays). Only a report newer than the row's moves it. True when the row changed.
+   */
+  reached(nodeId: string, at: string, addr: WireAddr | null): boolean {
+    return this.db.transaction(() => {
+      const row = this.row(nodeId);
+      if (row === null || (row.reachedAt !== null && row.reachedAt >= at)) return false;
+      const keep = addr === null || (addr.relay === null && addr.direct.length === 0) ? row.reachedAddr : addr;
+      this.db.query("UPDATE roster SET reached_at = ?, reached_addr = ? WHERE node_id = ?")
+        .run(at, keep === null ? null : JSON.stringify(keep), nodeId);
+      return true;
     })();
   }
 

@@ -8,6 +8,7 @@ import { shortId } from "../src/pool/ids";
 import { TaskObject } from "../src/state/contracts";
 import { startFakeLighthouse } from "./fake-lighthouse";
 import { meddle, replay, startServe } from "./helpers";
+import { hostname } from "node:os";
 
 /**
  * A temp home with a data dir, a created task root and a colocated jj repo, and the env a pooled meddle child runs with
@@ -81,7 +82,7 @@ test("a task moves from one node to another through the CLI and resumes there", 
       expect(set.stderr).toBe("");
       expect(set.code).toBe(0);
     }
-    await until(["pool"], atA, new RegExp(`^${shortId(B.id)} \\S+ online `, "m"));
+    await until(["pool"], atA, new RegExp(`^ +${shortId(B.id)} +\\S+ +online `, "m"));
     await writeFile(`${a.dir}/token`, "tok\n");
     expect((await meddle(["token", "set", "--file", `${a.dir}/token`], atA)).code).toBe(0);
     await until(["token", "status"], atB, /^active: [0-9a-f]{16}$/m);
@@ -96,7 +97,7 @@ test("a task moves from one node to another through the CLI and resumes there", 
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], atA);
     expect(created.stderr).toBe("");
     expect(created.code).toBe(0);
-    const [, taskId = "", on] = /^task (\S+) on (\S+)\n$/.exec(created.stdout) ?? [];
+    const [, taskId = "", on] = /^task (\S+) on (\S+)(?: \(.*\))?\n$/.exec(created.stdout) ?? [];
     expect(on).toBe(shortId(A.id));
     const first = await meddle(["task", "prompt", taskId, "Reply", "with", "ok."], atA);
     expect(first.code).toBe(0);
@@ -108,7 +109,7 @@ test("a task moves from one node to another through the CLI and resumes there", 
 
     // A: move it to B by B's short id
     const moved = await meddle(["task", "move", taskId, shortId(B.id)], atA);
-    expect(moved).toEqual({ stdout: `moving ${taskId} to ${shortId(B.id)}\n`, stderr: "", code: 0 });
+    expect(moved).toEqual({ stdout: `moving ${taskId} to ${shortId(B.id)} (${hostname()})\n`, stderr: "", code: 0 });
     await until(["status"], atB, /^tasks 1$/m);
     await until(["status"], atA, /^tasks 0$/m);
 

@@ -1,4 +1,4 @@
-// run-lab.ts: drives meddle through scenarios 1 to 13 of brief.md on a tpo lab (meddle-lab.toml), one line per check.
+// run-lab.ts: drives meddle through scenarios 1 to 13 of brief.md, then 14 (a simultaneous dial) and 15 (forgetting) on a tpo lab (meddle-lab.toml), one line per check.
 //   bun run run-lab.ts            (from anywhere; it brings the lab up from scratch and takes it down at the end)
 // Hermetic: no internet node, the lab's own lighthouse (lh:8080), MEDDLE_IROH_PRESET=minimal, fake token, replayer.
 // Logs: $S/logs/<scenario>-<node>.log (each scenario's slice of `tpo logs`), $S/logs/all-<node>.log, results.json.
@@ -133,16 +133,44 @@ const meddleLines = (lines: string[]) => lines.filter((l) => l.startsWith("meddl
 
 const ids: Record<string, string> = {};
 const short = (n: Node) => ids[n]!.slice(0, 10);
+/** The rows of `pool -v`, a table: each row's cells (two or more spaces apart), with `@` marking this node's row. */
+async function poolRows(node: Node): Promise<{ self: boolean; cells: string[] }[]> {
+  const r = await meddle(node, "pool", "-v");
+  return r.out.split("\n").slice(1).filter((l) => l.trim() !== "").map((l) => ({
+    self: l.startsWith("@"),
+    cells: l.replace(/^@/, " ").trim().split(/ {2,}/),
+  }));
+}
+/** Each host's state (`online`, `offline`, `gone`, `removed`) as `pool` on `node` shows it. */
 async function poolView(node: Node): Promise<Record<string, string>> {
-  const r = await meddle(node, "pool");
   const v: Record<string, string> = {};
-  for (const l of r.out.split("\n")) {
-    const [, host, state] = l.split(" ");
-    if (host) v[host] = state ?? "";
-  }
+  for (const { cells } of await poolRows(node)) if (cells[1]) v[cells[1]] = cells[2] ?? "";
   return v;
 }
 const sees = async (observer: Node, other: Node, state: string) => (await poolView(observer))[other] === state;
+/**
+ * What `pool -v` on `node` says of its connections: its own session, and for each other host the connection held
+ * with it (its dialer's short id and that node's session).
+ */
+async function linkView(node: Node): Promise<{ session: string | null; links: Record<string, { dialer: string; session: string }> }> {
+  const links: Record<string, { dialer: string; session: string }> = {};
+  let session: string | null = null;
+  // NODE HOST STATE MEDDLE CLAUDE TASKS DIALER SESSION
+  for (const { self, cells } of await poolRows(node)) {
+    const [, host, , , , , dialer, own] = cells;
+    if (self) session = own && own !== "-" ? own : null;
+    else if (host && dialer && dialer !== "-" && own && own !== "-") links[host] = { dialer, session: own };
+  }
+  return { session, links };
+}
+/** Whether `x` and `y` hold one and the same connection: they agree on its dialer and each names the other's session. */
+async function oneLink(x: Node, y: Node): Promise<{ ok: boolean; detail: string }> {
+  const [vx, vy] = await Promise.all([linkView(x), linkView(y)]);
+  const lx = vx.links[y];
+  const ly = vy.links[x];
+  const ok = lx !== undefined && ly !== undefined && lx.dialer === ly.dialer && lx.session === vy.session && ly.session === vx.session;
+  return { ok, detail: `${x}: ${lx ? `dialed by ${lx.dialer}, ${y}'s session ${lx.session.slice(0, 12)}…` : "none"}; ${y}: ${ly ? `dialed by ${ly.dialer}, ${x}'s session ${ly.session.slice(0, 12)}…` : "none"}` };
+}
 
 // ─── turns and memory ───
 
@@ -194,8 +222,7 @@ async function s2() {
   }, 30_000);
   check(scn, "every pool lists the others online", ms !== null, `${secs(ms)} after the last secret was set`);
   for (const n of MEDDLE) info(scn, `pool on ${n}`, (await meddle(n, "pool")).out.replace(/\n/g, " | "));
-  const sorted = [...MEDDLE].sort((x, y) => ids[x]!.localeCompare(ids[y]!));
-  info(scn, "dial direction (smaller id dials)", `a-c: ${ids.a! < ids.c! ? "a dials c" : "c dials a"}; order ${sorted.join("<")}`);
+  for (const [x, y] of [["a", "b"], ["a", "c"], ["b", "c"]] as const) info(scn, `connection ${x}-${y}`, (await oneLink(x, y)).detail);
   const roster = q<{ node_id: string; last_addr: string }>("c", "meddle.sqlite", "select node_id,last_addr from roster");
   const aRow = roster.find((r) => r.node_id === ids.a);
   info(scn, "c's roster entry for a", aRow?.last_addr ?? "(none)");
@@ -493,12 +520,18 @@ async function s10b() {
   for (const n of MEDDLE) info(scn, `${n} log`, meddleLines(logs[n]!).join(" || ") || "(silent)");
 }
 
-/** Restarts the member with the largest id: nobody dials it but through its new address, which only the lighthouse has. */
+/**
+ * Restarts the member with the largest id on a new port (`MEDDLE_IROH_BIND=<lab addr>:0`). It dials every member at
+ * once, at the addresses it remembers; the first it reaches reports its new address to the rest. With the lighthouse
+ * cut (`lhCutMs`), that is the only way back, and it must be back before the lighthouse is.
+ */
 async function restartLargest(scn: string, lhCutMs: number) {
   const m = await mark();
   const big = [...MEDDLE].sort((x, y) => ids[y]!.localeCompare(ids[x]!))[0]!;
   const others = MEDDLE.filter((n) => n !== big);
   const dash = (await logLines(big)).filter((l) => l.startsWith("dashboard at")).length;
+  const addrOf = () => q<{ last_addr: string | null; reached_addr: string | null }>(others[0]!, "meddle.sqlite", `select last_addr, reached_addr from roster where node_id='${ids[big]}'`)[0];
+  const before = addrOf();
   let tLhHeal = 0;
   if (lhCutMs > 0) { await tpo("cut", "lh", "--for", `${lhCutMs / 1000}s`); tLhHeal = Date.now() + lhCutMs; }
   await tpo("stop", big);
@@ -508,8 +541,10 @@ async function restartLargest(scn: string, lhCutMs: number) {
   await waitFor(async () => (await logLines(big)).filter((l) => l.startsWith("dashboard at")).length > dash, 60_000);
   const res = await Promise.all(others.map((n) => waitFor(() => sees(n, big, "online"), 120_000, 500).then((ms) => [n, ms === null ? null : Date.now() - t] as const)));
   const detail = res.map(([n, ms]) => `${n}: ${secs(ms)} after start${lhCutMs > 0 && ms !== null ? ` (${secs(t + ms - tLhHeal)} relative to the lighthouse heal)` : ""}`).join(", ");
-  if (lhCutMs > 0) check(scn, `${big} (largest id) comes back only once the lighthouse is back`, res.every(([, ms]) => ms !== null && t + ms >= tLhHeal - 1000), detail);
+  if (lhCutMs > 0) check(scn, `${big} (largest id), on a new port, is back on ${others.join(",")} while the lighthouse is still down`, res.every(([, ms]) => ms !== null && t + ms < tLhHeal), detail);
   else check(scn, `${big} (largest id) online on ${others.join(",")} after restart`, res.every(([, ms]) => ms !== null), detail);
+  const after = addrOf();
+  info(scn, `${big}'s address on ${others[0]} before/after (own word; reported by a member)`, `${before?.last_addr} / ${before?.reached_addr} → ${after?.last_addr} / ${after?.reached_addr}`);
   if (lhCutMs > 0) await sleep(Math.max(0, tLhHeal - Date.now()));
   const logs = await saveLogs(scn, m);
   for (const n of MEDDLE) info(scn, `${n} log`, meddleLines(logs[n]!).join(" || ") || "(silent)");
@@ -581,6 +616,74 @@ async function s12() {
   for (const n of MEDDLE) info(scn, `${n} log`, meddleLines(logs[n]!).join(" || ") || "(silent)");
 }
 
+/** Two members started together dial each other at once: they settle on one connection, the same on both sides. */
+async function s14() {
+  const scn = "s14";
+  const m = await mark();
+  const pair = ["a", "b"] as const;
+  const dash = Object.fromEntries(await Promise.all(pair.map(async (n) => [n, (await logLines(n)).filter((l) => l.startsWith("dashboard at")).length] as const)));
+  await Promise.all(pair.map((n) => tpo("stop", n)));
+  await sleep(3000);
+  await Promise.all(pair.map((n) => tpo("start", n)));
+  const t = Date.now();
+  await Promise.all(pair.map((n) => waitFor(async () => (await logLines(n)).filter((l) => l.startsWith("dashboard at")).length > dash[n]!, 60_000)));
+  const up = await waitFor(async () => (await sees("a", "b", "online")) && (await sees("b", "a", "online")), 60_000, 500);
+  check(scn, "a and b, started together, see each other online", up !== null, `${secs(up === null ? null : Date.now() - t)} after start`);
+  const settled = await waitFor(async () => (await oneLink("a", "b")).ok, 30_000, 500);
+  const first = await oneLink("a", "b");
+  check(scn, "a and b hold exactly one connection, the same on both sides", settled !== null, first.detail);
+  // It stays that way: sampled every second for 20 s, always online, always the one connection.
+  const samples: string[] = [];
+  let steady = true;
+  for (let i = 0; i < 20; i++) {
+    const [one, ab, ba] = await Promise.all([oneLink("a", "b"), sees("a", "b", "online"), sees("b", "a", "online")]);
+    if (!one.ok || !ab || !ba) { steady = false; samples.push(`+${i}s ${one.detail} online ${ab}/${ba}`); }
+    await sleep(1000);
+  }
+  check(scn, "the connection stays one and online for 20 s", steady, samples.join(" | ") || first.detail);
+  const logs = await saveLogs(scn, m);
+  for (const n of MEDDLE) info(scn, `${n} log`, meddleLines(logs[n]!).join(" || ") || "(silent)");
+}
+
+/**
+ * With `roster.forget` at 60 s and the lighthouse cut, a member that stops is counted gone by the others within a
+ * refresh of the threshold and no longer dialled; started again, it dials them, proves the secret and is back.
+ */
+async function s15() {
+  const scn = "s15";
+  const m = await mark();
+  const set = await meddle("a", "config", "set", "roster.forget", "60");
+  check(scn, "config set roster.forget 60 on a", set.code === 0, set.out || set.err);
+  const spread = await waitFor(async () => (await meddle("b", "config", "list")).out.includes("roster.forget = 60"), 30_000);
+  check(scn, "the setting reaches b", spread !== null, secs(spread));
+  const lhCutMs = 300_000;
+  await tpo("cut", "lh", "--for", `${lhCutMs / 1000}s`);
+  const tLhHeal = Date.now() + lhCutMs;
+  const dash = (await logLines("c")).filter((l) => l.startsWith("dashboard at")).length;
+  await tpo("stop", "c");
+  const t = Date.now();
+  const gone = await Promise.all((["a", "b"] as const).map((n) => waitFor(() => sees(n, "c", "gone"), 150_000, 1000).then((ms) => [n, ms === null ? null : Date.now() - t] as const)));
+  check(scn, "a and b count c gone once unheard of for 60 s (not before)", gone.every(([, ms]) => ms !== null && ms >= 55_000), gone.map(([n, ms]) => `${n}: ${secs(ms)} after the stop`).join(", "));
+  // Not dialled while gone: a dial failure would be logged again once its minute of deduplication is over.
+  const m2 = await mark();
+  await sleep(70_000);
+  const quiet = await saveLogs(`${scn}-gone`, m2);
+  const naming = (["a", "b"] as const).flatMap((n) => meddleLines(quiet[n]!).filter((l) => l.includes(short("c"))).map((l) => `${n}: ${l}`));
+  check(scn, "neither a nor b dials c while it is gone (70 s)", naming.length === 0, naming.join(" || ") || "no line names c");
+  const stillGone = await Promise.all((["a", "b"] as const).map((n) => sees(n, "c", "gone")));
+  check(scn, "c is still listed (gone, not removed)", stillGone.every(Boolean), stillGone.join(","));
+  await tpo("start", "c");
+  const tStart = Date.now();
+  await waitFor(async () => (await logLines("c")).filter((l) => l.startsWith("dashboard at")).length > dash, 60_000);
+  const back = await Promise.all((["a", "b"] as const).map((n) => waitFor(() => sees(n, "c", "online"), 90_000, 500).then((ms) => [n, ms === null ? null : Date.now() - tStart] as const)));
+  check(scn, "c, started again, rejoins a and b by proving the secret, the lighthouse still down", back.every(([, ms]) => ms !== null) && Date.now() < tLhHeal, back.map(([n, ms]) => `${n}: ${secs(ms)} after start`).join(", "));
+  const unset = await meddle("a", "config", "unset", "roster.forget");
+  info(scn, "config unset roster.forget", unset.out || unset.err || `exit ${unset.code}`);
+  await tpo("heal", "--all");
+  const logs = await saveLogs(scn, m);
+  for (const n of MEDDLE) info(scn, `${n} log`, meddleLines(logs[n]!).join(" || ") || "(silent)");
+}
+
 async function s13() {
   const scn = "s13";
   const script = `for p in $(pgrep -f 'cli[.]ts serve$'); do [ "$(cat /proc/$p/comm 2>/dev/null)" = bun ] || continue; tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null | grep -qx "TPO_NODE=$TPO_NODE" && root=$p; done
@@ -605,7 +708,7 @@ async function main() {
   try {
     // `LAB_SCENARIOS=s1,s2` runs only those (s1 always runs: it brings the lab up).
     const only = (process.env.LAB_SCENARIOS ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-    for (const [name, fn] of [["s1", s1], ["s2", s2], ["s3", s3], ["s4", s4], ["s5", s5], ["s6", s6], ["s7", s7], ["s8", s8], ["s9", s9], ["s10", s10], ["s10b", s10b], ["s11", s11], ["s11b", s11b], ["s12", s12], ["s13", s13]] as const) {
+    for (const [name, fn] of [["s1", s1], ["s2", s2], ["s3", s3], ["s4", s4], ["s5", s5], ["s6", s6], ["s7", s7], ["s8", s8], ["s9", s9], ["s10", s10], ["s10b", s10b], ["s11", s11], ["s11b", s11b], ["s12", s12], ["s14", s14], ["s15", s15], ["s13", s13]] as const) {
       if (only.length > 0 && name !== "s1" && !only.includes(name)) continue;
       try {
         await fn();

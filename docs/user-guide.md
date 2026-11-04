@@ -29,27 +29,36 @@ Outside the node:
 - **Your browser**, on any node's dashboard. The dashboard binds to localhost only; for a remote machine, tunnel it
   (`ssh -L 7777:127.0.0.1:7777 <host>`, the same port at both ends: the node accepts a browser only on its own port)
   and open the same URL.
-- **On each machine:** [bun](https://bun.sh), [jj](https://jj-vcs.github.io/jj/) and git. Claude Code itself ships
-  inside the Agent SDK dependency, so a task needs no `claude` on the machine. The `claude` CLI is needed once, on
+- **On each machine:** [jj](https://jj-vcs.github.io/jj/) 0.46.0 or later and git, and the `meddle` binary (below).
+  Claude Code itself is inside it, so a task needs no `claude` on the machine. The `claude` CLI is needed once, on
   any machine, to mint a login token (`claude setup-token`); the token then reaches every node through the pool.
 
 ## Is it a binary?
 
-Not in practice, not yet. The node runs from the checkout with bun, and so does the systemd unit `service install`
-writes (`ExecStart=<bun> run src/cli.ts serve`, `WorkingDirectory=<checkout>`). `bun run build` compiles a
-`dist/meddle`, but a node served from it cannot read the bundled Claude Code version, so it reports `unknown` to the
-pool and can neither move its tasks away nor take any (the README's [Install](../README.md#install) says why). Use it
-for `status` and the `token` commands if you like; serve from the checkout.
-
-So every machine keeps a checkout, with `node_modules` installed, at the same commit as every other machine. To stop
-typing `bun run src/cli.ts`, the checkout has `bin/meddle`, a wrapper script that runs the checkout's CLI from
-anywhere. Link it onto your `PATH` once:
+Yes. On one machine with a checkout (`bun install` done), build it:
 
 ```sh
-ln -s ~/projects/meddle/bin/meddle ~/.local/bin/meddle
+bun run build    # writes dist/meddle
 ```
 
-The rest of this guide writes `meddle <command>`; `bun run src/cli.ts <command>` from the checkout is the same thing.
+`dist/meddle` is one file, about 150 MB, holding bun, meddle and the dashboard, and naming the exact Claude Code to
+run. Copy it to each machine of the same platform and put it on the `PATH`:
+
+```sh
+scp dist/meddle <host>:.local/bin/meddle
+```
+
+Those machines need jj and git, and nothing else: no bun, no checkout. The first time a node starts, it downloads
+that Claude Code from the npm registry (about 140 MB) and checks it against the checksum the build carries; a machine
+that cannot reach the registry needs a build made with `bun run build --embed-claude` (about 450 MB, Claude Code
+inside). Give every machine the same build, so that they all run the same Claude Code and can move tasks to each
+other. A build runs on one platform; for a machine of
+another (a Raspberry Pi is `bun-linux-arm64`), see the README's [single binary](../README.md#the-single-binary).
+
+You can still run from a checkout instead: `bin/meddle` is a wrapper that runs the checkout's CLI from anywhere
+(`ln -s ~/projects/meddle/bin/meddle ~/.local/bin/meddle`), with bun and `node_modules` installed on that machine.
+
+The rest of this guide writes `meddle <command>`; `bun run src/cli.ts <command>` from a checkout is the same thing.
 
 ## The first machine
 
@@ -131,13 +140,13 @@ URL, and give it a task:
 
 ```sh
 meddle project add ~/src/myproject --name myproject
-meddle spawn "Find out why test_sync is flaky and fix it" --project myproject
+meddle task new "Find out why test_sync is flaky and fix it" --project myproject
 ```
 
-`spawn` prints `task <id> on <short id>` once the first turn has started. Open `http://127.0.0.1:7777/`: the pool
+`task new` prints `task <id> on <short id>` once the first turn has started. Open `http://127.0.0.1:7777/`: the pool
 view shows this node and its task; the task's view shows the conversation as it goes, with Approve and Deny for the
 tool calls Claude Code asks about, Interrupt, a composer for the next message, and the task's model, effort and
-permission mode. A task needs no project: `meddle spawn "Compare these two libraries for me"` starts in a scratch
+permission mode. A task needs no project: `meddle task new "Compare these two libraries for me"` starts in a scratch
 folder of its own with your user layer only.
 
 The work lands in the project's own repo, on the bookmark `meddle/task/<task id>/myproject`, pointed at the
@@ -153,7 +162,8 @@ meddle service install --dry-run   # prints the unit it would write and the task
 meddle service install             # writes ~/.config/systemd/user/meddle.service and starts it
 ```
 
-The unit runs `serve` from this checkout, restarts it on failure, and starts it at login. Then:
+The unit runs `meddle serve` (the binary where it is now, or from the checkout), restarts it on failure, and starts it
+at login. If you move the binary later, run `service install` again. Then:
 
 - `journalctl --user -u meddle -f` follows its log; `systemctl --user restart meddle` restarts it.
 - On a machine you are not logged in to (a server), make user services run without a login session:
@@ -177,7 +187,7 @@ never pass it as an argument:
 meddle pool secret --generate ~/pool-secret   # first machine: writes the file (mode 600) and sets it; prints "pool <short id> (default)"
 scp ~/pool-secret gem:                        # or however you copy a file between the two
 meddle pool secret --file ~/pool-secret       # second machine: prints the same pool id
-meddle pool                                   # on either: one line per node, online or offline
+meddle pool                                   # on either: one line per node, online, offline or gone
 ```
 
 The pool id is public (the lighthouse sees it), so a secret of your own must not be guessable from it: the generated
@@ -197,7 +207,7 @@ What follows on its own:
 - a project, the first time a task of it is placed on the new node: the repo is cloned from the project's home, and
   its memory with it. `meddle project list` on either node lists every project of the pool with its home and the
   nodes holding a copy;
-- placement: `spawn` and `task new` without `--node` now pick between the two, preferring the project's home, then
+- placement: `task new` without `--node` now picks between the two, preferring the project's home, then
   the node holding the project, then the one with fewer turns running. `--here` or `--node <short id>` chooses.
 
 What does not follow: the profile (see below), and the checkout itself. A node given the secret before the first
@@ -212,9 +222,10 @@ otherwise. Nothing needs opening in a firewall for that. If you want a fixed UDP
 
 ## Day to day
 
-**Starting work.** `meddle spawn "<prompt>" [--project <name>]...` from any machine, or the dashboard's new-task form
-(title, projects, node, first prompt). `meddle task new --title <t> --project <name>` creates without a prompt;
+**Starting work.** `meddle task new "<prompt>" [--project <name>]...` from any machine, or the dashboard's new-task
+form (title, projects, node, first prompt). Without a prompt `task new` creates a task that waits idle;
 `meddle task prompt <id> "<text>"` sends one and waits for the turn to end, so it is the command for scripts.
+`meddle task list` lists every task of the pool with its state and node.
 
 **Watching.** Any node's dashboard shows the whole pool: every node's card with its tasks, versions, token and load,
 every task's thread wherever it runs, and the notifications (a failed turn, a login out of tokens, a move that
@@ -291,8 +302,9 @@ directory and the task root carry over.
 | `no usable token` | No token is `ok` (or its value is not on this node yet). | `meddle token list`; add one, or `token enable` a disabled one. |
 | `this node has no task root` / `no online node hosts tasks` | The task root is missing or not writable on every candidate. | Create it (step 2) and restart the node. |
 | `meddle: push: meddle/task/… to <short id> failed: …` or `meddle: git: …` in the log | A turn end could not push the task's bookmarks or memory to the project's home: no jj identity, or the home offline. | `meddle config set jj.user …` and `jj.email`; check `meddle pool`. The next turn end pushes again. |
-| A node shows offline though it runs | In the network lab (`lab/REPORT-2026-11-02.md`) a node that went away was noticed only after about 30 s, and one restarted while the lighthouse was unreachable did not reconnect until the lighthouse was back. | Wait half a minute; check the lighthouse URL in Settings; `meddle pool` on both sides. |
-| `claude code <v> here, unknown there` on a move | The target serves from the compiled binary. | Serve it from the checkout. |
+| A node shows offline though it runs | In the network lab (`lab/REPORT-2026-11-02.md`) a node that went away was noticed only after about 30 s. A node that restarted dials every member it remembers at once, and the first one it reaches tells the rest where it is now. | Wait half a minute; check the lighthouse URL in Settings; `meddle pool` on both sides. |
+| A node shows `gone` | Nothing was heard of it (no connection, no member connected to it, no lighthouse listing) for longer than the pool's `roster.forget` (15 min by default), so this node stopped dialling it. It is still a member. | Start it: it dials the others, proves the secret and is back. `meddle pool remove` it if it is not coming back. |
+| `claude code <v> here, <w> there` on a move | The two nodes run different builds (or checkouts with different Agent SDKs). | Give both the same build. |
 | Mixed-versions flag on the pool view | Nodes run different meddle or Claude Code versions. | Update every node (above). |
 | Dashboard unreachable from another machine | It binds to localhost. | `ssh -L 7777:127.0.0.1:7777 <host>`, then open the local URL. |
 

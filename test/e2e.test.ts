@@ -31,7 +31,7 @@ async function home() {
 
 /** The task id `task new` printed (`task <id> on <node>`). */
 function taskIdOf(out: { stdout: string }): string {
-  const id = /^task (\S+) on \S+\n$/.exec(out.stdout)?.[1];
+  const id = /^task (\S+) on \S+(?: \(.*\))?\n$/.exec(out.stdout)?.[1];
   if (id === undefined) throw new Error(`task new printed ${JSON.stringify(out.stdout)}`);
   return id;
 }
@@ -59,7 +59,7 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], client);
     expect(created.stderr).toBe("");
     expect(created.code).toBe(0);
-    const [, taskId, on] = /^task (\S+) on (\S+)\n$/.exec(created.stdout) ?? [];
+    const [, taskId, on] = /^task (\S+) on (\S+)(?: \(.*\))?\n$/.exec(created.stdout) ?? [];
     expect(taskId).toMatch(/^\S+$/);
     expect(on).toBe(shortId(node.id));
 
@@ -72,7 +72,7 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     // nothing is parked, so there is nothing to retry (chord marks a method's own error `unavailable`)
     const retried = await meddle(["task", "retry", taskId], client);
     expect(retried.code).toBe(1);
-    expect(retried.stderr).toBe(`meddle: unavailable: no parked turn for task ${taskId}\n`);
+    expect(retried.stderr).toBe(`meddle: no parked turn for task ${taskId}\n`);
 
     const page = await fetch(node.url);
     expect(page.status).toBe(200);

@@ -31,17 +31,18 @@ export function poolProjects(nodes: readonly ProjectHolder[]): PoolProject[] {
 }
 
 /** `<id>  <name>  home <short>  on <short,short,…>`. */
-export function projectLine(p: PoolProject): string {
-  return `${p.id}  ${p.name}  home ${shortId(p.home)}  on ${p.holders.map(shortId).join(",")}`;
+export function projectLine(p: PoolProject, paint: { project(id: string): string; node(id: string): string } = { project: (id) => id, node: shortId }): string {
+  return `${paint.project(p.id)}  ${p.name}  home ${paint.node(p.home)}  on ${p.holders.map(paint.node).join(",")}`;
 }
 
 /** The shape of a project id (`newId`). */
 const PROJECT_ID = /^[0-9a-f]{12}$/;
 
 /**
- * The project `x` names: a project's id, or the name of exactly one project of the pool. Throws
- * `ambiguous project name: <x>` when several have that name; when none has it, an id-shaped `x` (12 hex digits)
- * passes through for the node to ask the members, and anything else throws `unknown project: <x>`.
+ * The project `x` names: a project's id, the name of exactly one project of the pool, or the start of exactly one
+ * project's id (a name wins over a prefix). Throws `ambiguous project name: <x>` when several have that name, and
+ * `ambiguous project: <x> (<ids>)` when several ids start with it; when none matches, an id-shaped `x` (12 hex
+ * digits) passes through for the node to ask the members, and anything else throws `unknown project: <x>`.
  */
 export function resolveProject(projects: readonly PoolProject[], x: string): string {
   if (projects.some((p) => p.id === x)) return x;
@@ -50,5 +51,8 @@ export function resolveProject(projects: readonly PoolProject[], x: string): str
   if (named.length === 1) return named[0]!.id;
   // A project id (`newId`: 12 hex digits) the roster does not list yet: the node asks the members, as before.
   if (PROJECT_ID.test(x)) return x;
+  const prefixed = x === "" ? [] : projects.filter((p) => p.id.startsWith(x));
+  if (prefixed.length === 1) return prefixed[0]!.id;
+  if (prefixed.length > 1) throw new Error(`ambiguous project: ${x} (${prefixed.map((p) => p.id).sort().join(", ")})`);
   throw new Error(`unknown project: ${x}`);
 }

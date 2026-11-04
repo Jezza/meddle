@@ -63,7 +63,10 @@ export function Unavailable({ status }: { status: HostStatus }) {
 }
 
 function CardHead({ row, hostname }: { row: PoolNode; hostname: string }) {
-  const [label, badge] = row.status === "removed" ? ["removed", "removed"] : row.online ? ["online", "online"] : ["offline", "offline"];
+  const [label, badge] = row.status === "removed" ? ["removed", "removed"]
+    : row.online ? ["online", "online"]
+    : row.gone ? ["gone", "gone"]
+    : ["offline", "offline"];
   return (
     <h2>
       {hostname} <span class="muted id">{shortId(row.nodeId)}</span> <span class={`badge ${badge}`}>{label}</span>
@@ -381,14 +384,17 @@ function NewTaskForm({ node, nodes, canHost, open }: { node: NodeRef; nodes: rea
     let created: { taskId: string; nodeId: string } | undefined;
     const ok = await action.run(async () => {
       const first = prompt.trim() === "" ? null : prompt;
-      const { manifest, nodeId } = await node.createTask({ title, projectIds: chosen, node: where === AUTOMATIC ? null : where, prompt: first });
+      const named = title.trim() === "" ? {} : { title };
+      const { manifest, nodeId } = await node.createTask({ ...named, projectIds: chosen, node: where === AUTOMATIC ? null : where, prompt: first });
       created = { taskId: manifest.id, nodeId };
     });
     if (ok && created !== undefined) open(created.nodeId, created.taskId);
   };
   return (
     <form onSubmit={submit}>
-      <label>Title <input value={title} onInput={(e) => setTitle(e.currentTarget.value)} required /></label>
+      <label>Title (optional){" "}
+        <input value={title} placeholder="the prompt's first line, or a generated name" onInput={(e) => setTitle(e.currentTarget.value)} />
+      </label>
       <label>Node{" "}
         <select value={where} onChange={(e) => setPicked(e.currentTarget.value)}>
           <option value={AUTOMATIC}>Automatic</option>
@@ -408,7 +414,7 @@ function NewTaskForm({ node, nodes, canHost, open }: { node: NodeRef; nodes: rea
       <label>First prompt (optional){" "}
         <textarea value={prompt} rows={3} onInput={(e) => setPrompt(e.currentTarget.value)} />
       </label>
-      <button type="submit" disabled={action.busy || title.trim() === ""}>Create</button>
+      <button type="submit" disabled={action.busy}>Create</button>
       {action.error !== null && <p class="error">{action.error}</p>}
     </form>
   );

@@ -68,10 +68,17 @@ test("two nodes given one secret form a pool through the lighthouse, replicate a
     const setB = await meddle(["pool", "secret", "--file", `${b.dir}/secret`], atB);
     expect(setB).toEqual({ stdout: `pool ${shortId(poolId)} (default)\n`, stderr: "", code: 0 });
 
-    const listing = await until(["pool"], atA, new RegExp(`^${shortId(B.id)} \\S+ online meddle \\S+ claude \\S+ tasks 0$`, "m"));
-    const lines = listing.input.trim().split("\n");
-    expect(lines).toHaveLength(2);
-    expect(lines).toContainEqual(expect.stringMatching(new RegExp(`^${shortId(A.id)} \\S+ online meddle \\S+ claude \\S+ tasks 0 \\(this node\\)$`)));
+    // A table, this node first and marked @; with -v, the connection held with the other: who dialed it, B's session.
+    const listing = await until(["pool", "-v"], atA, new RegExp(`^ +${shortId(B.id)} +\\S+ +online +\\S+ +\\S+ +0 +[0-9a-f]{10} +([0-9a-f]{28})$`, "m"));
+    const lines = listing.input.trimEnd().split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^ +NODE +HOST +STATE +MEDDLE +CLAUDE +TASKS +DIALER +SESSION$/);
+    expect(lines[1]).toMatch(new RegExp(`^@ +${shortId(A.id)} +\\S+ +online +\\S+ +\\S+ +0 +- +[0-9a-f]{28}$`));
+    // B's session as A sees it on the connection is B's own.
+    const atBListing = await until(["pool", "-v"], atB, new RegExp(`^@ +${shortId(B.id)} .* ([0-9a-f]{28})$`, "m"));
+    expect(listing[1]).toBe(atBListing[1]);
+    // Without -v, no connection columns.
+    expect((await meddle(["pool"], atA)).stdout.split("\n")[0]).toMatch(/^ +NODE +HOST +STATE +MEDDLE +CLAUDE +TASKS$/);
     await until(["status"], atB, new RegExp(`^pool ${poolId} \\(default\\) members 2$`, "m"));
     // both announce the pool's topic
     for (let i = 0; ![...lighthouse.topics().values()].some((t) => t.has(A.id) && t.has(B.id)); i++) {
@@ -107,6 +114,7 @@ test("two nodes given one secret form a pool through the lighthouse, replicate a
   }
 }, 60_000);
 
+// Each CLI process here pays about 370 ms of scrypt on a Raspberry Pi: together far past bun's default 5 s there.
 test("pool secret --generate writes a new 600 file and sets the pool; --file elsewhere gives the same id; a short secret is refused", async () => {
   const { dir, env } = await home("");
   const offline = { ...env, MEDDLE_PORT: String(await closedPort()) };
@@ -133,7 +141,7 @@ test("pool secret --generate writes a new 600 file and sets the pool; --file els
   await writeFile(`${dir}/weak`, "hunter2\n");
   expect(await meddle(["pool", "secret", "--file", `${dir}/weak`], offline)).toEqual({ stdout: "", stderr: "meddle: the secret is shorter than 16 characters (use --generate)\n", code: 1 });
   expect((await meddle(["pool", "secret", "this-is-a-long-enough-secret"], offline)).code).toBe(2);
-});
+}, 30_000);
 
 test("token set without a running node writes the token and says so", async () => {
   const { dir, env } = await home("");

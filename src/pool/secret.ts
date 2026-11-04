@@ -22,8 +22,16 @@ const CONTROL = /[\x00-\x1f\x7f-\x9f]/;
 const POOL_ID = /^[0-9a-f]{64}$/;
 /** A 64-byte ed25519 signature as base64url, no padding. */
 const PROOF = /^[A-Za-z0-9_-]{86}$/;
-/** What a proof signs: this domain, the prover's node id and the verifier's, so a proof is good for one pair, one way. */
-const ADMIT_DOMAIN = "meddle/admit/1";
+/**
+ * What a proof signs: this domain, the prover's node id, the verifier's and the prover's session, so a proof is good for
+ * one pair, one way, and names the process that sent it.
+ */
+const ADMIT_DOMAIN = "meddle/admit/2";
+/**
+ * A session id: the process's start time in ms as 12 hex digits, then 8 random bytes as hex. Sessions of one node sort
+ * by when they started (on that node's clock); the random part keeps two processes started in the same ms apart.
+ */
+export const SESSION = /^[0-9a-f]{28}$/;
 /** The DER prefix that makes a raw ed25519 public key an SPKI, the one form node's crypto imports. */
 const SPKI_ED25519 = Buffer.from("302a300506032b6570032100", "hex");
 
@@ -66,21 +74,32 @@ export function poolKey(name: string, secret: string): PoolKey {
   return key;
 }
 
-function admitMessage(from: string, to: string): Uint8Array {
-  return encoder.encode(`${ADMIT_DOMAIN}.${from}.${to}`);
+/** A new session id (`SESSION`), made once per process (per `PoolNet`). */
+export function newSession(now: number = Date.now()): string {
+  return now.toString(16).padStart(12, "0").slice(-12) + randomBytes(8).toString("hex");
 }
 
-/** `from`'s proof to `to` that it holds the pool secret: the admit message signed with the topic key, as base64url. */
-export function proofFor(key: PoolKey, from: string, to: string): string {
-  return Buffer.from(key.topic.sign(admitMessage(from, to))).toString("base64url");
+function admitMessage(from: string, to: string, session: string): Uint8Array {
+  return encoder.encode(`${ADMIT_DOMAIN}.${from}.${to}.${session}`);
 }
 
-/** Whether `proof` is `from`'s proof to `to` under the pool whose id (topic public key) is `poolId`. Never throws. */
-export function verifyProof(poolId: string, from: string, to: string, proof: string): boolean {
-  if (!POOL_ID.test(poolId) || !PROOF.test(proof)) return false;
+/**
+ * `from`'s proof to `to`, as its session `session`, that it holds the pool secret: the admit message signed with the
+ * topic key, as base64url.
+ */
+export function proofFor(key: PoolKey, from: string, to: string, session: string): string {
+  return Buffer.from(key.topic.sign(admitMessage(from, to, session))).toString("base64url");
+}
+
+/**
+ * Whether `proof` is `from`'s proof to `to`, as session `session`, under the pool whose id (topic public key) is
+ * `poolId`. A session that is not a `SESSION` never verifies. Never throws.
+ */
+export function verifyProof(poolId: string, from: string, to: string, session: string, proof: string): boolean {
+  if (!POOL_ID.test(poolId) || !PROOF.test(proof) || !SESSION.test(session)) return false;
   try {
     const key = createPublicKey({ key: Buffer.concat([SPKI_ED25519, Buffer.from(poolId, "hex")]), format: "der", type: "spki" });
-    return verifySignature(null, admitMessage(from, to), key, Buffer.from(proof, "base64url"));
+    return verifySignature(null, admitMessage(from, to, session), key, Buffer.from(proof, "base64url"));
   } catch {
     return false;
   }

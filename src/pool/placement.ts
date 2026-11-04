@@ -21,11 +21,15 @@ export type SelfCandidate = Omit<Candidate, "online">;
 /**
  * The candidates for a new task: every other member of the roster as its last summary says (a summary from an older
  * meddle has no `running`, `limit` or `projects`: 0, 0 and []; a member never heard from hosts no tasks), online as
- * `isOnline` says, then this node, always online, with its live numbers.
+ * `isOnline` says, then this node, always online, with its live numbers. A member `isGone` says is gone is left out
+ * altogether: its work counts as lost, so neither its load nor the projects it holds (nor its word on where they
+ * live) weigh in.
  */
-export function placementCandidates(rows: RosterRow[], isOnline: (id: string) => boolean, self: SelfCandidate): Candidate[] {
+export function placementCandidates(
+  rows: RosterRow[], isOnline: (id: string) => boolean, self: SelfCandidate, isGone: (id: string) => boolean = () => false,
+): Candidate[] {
   const others = rows
-    .filter((r) => r.nodeId !== self.nodeId && r.status === "member")
+    .filter((r) => r.nodeId !== self.nodeId && r.status === "member" && !isGone(r.nodeId))
     .map((r): Candidate => {
       const s = r.summary;
       return {

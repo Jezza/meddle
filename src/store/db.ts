@@ -98,6 +98,10 @@ const ADDED_COLUMNS = [
   { table: "tasks", column: "archived_at", type: "TEXT" },
   // The pool's name, which with the secret derives its id; NULL marks a pool of an older meddle (reset at the next start).
   { table: "pool", column: "name", type: "TEXT" },
+  // The newest time any member reported a connection with the node (on the reporter's clock), and the node's address
+  // as that member saw it (JSON): how a node that moved is found again, and when it was last heard of.
+  { table: "roster", column: "reached_at", type: "TEXT" },
+  { table: "roster", column: "reached_addr", type: "TEXT" },
 ];
 
 export function openDb(path: string): Database {

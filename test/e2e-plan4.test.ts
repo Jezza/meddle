@@ -1,5 +1,5 @@
 // test/e2e-plan4.test.ts — two `meddle serve` processes in one pool, through the CLI: a pool setting gives the other
-// node's commits their author, a rate-limited token hands a turn to the next one and the pool learns it, spawn places
+// node's commits their author, a rate-limited token hands a turn to the next one and the pool learns it, task new with a prompt places
 // a task on a project's home or on the node asked for, a side bookmark made on a non-home node reaches the home, and an
 // archived task restores where placement says and resumes there.
 import { test, expect } from "bun:test";
@@ -102,7 +102,7 @@ async function idle(port: number, taskId: string): Promise<void> {
 function taskOn(out: { stdout: string; stderr: string; code: number }, node: string): string {
   expect(out.stderr).toBe("");
   expect(out.code).toBe(0);
-  const [, taskId = "", on] = /^task (\S+) on (\S+)\n$/.exec(out.stdout) ?? [];
+  const [, taskId = "", on] = /^task (\S+) on (\S+)(?: \(.*\))?\n$/.exec(out.stdout) ?? [];
   expect(on).toBe(shortId(node));
   return taskId;
 }
@@ -128,8 +128,8 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
       expect(set.stderr).toBe("");
       expect(set.code).toBe(0);
     }
-    await until(["pool"], atA, new RegExp(`^${shortId(B.id)} \\S+ online `, "m"));
-    await until(["pool"], atB, new RegExp(`^${shortId(A.id)} \\S+ online `, "m"));
+    await until(["pool"], atA, new RegExp(`^ +${shortId(B.id)} +\\S+ +online `, "m"));
+    await until(["pool"], atB, new RegExp(`^ +${shortId(A.id)} +\\S+ +online `, "m"));
 
     // settings: a jj identity set on A reaches B
     expect(await meddle(["config", "set", "jj.user", "Pool Person"], atA)).toEqual({ stdout: "", stderr: "", code: 0 });
@@ -164,8 +164,8 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     expect(lines.at(-1)).toBe("result/success");
     await until(["token", "list"], atB, new RegExp(`^${idA} {2}a {2}exhausted until 2100-01-01T00:00:00\\.000Z \\(five_hour\\) .*\\nactive: ${idB}\\n$`, "ms"));
 
-    // spawn on A for B's project: placed on B, its home; its turn commits on B with the pool's author
-    const spawnedB = taskOn(await meddle(["spawn", "Reply", "with", "ok.", "--project", "pb"], atA), B.id);
+    // task new with a prompt on A for B's project: placed on B, its home; its turn commits on B with the pool's author
+    const spawnedB = taskOn(await meddle(["task", "new", "Reply", "with", "ok.", "--project", "pb"], atA), B.id);
     await idle(B.port, spawnedB);
     const author = await jj(
       ["log", "--ignore-working-copy", "--no-graph", "-r", `meddle/task/${spawnedB}/pb`, "-T", 'author.name() ++ " <" ++ author.email() ++ ">"'],
@@ -173,8 +173,8 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     );
     expect(author).toBe("Pool Person <pool@meddle.invalid>");
 
-    // spawn on A for A's project, asked onto B; a side bookmark made in its workspace on B reaches A after a turn
-    const spawned = taskOn(await meddle(["spawn", "Reply", "with", "ok.", "--project", pa, "--node", shortId(B.id)], atA), B.id);
+    // task new with a prompt on A for A's project, asked onto B; a side bookmark made in its workspace on B reaches A after a turn
+    const spawned = taskOn(await meddle(["task", "new", "Reply", "with", "ok.", "--project", pa, "--node", shortId(B.id)], atA), B.id);
     await idle(B.port, spawned);
     const spike = `meddle/task/${spawned}/pa.spike`;
     await jj(["bookmark", "create", spike, "-r", "@"], `${b.dir}/t/${spawned}/pa`);
@@ -193,7 +193,7 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     const restored = await meddle(["task", "restore", spawned], atB);
     expect(restored.stderr).toBe("");
     expect(restored.code).toBe(0);
-    const [, to = ""] = /^restoring to (\S+)\n$/.exec(restored.stdout) ?? [];
+    const [, to = ""] = /^restoring to (\S+)(?: \(.*\))?\n$/.exec(restored.stdout) ?? [];
     expect(to).toBe(shortId(A.id));
     await until(["status"], atA, /^tasks 2$/m);
     await until(["status"], atB, /^tasks 1$/m);

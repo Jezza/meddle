@@ -19,6 +19,7 @@ import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, ty
 import { claimHomelessProjects, getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
 import { taskNamespace, type TaskManifest } from "../tasks/manifest";
+import { taskTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
@@ -324,7 +325,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       models,
       notifications,
       efforts,
-      createTask: async ({ title, projectIds: ids, prompt, node }, ctx) => {
+      createTask: async ({ title: given, projectIds: ids, prompt, node }, ctx) => {
+        // Named here, before it goes anywhere, so that a peer of any version gets a title.
+        const title = taskTitle(given, prompt);
         const selfId = pool.identity.id;
         const target = node === "here" ? selfId : node ?? await placeTask(ids);
         if (target === selfId) {

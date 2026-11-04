@@ -1094,7 +1094,7 @@ export class TaskRunner {
       projects: listProjects(this.#db).map((p) => ({ id: p.id, home: p.home })),
       limit: pool.settings.runningLimit(),
     };
-    const nodes = placementCandidates(pool.store.roster(), (id) => pool.net.isOnline(id), self)
+    const nodes = placementCandidates(pool.store.roster(), (id) => pool.net.isOnline(id), self, (id) => pool.isGone(id))
       .filter((n) => n.nodeId === self.nodeId || accept(n.nodeId));
     const choice = place({ projectIds, nodes });
     if (!("error" in choice)) return choice.nodeId;
@@ -1167,7 +1167,9 @@ export class TaskRunner {
     await serialised(taskKey(taskId), async () => {
       const row = this.#row(taskId);
       if (this.#moving.has(taskId)) throw new Error("task is moving");
-      if (row.state !== "archived" && row.state !== "moved") throw new Error(`task is ${row.state}`);
+      if (row.state !== "archived" && row.state !== "moved") {
+        throw new Error(`task is ${row.state}${row.state === "idle" ? "; only an archived task is deleted: archive it first" : ""}`);
+      }
       const self = this.#pool?.identity.id;
       if (self !== undefined) await releaseFolder(this.#cfg, this.#db, self, taskId);
       else await this.#clearLeftovers(JSON.parse(row.manifest) as TaskManifest);

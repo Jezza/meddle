@@ -2,8 +2,8 @@
 Description=meddle node
 
 [Service]
-ExecStart={{bun}} run src/cli.ts serve
-WorkingDirectory={{checkout}}
+ExecStart={{exec}}
+WorkingDirectory={{dir}}
 Restart=on-failure
 RestartSec=2
 # The pool's iroh endpoint binds a UDP socket on iroh's default address; to pin it (for a firewall rule), add

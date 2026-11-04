@@ -4,7 +4,12 @@ import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 
 /** The keys a pool setting may have; `env.<NAME>` sets `<NAME>` for jj and for every task's Claude Code. */
-export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|env\.[A-Z_][A-Z0-9_]*)$/;
+export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|roster\.forget|env\.[A-Z_][A-Z0-9_]*)$/;
+
+/** How long a member goes unheard of before it is gone (`roster.forget`'s default): three lighthouse announce TTLs. */
+export const DEFAULT_FORGET_SECS = 900;
+/** The shortest `roster.forget` other than 0: a member is reported every 15 s, so a shorter one would make it flap. */
+export const MIN_FORGET_SECS = 60;
 
 /**
  * Environment names an `env.*` setting may not set (besides those starting with a `RESERVED_ENV_PREFIXES` entry):
@@ -77,6 +82,10 @@ function valueProblem(key: string, value: string): string | null {
   if (value.length > MAX_SETTING_VALUE || CONTROL.test(value)) return BAD_VALUE;
   if (NON_EMPTY.has(key) && value === "") return `${key} must not be empty`;
   if (key === "limits.running" && nonNegativeInteger(value) === null) return "limits.running must be a non-negative integer";
+  if (key === "roster.forget") {
+    const secs = nonNegativeInteger(value);
+    if (secs === null || (secs !== 0 && secs < MIN_FORGET_SECS)) return `roster.forget must be 0 or at least ${MIN_FORGET_SECS} (seconds)`;
+  }
   return null;
 }
 
@@ -260,6 +269,18 @@ export class PoolSettings {
     if (this.cfg.maxRunning !== null) return this.cfg.maxRunning;
     const raw = this.get("limits.running");
     return raw === null ? 0 : nonNegativeInteger(raw) ?? 0;
+  }
+
+  /**
+   * How long, in ms, a member may go unheard of before it is gone: `MEDDLE_FORGET_MS` when the node sets it, else
+   * `roster.forget` (seconds; one below `MIN_FORGET_SECS` reads as that), else `DEFAULT_FORGET_SECS`; null when it is 0
+   * (members are never forgotten).
+   */
+  forgetAfterMs(): number | null {
+    if (this.cfg.forgetMs !== null) return this.cfg.forgetMs === 0 ? null : this.cfg.forgetMs;
+    const raw = this.get("roster.forget");
+    const secs = raw === null ? DEFAULT_FORGET_SECS : nonNegativeInteger(raw) ?? DEFAULT_FORGET_SECS;
+    return secs === 0 ? null : Math.max(secs, MIN_FORGET_SECS) * 1000;
   }
 
   /** `lighthouse.url`, or null when it is unset or empty (a replicated empty value must not reach discovery). */

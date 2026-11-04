@@ -10,7 +10,7 @@ Prerequisites: `tpo` (`cargo install tpo`; `tpo doctor` must say "ready to run l
 server binary (`cargo build --release -p iroh-lighthouse` in its repo; set `LIGHTHOUSE_BIN` if it is
 not at `~/projects/iroh-lighthouse/target/release/lighthouse`), bun, jj and git.
 
-Run everything (about 12 minutes; wipes `lab/nodes` and `lab/logs`):
+Run everything (about 18 minutes; wipes `lab/nodes` and `lab/logs`):
 
 ```sh
 bun run lab/run-lab.ts
@@ -36,5 +36,9 @@ node's lab address.
 
 Scenarios: up; one secret on every node, found through discovery; token replication; project and task; a move over a degraded
 link; a partition before a move; a partition during a move (several phases); a crash mid-receive; a
-lighthouse outage; node isolation; restarts; memory across three nodes; resources. The results of the
+lighthouse outage; node isolation; restarts (the largest id on a new port, once with the lighthouse cut: it must
+rejoin through an address it remembers); memory across three nodes; a simultaneous dial (two nodes started together
+must settle on exactly one connection, the same on both sides, read from `link` in `meddle pool`); forgetting
+(`roster.forget` at 60 s and the lighthouse cut: a stopped node is `gone` on the others, not dialled, and rejoins by
+proving the secret when started); resources. The results of the
 first run are in `REPORT-2026-11-02.md`.

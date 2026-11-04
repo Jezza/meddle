@@ -2,9 +2,9 @@ import { test, expect } from "bun:test";
 import { randomBytes } from "node:crypto";
 import type { Connection } from "@number0/iroh";
 import { ALPN_POOL, StreamReader, writeLine } from "../src/pool/frames";
-import { PeerClosed, PoolNet, fromEndpoint, toEndpointAddr, type NetDeps, type PeerStream } from "../src/pool/net";
-import { poolKey, proofFor, verifyProof } from "../src/pool/secret";
-import { POOL_KEY, endpointPair, proofDeps, type TestNode } from "./pool-helpers";
+import { PeerClosed, PoolNet, fromEndpoint, supersedes, toEndpointAddr, type NetDeps, type PeerStream } from "../src/pool/net";
+import { newSession, poolKey, proofFor, verifyProof } from "../src/pool/secret";
+import { POOL_KEY, endpointPair, proofDeps, testNode, type TestNode } from "./pool-helpers";
 
 const fast = { initialMs: 50, maxMs: 200 };
 
@@ -35,7 +35,20 @@ function netOf(node: TestNode, deps: Partial<NetDeps> = {}, claims: (s: PeerStre
   return { net, peers, streams, errors, raw, id: node.identity.id };
 }
 
-/** Both ends of a pair as PoolNets, `lo` the one with the smaller id (the dialer). */
+/**
+ * Whether `x` and `y` hold one and the same connection with each other: they agree on who dialed it, and each has the
+ * other's session on it.
+ */
+function agreed(x: { net: PoolNet; id: string }, y: { net: PoolNet; id: string }): boolean {
+  const xs = x.net.linkOf(y.id);
+  const ys = y.net.linkOf(x.id);
+  return xs !== null && ys !== null && xs.dialer === ys.dialer && xs.session === y.net.session && ys.session === x.net.session;
+}
+
+/**
+ * Both ends of a pair as PoolNets, `lo` the one with the smaller id. Only `lo` dials at first; `hi` watches `lo` once
+ * the two are connected, so the pair starts on one connection, `lo`'s.
+ */
 async function poolPair(admit: { lo?: (id: string) => boolean; hi?: (id: string) => boolean } = {}, claims?: (s: PeerStream) => boolean) {
   const pair = await endpointPair();
   const [loNode, hiNode] = pair.a.identity.id < pair.b.identity.id ? [pair.a, pair.b] : [pair.b, pair.a];
@@ -44,22 +57,25 @@ async function poolPair(admit: { lo?: (id: string) => boolean; hi?: (id: string)
   lo.net.start();
   hi.net.start();
   lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
+  hi.net.offerAddress(fromEndpoint(loNode.endpoint));
   lo.net.watch(hi.id);
-  hi.net.watch(lo.id);
   await until(() => lo.net.isOnline(hi.id) && hi.net.isOnline(lo.id));
+  hi.net.watch(lo.id);
   return {
     lo, hi,
     async stop() { await Promise.all([lo.net.stop(), hi.net.stop()]); await pair.close(); },
   };
 }
 
-test("a member connects, the smaller id dials, streams carry headers both ways", async () => {
+test("a member connects, streams carry headers both ways", async () => {
   const { lo, hi, stop } = await poolPair();
   try {
     expect(lo.peers).toEqual([[hi.id, true]]);
     expect(hi.peers).toEqual([[lo.id, true]]);
     expect(lo.net.online()).toEqual([hi.id]);
     expect(hi.net.online()).toEqual([lo.id]);
+    expect(agreed(lo, hi)).toBe(true);
+    expect(lo.net.linkOf(hi.id)?.dialer).toBe(lo.id);
 
     const mine = await lo.net.openStream(hi.id, { stream: "x", n: 1 });
     expect(mine.peerId).toBe(hi.id);
@@ -97,12 +113,14 @@ test("a dialer that proved the secret but is not admitted gets the acceptor's pr
   try {
     const conn = await pair.a.endpoint.connect(toEndpointAddr(fromEndpoint(pair.b.endpoint)), ALPN_POOL);
     const proof = await conn.openUni();
-    await writeLine(proof, proofFor(POOL_KEY, pair.a.identity.id, pair.b.identity.id));
+    const session = newSession();
+    await writeLine(proof, `${session} ${proofFor(POOL_KEY, pair.a.identity.id, pair.b.identity.id, session)}`);
     await proof.finish();
     await conn.openBi().then((s) => writeLine(s.send, '{"stream":"x"}')).catch(() => {});
     const answer = new StreamReader(await conn.acceptUni());
-    const theirs = await answer.readLine();
-    expect(verifyProof(POOL_KEY.id, pair.b.identity.id, pair.a.identity.id, theirs ?? "")).toBe(true);
+    const [theirSession, theirProof] = (await answer.readLine())?.split(" ") ?? [];
+    expect(theirSession).toBe(b.net.session);
+    expect(verifyProof(POOL_KEY.id, pair.b.identity.id, pair.a.identity.id, theirSession ?? "", theirProof ?? "")).toBe(true);
     expect(await answer.readLine()).toBe("not a member");
     // The acceptor waits for the dialer's close before its own, so that the verdict is read.
     await Bun.sleep(100);
@@ -131,7 +149,8 @@ test("a dialer that sends no proof, or another pool's, is refused as bad proof; 
     const other = poolKey("default", "another-pool-secret");
     const wrong = await pair.a.endpoint.connect(toEndpointAddr(fromEndpoint(pair.b.endpoint)), ALPN_POOL);
     const proof = await wrong.openUni();
-    await writeLine(proof, proofFor(other, pair.a.identity.id, pair.b.identity.id));
+    const session = newSession();
+    await writeLine(proof, `${session} ${proofFor(other, pair.a.identity.id, pair.b.identity.id, session)}`);
     await proof.finish();
     expect(await wrong.closed()).toBe("closed by peer: bad proof (code 1)");
     expect(b.peers).toEqual([]);
@@ -147,7 +166,7 @@ test("a dialer that sends no proof, or another pool's, is refused as bad proof; 
   const [loNode, hiNode] = ordered(pair2);
   const lo = netOf(loNode, { admitTimeoutMs: 300 });
   const other = poolKey("default", "another-pool-secret");
-  const hi = netOf(hiNode, { prove: (peer) => proofFor(other, hiNode.identity.id, peer), verify: () => true, admitTimeoutMs: 300 });
+  const hi = netOf(hiNode, { prove: (peer, session) => proofFor(other, hiNode.identity.id, peer, session), verify: () => true, admitTimeoutMs: 300 });
   lo.net.start();
   hi.net.start();
   try {
@@ -220,11 +239,12 @@ test("a dropped connection is noticed and redialled", async () => {
   try {
     hi.net.unwatch(lo.id, "removed");
     hi.net.watch(lo.id);
-    await until(() => lo.peers.length === 3 && hi.peers.length === 3);
-    expect(lo.peers).toEqual([[hi.id, true], [hi.id, false], [hi.id, true]]);
-    expect(hi.peers).toEqual([[lo.id, true], [lo.id, false], [lo.id, true]]);
-    expect(lo.net.isOnline(hi.id)).toBe(true);
-    expect(hi.net.isOnline(lo.id)).toBe(true);
+    // Both redial (hi at once, lo after its backoff): whichever connections come up, the two settle on one.
+    await until(() => agreed(lo, hi));
+    expect(lo.peers.slice(0, 2)).toEqual([[hi.id, true], [hi.id, false]]);
+    expect(hi.peers.slice(0, 2)).toEqual([[lo.id, true], [lo.id, false]]);
+    expect(lo.peers.at(-1)).toEqual([hi.id, true]);
+    expect(hi.peers.at(-1)).toEqual([lo.id, true]);
     const s = await lo.net.openStream(hi.id, { stream: "x" });
     await until(() => hi.streams.length === 1);
     expect(hi.streams[0]!.header).toEqual({ stream: "x" });
@@ -350,5 +370,98 @@ test("a stream of a kind nobody takes is reset: the opener fails at once instead
     expect(hi.errors).toEqual([]);
   } finally {
     await stop();
+  }
+});
+
+test("supersedes: the newer session wins; within one session the smaller dialer; the same dialer's newest", () => {
+  const [old, now] = ["0000000000010000000000000000", "0000000000020000000000000000"];
+  const [small, big] = ["a".repeat(64), "b".repeat(64)];
+  expect(supersedes({ session: now, dialer: big }, { session: old, dialer: small })).toBe(true);
+  expect(supersedes({ session: old, dialer: small }, { session: now, dialer: big })).toBe(false);
+  expect(supersedes({ session: now, dialer: small }, { session: now, dialer: big })).toBe(true);
+  expect(supersedes({ session: now, dialer: big }, { session: now, dialer: small })).toBe(false);
+  expect(supersedes({ session: now, dialer: big }, { session: now, dialer: big })).toBe(true);
+});
+
+test("both sides dialing at once leave exactly one connection, the one the smaller id dialed, on both sides", async () => {
+  for (let round = 0; round < 5; round++) {
+    const pair = await endpointPair();
+    const [loNode, hiNode] = ordered(pair);
+    const lo = netOf(loNode);
+    const hi = netOf(hiNode);
+    lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
+    hi.net.offerAddress(fromEndpoint(loNode.endpoint));
+    lo.net.watch(hi.id);
+    hi.net.watch(lo.id);
+    // Both start together: each dials the other at once.
+    lo.net.start();
+    hi.net.start();
+    try {
+      await until(() => agreed(lo, hi));
+      expect(lo.net.linkOf(hi.id)?.dialer).toBe(lo.id);
+      await Bun.sleep(300);
+      // Settled: still the one connection, nobody went offline since, and a stream each way reaches the other side.
+      expect(agreed(lo, hi)).toBe(true);
+      expect(lo.peers.at(-1)).toEqual([hi.id, true]);
+      expect(hi.peers.at(-1)).toEqual([lo.id, true]);
+      await lo.net.openStream(hi.id, { stream: "x" });
+      await hi.net.openStream(lo.id, { stream: "y" });
+      await until(() => hi.streams.length === 1 && lo.streams.length === 1);
+      expect(lo.raw.filter((e) => e instanceof PeerClosed)).toEqual([]);
+      expect(hi.raw.filter((e) => e instanceof PeerClosed)).toEqual([]);
+    } finally {
+      await Promise.all([lo.net.stop(), hi.net.stop()]);
+      await pair.close();
+    }
+  }
+});
+
+test("a dial from an older session of a connected peer is answered duplicate, and the connection held stays", async () => {
+  const { lo, hi, stop } = await poolPair();
+  try {
+    const before = hi.net.linkOf(lo.id);
+    const loNode = { endpoint: lo.net.endpoint };
+    const stale = "000000000001" + "0".repeat(16);
+    const conn = await loNode.endpoint.connect(toEndpointAddr(fromEndpoint(hi.net.endpoint)), ALPN_POOL);
+    const proof = await conn.openUni();
+    await writeLine(proof, `${stale} ${proofFor(POOL_KEY, lo.id, hi.id, stale)}`);
+    await proof.finish();
+    const answer = new StreamReader(await conn.acceptUni());
+    await answer.readLine();
+    expect(await answer.readLine()).toBe("duplicate");
+    conn.close(0n, Array.from(new TextEncoder().encode("bye")));
+    await Bun.sleep(100);
+    expect(hi.net.linkOf(lo.id)).toEqual(before);
+    expect(hi.peers).toEqual([[lo.id, true]]);
+    expect(lo.peers).toEqual([[hi.id, true]]);
+  } finally {
+    await stop();
+  }
+});
+
+test("an address offered while a dial to a dead one is in flight is dialled at once, and the stale attempt ends quietly", async () => {
+  const pair = await endpointPair();
+  const [loNode, hiNode] = ordered(pair);
+  // A port nothing answers on any more: an endpoint that was there and is closed.
+  const gone = await testNode();
+  const deadAddr = { ...fromEndpoint(hiNode.endpoint), direct: fromEndpoint(gone.endpoint).direct };
+  await gone.endpoint.close();
+  const lo = netOf(loNode);
+  const hi = netOf(hiNode);
+  hi.net.start();
+  lo.net.start();
+  try {
+    lo.net.offerAddress(deadAddr);
+    lo.net.watch(hi.id);
+    await Bun.sleep(300);
+    expect(lo.net.isOnline(hi.id)).toBe(false);
+    const t = Date.now();
+    lo.net.offerAddress(fromEndpoint(hiNode.endpoint));
+    await until(() => lo.net.isOnline(hi.id) && hi.net.isOnline(lo.id), 3000);
+    expect(Date.now() - t).toBeLessThan(2000);
+    expect(lo.errors).toEqual([]);
+  } finally {
+    await Promise.all([lo.net.stop(), hi.net.stop()]);
+    await pair.close();
   }
 });

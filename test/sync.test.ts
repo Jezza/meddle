@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { createHost, memoryLinkPair } from "@earendil-works/chord";
 import { PoolObject } from "../src/state/contracts";
 import { addToken, listTokens, tokenFile, tokenId, tokenValue } from "../src/token";
+import { HoldFailed } from "../src/pool/sync";
 import { twoNodes, type PoolNode, type TappedFrame } from "./pool-helpers";
 
 const C = "c".repeat(64);
@@ -63,6 +64,24 @@ test("summaries, roster edits and the tokens replicate through chord over iroh",
     expect([...a.errors, ...b.errors].map(String)).toEqual([]);
 
     tapped.push(...framesOf(a), ...framesOf(b));
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a peer not serving its pool yet (still starting) is held once it does, over the connection already up", async () => {
+  const { a, b, servePeers, close } = await twoNodes({ servePeersLater: true });
+  try {
+    await until(() => a.net.isOnline(b.id) && b.net.isOnline(a.id));
+    // Each tries to hold the other's pool and is refused: nothing replicates yet.
+    await until(() => a.errors.some((e) => e instanceof HoldFailed) && b.errors.some((e) => e instanceof HoldFailed));
+    expect(knows(a, b) || knows(b, a)).toBe(false);
+    const link = a.net.linkOf(b.id);
+
+    // Both start serving; neither connection drops, yet each holds the other's pool and learns its summary.
+    servePeers();
+    await until(() => knows(a, b) && knows(b, a));
+    expect(a.net.linkOf(b.id)).toEqual(link);
   } finally {
     await close();
   }

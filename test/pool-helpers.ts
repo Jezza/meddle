@@ -38,8 +38,8 @@ export const POOL_KEY: PoolKey = poolKey(DEFAULT_POOL_NAME, POOL_SECRET);
 /** `prove`, `verify` and `admit` (everyone) for a PoolNet of node `selfId` in the pool of `key`. */
 export function proofDeps(selfId: string, key: PoolKey = POOL_KEY): Pick<NetDeps, "prove" | "verify" | "admit"> {
   return {
-    prove: (peer) => proofFor(key, selfId, peer),
-    verify: (peer, proof) => verifyProof(key.id, peer, selfId, proof),
+    prove: (peer, session) => proofFor(key, selfId, peer, session),
+    verify: (peer, session, proof) => verifyProof(key.id, peer, selfId, session, proof),
     admit: () => true,
   };
 }
@@ -107,7 +107,10 @@ function notInThisTest(): never {
   throw new Error("not in this test");
 }
 
-async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedFrame[]; stopAccepting: () => void }> {
+async function poolNode(
+  name: string,
+  servePeers = true,
+): Promise<{ node: PoolNode; frames: TappedFrame[]; servePeers: () => void; stopAccepting: () => void }> {
   const home = await mkdtemp(`/tmp/meddle-pool-${name}-`);
   const cfg = loadConfig({
     HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t`,
@@ -141,7 +144,7 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
   net.onPeer(() => changed());
   const settings = new PoolSettings(db, cfg, id, () => {});
   settings.apply();
-  const sync = new PoolSync({ cfg, db, store, net, selfId: id, settings, summary: () => summary, onChange: changed, onError, tap });
+  const sync = new PoolSync({ cfg, db, store, net, selfId: id, settings, summary: () => summary, onChange: changed, onError, tap, holdRetryMs: 50 });
   const settingsChanged = async () => {
     settings.apply();
     await sync.refreshSelf();
@@ -149,6 +152,7 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
   const deps: PoolObjectDeps = {
     store, db, cfg, selfId: id,
     isOnline: (peer) => net.isOnline(peer),
+    isGone: () => false,
     liveSummary: () => summary,
     poolChanged: async () => notInThisTest(),
     remove: async () => notInThisTest(),
@@ -167,30 +171,43 @@ async function poolNode(name: string): Promise<{ node: PoolNode; frames: TappedF
   };
   const host = createHost({ name: "node", self: "node", onError });
   servePool(host, deps);
-  const stopAccepting = acceptPeerLinks(net, host, (peer) => store.isMember(peer));
-  return { node: { id, identity, home, cfg, db, store, net, host, sync, settings, summary, deps, changed, errors }, frames, stopAccepting };
+  let stopAccepting = () => {};
+  const serve = () => {
+    stopAccepting();
+    stopAccepting = acceptPeerLinks(net, host, (peer) => store.isMember(peer));
+  };
+  if (servePeers) serve();
+  return {
+    node: { id, identity, home, cfg, db, store, net, host, sync, settings, summary, deps, changed, errors },
+    frames,
+    servePeers: serve,
+    stopAccepting: () => stopAccepting(),
+  };
 }
 
 /**
  * Two pool nodes in temp homes (presetMinimal on 127.0.0.1:0), both with `POOL_SECRET` and each a member of the
  * other's roster, with a chord host serving PoolObject, `acceptPeerLinks` and a `PoolSync` whose frames
- * `framesOf(node)` collects. The node with the smaller id is offered the other's address unless `offerAddresses:
- * false` (then only discovery can connect them). Started unless `start: false` (then call `start()`); `close()` stops
- * everything and removes the homes.
+ * `framesOf(node)` collects. Each is offered the other's address unless `offerAddresses: false` (then only discovery
+ * can connect them), and both dial at start. Started unless `start: false` (then call `start()`). With
+ * `servePeersLater`, neither serves its PoolObject to the other until `servePeers()`, as a node still starting does.
+ * `close()` stops everything and removes the homes.
  */
-export async function twoNodes(options: { start?: boolean; offerAddresses?: boolean } = {}): Promise<{
+export async function twoNodes(options: { start?: boolean; offerAddresses?: boolean; servePeersLater?: boolean } = {}): Promise<{
   a: PoolNode; b: PoolNode;
   framesOf(node: PoolNode): TappedFrame[];
   start(): void;
+  servePeers(): void;
   close(): Promise<void>;
 }> {
-  const made = [await poolNode("a"), await poolNode("b")] as const;
+  const serveNow = options.servePeersLater !== true;
+  const made = [await poolNode("a", serveNow), await poolNode("b", serveNow)] as const;
   const [a, b] = [made[0].node, made[1].node];
   a.store.upsert({ ...a.store.row(a.id)!, nodeId: b.id, hostname: b.summary.hostname });
   b.store.upsert({ ...b.store.row(b.id)!, nodeId: a.id, hostname: a.summary.hostname });
   for (const [self, other] of [[a, b], [b, a]] as const) {
     self.net.watch(other.id);
-    if (options.offerAddresses !== false && self.id < other.id) self.net.offerAddress(fromEndpoint(other.net.endpoint));
+    if (options.offerAddresses !== false) self.net.offerAddress(fromEndpoint(other.net.endpoint));
   }
   let started = false;
   const start = () => {
@@ -204,6 +221,7 @@ export async function twoNodes(options: { start?: boolean; offerAddresses?: bool
   if (options.start !== false) start();
   return {
     a, b, start,
+    servePeers: () => { for (const m of made) m.servePeers(); },
     framesOf: (node) => (node === a ? made[0].frames : made[1].frames),
     async close() {
       await Promise.all([a.sync.stop(), b.sync.stop()]);

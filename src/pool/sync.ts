@@ -8,7 +8,7 @@ import { PoolObject } from "../state/contracts";
 import { deleteTokenValue, hasTokenValue, listTokens, mergeTokens, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
 import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
-import { fromEndpoint, type PoolNet } from "./net";
+import { fromEndpoint, remoteAddrOf, type PoolNet } from "./net";
 import { PEER_PRINCIPAL_PREFIX } from "./object";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore } from "./store";
@@ -32,6 +32,8 @@ export type SyncDeps = {
   tap?: LinkTap;
   /** Self-row refresh period, default 15000. */
   refreshMs?: number;
+  /** The first wait before holding a peer's PoolObject again after a failure, default 1000 (doubling to 30 s). */
+  holdRetryMs?: number;
 };
 
 /** The peer's PoolObject as held over its link; `host` is this node's client host for that link. */
@@ -44,7 +46,7 @@ type PeerView = {
   fetchToken: ((id: string) => Promise<{ value: string }>) | null;
 };
 
-/** Reported when this node could not hold a peer's PoolObject (it is tried again when the peer is next online). */
+/** Reported when this node could not hold a peer's PoolObject (it is tried again, with backoff, while the peer is online). */
 export class HoldFailed extends Error {
   constructor(readonly peerId: string, message: string) {
     super(message);
@@ -68,6 +70,20 @@ function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> 
   });
 }
 
+/** Whether `promise` settles within `ms`. */
+async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([
+    promise.then(() => true, () => true),
+    new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); }),
+  ]);
+  clearTimeout(timer);
+  return settled;
+}
+
+/** The longest wait between attempts to hold an online peer's PoolObject. */
+const HOLD_RETRY_MAX_MS = 30_000;
+
 /** How many dropped token ids are logged at most, so that a peer sending junk cannot fill the log. */
 const MAX_LOGGED_REJECTIONS = 100;
 
@@ -86,6 +102,8 @@ export class PoolSync {
   private retries = 0;
   /** Token ids already logged as dropped (at most `MAX_LOGGED_REJECTIONS`), so each is logged once. */
   private readonly rejectedLogged = new Set<string>();
+  /** Per peer whose hold failed: the next wait before trying again, and the timer of the try pending. */
+  private readonly holdRetry = new Map<string, { waitMs: number; timer: ReturnType<typeof setTimeout> | null }>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private unsubscribe: (() => void) | undefined;
   private started = false;
@@ -99,7 +117,11 @@ export class PoolSync {
     this.started = true;
     this.unsubscribe = this.deps.net.onPeer((id, online) => {
       if (online) this.hold(id);
-      else void this.drop(id);
+      else {
+        // Back online later, it is held at once, and a failure then backs off from the start.
+        this.cancelRetry(id, true);
+        void this.drop(id);
+      }
     });
     for (const id of this.deps.net.online()) this.hold(id);
     this.refreshInBackground();
@@ -110,6 +132,7 @@ export class PoolSync {
     if (this.stopped) return;
     this.stopped = true;
     clearInterval(this.timer);
+    for (const id of [...this.holdRetry.keys()]) this.cancelRetry(id, true);
     this.unsubscribe?.();
     for (const id of [...this.views.keys()]) void this.drop(id);
     await Promise.all([...this.closing]);
@@ -130,11 +153,27 @@ export class PoolSync {
     return view?.host ? { host: view.host, signal: view.abort.signal } : undefined;
   }
 
-  /** Records this node's current summary and address in its own row, then tells the node. */
+  /**
+   * Records this node's current summary and address in its own row, and a report of each connection it holds (now,
+   * at the address it sees the peer at) in that peer's row, then tells the node.
+   */
   async refreshSelf(): Promise<void> {
     const { store, net, selfId } = this.deps;
-    store.seen(selfId, new Date().toISOString(), await this.deps.summary(), fromEndpoint(net.endpoint));
+    const now = new Date().toISOString();
+    store.seen(selfId, now, await this.deps.summary(), fromEndpoint(net.endpoint));
+    await this.reportLinks(net.online(), now);
     this.deps.onChange();
+  }
+
+  /** Reports this node's connection with each of `ids` at `at` (default now), at the address it sees each at. */
+  async reportLinks(ids: string[], at: string = new Date().toISOString()): Promise<boolean> {
+    const { store, net } = this.deps;
+    let changed = false;
+    for (const id of ids) {
+      const addr = await remoteAddrOf(net.endpoint, id).catch(() => null);
+      if (net.isOnline(id) && store.reached(id, at, addr)) changed = true;
+    }
+    return changed;
   }
 
   private refreshInBackground(): void {
@@ -178,17 +217,25 @@ export class PoolSync {
   /** Starts holding the peer's PoolObject, replacing any view of it held before. */
   private hold(id: string): void {
     if (this.stopped) return;
+    this.cancelRetry(id, false);
     void this.drop(id);
     const view: PeerView = { host: null, abort: new AbortController(), tokenIds: new Set(), fetchToken: null };
     this.views.set(id, view);
     void this.attach(id, view);
   }
 
-  /** Opens a `chord` stream to the peer and holds its PoolObject; a failure is reported and retried when it is next online. */
+  /**
+   * Opens a `chord` stream to the peer and holds its PoolObject. A failure is reported (unless the connection it rode
+   * on closed: the net then says the peer went, and holding starts again when it is back) and tried again while the
+   * peer stays online, after 1 s doubling to 30 s: a peer that was not serving its PoolObject yet (it is still
+   * starting) is held once it does, without waiting for the connection to drop.
+   */
   private async attach(id: string, view: PeerView): Promise<void> {
     const current = () => !this.stopped && this.views.get(id) === view;
+    let closed: Promise<string> | null = null;
     try {
       const stream = await this.deps.net.openStream(id, { stream: "chord" });
+      closed = stream.closed;
       const link = new IrohLink(stream, this.deps.tap ? { tap: this.deps.tap } : {});
       if (!current()) {
         link.close("bye");
@@ -217,6 +264,8 @@ export class PoolSync {
       // A call in flight when the view is dropped is not settled by closing its client host: the drop's abort ends it,
       // so that one gone peer cannot hold up the chain (and `stop()`).
       view.fetchToken = (tokenId) => unlessAborted(pool.fetchToken({ id: tokenId }), view.abort.signal);
+      // Held: a later failure backs off from the start again.
+      this.holdRetry.delete(id);
       pool.tokens.subscribe((rows) => {
         if (!current()) return;
         view.tokenIds = new Set(rows.filter((r) => !r.removed).map((r) => r.id));
@@ -228,9 +277,45 @@ export class PoolSync {
       });
     } catch (err) {
       if (!current()) return;
+      // The connection the stream rode on closed (the peer went, or a connection that wins replaced it): the net says
+      // so, and the hold starts again on the next connection. Nothing failed that is this node's to report.
+      if (closed !== null && (await settlesWithin(closed, 250))) {
+        if (current()) {
+          await this.drop(id);
+          this.retryHold(id);
+        }
+        return;
+      }
+      if (!current()) return;
       this.report(new HoldFailed(id, `holding the pool of ${shortId(id)}: ${messageOf(view.abort.signal.reason ?? err)}`));
       await this.drop(id);
+      this.retryHold(id);
     }
+  }
+
+  /** Holds the peer again after the wait its failures have earned, if it is still online and not held by then. */
+  private retryHold(id: string): void {
+    if (this.stopped) return;
+    const first = this.deps.holdRetryMs ?? 1000;
+    const entry = this.holdRetry.get(id) ?? { waitMs: first, timer: null };
+    if (entry.timer !== null) return;
+    const wait = entry.waitMs;
+    entry.waitMs = Math.min(wait * 2, HOLD_RETRY_MAX_MS);
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      if (!this.stopped && this.deps.net.isOnline(id) && !this.views.has(id)) this.hold(id);
+    }, wait);
+    entry.timer.unref?.();
+    this.holdRetry.set(id, entry);
+  }
+
+  /** Cancels a pending retry of holding the peer; `reset` also forgets its backoff. */
+  private cancelRetry(id: string, reset: boolean): void {
+    const entry = this.holdRetry.get(id);
+    if (entry === undefined) return;
+    if (entry.timer !== null) clearTimeout(entry.timer);
+    entry.timer = null;
+    if (reset) this.holdRetry.delete(id);
   }
 
   /** Runs `step` after the pulls and deletions before it; its failure is reported while the view is current. */

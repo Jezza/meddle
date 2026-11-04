@@ -7,6 +7,7 @@ import type { NodeConfig } from "../config";
 import type { PoolRuntime } from "../pool/runtime";
 import { DASHBOARD_PRINCIPAL, bridgeSocket } from "./tunnel";
 import { BunSocketShim, ShimServer } from "./ws-shim";
+import { embedded } from "../embedded";
 
 const UI_DIR = join(import.meta.dir, "ui");
 const PREBUILT = join(import.meta.dir, "../../dist/ui/main.js");
@@ -30,6 +31,7 @@ export type Dashboard = { url: string; stop(): Promise<void> };
  */
 export async function startDashboard(cfg: Pick<NodeConfig, "port">, host: Host, pool?: PoolRuntime): Promise<Dashboard> {
   const script = await uiScript();
+  const page = uiPage();
   const sockets = new ShimServer<Request>();
   let port = 0;
   acceptWebSockets(sockets, host, { principal: (request) => (trusted(request, port) ? PRINCIPAL : undefined) });
@@ -41,7 +43,7 @@ export async function startDashboard(cfg: Pick<NodeConfig, "port">, host: Host, 
       if (!trusted(request, server.port ?? port)) return new Response("forbidden", { status: 403 });
       const { pathname } = new URL(request.url);
       if (pathname === "/" || pathname === "/index.html") {
-        return new Response(Bun.file(join(UI_DIR, "index.html")), { headers: { "content-type": "text/html; charset=utf-8" } });
+        return new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } });
       }
       if (pathname === "/main.js") {
         return new Response(script, { headers: { "content-type": "text/javascript; charset=utf-8" } });
@@ -107,8 +109,16 @@ function isLoopback(url: string, port: number): boolean {
     && parsed.pathname === "/" && parsed.username === "" && parsed.search === "";
 }
 
-/** The browser bundle: `dist/ui/main.js` when built ahead, else built from `ui/main.tsx` now. */
+/** The dashboard page: embedded in the single binary, else this checkout's `ui/index.html`. */
+function uiPage(): Blob {
+  const packed = embedded();
+  return packed !== null ? new Blob([packed.html]) : Bun.file(join(UI_DIR, "index.html"));
+}
+
+/** The browser bundle: embedded in the single binary, else `dist/ui/main.js` when built ahead, else built from `ui/main.tsx` now. */
 async function uiScript(): Promise<Blob> {
+  const packed = embedded();
+  if (packed !== null) return new Blob([packed.script]);
   const prebuilt = Bun.file(PREBUILT);
   if (await prebuilt.exists()) return prebuilt;
   const build = await Bun.build({ entrypoints: [join(UI_DIR, "main.tsx")], target: "browser", format: "esm" });

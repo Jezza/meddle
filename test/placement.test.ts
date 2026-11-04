@@ -82,7 +82,8 @@ test("homes come from any candidate's entry, even one that cannot take the task"
 function row(nodeId: string, summary: unknown, extra: Partial<RosterRow> = {}): RosterRow {
   return {
     nodeId, hostname: `host-${nodeId[0]}`, status: "member", updatedAt: "2026-11-02T00:00:00.000Z", addedBy: A,
-    summary: summary as RosterRow["summary"], lastSeenAt: "2026-11-02T00:00:00.000Z", lastAddr: null, ...extra,
+    summary: summary as RosterRow["summary"], lastSeenAt: "2026-11-02T00:00:00.000Z", lastAddr: null,
+    reachedAt: null, reachedAddr: null, ...extra,
   };
 }
 

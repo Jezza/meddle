@@ -39,6 +39,8 @@ export type DiscoveryDeps = {
   pollMs: number;
   /** The other nodes on the topic; called only when the set of ids or an address changed. */
   onPeers(peers: WireAddr[]): void;
+  /** The ids of the other nodes on the topic, after every announce or lookup that answered (changed or not). */
+  onListed?(ids: string[]): void;
   /** Each distinct message at most once a minute. */
   onError?(message: string): void;
   /** Announce retry delays, doubling from `initialMs` up to `maxMs`; default 1000 / 60000. */
@@ -251,6 +253,11 @@ export class Discovery {
     for (const p of peers) {
       if (!p?.addr || !isNodeId(p.addr.id) || p.addr.id === this.deps.identity.id || !Array.isArray(p.addr.addrs)) continue;
       found.set(p.addr.id, fromLighthouseAddr(p.addr));
+    }
+    try {
+      this.deps.onListed?.([...found.keys()]);
+    } catch (err) {
+      this.report(`handling listed peers: ${messageOf(err)}`);
     }
     const next = new Map([...found].map(([id, addr]) => [id, JSON.stringify(addr)]));
     if (next.size === this.known.size && [...next].every(([id, json]) => this.known.get(id) === json)) return;

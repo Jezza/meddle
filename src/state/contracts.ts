@@ -117,12 +117,13 @@ const nodeState = {
 const nodeMethods = {
   /**
    * Creates a task on the node `node` names: absent or null, the one placement picks (`place`); `"here"`, this node;
-   * else that node id, a member of the pool. `prompt`, when given, starts its first turn there. Answers the manifest
-   * and the node the task is on.
+   * else that node id, a member of the pool. `prompt`, when given, starts its first turn there. `title` absent or
+   * blank: the prompt's first line, or two adjectives and a noun (`taskTitle`). Answers the manifest and the node the
+   * task is on.
    */
   createTask: method(
     Type.Object({
-      title: Type.String(),
+      title: Type.Optional(Type.String()),
       projectIds: Type.Array(Type.String()),
       prompt: Type.Optional(Nullable(Type.String())),
       node: Type.Optional(Nullable(Type.String())),
@@ -321,6 +322,9 @@ export const RosterRowSchema = Type.Object({
   summary: Nullable(NodeSummarySchema),
   lastSeenAt: Nullable(Type.String()),
   lastAddr: Nullable(WireAddrSchema),
+  /** The newest report by a member of a connection with the node, and the address it saw (absent from older nodes). */
+  reachedAt: Type.Optional(Nullable(Type.String())),
+  reachedAddr: Type.Optional(Nullable(WireAddrSchema)),
 });
 
 /** One pool setting as replicated (`SettingRow`); `value: null` is an unset. */
@@ -365,6 +369,17 @@ export const PoolNodeSchema = Type.Object({
   /** Every project the node holds ([] for a node of an older meddle). */
   projects: Type.Array(ProjectInfoSchema),
   lastSeenAt: Nullable(Type.String()),
+  /**
+   * Not heard of (no connection, no member reporting one, no lighthouse listing) for longer than the pool's
+   * `roster.forget`: not dialed, and placement counts its work as lost. It rejoins by proving the secret.
+   */
+  gone: Type.Boolean(),
+  /**
+   * The connection this node holds with it, null when none (and for this node): the node id that dialed it and the
+   * node's session on it. Two nodes hold the same connection when they agree on the dialer and each names the other's
+   * session.
+   */
+  link: Type.Optional(Nullable(Type.Object({ dialer: Type.String(), session: Type.String() }))),
 });
 
 /** What one node asks of another (principal `peer:<nodeId>` only); bulk goes over `git` and `blob` streams. */
@@ -420,6 +435,8 @@ export const PoolObject = remote("meddle.pool", {
         poolId: Type.String(),
         poolName: Type.String(),
         self: Type.String(),
+        /** This node's session: its process, as its proofs to other nodes name it. */
+        session: Type.Optional(Type.String()),
         nodes: Type.Array(PoolNodeSchema),
         /** The login tokens in the order turns try them, removed ones left out. */
         tokens: Type.Array(TokenMetaSchema),

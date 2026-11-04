@@ -25,6 +25,16 @@ export type NodeConfig = {
   /** How many turns may run at once on this node, `MEDDLE_MAX_RUNNING`; null (unset) for the pool's `limits.running`. */
   maxRunning: number | null;
   /**
+   * How long a member may go unheard of before this node counts it gone, in ms, `MEDDLE_FORGET_MS` (0 never); null
+   * (unset) for the pool's `roster.forget`.
+   */
+  forgetMs: number | null;
+  /**
+   * The npm registry the single binary downloads its pinned Claude Code from on first start, `MEDDLE_NPM_REGISTRY`
+   * (no trailing slash): `https://registry.npmjs.org` unless set.
+   */
+  npmRegistry: string;
+  /**
    * What the pool's settings add to the environment of jj and of Claude Code (`JJ_USER`, `JJ_EMAIL`, `env.*`).
    * `{}` from `loadConfig`; owned by `PoolSettings.apply`, which replaces the object on every change.
    */
@@ -72,6 +82,12 @@ function parseMaxRunning(raw: string | undefined): number | null {
   return Number(raw);
 }
 
+function parseForgetMs(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("MEDDLE_FORGET_MS must be a non-negative integer");
+  return Number(raw);
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): NodeConfig {
   const home = env.HOME ?? homedir();
   return {
@@ -92,6 +108,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     gitSocket: env.MEDDLE_GIT_SOCKET === undefined || env.MEDDLE_GIT_SOCKET === "" ? null : resolve(env.MEDDLE_GIT_SOCKET),
     jjNetworkTimeoutMs: parseJjNetworkTimeoutMs(env.MEDDLE_JJ_NETWORK_TIMEOUT_MS),
     maxRunning: parseMaxRunning(env.MEDDLE_MAX_RUNNING),
+    forgetMs: parseForgetMs(env.MEDDLE_FORGET_MS),
+    npmRegistry: (env.MEDDLE_NPM_REGISTRY || "https://registry.npmjs.org").replace(/\/+$/, ""),
     poolEnv: {},
   };
 }

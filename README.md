@@ -9,8 +9,8 @@ set of Claude logins and each project's memory, and a task can move between mach
 Status: Plan 4, settings, tokens, placement, archive and spawn. Nodes given one pool secret form a pool over iroh:
 they find each other through a lighthouse and prove the secret to each other, share their settings and an ordered list of login tokens (a turn whose login hits a limit
 switches to the next), and the dashboard of any node shows every node and opens its tasks. meddle places a new task
-on a node unless you name one, a task may have no project, and `spawn` creates a task and sends its first prompt in
-one command. A project's repo and memory follow its tasks to whichever node they run on, a task moves between nodes
+on a node unless you name one, a task may have no project, and `task new` creates a task and sends its first prompt
+in one command. A project's repo and memory follow its tasks to whichever node they run on, a task moves between nodes
 with its workspaces, conversation and queued prompts, and an idle task can be archived off its node and restored on
 any node. Moving a project's home to another node is not here yet (see [Known limits](#known-limits)).
 
@@ -19,7 +19,9 @@ up, and where things are; the sections below are the reference.
 
 ## Install
 
-Requires [bun](https://bun.sh), [jj](https://jj-vcs.github.io/jj/) and git.
+Each machine needs [jj](https://jj-vcs.github.io/jj/) 0.46.0 or later (a task's workspaces are made with
+`jj workspace add --colocate`, which 0.45 lacks) and git, and either the single binary (see
+[The single binary](#the-single-binary)) or a checkout run with [bun](https://bun.sh):
 
 ```sh
 git clone <this repo> meddle
@@ -41,13 +43,43 @@ jj user config on the node) jj refuses to push the commits, so every push to a p
 logs a `meddle: git: …` line saying so (see [Projects across the pool](#projects-across-the-pool)).
 
 The commands below run from the checkout as `bun run src/cli.ts <command>`; `bin/meddle` runs the same CLI from
-anywhere once linked onto your `PATH` (`ln -s $PWD/bin/meddle ~/.local/bin/meddle`). `bun run build` also produces a compiled
-`dist/meddle` for `status` and the `token` commands; the service itself runs from the checkout. The compiled binary embeds
-iroh's native modules (two `.node` files, its glibc and musl builds), which make it about 40 MB larger (147 MB on
-linux-x64). It carries no `node_modules`, so it reports its Claude Code version as `unknown`. A node served from it
-reports `unknown` to the pool too, so in a pool with nodes served from a checkout the dashboard flags the members'
-versions as mixed, and it can neither move its tasks away nor take tasks from other nodes (see
-[Moving a task](#moving-a-task)).
+anywhere once linked onto your `PATH` (`ln -s $PWD/bin/meddle ~/.local/bin/meddle`). `meddle help` lists every command with
+what it does, and `meddle help <command>` (or `meddle <command> --help`) says more about one; on a terminal it is
+coloured (`NO_COLOR` turns that off, `FORCE_COLOR` on).
+
+### The single binary
+
+```sh
+bun run build                              # dist/meddle, for this machine
+bun run build --target=bun-linux-arm64     # for another platform (a Raspberry Pi)
+bun run build --embed-claude               # with Claude Code inside, for machines that cannot reach the npm registry
+```
+
+`bun run build` makes `dist/meddle`, one file that runs a node with nothing else installed but jj and git: no bun, no
+checkout, no `node_modules`. It embeds bun, the dashboard (its page and bundled script), the service unit's template,
+iroh's native modules (both the glibc and the musl build), and which Claude Code to run: the version the Agent SDK
+pins, with the SHA-256 and size its manifest gives for the target platform's binary. About 150 MB on linux-x64. One
+binary runs on one platform: the machine's own by default, or the `--target` given
+(`bun-<linux|darwin|windows>-<x64|arm64>[-musl]`, a Bun compile target). On Linux the build picks the musl platform
+when the machine has no glibc.
+
+Copy it onto each machine's `PATH` (`~/.local/bin/meddle`, say) and use it as `meddle <command>`. When `serve` starts
+and `<data dir>/bin/claude-<version>` is not there, it downloads the Agent SDK's platform package for that version
+from the npm registry (`MEDDLE_NPM_REGISTRY`, `https://registry.npmjs.org` by default; about 140 MB for linux-x64),
+unpacks Claude Code from it as it arrives, and installs it there (mode 755, in the data directory rather than a temp
+directory, which may be mounted `noexec`) only if its size and SHA-256 are the pinned ones; turns run that file. It
+logs `meddle: downloading Claude Code <version> (<platform>) from <url>`, then `… installed at <path> (SHA-256
+verified)`. A download that fails or does not match stops `serve` with the reason, leaves nothing at that path, and is
+tried again at the next start. Later starts find the file and download nothing.
+
+`--embed-claude` puts Claude Code itself into the binary instead (about 450 MB on linux-x64, of which Claude Code is
+285 MB): `serve` installs it from there, checked the same way, and never needs the registry. It needs the target
+platform's Agent SDK package installed when building; `bun install` brings only this machine's, so for another
+`bun add --no-save @anthropic-ai/claude-agent-sdk-<platform>` first (the build says which).
+
+Either way the binary reports the pinned version, so nodes running the same build can move tasks between them, and so
+can a node served from a checkout whose `node_modules` hold the same Agent SDK. Files of older versions in
+`<data dir>/bin` are not removed.
 
 ## Task root
 
@@ -168,18 +200,17 @@ stay, and merge with the pool's like any member's. A new secret on the nodes you
 the pool for good; Remove (below) is for the meantime, and neither takes back the login tokens the node pulled while
 it was a member: revoke or reissue those too (`claude setup-token` again, `token remove` the old one).
 
-Two nodes with the secret find each other through the lighthouse (below). Without one, tell the node with the
-smaller id the other's id (or both nodes each other's): `pool peer <node id>` records it here as a member at once,
-listed and counted as one, with or without the node running, so that this node dials it when it is the one to dial
-(iroh resolves an id by DNS under the `n0` preset; not under `minimal`). The other node still has to prove the
-secret before anything passes between them.
+Two nodes with the secret find each other through the lighthouse (below). Without one, tell either node the other's
+id: `pool peer <node id>` records it here as a member at once, listed and counted as one, with or without the node
+running, so that this node dials it (iroh resolves an id by DNS under the `n0` preset; not under `minimal`). The other
+node still has to prove the secret before anything passes between them.
 
 ### Discovery
 
 Nodes find each other through an iroh-lighthouse, the hosted `https://iroh.ichor.io` by default
 (`MEDDLE_LIGHTHOUSE_URL` names another). Each node announces itself on the pool's topic, signed with the topic key,
-and looks the topic up: only holders of the secret can do either, so every node the lighthouse lists is dialled (by
-the one of the two with the smaller id) and is a member once the two have proved the secret to each other; a node
+and looks the topic up: only holders of the secret can do either, so every node the lighthouse lists is dialled and is
+a member once the two have proved the secret to each other; a node
 the roster has as removed is left alone, and one that leaves the topic before it proved anything is dropped again.
 An announce asks for 300 s and is renewed at half the time the lighthouse grants; a node looks the topic up every
 `MEDDLE_DISCOVERY_POLL_MS`. The lighthouse is only ever a hint: a node it lists that does not prove the secret is
@@ -187,22 +218,32 @@ refused, so a lighthouse of someone else's cannot add a member.
 
 If the lighthouse is unreachable the node still starts; it retries with backoff and logs each distinct error at most
 once a minute. Set `MEDDLE_LIGHTHOUSE_URL=` (empty) to turn discovery off: nodes then reach each other at the
-addresses recorded in the roster, and a new node is told of with `pool peer`.
+addresses recorded in the roster (see [Addresses and forgetting](#addresses-and-forgetting)), and a new node is told
+of with `pool peer`.
 
 ### Connections and removal
 
 Nodes talk over iroh: QUIC, encrypted end to end, through iroh's relays when there is no direct path. A connection
 opens with a proof of the pool secret each way, one line on a one-way stream: the dialer's first, then the
-acceptor's, each the topic key's signature over the two node ids (iroh authenticates the ids, so a proof is good for
-that pair, that way, and nothing else). The acceptor refuses, before reading anything else, a dialer that sends no
+acceptor's, each the prover's session id and the topic key's signature over `meddle/admit/2.<prover>.<verifier>.<session>`
+(iroh authenticates the ids, so a proof is good for that pair, that way, that process, and nothing else). A session
+id is made once per process: its start time, then random bytes, so a node's sessions sort by when they started. The acceptor refuses, before reading anything else, a dialer that sends no
 proof or another pool's (`bad proof`), any dialer while it has no secret itself (`no pool secret`), and a node its
 roster has as removed (`removed <time>`); the dialer closes an acceptor that does not prove the secret and logs
 `<short id> did not prove the pool secret`. The acceptor proves itself before it gives a verdict, and a dialer takes
 a refusal as the peer's word only from a peer that proved the secret (one closed before proving is logged as a
 failed dial); a removal dated more than five minutes ahead of this node's clock is ignored. A node that proves the
 secret and was never heard of becomes a member here on the spot, named by its short id until its own row arrives
-with the first sync. Of two members, the one with
-the smaller node id dials and the other accepts. When a node cannot reach a member (a dial fails or is not answered,
+with the first sync.
+
+Every node dials every member it has no connection with, and accepts their dials too. A node that starts dials every
+member at once; one that loses a connection, or fails to make one, dials again after a delay that doubles from 1 s
+to 30 s, each jittered by half either way so that two nodes do not keep dialling in step. When both have dialled at
+once, or a connection from a restarted process meets one from before, each node keeps exactly one by a rule both
+apply on their own and agree on: of two sessions of the peer the newer one's connection wins (the older process is
+gone or going); within one session, the connection the smaller node id dialed wins. The other is closed (code 0,
+`duplicate`), or, when the acceptor already holds the winner, answered `duplicate` instead of `admitted`, and the
+dialer lets it go quietly. When a node cannot reach a member (a dial fails or is not answered,
 the member keeps refusing it, or it cannot read the member's pool state) it logs why, as `meddle: pool: …`, each
 distinct message at most once a minute; a healthy pool logs nothing.
 
@@ -216,10 +257,29 @@ sync over it tells the node it is a member once more. Removal is bookkeeping, no
 the secret, can look the topic up, and with a new node key is simply a new node that proves the secret. A new secret
 on the nodes you keep is the only real revocation.
 
-One known limit: a node removed while it is unreachable learns of it only when it next dials a member, and a node
-dials only members whose ids sort after its own. If its id sorts after every remaining member's, nobody dials it and
-it dials nobody, so it keeps showing itself as a member with every other node offline. Allowing it again brings it
-back all the same: the members then dial it.
+A node removed while it is unreachable learns of it the next time it dials a member, which it does as soon as it is
+back.
+
+### Addresses and forgetting
+
+Each node records its own address in its roster row at every self refresh (every 15 s), and also reports, for every
+member it is connected to, that it is (with the time, on its clock) and the address it sees that member at: at once
+when the connection comes up, and again at every self refresh. Those reports replicate with the roster, the newest
+winning, and a node dials a member at the newer of the member's own word and the newest report. A node that comes
+back at a new address (a restart picks a new port unless `MEDDLE_IROH_BIND` fixes one) therefore needs to reach only
+one member, at the address it remembers, for the whole pool to learn where it is, with or without the lighthouse. A
+report dated more than five minutes ahead of the receiving node's clock is ignored.
+
+A member is last heard of at the newest of: a connection with this node, a member's report of a connection with it,
+and the lighthouse listing it on the pool's topic. One not heard of for longer than the pool's `roster.forget`
+([Pool settings](#pool-settings), 900 s by default, `0` never) is **gone** on this node: it drops out of the address
+book, so it is neither dialled nor offered an address, `pool` lists it as `gone` and the dashboard shows it so. It is
+not removed: its roster row stays a member, tasks and projects keep its id, and it rejoins by dialling a member and
+proving the secret, after which it is online and no longer gone. Placement counts a gone node's work as lost: it is
+not a candidate, and neither its load nor the projects it holds count. Gone is each node's own judgement and is not
+replicated. The clock only runs while the node itself hears of the pool: a node with no connection and no lighthouse
+forgets nobody (so it keeps dialling everyone), and a node that just started or woke from sleep judges no one by the
+time it was away; the threshold runs from then.
 
 ### Tokens
 
@@ -257,6 +317,7 @@ one, and sets a key picked from the table below (an `env.` key with the name typ
 | `env.<NAME>` | `<NAME>` (upper case, digits and `_`) in every task's Claude Code environment and in every jj command meddle runs (with the git processes jj starts). Not in the `git upload-pack` and `git receive-pack` a node runs to serve another node's fetch or push. A project's context `env` wins over it for that project's tasks. |
 | `lighthouse.url` | The discovery lighthouse, applied live; it cannot be set empty. A node that sets `MEDDLE_LIGHTHOUSE_URL` (even empty, which turns discovery off there) uses its own instead. |
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
+| `roster.forget` | How long, in seconds, a member may go unheard of before a node counts it gone ([Addresses and forgetting](#addresses-and-forgetting)): `0` never, else at least `60`; `900` (three lighthouse announce TTLs) when unset. A node that sets `MEDDLE_FORGET_MS` uses its own instead. |
 
 Each key replicates on its own, last writer wins on the time it was set, the roster's rule (on equal times, the
 setting from the node with the greater id wins, then the greater value); an unset replicates too. A value is at most
@@ -275,16 +336,34 @@ the secret first and the settings after, and know that the newest value wins whe
 ### `meddle pool`
 
 ```sh
-bun run src/cli.ts pool
+bun run src/cli.ts pool        # or pool -v
 ```
 
-prints one line per node in the roster:
+prints the roster as a table, this node first and marked `@`:
 
 ```
-<short id> <hostname> <online|offline|removed> meddle <version> claude <claude code version> tasks <n>
+   NODE        HOST         STATE   MEDDLE  CLAUDE   TASKS
+@  1743a65f16  peeriot-00X  online  0.1.0   2.1.314  0
+   164ff3e5ed  Gem          online  0.1.0   2.1.314  1
 ```
 
-with `(this node)` after this node's line.
+`STATE` is `online`, `offline`, `gone` or `removed`; `HOST` and the versions are `-` until the node's summary has
+reached this one. `-v` adds `DIALER` (the node that dialed the connection held with that node) and `SESSION` (that
+node's session on it; this node's own on its row).
+
+### Ids and prefixes
+
+Wherever the CLI takes a node, a task or a project by id, it takes a unique prefix of one too, as jj does: `task move
+e98d 164`. A task's prefix is unique among every task of the pool (and the rows this node keeps of tasks that
+moved away); a node's among the roster; a project's among the pool's projects (a project's name wins over a prefix).
+`ambiguous task: e98 (e98a…, e98d…)` names the candidates. On a terminal, `pool`, `task list` and `project list`
+print each id's shortest unique prefix in bold magenta: what you need to type. (`NO_COLOR` turns colour off,
+`FORCE_COLOR` on.)
+
+The task commands (`task prompt`, `retry`, `move`, `archive`, `restore`, `delete`) work from any node: they act on
+the node the task lives on (or is archived on), reaching it through this node as the dashboard does. A task named by
+its whole id that lives on this node needs no other node; a prefix is looked up across every online member. Nodes are
+named by short id and hostname in what they print, such as `moving e98d79415f8e to 164ff3e5ed (Gem)`.
 
 ### Environment
 
@@ -298,6 +377,8 @@ with `(this node)` after this node's line.
 | `MEDDLE_MAX_RUNNING` | the pool's `limits.running` | How many turns this node runs at once before placement treats it as full, overriding the pool setting here; a non-negative integer, `0` unlimited. |
 | `MEDDLE_LIGHTHOUSE_URL` | the pool's `lighthouse.url`, else `https://iroh.ichor.io` | The lighthouse for discovery, overriding the pool setting here; empty turns discovery off. |
 | `MEDDLE_DISCOVERY_POLL_MS` | `10000` | How often a node looks its pool's topic up; at least `500`. |
+| `MEDDLE_NPM_REGISTRY` | `https://registry.npmjs.org` | Where the single binary downloads its pinned Claude Code from on first start (see [The single binary](#the-single-binary)); a mirror of the npm registry. |
+| `MEDDLE_FORGET_MS` | the pool's `roster.forget` | How long, in ms, a member may go unheard of before this node counts it gone, overriding the pool setting here; a non-negative integer, `0` never (no 60 s floor: for tests and labs). |
 | `MEDDLE_IROH_PRESET` | `n0` | iroh's `n0` preset (number 0's public relays and address lookup), or `minimal`: no relays and no address lookup, so nodes reach each other only at direct addresses (loopback setups and tests). |
 | `MEDDLE_IROH_BIND` | iroh's default | The address iroh's UDP socket binds, as `<ip>:<port>`. |
 | `MEDDLE_JJ_NETWORK_TIMEOUT_MS` | `120000` | How long a jj fetch or push with another node may take before meddle kills it (with its git processes) and fails it as `jj <args> timed out after <ms> ms`. A clone (from a peer or from an upstream) may take ten times as long. |
@@ -305,14 +386,15 @@ with `(this node)` after this node's line.
 ## Projects and tasks
 
 With the node running (see [Dashboard](#dashboard)), add a project from an existing folder or an upstream URL, then
-create a task on it and send it a prompt, or do both at once with `spawn`:
+create a task on it and send it a prompt, or do both at once with `task new <prompt>`:
 
 ```sh
 bun run src/cli.ts project add ~/src/myproject [--name myproject]   # prints the project id
 bun run src/cli.ts project list
-bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id|name>   # prints: task <id> on <node>
+bun run src/cli.ts task new "Find out why test_sync is flaky and fix it" --project myproject   # prints: task <id> on <node>
+bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id|name>   # no prompt: it waits idle
 bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fix it"
-bun run src/cli.ts spawn "Find out why test_sync is flaky and fix it" --project myproject   # prints: task <id> on <node>
+bun run src/cli.ts task list   # every task of the pool, with its state and node
 bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
 bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to another node
 bun run src/cli.ts task archive <task-id>   # takes an idle task's folder off its node, keeps its log
@@ -320,15 +402,22 @@ bun run src/cli.ts task restore <task-id> [--node <id|prefix> | --here]   # brin
 bun run src/cli.ts task delete <task-id>    # deletes an archived or moved task's log and archive
 ```
 
-`spawn <prompt> [--project <id|name>]... [--node <id|prefix> | --here] [--title <t>]` creates a task, places it like
-`task new` (see [Where a new task runs](#where-a-new-task-runs)) and sends it the prompt as its first turn, which starts
-on the node chosen; it prints `task <id> on <short id>` once the turn has started, not when it ends (follow it in the
-dashboard, or send the next prompt with `task prompt`). The title defaults to the first 60 characters of the prompt's
-first line. `--project` is repeatable, one project each, the first the primary; with none the task has no project.
+`task new [<prompt>] [--title <t>] [--project <id|name>]... [--node <id|prefix> | --here]` creates a task, placed as
+[Where a new task runs](#where-a-new-task-runs) says. Given a prompt (the words that are not options), it sends it as
+the task's first turn, which starts on the node chosen, and prints `task <id> on <short id>` once the turn has
+started, not when it ends (follow it in the dashboard, or send the next prompt with `task prompt`); without one the
+task waits idle. The title defaults to the first 60 characters of the prompt's first line, or, with no prompt, to two
+adjectives and a noun (`quiet amber otter`). `--project` is repeatable, one project each, the first the primary; with
+none the task has no project.
+
+`task list` prints a table of every task of the pool, node by node (this node first), the archived ones after the
+others: `ID`, `STATE`, `NODE`, `HOST`, `PROJECTS` (comma-separated, `-` for none) and `TITLE`; nothing when there are
+none. It reads each online member's tasks over the pool, as the dashboard does; an offline member's are not listed,
+and a line on stderr says how many it had when last heard of (or that a member online did not answer within 10 s).
 
 `project list` prints one line per project of the pool, from what each node's summary in the roster says (this node
 included), so it works while a holder is offline: `<id>  <name>  home <short id>  on <short id>,<short id>,…`, named as
-its home names it, with the nodes that hold a copy after `on`. `--project` (of `task new` and `spawn`) takes a
+its home names it, with the nodes that hold a copy after `on`. `--project` (of `task new`) takes a
 project's id, or a name exactly one project of the pool has: `ambiguous project name: <name>` when several have it,
 `unknown project: <x>` when none does (pass the id then). An id the roster does not list yet (12 hex digits) is
 passed on to the node, which asks the online members for it. A task is
@@ -341,7 +430,8 @@ archived task is `archived` (see [Archiving a task](#archiving-a-task)).
 `task new` creates the task on the node meddle picks for it, and prints `task <id> on <short id>`; `--here` creates
 it on this node and `--node <id|prefix>` on that member (an id or a unique prefix of one; `no such node: <x>`
 otherwise). The dashboard's new-task form has the same choice: `Automatic` (the default) or one of the online nodes
-that host tasks; the form also takes a first prompt, and needs no project.
+that host tasks; the form also takes a first prompt, and needs neither a project nor a title (it is named as
+`task new` names one).
 
 meddle picks among the online members that host tasks (have a task root) and run fewer tasks (`running` or `waiting`)
 than their limit, `limits.running` (see [Pool settings](#pool-settings); `MEDDLE_MAX_RUNNING` on a node overrides it,
@@ -365,7 +455,7 @@ create a task there nor move one to it.
 
 ### Tasks without a project
 
-A task may have no project: `spawn` without `--project`, `task new` without `--project`, or the dashboard's form with
+A task may have no project: `task new` without `--project`, or the dashboard's form with
 no project ticked. Claude Code then starts in the task folder with the user settings layer only and
 `CLAUDE_CODE_PROJECT_DIR_NAME` unset, so its memory and transcript key on the task folder inside the task's config
 directory: they travel with the task and end with it, and nothing syncs them. The task folder holds only a generated
@@ -515,8 +605,8 @@ restarts.
 ### Who can take a task
 
 A move is refused before it starts unless the target is another online member of the pool, hosts tasks, and reports
-the same Claude Code version as this node, with neither reporting `unknown` (as a node served from the compiled
-binary does). The refusal names the reason, such as `<short id> does not host tasks` or
+the same Claude Code version as this node, with neither reporting `unknown` (as a node of a meddle before the single
+binary embedded Claude Code does when served from its compiled binary). The refusal names the reason, such as `<short id> does not host tasks` or
 `claude code <version> here, unknown there`. A task that is already moving, has moved or is being received is refused
 too, as is one whose turn is parked (retry it first). The dashboard offers only the nodes that can take the task.
 
@@ -667,6 +757,11 @@ refused for a task that is not archived or moved (`task is idle`, …). The book
   keeps knocking, and with a fresh node key it is a new node that proves the secret. A new secret on the nodes you
   keep (`pool secret` on each) is the only real revocation, and the login tokens it pulled meanwhile must be revoked
   or reissued separately.
+- Two groups of members cut off from each other for longer than `roster.forget`, with no lighthouse either side can
+  reach, count each other gone and stop dialling: when the cut heals they stay apart until a node on either side
+  restarts (it dials every member it knows at once) or the lighthouse lists them again.
+- Two nodes that dial each other at the same moment (both starting, or both redialling after a cut) may each show the
+  other offline and online again once, within a second or so, while they settle on one connection.
 - The lighthouse cannot admit anyone, but it chooses whom a node dials and with what address: one that lies can keep
   a node from reaching members it is not already connected to, and learns which nodes hold the secret, since the
   dialer's proof goes first.
@@ -676,8 +771,11 @@ refused for a task that is not archived or moved (`task is idle`, …). The book
 - When a node's last push of a project's memory to the home failed, the memory commits it has not pushed do not
   travel with a task that moves away: the target syncs memory from the home. They stay in this node's memory repo
   and reach the home only with a later turn of that project here.
-- A node whose Claude Code version is `unknown` (served from the compiled binary) cannot move tasks, either away or
-  to it.
+- A node whose Claude Code version is `unknown` (an older meddle served from its compiled binary) cannot move tasks,
+  either away or to it.
+- The single binary runs on one platform; each platform needs its own build. It downloads Claude Code (about 140 MB)
+  on the first start of each version, so that start needs the npm registry or a mirror, unless it was built with
+  `--embed-claude` (about 450 MB).
 - Background shells and subagents do not travel on "move now", and the dashboard cannot list them.
 - When a node restarts in the middle of a turn, the turn's rerun resumes the session and tells Claude to carry on;
   text you sent into that turn that Claude Code had not yet written to its transcript is not sent again.
@@ -747,8 +845,10 @@ To run the node as a systemd user service, look at what would be installed first
 bun run src/cli.ts service install --dry-run
 ```
 
-It prints the unit (`ExecStart=<bun> run src/cli.ts serve` with `WorkingDirectory=` this checkout) and the task-root
-command. Without `--dry-run` it writes `~/.config/systemd/user/meddle.service`, runs `systemctl --user daemon-reload`
+It prints the unit and the task-root command. From a checkout the unit runs `ExecStart=<bun> run src/cli.ts serve`
+with `WorkingDirectory=` this checkout; from the single binary, `ExecStart=<the binary> serve` with
+`WorkingDirectory=%h` (your home), so put the binary where it will stay before installing, and run `service install`
+again after moving it. Without `--dry-run` it writes `~/.config/systemd/user/meddle.service`, runs `systemctl --user daemon-reload`
 and `systemctl --user enable --now meddle.service`, and prints the task-root command to run once.
 
 ## Links

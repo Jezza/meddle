@@ -73,7 +73,7 @@ function PoolSection({ pool }: { pool: PoolRef }) {
 }
 
 /** The keys the set form offers by name; `ENV` stands for `env.<NAME>`, whose name is typed. */
-const SETTING_KEYS = ["jj.user", "jj.email", "lighthouse.url", "limits.running"];
+const SETTING_KEYS = ["jj.user", "jj.email", "lighthouse.url", "limits.running", "roster.forget"];
 const ENV = "env.";
 
 /** A node's hostname from the roster, else its short id. */
