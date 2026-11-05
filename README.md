@@ -108,23 +108,35 @@ bun run src/cli.ts token add --file <path> [--label <l>]
 bun run src/cli.ts token list                             # or token status
 bun run src/cli.ts token remove <id|label>
 bun run src/cli.ts token enable <id|label>
+bun run src/cli.ts token move <id|label> --before <id|label>   # or --after <id|label>
 ```
 
-The dashboard's Settings view lists the same tokens, and its Enable button does what `token enable` does for an
-`exhausted` or `disabled` one; adding and removing stay on the CLI, so a value never passes through the dashboard.
+The dashboard's Settings view lists the same tokens, in order. Its Enable button does what `token enable` does for an
+`exhausted` or `disabled` one, and its Up and Down buttons move a token past its neighbour as `token move` does.
+Adding and removing stay on the CLI, so a value never passes through the dashboard.
 
 A token's id is the first 16 hex characters of the SHA-256 of its value, so the same token added twice, on one node
-or on two, is listed once. Adding it again with `--label` renames it, and adding a removed token brings it back.
+or on two, is listed once. Adding it again with `--label` renames it and leaves it where it is in the order. Adding a
+removed token brings it back at the end of the list, keeping when it was first set (and so its expiry).
 Without `--label` a token is named after the first 8 characters of its id; a label is at most 64 characters. `token
 add` prints `token <id> (<label>)`, and `token set` is the same command. `remove` and `enable` take a full id or a
 label; a label two tokens share is refused (`ambiguous token label`), so name the token by its id then.
+
+The order is each token's rank, kept apart from when it was set. A new token goes last: its rank is the time it was
+added, or just past the last token's when this node's clock is behind. `token move a --before b` (or `--after b`)
+puts `a` right next to `b` by giving it a rank between `b`'s and its neighbour's, rewriting `a`'s row alone, so a
+move replicates like any other change to a token and does not undo a mark another node made on another token at the
+same time. When two ranks are too close for one between them, the list is renumbered. `move` takes full ids or labels,
+refuses moving a token before or after itself, prints `moved <id> (<label>) before|after <id> (<label>)`, and works
+with or without the node running. A node of an older meddle sends no rank: its rows sort by when they were set, and
+a move it overwrites with a later change to the same token is lost.
 
 Each value is written mode 600 to `secrets/tokens/<id>` in the data directory (`~/.local/share/meddle`, or
 `MEDDLE_DATA_DIR`; the directory is mode 700) and given to Claude Code as `CLAUDE_CODE_OAUTH_TOKEN`. The list itself
 (each token's label, who set it and when, its status and its expiry, a year after it was set) is in the node's
 database.
 
-A turn uses the first token in order (by when each was set) whose status is `ok`, or `exhausted` until a time that
+A turn uses the first token in order whose status is `ok`, or `exhausted` until a time that
 has passed, and whose value the node holds. A `disabled` token waits for `token enable`. With no usable token a turn
 fails with `no usable token`, and `task new` is refused the same way. `token list` prints a line per token (id, label,
 status with its time and reason, expiry) and then `active: <id>`, the token a turn starting now would use, or

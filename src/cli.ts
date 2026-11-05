@@ -32,7 +32,8 @@ import { countRunningTasks, listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
 import {
-  addToken, enableToken, listTokens, migrateLegacyToken, pickToken, removeToken, sweepTokenValues, type TokenMeta,
+  addToken, enableToken, listTokens, migrateLegacyToken, moveToken, pickToken, removeToken, sweepTokenValues, findToken,
+  type TokenMeta,
 } from "./token";
 import { ensureClaude } from "./claude-code";
 import { embedded } from "./embedded";
@@ -48,6 +49,7 @@ const USAGE = `usage: meddle --version
        meddle pool peer <node id> | meddle pool remove <id|prefix> | meddle pool allow <id|prefix>
        meddle token add [--file <path>] [--label <l>] | meddle token set [--file <path>] [--label <l>]
        meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
+       meddle token move <id|label> --before <id|label> | meddle token move <id|label> --after <id|label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
        meddle project add <path-or-url> [--name <n>] | meddle project list
        meddle task new [<prompt>] [--title <t>] [--project <id|name>]... [--node <id|prefix> | --here]
@@ -125,7 +127,7 @@ async function serve(): Promise<number> {
   const node: OpenNode = {};
   try {
     const db = (node.db = openDb(paths(cfg).db));
-    // The single token of an older meddle becomes the first of the list, once.
+    // The single token of an older meddle joins the list (last, behind any already there), once.
     await migrateLegacyToken(cfg, db, (await loadOrCreateIdentity(cfg)).id);
     // What a crash left in the tokens directory: a half-written value, the value of a removed token.
     await sweepTokenValues(cfg, db);
@@ -325,6 +327,17 @@ async function tokenEnable(idOrLabel: string): Promise<number> {
   const enabled = await withDb(cfg, (db) => enableToken(db, idOrLabel));
   await tokensChanged();
   console.log(`enabled ${enabled.id} (${enabled.label})`);
+  return 0;
+}
+
+/** Puts a token (its full id or its label) just before or just after another here, and tells the running node. */
+async function tokenMove(idOrLabel: string, to: { before: string } | { after: string }): Promise<number> {
+  const cfg = loadConfig();
+  if (!existsSync(paths(cfg).db)) throw new Error(`no such token: ${idOrLabel}`);
+  const [moved, anchor] = await withDb(cfg, (db) =>
+    [moveToken(db, idOrLabel, to), findToken(db, "before" in to ? to.before : to.after)] as const);
+  await tokensChanged();
+  console.log(`moved ${moved.id} (${moved.label}) ${"before" in to ? "before" : "after"} ${anchor.id} (${anchor.label})`);
   return 0;
 }
 
@@ -1074,6 +1087,11 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "token" && (sub === "list" || sub === "status") && rest.length === 0) return tokenList;
   if (command === "token" && sub === "remove" && rest.length === 1) return () => tokenRemove(rest[0]!);
   if (command === "token" && sub === "enable" && rest.length === 1) return () => tokenEnable(rest[0]!);
+  if (command === "token" && sub === "move" && rest.length === 3 && !rest[0]!.startsWith("--")) {
+    const [idOrLabel, flag, anchor] = rest as [string, string, string];
+    if (flag === "--before") return () => tokenMove(idOrLabel, { before: anchor });
+    if (flag === "--after") return () => tokenMove(idOrLabel, { after: anchor });
+  }
   if (command === "config" && sub === "set" && rest.length === 2) return () => configSet(rest[0]!, rest[1]!);
   if (command === "config" && sub === "unset" && rest.length === 1) return () => configUnset(rest[0]!);
   if (command === "config" && sub === "list" && rest.length === 0) return configList;

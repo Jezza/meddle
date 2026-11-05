@@ -198,6 +198,41 @@ test("the dashboard enables a token by its full id and the pool learns it; anyth
   });
 }, 15_000);
 
+test("the dashboard moves a token by full ids and the pool learns the order; anything else is refused", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    const poolA = a!.pool;
+    const poolB = b!.pool;
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+
+    const tok = tokenId("tok");
+    const second = await addToken(A.cfg, A.db, "tok2", { label: "second", setBy: A.id });
+    await poolA.tokenChanged({});
+    const order = (ts: { id: string }[]) => ts.map((t) => t.id).join(",");
+    await until(poolB.tokens, (ts) => order(ts) === `${tok},${second.id}`);
+
+    await poolA.moveToken({ id: second.id, before: tok });
+    await until(poolA.tokens, (ts) => order(ts) === `${second.id},${tok}`);
+    await until(poolA.activeTokenId, (id) => id === second.id);
+    await until(poolB.tokens, (ts) => order(ts) === `${second.id},${tok}`);
+
+    await poolA.moveToken({ id: second.id, after: tok });
+    await until(poolB.tokens, (ts) => order(ts) === `${tok},${second.id}`);
+
+    // neither or both of before and after, labels, unknown ids, a token against itself and a removed token are refused
+    await expect(poolA.moveToken({ id: second.id })).rejects.toThrow("give one of before and after");
+    await expect(poolA.moveToken({ id: second.id, before: tok, after: tok })).rejects.toThrow("give one of before and after");
+    await expect(poolA.moveToken({ id: "second", before: tok })).rejects.toThrow(/: no such token$/);
+    await expect(poolA.moveToken({ id: second.id, before: "x\u001b[2J" })).rejects.toThrow(/: no such token$/);
+    await expect(poolA.moveToken({ id: "0".repeat(16), before: tok })).rejects.toThrow(`no such token: ${"0".repeat(16)}`);
+    await expect(poolA.moveToken({ id: tok, after: tok })).rejects.toThrow("cannot move a token before or after itself");
+    await removeToken(A.cfg, A.db, second.id);
+    await expect(poolA.moveToken({ id: second.id, before: tok })).rejects.toThrow(`no such token: ${second.id}`);
+  });
+}, 15_000);
+
 test("the dashboard's settings show who set each one", async () => {
   await withNodes(2, async ([a, b]) => {
     const A = a!.node;

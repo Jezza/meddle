@@ -154,6 +154,34 @@ test("token add, set, list, enable, remove and status work on the database, with
   expect(await meddle(["token", "list"], env)).toEqual({ stdout: "active: none\n", stderr: "", code: 0 });
 }, 30_000);
 
+test("token move puts a token before or after another, without a node", async () => {
+  const dir = await mkdtemp("/tmp/meddle-cli-token-move-");
+  const env = { HOME: dir, MEDDLE_DATA_DIR: `${dir}/d`, MEDDLE_TASK_ROOT: `${dir}/t`, MEDDLE_PORT: String(await closedPort()) };
+  expect(await meddle(["token", "move", "a", "--before", "b"], env)).toEqual({ stdout: "", stderr: "meddle: no such token: a\n", code: 1 });
+  for (const name of ["a", "b", "c"]) {
+    await writeFile(`${dir}/${name}`, `tok-${name}\n`);
+    expect((await meddle(["token", "add", "--file", `${dir}/${name}`, "--label", name], env)).code).toBe(0);
+  }
+  const [a, b, c] = ["tok-a", "tok-b", "tok-c"].map(tokenId);
+  const order = async () => (await meddle(["token", "list"], env)).stdout.trimEnd().split("\n").slice(0, -1).map((l) => l.split("  ")[1]!);
+
+  expect(await meddle(["token", "move", "c", "--before", "a"], env)).toEqual({ stdout: `moved ${c} (c) before ${a} (a)\n`, stderr: "", code: 0 });
+  expect(await order()).toEqual(["c", "a", "b"]);
+  expect((await meddle(["token", "list"], env)).stdout).toEndWith(`active: ${c}\n`);
+  expect(await meddle(["token", "move", c, "--after", b], env)).toEqual({ stdout: `moved ${c} (c) after ${b} (b)\n`, stderr: "", code: 0 });
+  expect(await order()).toEqual(["a", "b", "c"]);
+
+  expect(await meddle(["token", "move", "a", "--after", "a"], env)).toEqual({ stdout: "", stderr: "meddle: cannot move a token before or after itself\n", code: 1 });
+  expect(await meddle(["token", "move", "a", "--before", "nope"], env)).toEqual({ stdout: "", stderr: "meddle: no such token: nope\n", code: 1 });
+  for (const bad of [["a"], ["a", "--before"], ["a", "--before", "b", "--after", "c"], ["a", "--first"], ["--before", "b"]]) {
+    const out = await meddle(["token", "move", ...bad], env);
+    expect(out.code).toBe(2);
+    expect(out.stderr).toBe(
+      "usage: meddle token move <id|label> --before <id|label>\n       meddle token move <id|label> --after <id|label>\n\nmeddle help token move says more.\n",
+    );
+  }
+}, 30_000);
+
 test("token add tells a running node, whose pool lists the token as active", async () => {
   const { A, close } = await twoPoolNodes({ nodes: [{ token: null }, { token: null }] });
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
@@ -186,6 +214,7 @@ test("the usage text lists the token subcommands", async () => {
   expect(out.code).toBe(2);
   expect(out.stderr).toContain("meddle token add [--file <path>] [--label <l>] | meddle token set [--file <path>] [--label <l>]");
   expect(out.stderr).toContain("meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>");
+  expect(out.stderr).toContain("meddle token move <id|label> --before <id|label> | meddle token move <id|label> --after <id|label>");
 });
 
 test("task new --here creates the task on this node and says so; an unknown --node is refused", async () => {

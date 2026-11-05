@@ -119,8 +119,10 @@ meddle token list
 ```
 
 Or `meddle token add --file <path>`. Never pass the token as an argument. The token commands work with or without
-the node running. Add a second login the same way: a turn whose login hits a usage limit switches to the next token
-in the list by itself ([Login tokens](../README.md#login-tokens)).
+the node running. Add a second login the same way: it goes to the end of the list, and a turn whose login hits a
+usage limit switches to the next token in the list by itself ([Login tokens](../README.md#login-tokens)). To have a
+turn try one login before another, `meddle token move <a> --before <b>` (or the Up and Down buttons in the dashboard's
+Settings view).
 
 ### 5. Set the jj identity
 

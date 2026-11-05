@@ -166,18 +166,18 @@ function TokenSection({ pool }: { pool: PoolRef }) {
   const tokens = useValue(pool.tokens);
   const active = useValue(pool.activeTokenId);
   const nodes = useValue(pool.nodes);
-  const enable = useAction();
+  const action = useAction();
   const setByName = (id: string | null) => (id === null ? "?" : nodeName(nodes, id));
   return (
     <>
       <h3>Tokens</h3>
       {active === null && <p class="error">{tokens.length === 0 ? "No token: turns cannot run." : "No usable token on this node: turns cannot run."}</p>}
-      {enable.error !== null && <p class="error">{enable.error}</p>}
+      {action.error !== null && <p class="error">{action.error}</p>}
       {tokens.length > 0 && (
         <table>
           <thead><tr><th>Label</th><th>Id</th><th>Status</th><th>Set by</th><th>Expires</th><th></th></tr></thead>
           <tbody>
-            {tokens.map((t) => (
+            {tokens.map((t, i) => (
               <tr key={t.id} class={t.id === active ? "active" : ""}>
                 <td>{t.label}{t.id === active ? " (active)" : ""}</td>
                 <td title={t.id}><code>{t.id.slice(0, 8)}</code></td>
@@ -185,11 +185,25 @@ function TokenSection({ pool }: { pool: PoolRef }) {
                 <td title={t.setBy ?? ""}>{setByName(t.setBy)}</td>
                 <td>{tokenText({ present: true, expiresAt: t.expiresAt })}</td>
                 <td>
+                  {tokens.length > 1 && (
+                    <>
+                      <button
+                        disabled={action.busy || i === 0}
+                        title="Try it before the one above, for the whole pool"
+                        onClick={() => void action.run(() => pool.moveToken({ id: t.id, before: tokens[i - 1]!.id }))}
+                      >Up</button>
+                      <button
+                        disabled={action.busy || i === tokens.length - 1}
+                        title="Try it after the one below, for the whole pool"
+                        onClick={() => void action.run(() => pool.moveToken({ id: t.id, after: tokens[i + 1]!.id }))}
+                      >Down</button>
+                    </>
+                  )}
                   {t.status !== "ok" && (
                     <button
-                      disabled={enable.busy}
+                      disabled={action.busy}
                       title="Mark it usable again, for the whole pool"
-                      onClick={() => void enable.run(() => pool.enableToken({ id: t.id }))}
+                      onClick={() => void action.run(() => pool.enableToken({ id: t.id }))}
                     >Enable</button>
                   )}
                 </td>
@@ -201,7 +215,8 @@ function TokenSection({ pool }: { pool: PoolRef }) {
       <p class="muted">
         Claude Code OAuth tokens are added on a node with <code>meddle token add</code> and shared with the pool; turns use
         the first usable one in this order. Their values never pass through the dashboard: it shows only what is listed
-        here. Enable marks an exhausted or disabled token usable again for the whole pool.
+        here. Up and Down change the order (<code>meddle token move</code>), and Enable marks an exhausted or disabled
+        token usable again, both for the whole pool.
       </p>
     </>
   );

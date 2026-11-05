@@ -381,6 +381,8 @@ export const TokenMetaSchema = Type.Object({
   detail: Nullable(Type.String()),
   updatedAt: Type.String(),
   removed: Type.Boolean(),
+  /** Where the token sits in the order (ascending); absent from a node of a meddle before ranks. */
+  rank: Type.Optional(Type.Number()),
   expiresAt: Type.String(),
 });
 
@@ -495,6 +497,13 @@ export const PoolObject = remote("meddle.pool", {
          * (`no such token` when it is not an id at all).
          */
         enableToken: method(Type.Object({ id: Type.String() })),
+        /**
+         * Puts the token with full id `id` just before or just after the one with full id `before` or `after` (exactly
+         * one of them) and tells the pool; refuses `give one of before and after`, `no such token: <id>` for an id this
+         * node does not list or lists as removed (`no such token` when it is not an id at all), and
+         * `cannot move a token before or after itself`.
+         */
+        moveToken: method(Type.Object({ id: Type.String(), before: Type.Optional(Type.String()), after: Type.Optional(Type.String()) })),
         /** Sets a pool setting; refuses an invalid key, a reserved env name or an invalid value. */
         setSetting: method(Type.Object({ key: Type.String(), value: Type.String() })),
         /** Unsets a pool setting. */

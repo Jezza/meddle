@@ -9,8 +9,8 @@ import { ensureDataDirs, loadConfig, paths } from "../src/config";
 import { NodeObject, PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
 import {
-  TOKEN_ID, addToken, enableToken, listTokens, markToken, mergeTokens, migrateLegacyToken, pickToken, removeToken,
-  sweepTokenValues, tokenFile, tokenId, tokenValue, writeTokenValue, type TokenMeta,
+  TOKEN_ID, addToken, enableToken, listTokens, markToken, mergeTokens, migrateLegacyToken, moveToken, pickToken,
+  removeToken, sweepTokenValues, tokenFile, tokenId, tokenValue, writeTokenValue, type TokenMeta,
 } from "../src/token";
 import { linkClient, twoNodes, twoPoolNodes } from "./pool-helpers";
 
@@ -42,7 +42,7 @@ async function eventually(cond: () => boolean | Promise<boolean>, ms = 10_000): 
 function row(over: Partial<TokenMeta> & { id: string }): TokenMeta {
   return {
     label: "x", setAt: T1, setBy: A, status: "ok", until: null, detail: null, updatedAt: T1, removed: false,
-    expiresAt: "2027-10-02T00:00:00.000Z", ...over,
+    rank: Date.parse(T1), expiresAt: "2027-10-02T00:00:00.000Z", ...over,
   };
 }
 
@@ -57,7 +57,7 @@ test("tokenId is stable and addToken is idempotent on the value", async () => {
   const first = await addToken(cfg, db, "tok-a\n", { label: "work", setBy: A, now: T1 });
   expect(first).toEqual({
     id, label: "work", setAt: T1, setBy: A, status: "ok", until: null, detail: null, updatedAt: T1, removed: false,
-    expiresAt: "2027-10-02T00:00:00.000Z",
+    rank: Date.parse(T1), expiresAt: "2027-10-02T00:00:00.000Z",
   });
   expect(await tokenValue(cfg, id)).toBe("tok-a");
   expect((await stat(tokenFile(cfg, id))).mode & 0o777).toBe(0o600);
@@ -70,9 +70,9 @@ test("tokenId is stable and addToken is idempotent on the value", async () => {
   const renamed = await addToken(cfg, db, "tok-a", { label: "main", setBy: B, now: T3 });
   expect(renamed).toMatchObject({ id, label: "main", setAt: T1, setBy: A, updatedAt: T3 });
 
-  // A different value is a second token, ordered by when it was set.
-  const earlier = await addToken(cfg, db, "tok-b", { label: "spare", setBy: null, now: T0 });
-  expect(listTokens(db).map((t) => [t.id, t.label])).toEqual([[earlier.id, "spare"], [id, "main"]]);
+  // A different value is a second token, after the first.
+  const second = await addToken(cfg, db, "tok-b", { label: "spare", setBy: null, now: T0 });
+  expect(listTokens(db).map((t) => [t.id, t.label])).toEqual([[id, "main"], [second.id, "spare"]]);
   // Without a label, a token is named after its id.
   const unnamed = await addToken(cfg, db, "tok-c", { setBy: null, now: T4 });
   expect(unnamed.label).toBe(unnamed.id.slice(0, 8));
@@ -128,11 +128,11 @@ test("remove deletes the value file and keeps a removed row; add again revives i
   expect(await pickToken(cfg, db)).toMatchObject({ id: b.id });
   await expect(removeToken(cfg, db, "work")).rejects.toThrow("no such token: work");
 
-  // Added again: the same row, no longer removed, its value back.
+  // Added again: the same row, no longer removed, its value back, at the end of the list.
   const revived = await addToken(cfg, db, "tok-a", { setBy: B, now: T4 });
   expect(revived).toMatchObject({ id: a.id, label: "work", removed: false, setAt: T1, updatedAt: T4 });
   expect(await tokenValue(cfg, a.id)).toBe("tok-a");
-  expect(await pickToken(cfg, db)).toMatchObject({ id: a.id });
+  expect(await pickToken(cfg, db)).toMatchObject({ id: b.id });
 
   // Two tokens named the same are named by id instead; an id prefix names nothing.
   const c = await addToken(cfg, db, "tok-c", { label: "home", setBy: A });
@@ -141,7 +141,98 @@ test("remove deletes the value file and keeps a removed row; add again revives i
   await expect(removeToken(cfg, db, c.id.slice(0, 8))).rejects.toThrow(`no such token: ${c.id.slice(0, 8)}`);
   expect((await removeToken(cfg, db, c.id)).id).toBe(c.id);
   expect(existsSync(tokenFile(cfg, b.id))).toBe(true);
-  expect(listTokens(db).map((t) => t.id)).toEqual([a.id, b.id]);
+  expect(listTokens(db).map((t) => t.id)).toEqual([b.id, a.id]);
+});
+
+test("a removed token added again goes to the end of the list, keeping when it was set and its expiry", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T1 });
+  const b = await addToken(cfg, db, "tok-b", { label: "b", setBy: A, now: T2 });
+  await removeToken(cfg, db, "a", T3);
+  const revived = await addToken(cfg, db, "tok-a", { setBy: B, now: T4 });
+  expect(revived).toMatchObject({ id: a.id, setAt: T1, expiresAt: a.expiresAt });
+  expect(listTokens(db).map((t) => t.label)).toEqual(["b", "a"]);
+  expect(await pickToken(cfg, db)).toMatchObject({ id: b.id });
+  // Renaming a listed token leaves it where it is.
+  await addToken(cfg, db, "tok-b", { label: "b2", setBy: B, now: "2026-10-06T00:00:00.000Z" });
+  expect(listTokens(db).map((t) => t.label)).toEqual(["b2", "a"]);
+});
+
+test("a new token goes to the end of the list even when this clock is behind the last token's", async () => {
+  const { cfg, db } = await node();
+  await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T2 });
+  const b = await addToken(cfg, db, "tok-b", { label: "b", setBy: A, now: T1 });
+  expect(b.setAt).toBe(T1);
+  expect(listTokens(db).map((t) => t.label)).toEqual(["a", "b"]);
+});
+
+test("moveToken puts a token before or after another, writing only the moved row", async () => {
+  const { cfg, db } = await node();
+  await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T0 });
+  await addToken(cfg, db, "tok-b", { label: "b", setBy: A, now: T1 });
+  await addToken(cfg, db, "tok-c", { label: "c", setBy: A, now: T2 });
+  const labels = () => listTokens(db).map((t) => t.label);
+  const others = (moved: string) => JSON.stringify(listTokens(db).filter((t) => t.label !== moved));
+
+  let before = others("c");
+  const moved = moveToken(db, "c", { before: "a" }, T3);
+  expect(moved).toMatchObject({ label: "c", updatedAt: T3, setAt: T2 });
+  expect(labels()).toEqual(["c", "a", "b"]);
+  expect(others("c")).toBe(before);
+
+  before = others("c");
+  moveToken(db, "c", { after: "b" }, T4);
+  expect(labels()).toEqual(["a", "b", "c"]);
+  expect(others("c")).toBe(before);
+
+  before = others("a");
+  moveToken(db, "a", { after: "b" });
+  expect(labels()).toEqual(["b", "a", "c"]);
+  expect(others("a")).toBe(before);
+
+  moveToken(db, "c", { before: "a" });
+  expect(labels()).toEqual(["b", "c", "a"]);
+  // Already there: nothing is written.
+  const rows = JSON.stringify(listTokens(db));
+  expect(moveToken(db, "c", { before: "a" })).toMatchObject({ label: "c" });
+  expect(moveToken(db, "c", { after: "b" })).toMatchObject({ label: "c" });
+  expect(JSON.stringify(listTokens(db))).toBe(rows);
+  // A new token still goes to the end.
+  await addToken(cfg, db, "tok-d", { label: "d", setBy: A });
+  expect(labels()).toEqual(["b", "c", "a", "d"]);
+});
+
+test("moveToken refuses a token moved against itself, an unknown token and an ambiguous label", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T0 });
+  await addToken(cfg, db, "tok-b", { label: "dup", setBy: A, now: T1 });
+  await addToken(cfg, db, "tok-c", { label: "dup", setBy: A, now: T2 });
+  await addToken(cfg, db, "tok-d", { label: "gone", setBy: A, now: T3 });
+  await removeToken(cfg, db, "gone");
+  const rows = JSON.stringify(listTokens(db, { includeRemoved: true }));
+  expect(() => moveToken(db, "a", { before: a.id })).toThrow("cannot move a token before or after itself");
+  expect(() => moveToken(db, "nope", { before: "a" })).toThrow("no such token: nope");
+  expect(() => moveToken(db, "a", { after: "nope" })).toThrow("no such token: nope");
+  expect(() => moveToken(db, "a", { after: "gone" })).toThrow("no such token: gone");
+  expect(() => moveToken(db, "dup", { after: "a" })).toThrow("ambiguous token label: dup");
+  expect(() => moveToken(db, "a", { before: "dup" })).toThrow("ambiguous token label: dup");
+  expect(JSON.stringify(listTokens(db, { includeRemoved: true }))).toBe(rows);
+});
+
+test("moves that run out of room between two tokens renumber the list, keeping its order", async () => {
+  const { cfg, db } = await node();
+  await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T0 });
+  await addToken(cfg, db, "tok-b", { label: "b", setBy: A, now: "2026-10-01T00:00:00.001Z" });
+  await addToken(cfg, db, "tok-c", { label: "c", setBy: A, now: "2026-10-01T00:00:00.002Z" });
+  // Each move halves the gap after a: without renumbering, two ranks would soon be equal.
+  for (let i = 0; i < 100; i++) {
+    moveToken(db, "c", { before: "b" });
+    expect(listTokens(db).map((t) => t.label)).toEqual(["a", "c", "b"]);
+    moveToken(db, "b", { before: "c" });
+    expect(listTokens(db).map((t) => t.label)).toEqual(["a", "b", "c"]);
+  }
+  const ranks = listTokens(db).map((t) => t.rank);
+  expect(new Set(ranks).size).toBe(3);
 });
 
 test("an empty value file is no value: mergeTokens names it missing, and writeTokenValue replaces it", async () => {
@@ -209,6 +300,32 @@ test("mergeTokens is last writer wins per id, names missing values, and rejects 
   expect(await readFile(canary, "utf8")).toBe("key");
 });
 
+test("mergeTokens orders a row without a rank (an older node's) by when it was set, takes a newer row's rank, and rejects a bad rank", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T1 });
+  const b = await addToken(cfg, db, "tok-b", { label: "b", setBy: A, now: T2 });
+
+  // An older node's row has no rank: it sorts by when it was set.
+  const { rank: _, ...old } = row({ id: tokenId("tok-o"), label: "o", setAt: T0, updatedAt: T0 });
+  expect(mergeTokens(cfg, db, [old as TokenMeta]).rejected).toEqual([]);
+  expect(listTokens(db).map((t) => t.label)).toEqual(["o", "a", "b"]);
+  expect(listTokens(db)[0]!.rank).toBe(Date.parse(T0));
+
+  // A peer moved b first: its newer row's rank is taken.
+  expect(mergeTokens(cfg, db, [row({ ...b, rank: Date.parse(T0) - 1000, updatedAt: T3 })]).changed).toBe(true);
+  expect(listTokens(db).map((t) => t.label)).toEqual(["b", "o", "a"]);
+
+  // A rank that is not a finite number is dropped.
+  const bad = [
+    row({ ...a, rank: Number.NaN, updatedAt: T4 }),
+    row({ ...a, rank: Number.POSITIVE_INFINITY, updatedAt: T4 }),
+    row({ ...a, rank: "1" as unknown as number, updatedAt: T4 }),
+    row({ ...a, rank: null as unknown as number, updatedAt: T4 }),
+  ];
+  expect(mergeTokens(cfg, db, bad)).toMatchObject({ changed: false, rejected: [a.id, a.id, a.id, a.id] });
+  expect(listTokens(db).map((t) => t.label)).toEqual(["b", "o", "a"]);
+});
+
 test("tokenFile refuses an invalid id", async () => {
   const { cfg } = await node();
   const id = tokenId("tok-a");
@@ -229,7 +346,7 @@ test("migrateLegacyToken imports the single token once as default, and no copy o
   const id = tokenId("tok-legacy");
   expect(listTokens(db)).toEqual([{
     id, label: "default", setAt: T1, setBy: A, status: "ok", until: null, detail: null, updatedAt: T1, removed: false,
-    expiresAt: "2027-10-02T00:00:00.000Z",
+    rank: Date.parse(T1), expiresAt: "2027-10-02T00:00:00.000Z",
   }]);
   expect(await tokenValue(cfg, id)).toBe("tok-legacy");
   expect(existsSync(legacy)).toBe(false);

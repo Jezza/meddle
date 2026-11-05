@@ -5,7 +5,7 @@ import Type from "typebox";
 import { forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
 import { NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema, TokenMetaSchema } from "../state/contracts";
-import { TOKEN_ID, enableToken, listTokens, pickToken, tokenRow, tokenValue } from "../token";
+import { TOKEN_ID, enableToken, listTokens, moveToken, pickToken, tokenRow, tokenValue, type TokenMeta } from "../token";
 import { isNodeId } from "./identity";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore, WireRosterRow } from "./store";
@@ -93,6 +93,16 @@ function mixed(rows: readonly WireRosterRow[], selfId: string, live: Live): bool
     .map((r) => (r.nodeId === selfId ? live.summary : r.summary))
     .filter((s) => s !== null);
   return new Set(summaries.map((s) => s.version)).size > 1 || new Set(summaries.map((s) => s.claudeCodeVersion)).size > 1;
+}
+
+/**
+ * The token the dashboard names by `id`: only a full id the table lists, not removed (a label is the CLI's convenience;
+ * the dashboard always has the id). Throws `no such token: <id>`, echoing the text sent only when it has an id's shape.
+ */
+function listedToken(db: Database, id: string): TokenMeta {
+  const row = TOKEN_ID.test(id) ? tokenRow(db, id) : null;
+  if (row === null || row.removed) throw new Error(TOKEN_ID.test(id) ? `no such token: ${id}` : "no such token");
+  return row;
 }
 
 /** Serves PoolObject on `host`: the `peer` variant to `peer:` principals, `default` to everyone else. */
@@ -190,11 +200,14 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       allow: ({ nodeId }) => deps.allow(nodeId),
       tokenChanged: () => deps.tokenChanged(),
       enableToken: async ({ id }) => {
-        // Only a full id the table lists (a label is the CLI's convenience; the dashboard always has the id).
-        const row = TOKEN_ID.test(id) ? tokenRow(db, id) : null;
-        // The text the caller sent is echoed only when it has an id's shape.
-        if (row === null || row.removed) throw new Error(TOKEN_ID.test(id) ? `no such token: ${id}` : "no such token");
-        enableToken(db, row.id);
+        enableToken(db, listedToken(db, id).id);
+        await deps.tokenChanged();
+      },
+      moveToken: async ({ id, before, after }) => {
+        if ((before === undefined) === (after === undefined)) throw new Error("give one of before and after");
+        const moving = listedToken(db, id).id;
+        const anchor = listedToken(db, (before ?? after)!).id;
+        moveToken(db, moving, before !== undefined ? { before: anchor } : { after: anchor });
         await deps.tokenChanged();
       },
       setSetting: ({ key, value }) => deps.setSetting(key, value),

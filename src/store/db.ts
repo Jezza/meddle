@@ -102,6 +102,8 @@ const ADDED_COLUMNS = [
   // as that member saw it (JSON): how a node that moved is found again, and when it was last heard of.
   { table: "roster", column: "reached_at", type: "TEXT" },
   { table: "roster", column: "reached_addr", type: "TEXT" },
+  // Where a token sits in the order turns try them (src/token.ts); NULL for a row from before it: sorted by set_at.
+  { table: "tokens", column: "rank", type: "REAL" },
 ];
 
 export function openDb(path: string): Database {

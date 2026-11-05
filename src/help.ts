@@ -112,7 +112,8 @@ const GROUPS: Group[] = [
         details:
           "Never takes the token as an argument: paste it and end with Ctrl-D, or give --file. --label names it (else the " +
           "first 8 characters of its id); adding the same token again with a label renames it. Tokens are shared with the " +
-          "pool, and a turn uses the first usable one in the order they were added. `token set` is the same command. " +
+          "pool, and a turn uses the first usable one in order: a new token goes last, as does a removed one added " +
+          "again; `token move` changes the order. `token set` is the same command. " +
           "Works with or without the node running. Prints `token <id> (<label>)`.",
       },
       {
@@ -134,6 +135,15 @@ const GROUPS: Group[] = [
         usage: ["token enable <id|label>"],
         summary: "Make an exhausted or disabled token usable again.",
         details: "Takes a full id or a label. The dashboard's Enable button does the same.",
+      },
+      {
+        name: "token move",
+        usage: ["token move <id|label> --before <id|label>", "token move <id|label> --after <id|label>"],
+        summary: "Put a token just before or just after another in the order turns try them, across the pool.",
+        details:
+          "Takes full ids or labels. A turn uses the first usable token in order, so `token move a --before b` makes a " +
+          "turn try a first. Works with or without the node running; the dashboard's Up and Down buttons do the same. " +
+          "Prints `moved <id> (<label>) before|after <id> (<label>)`.",
       },
     ],
   },
