@@ -1,6 +1,6 @@
 // test/help.test.ts — `meddle help`, `--help` and `<command> --help`: what each command does, coloured on a terminal.
 import { test, expect } from "bun:test";
-import { helpRequest, wantsColour } from "../src/help";
+import { helpRequest, usageFor, wantsColour } from "../src/help";
 import { closedPort, meddle } from "./helpers";
 
 const ESC = "\x1b[";
@@ -47,6 +47,25 @@ test("help for no such command says so on stderr and exits 2; a usage error poin
   const usage = await meddle(["frob"], await env());
   expect(usage.code).toBe(2);
   expect(usage.stderr).toContain("meddle help [<command>] says what each command does.");
+});
+
+test("a usage error under a known command lists only that command's forms; under none, every command", async () => {
+  const group = await meddle(["token"], await env());
+  expect(group.code).toBe(2);
+  expect(group.stderr).toStartWith("usage: meddle token add [--file <path>] [--label <l>]\n");
+  expect(group.stderr).toContain("       meddle token enable <id|label>\n");
+  expect(group.stderr).toContain("meddle help token says more.");
+  expect(group.stderr).not.toContain("meddle pool");
+  expect(group.stderr).not.toContain("meddle task");
+
+  // An unknown subcommand falls back to its group; a known one with bad arguments narrows to its own forms.
+  expect(usageFor(["token", "frob"])).toBe(usageFor(["token"]));
+  expect(usageFor(["task", "move", "x"])).toBe(
+    "usage: meddle task move <id> <node> [--now]\n       meddle task move <id> --now\n       meddle task move <id> --cancel\n\nmeddle help task move says more.",
+  );
+  expect(usageFor(["service"])).toStartWith("usage: meddle service install [--dry-run]\n\n");
+  expect(usageFor(["frob"])).toBeNull();
+  expect(usageFor([])).toBeNull();
 });
 
 test("help is coloured on a terminal or with FORCE_COLOR, plain otherwise or with NO_COLOR", async () => {

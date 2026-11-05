@@ -36,7 +36,7 @@ import {
 } from "./token";
 import { ensureClaude } from "./claude-code";
 import { embedded } from "./embedded";
-import { helpRequest } from "./help";
+import { helpRequest, usageFor } from "./help";
 import { highlightId, palette, table, wantsColour } from "./ansi";
 import { claudeCodeVersion, VERSION } from "./version";
 
@@ -1125,7 +1125,7 @@ if (help !== null) {
 }
 const run = dispatch(process.argv.slice(2));
 if (run === null) {
-  console.error(USAGE);
+  console.error(usageFor(process.argv.slice(2)) ?? USAGE);
   process.exit(2);
 }
 try {

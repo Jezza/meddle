@@ -440,6 +440,27 @@ export function helpRequest(args: string[], colour = false): { text: string; fou
   return notFound(words, paint);
 }
 
+/**
+ * The usage forms for a command line that named no command, narrowed to the longest run of its leading words (at most
+ * two) that some form starts with: `token frob` gives every `token` form, `task move x` the `task move` forms. Null
+ * when no form starts with its first word, or with no words at all.
+ */
+export function usageFor(args: string[]): string | null {
+  const forms = COMMANDS.flatMap((c) => c.usage);
+  for (let n = Math.min(args.length, 2); n > 0; n--) {
+    const topic = args.slice(0, n).join(" ");
+    const matching = forms.filter((u) => {
+      const lead = leadingWords(u);
+      return lead === topic || lead.startsWith(`${topic} `);
+    });
+    if (matching.length > 0) {
+      const lines = matching.map((u, i) => `${i === 0 ? "usage:" : "      "} meddle ${u}`);
+      return [...lines, "", `meddle help ${topic} says more.`].join("\n");
+    }
+  }
+  return null;
+}
+
 function notFound(words: string[], paint: Paint): { text: string; found: false } {
   return { text: `meddle: no such command: ${words.join(" ")}\n\n${overview(paint)}`, found: false };
 }
