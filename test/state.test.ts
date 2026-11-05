@@ -175,6 +175,32 @@ test("a session keeps stream deltas out of its window and in live until the next
   }
 });
 
+test("a session's live says which block streams, a thinking block with no text and a tool call's name among them", async () => {
+  const { client, host, db, project, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { id } = (await node.createTask({ title: "t", projectIds: [project.id] })).manifest;
+    const start = (block: Record<string, unknown>) => ({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: block } });
+    appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "default", model: "m" });
+    appendEvent(db, id, start({ type: "thinking", thinking: "" }));
+    const session = await client.get(SessionObject, { taskId: id });
+    expect(session.live.value).toEqual({ text: "", thinking: "", block: "thinking" });
+
+    appendEvent(db, id, { type: "assistant", message: { content: [{ type: "thinking", thinking: "" }] } });
+    appendEvent(db, id, start({ type: "text", text: "" }));
+    appendEvent(db, id, { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Let me look." } } });
+    appendEvent(db, id, start({ type: "tool_use", id: "t1", name: "Bash", input: {} }));
+    session.release();
+    // the node's own reference is another principal's object, so it reads the log afresh
+    const again = await host.get(SessionObject, { taskId: id });
+    expect(again.live.value).toEqual({ text: "Let me look.", thinking: "", block: "tool_use", tool: "Bash" });
+    again.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
 test("a turn whose result is an error is notified as failed", async () => {
   const { client, project, close } = await connect(await errorResultFixture("error_max_turns"));
   try {

@@ -706,13 +706,20 @@ function foldTaskLog(log: TaskLog, events: EventRecord[]): TaskLog {
 
 const EMPTY_SESSION: SessionView = { lastSeq: 0, window: [], live: null };
 
+type StreamEvent = {
+  type?: string;
+  content_block?: { type?: unknown; name?: unknown };
+  delta?: { type?: string; text?: string; thinking?: string };
+};
+
 function isStreamEvent(e: EventRecord): boolean {
   return (e.message as Message).type === "stream_event";
 }
 
 /**
  * Appends events to the window (the newest `WINDOW_SIZE`, progress frames left out). A `stream_event`'s text or
- * thinking delta goes to `live` instead, which the next other event clears.
+ * thinking delta goes to `live` instead, and the start of a content block says which kind streams; the next other
+ * event clears it.
  */
 function foldSession(view: SessionView, events: EventRecord[]): SessionView {
   let window = view.window;
@@ -725,10 +732,16 @@ function foldSession(view: SessionView, events: EventRecord[]): SessionView {
       live = null;
       continue;
     }
-    const event = (e.message as { event?: { type?: string; delta?: { type?: string; text?: string; thinking?: string } } }).event;
+    const event = (e.message as { event?: StreamEvent }).event;
+    if (event?.type === "content_block_start" && typeof event.content_block?.type === "string") {
+      const { type, name } = event.content_block;
+      live = { text: live?.text ?? "", thinking: live?.thinking ?? "", block: type };
+      if (typeof name === "string") live.tool = name;
+      continue;
+    }
     const delta = event?.type === "content_block_delta" ? event.delta : undefined;
-    if (delta?.type === "text_delta") live = { text: (live?.text ?? "") + (delta.text ?? ""), thinking: live?.thinking ?? "" };
-    else if (delta?.type === "thinking_delta") live = { text: live?.text ?? "", thinking: (live?.thinking ?? "") + (delta.thinking ?? "") };
+    if (delta?.type === "text_delta") live = { ...live, text: (live?.text ?? "") + (delta.text ?? ""), thinking: live?.thinking ?? "" };
+    else if (delta?.type === "thinking_delta") live = { ...live, text: live?.text ?? "", thinking: (live?.thinking ?? "") + (delta.thinking ?? "") };
   }
   if (added.length > 0) window = [...window, ...added].slice(-WINDOW_SIZE);
   return { lastSeq: events.at(-1)?.seq ?? view.lastSeq, window, live };

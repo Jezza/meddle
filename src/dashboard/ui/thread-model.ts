@@ -1,5 +1,5 @@
 // The thread a task's event log renders as: pure, so it is tested without a DOM or a link.
-import { isProgress } from "../../state/contracts";
+import { isProgress, type Live } from "../../state/contracts";
 
 export type ThreadItem =
   | { kind: "user"; text: string }
@@ -292,8 +292,90 @@ export function toolSummary(input: unknown, max = 120): string {
   return "";
 }
 
-/** A run of calls in one line: the first two named with their summary, then how many more. */
-export function toolsLine(tools: readonly ToolItem[]): { named: Array<{ name: string; summary: string }>; more: number } {
-  const named = tools.slice(0, 2).map((t) => ({ name: t.name, summary: toolSummary(t.input, 60) }));
-  return { named, more: tools.length - named.length };
+/** How a run names each kind of call: by what it does, present while one runs, and what it counts. */
+const KINDS: Array<{ tools: string[]; doing: string; did: string; one: string; many: string; label?: string }> = [
+  { tools: ["Bash", "BashOutput"], doing: "Running", did: "Ran", one: "command", many: "commands" },
+  { tools: ["Read", "NotebookRead"], doing: "Reading", did: "Read", one: "file", many: "files" },
+  { tools: ["Grep", "Glob"], doing: "Searching for", did: "Searched for", one: "pattern", many: "patterns" },
+  { tools: ["Edit", "MultiEdit", "NotebookEdit"], doing: "Editing", did: "Edited", one: "file", many: "files" },
+  { tools: ["Write"], doing: "Writing", did: "Wrote", one: "file", many: "files" },
+  { tools: ["WebFetch"], doing: "Fetching", did: "Fetched", one: "page", many: "pages" },
+  { tools: ["WebSearch"], doing: "Searching the web for", did: "Searched the web for", one: "query", many: "queries" },
+  { tools: ["Agent", "Task"], doing: "Running", did: "Ran", one: "agent", many: "agents", label: "agent: " },
+];
+
+/**
+ * A run of steps in one line that keeps its shape as calls come in: a lone call says what it did ("Ran cargo
+ * check"), more count by kind ("Read 2 files, searched for 1 pattern"), each kind in the present while one of its
+ * calls runs. Thinking is not counted; a run of only thinking says nothing.
+ */
+export function stepsLine(steps: readonly Step[]): { text: string; running: boolean; failed: number } {
+  const tools = steps.filter((s): s is ToolItem => s.kind === "tool");
+  const events = steps.filter((s) => s.kind === "unknown").length;
+  const running = tools.some((t) => t.result === undefined);
+  const failed = tools.filter((t) => t.result?.isError === true).length;
+  const groups = new Map<string, ToolItem[]>();
+  for (const t of tools) {
+    const key = KINDS.findIndex((k) => k.tools.includes(t.name));
+    const id = key >= 0 ? String(key) : `tool:${t.name}`;
+    groups.set(id, [...(groups.get(id) ?? []), t]);
+  }
+  const parts: string[] = [];
+  for (const [id, calls] of groups) {
+    const busy = calls.some((t) => t.result === undefined);
+    const kind = id.startsWith("tool:") ? undefined : KINDS[Number(id)]!;
+    if (kind === undefined) {
+      const verb = busy ? "calling" : "called";
+      parts.push(calls.length === 1 ? `${verb} ${calls[0]!.name}` : `${verb} ${calls[0]!.name} ${calls.length} times`);
+      continue;
+    }
+    const verb = (busy ? kind.doing : kind.did).toLowerCase();
+    const summary = tools.length === 1 ? toolSummary(calls[0]!.input, 100) : "";
+    parts.push(summary !== "" ? `${verb} ${kind.label ?? ""}${summary}` : `${verb} ${calls.length} ${calls.length === 1 ? kind.one : kind.many}`);
+  }
+  if (events > 0) parts.push(`${events} event${events === 1 ? "" : "s"}`);
+  const text = parts.join(", ");
+  return { text: (text.charAt(0).toUpperCase() + text.slice(1)) + (running ? "…" : ""), running, failed };
+}
+
+/**
+ * What a running turn is doing, for the line under it: the content block streaming (a thinking block says so even
+ * when the API leaves its text out), else the call still waiting on its result (into a subagent's own calls).
+ */
+export function activity(live: Live, items: readonly ThreadItem[]): string {
+  if (live !== null) {
+    if (live.block === "tool_use" || live.block === "server_tool_use") {
+      return live.tool !== undefined ? `Writing a ${live.tool} call` : "Writing a tool call";
+    }
+    if (live.block === "thinking" || live.block === "redacted_thinking") return "Thinking";
+    if (live.block === "text" || live.text !== "") return "Writing";
+    return "Thinking";
+  }
+  const names: string[] = [];
+  for (let list = items; ;) {
+    const tool = list.findLast((i): i is ToolItem => i.kind === "tool" && i.result === undefined);
+    if (tool === undefined) break;
+    names.push(tool.name);
+    list = tool.children;
+  }
+  return names.length > 0 ? `Running ${names.join(" › ")}` : "Working";
+}
+
+/** Seconds as the activity line says them: `12s`, `3m 4s`. */
+export function duration(seconds: number): string {
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+/**
+ * The activity line for what a turn is doing (`activity`), `phase` seconds into it and `quiet` seconds since
+ * anything last streamed or landed. Thinking says so longer as it runs on, and is never stalled (its text may not
+ * stream at all), nor is a running call; anything else stalls from 10 s of quiet, fully at 20 s (`stall` 0 to 1).
+ */
+export function activityLine(doing: string, phase: number, quiet: number): { text: string; stall: number } {
+  if (doing === "Thinking") {
+    const text = phase < 10 ? "Thinking" : phase < 20 ? "Still thinking" : phase < 30 ? "Thinking more" : phase < 45 ? "Thinking some more" : "Deep in thought";
+    return { text, stall: 0 };
+  }
+  if (doing.startsWith("Running ")) return { text: doing, stall: 0 };
+  return { text: doing, stall: Math.min(1, Math.max(0, (quiet - 10) / 10)) };
 }

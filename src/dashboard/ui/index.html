@@ -180,18 +180,30 @@
   .thinking summary { cursor: pointer; }
   .thinking-text { white-space: pre-wrap; padding: 4px 0 4px 12px; border-left: 2px solid var(--line); }
   .live .md { opacity: 0.9; }
+  /* --stall (0 to 1, set by the page) blends the line from muted to red as a turn that should be streaming stays quiet. */
+  .working { --stall: 0; display: flex; gap: 6px; align-items: center; height: 1.5em; font-size: 12.5px; white-space: nowrap; overflow: hidden;
+    color: color-mix(in srgb, var(--bad) calc(var(--stall) * 100%), var(--muted)); transition: color 1s linear; }
+  .working .elapsed { color: var(--faint); font-variant-numeric: tabular-nums; }
+  .working .quiet { font-variant-numeric: tabular-nums; }
+  .dots { display: inline-flex; gap: 4px; align-items: center; margin-right: 2px; }
+  .dots i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: working 1.2s ease-in-out infinite; }
+  .dots i:nth-child(2) { animation-delay: 0.15s; }
+  .dots i:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes working { 0%, 60%, 100% { opacity: 0.25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+  @media (prefers-reduced-motion: reduce) { .dots i { animation-duration: 2.4s; transform: none !important; } }
   .tools { margin: 4px 0 10px; color: var(--muted); font-size: 12.5px; }
-  .tools > summary:hover, .tools.single > .tool > summary:hover { color: var(--fg-soft); }
-  .tools > summary { cursor: pointer; list-style: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .tools > summary::-webkit-details-marker, .tools.single > .tool > summary::-webkit-details-marker { display: none; }
-  .tools > summary::before { content: "▸ "; }
-  .tools[open] > summary::before { content: "▾ "; }
+  .tools > summary:hover, .tool > summary:hover { color: var(--fg-soft); }
+  .tools > summary, .tool > summary { list-style: none; }
+  .tools > summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tools > summary::-webkit-details-marker, .tool > summary::-webkit-details-marker { display: none; }
   .tools summary b { color: var(--fg-soft); font-weight: 500; margin-right: 3px; }
-  .tools.single > .tool { margin: 0; }
-  .tools.single > .tool > summary { list-style: none; }
-  .tools.single > .tool > summary::before { content: "▸ "; }
-  .tools.single > .tool[open] > summary::before { content: "▾ "; }
-  .tools.single > .tool > summary b { color: var(--fg-soft); font-weight: 500; margin-right: 3px; }
+  /* A call's state: blinking while it runs, then green or red. */
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin: 0 7px 1px 1px; vertical-align: middle; background: var(--faint); }
+  .dot.running { background: var(--muted); animation: blink 1.2s ease-in-out infinite; }
+  .dot.ok { background: var(--ok); }
+  .dot.error { background: var(--bad); }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+  @media (prefers-reduced-motion: reduce) { .dot.running { animation-duration: 2.4s; } }
   .tool-list { margin: 6px 0 4px 4px; padding-left: 10px; border-left: 2px solid var(--line); }
   .tool-list .thinking { margin: 4px 0; }
   .tool-note { margin: 4px 0 0; font-size: 12px; }

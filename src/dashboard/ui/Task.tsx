@@ -4,14 +4,14 @@ import type { EffortLevel, PermissionMode } from "@anthropic-ai/claude-agent-sdk
 import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import { NodeObject, SessionObject, TaskObject } from "../../state/contracts";
+import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
 import { type Anchor, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { usageShort } from "./sidebar-model";
-import { buildThread, foldSteps, toolsLine, toolSummary, type ShownItem, type Step, type ThreadItem } from "./thread-model";
+import { activity, activityLine, buildThread, duration, foldSteps, stepsLine, toolSummary, type ShownItem, type Step, type ThreadItem } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
 type TaskRef = Ref<typeof TaskObject>;
@@ -87,7 +87,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
       {state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
       ) : (
-        <Thread session={session} readOnly={archived} after={pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)} />
+        <Thread session={session} readOnly={archived} working={state === "running"} after={pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)} />
       )}
       {!archived && state !== "moved" && <Composer task={task} running={live} disabled={moving} />}
       <BottomBar task={task} pool={pool} node={node} nodeId={nodeId} archived={archived} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} moving={moving} />
@@ -197,7 +197,7 @@ function blocksOf(items: readonly ShownItem[]): Block[] {
   return out;
 }
 
-function Thread({ session, readOnly, after }: { session: SessionRef; readOnly: boolean; after: preact.ComponentChildren }) {
+function Thread({ session, readOnly, working, after }: { session: SessionRef; readOnly: boolean; working: boolean; after: preact.ComponentChildren }) {
   const window = useValue(session.window);
   const live = useValue(session.live);
   /** Every event seen since the view opened: the window slides past events, and "load earlier" adds older ones. */
@@ -207,7 +207,8 @@ function Thread({ session, readOnly, after }: { session: SessionRef; readOnly: b
   useEffect(() => setSeen((prev) => merged(prev, window)), [window]);
 
   const events = useMemo(() => [...merged(seen, window).values()].sort((a, b) => a.seq - b.seq), [seen, window]);
-  const blocks = useMemo(() => blocksOf(foldSteps(buildThread(events))), [events]);
+  const items = useMemo(() => buildThread(events), [events]);
+  const blocks = useMemo(() => blocksOf(foldSteps(items)), [items]);
   const oldest = events[0]?.seq;
 
   // Kept at the bottom while you are there; left alone while you read further up.
@@ -227,6 +228,11 @@ function Thread({ session, readOnly, after }: { session: SessionRef; readOnly: b
   });
 
   const lastClaude = blocks.at(-1)?.who === "claude";
+  // Kept for the whole running turn, not only while text streams, so it does not blink out between steps.
+  const tail = live !== null || working;
+  const doing = activity(live, items);
+  /** Changes whenever anything streams or lands, so the activity line can tell a quiet turn from a busy one. */
+  const pulse = `${events.at(-1)?.seq ?? 0}:${live?.text.length ?? -1}:${live?.thinking.length ?? -1}:${live?.block ?? ""}`;
   return (
     <div class="thread-scroll" ref={scroller}
       onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
@@ -235,13 +241,13 @@ function Thread({ session, readOnly, after }: { session: SessionRef; readOnly: b
           <button class="earlier" disabled={action.busy} onClick={loadEarlier}>Load earlier</button>
         )}
         {action.error !== null && <p class="error">{action.error}</p>}
-        {blocks.length === 0 && live === null && <p class="muted empty">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
+        {blocks.length === 0 && !tail && <p class="muted empty">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
         {blocks.map((b, i) => (
           <BlockView key={i} block={b}>
-            {i === blocks.length - 1 && live !== null && <Live live={live} />}
+            {i === blocks.length - 1 && lastClaude && tail && <Live live={live} doing={doing} pulse={pulse} />}
           </BlockView>
         ))}
-        {live !== null && !lastClaude && <BlockView block={{ who: "claude", items: [] }}><Live live={live} /></BlockView>}
+        {tail && !lastClaude && <BlockView block={{ who: "claude", items: [] }}><Live live={live} doing={doing} pulse={pulse} /></BlockView>}
         {after}
       </div>
     </div>
@@ -270,13 +276,47 @@ function BlockView({ block, children }: { block: Block; children?: preact.Compon
   );
 }
 
-function Live({ live }: { live: { text: string; thinking: string } }) {
+/**
+ * The running turn's tail: the text streaming, laid out as it will land, then one line saying what the turn is doing
+ * and for how long. The line stays last and one line high, so landed items take the streamed text's place without
+ * the thread shifting; streamed thinking is not shown, only that it is happening. A turn that should be streaming
+ * but has gone quiet (`activityLine`) turns the line red and says for how long.
+ */
+function Live({ live, doing, pulse }: { live: LiveState; doing: string; pulse: string }) {
+  useTick(1000);
+  const now = Date.now();
+  const phase = seconds(now - useSince(doing));
+  const quiet = seconds(now - useSince(pulse));
+  const line = activityLine(doing, phase, quiet);
   return (
     <div class="live">
-      {live.thinking !== "" && <details class="thinking" open><summary>thinking</summary><div class="thinking-text">{live.thinking}</div></details>}
-      {live.text !== "" ? <Markdown text={live.text} /> : live.thinking === "" && <span class="muted">…</span>}
+      {live !== null && live.text !== "" && <Markdown text={live.text} />}
+      <div class={line.stall > 0 ? "working stalled" : "working"} role="status" style={{ "--stall": String(line.stall) } as Record<string, string>}>
+        <span class="dots" aria-hidden="true"><i /><i /><i /></span>
+        {line.text}
+        {phase >= 1 && <span class="elapsed" aria-hidden="true">· {duration(phase)}</span>}
+        {line.stall > 0 && <span class="quiet">· no output for {duration(quiet)}</span>}
+      </div>
     </div>
   );
+}
+
+const seconds = (ms: number) => Math.max(0, Math.floor(ms / 1000));
+
+/** Renders again every `ms` while mounted. */
+function useTick(ms: number) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick((n) => n + 1), ms);
+    return () => clearInterval(timer);
+  }, [ms]);
+}
+
+/** When `key` last changed (or the component mounted). */
+function useSince(key: string): number {
+  const last = useRef<{ key: string; at: number } | null>(null);
+  if (last.current === null || last.current.key !== key) last.current = { key, at: Date.now() };
+  return last.current.at;
 }
 
 function Markdown({ text }: { text: string }) {
@@ -290,13 +330,11 @@ function ShownView({ item }: { item: ShownItem }) {
       return <div class="user-text">{item.text}</div>;
     case "assistant":
       return (
-        <>
-          {item.thinking !== undefined && <Thinking text={item.thinking} />}
-          {item.text !== "" && <Markdown text={item.text} />}
-        </>
+        // Finished thinking is not shown in the thread; a run of steps keeps what thinking stood alone.
+        item.text !== "" && <Markdown text={item.text} />
       );
     case "steps":
-      return <Steps steps={item.steps} tools={item.tools} />;
+      return <Steps steps={item.steps} />;
     case "question":
       return (
         <div class="asked">
@@ -333,30 +371,29 @@ function StepView({ step }: { step: Step }) {
 }
 
 /**
- * What Claude did between its prose, as one line naming the tool calls; open while one of them still runs. A lone
- * call or a lone thinking is its own line.
+ * What Claude did between its prose, as one row from its first call on: a state dot and a line saying what the calls
+ * did (`stepsLine`), closed until you open it. Calls coming in and finishing only change that line, so the thread
+ * does not shift; a run of only thinking shows nothing.
  */
-function Steps({ steps, tools }: { steps: Step[]; tools: ToolItem[] }) {
-  const only = steps.length === 1 ? steps[0]! : undefined;
-  if (only?.kind === "tool") return <div class="tools single"><Tool tool={only} /></div>;
-  if (only?.kind === "assistant") return <Thinking text={only.thinking ?? ""} />;
-  const running = tools.some((t) => t.result === undefined);
-  const failed = tools.filter((t) => t.result?.isError === true).length;
-  const others = steps.filter((s) => s.kind === "unknown").length;
-  const { named, more } = toolsLine(tools);
+function Steps({ steps }: { steps: Step[] }) {
+  const line = stepsLine(steps);
+  if (line.text === "") return null;
   return (
-    <details class="tools" open={running}>
+    <details class="tools">
       <summary>
-        {named.map((n, i) => <span key={i}>{i > 0 && " · "}<b>{n.name}</b> {n.summary}</span>)}
-        {more > 0 && <span> · {more} more</span>}
-        {tools.length > 1 && <span class="muted"> · {tools.length} calls</span>}
-        {tools.length === 0 && (others === 0 ? "thinking" : `${others} event${others === 1 ? "" : "s"}`)}
-        {running && <span class="muted"> · running…</span>}
-        {failed > 0 && <span class="error"> · {failed} failed</span>}
+        <Dot state={line.running ? "running" : line.failed > 0 ? "error" : "ok"} />
+        {line.text}
+        {line.failed > 0 && <span class="error"> · {line.failed} failed</span>}
       </summary>
       <div class="tool-list">{steps.map((s, i) => <StepView key={s.kind === "tool" ? s.toolUseId : i} step={s} />)}</div>
     </details>
   );
+}
+
+/** A call's state: blinking while it runs, then green, or red when it failed. */
+function Dot({ state }: { state: "running" | "ok" | "error" }) {
+  const label = state === "running" ? "running" : state === "ok" ? "done" : "failed";
+  return <span class={`dot ${state}`} role="img" aria-label={label} title={label} />;
 }
 
 function Tool({ tool }: { tool: ToolItem }) {
@@ -365,8 +402,8 @@ function Tool({ tool }: { tool: ToolItem }) {
   return (
     <details class="tool">
       <summary>
+        <Dot state={tool.result === undefined ? "running" : tool.result.isError ? "error" : "ok"} />
         <b>{tool.name}</b> <span class="muted">{toolSummary(tool.input)}</span>
-        {tool.result === undefined ? <span class="muted"> · running</span> : tool.result.isError && <span class="error"> · error</span>}
       </summary>
       {typeof input?.command === "string"
         ? <>{typeof input.description === "string" && <p class="tool-note muted">{input.description}</p>}<pre>{input.command}</pre></>

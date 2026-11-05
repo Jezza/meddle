@@ -276,6 +276,15 @@ export function isProgress(m: { type?: unknown; subtype?: unknown }): boolean {
   return PROGRESS_KINDS.includes(typeof m.subtype === "string" ? `${String(m.type)}:${m.subtype}` : String(m.type));
 }
 
+/** What streams in a running turn after the last event in its log; null when nothing is streaming. */
+const LiveSchema = Nullable(Type.Object({
+  text: Type.String(),
+  thinking: Type.String(),
+  block: Type.Optional(Type.String()),
+  tool: Type.Optional(Type.String()),
+}));
+export type Live = Type.Static<typeof LiveSchema>;
+
 export const SessionObject = remote("meddle.session", {
   version: 1,
   input: Type.Object({ taskId: Type.String() }),
@@ -287,8 +296,12 @@ export const SessionObject = remote("meddle.session", {
         window: Type.Array(EventSchema),
         /** The seq of the window's oldest event; 0 when it is empty. */
         fromSeq: Type.Number(),
-        /** Text and thinking streamed since the last event in the window. */
-        live: Nullable(Type.Object({ text: Type.String(), thinking: Type.String() })),
+        /**
+         * Text and thinking streamed since the last event in the window, and the kind of content block streaming
+         * (`thinking`, `text`, `tool_use`, …), with a tool call's name; a thinking block streams no text when the
+         * API leaves it out. Older nodes send no `block`.
+         */
+        live: LiveSchema,
       },
       methods: {
         /** The newest `limit` events (no progress frames) before `beforeSeq`, oldest first. */
@@ -316,7 +329,7 @@ export type TaskLog = Type.Static<typeof TaskLogSchema>;
 export const SessionViewSchema = Type.Object({
   lastSeq: Type.Number(),
   window: Type.Array(EventSchema),
-  live: Nullable(Type.Object({ text: Type.String(), thinking: Type.String() })),
+  live: LiveSchema,
 });
 export type SessionView = Type.Static<typeof SessionViewSchema>;
 
