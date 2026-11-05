@@ -130,7 +130,7 @@ test("PeerObject.createTask refuses a peer that is not a member, before creating
       activateTask: async () => ({ ok: false }),
       abandonTask: async () => {},
       create: async (input) => { created.push(input); throw new Error("not reached"); },
-      prompt: async () => { created.push("prompt"); },
+      prompt: async () => { created.push("prompt"); return "turn" as const; },
     },
   });
   const [down, up] = memoryLinkPair();

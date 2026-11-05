@@ -98,11 +98,11 @@ function moreTelling(a: TokenFault | null, b: TokenFault): TokenFault {
 }
 
 /**
- * The event meddle records for a prompt or steer it sends: Claude Code does not echo the user's text back, so the
- * log would otherwise hold none. It has no `uuid`, unlike the SDK's own messages.
+ * The event meddle records for a prompt or steer it sends, with the `uuid` it was sent with when it has one: Claude
+ * Code does not echo the user's text back, so the log would otherwise hold none.
  */
-export function promptEvent(text: string): SDKUserMessage {
-  return { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null };
+export function promptEvent(text: string, uuid?: string): SDKUserMessage {
+  return { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, ...(uuid !== undefined ? { uuid: uuid as SDKUserMessage["uuid"] } : {}) };
 }
 
 /**
@@ -114,7 +114,10 @@ export function resultError(m: { subtype?: unknown; is_error?: unknown }): strin
   return m.is_error === true ? "error" : null;
 }
 
-/** How long the child may outlive its `result` (stdin closed) before it is closed for it. */
+/**
+ * How long the child may outlive its `result` (stdin closed) before it is closed for it; and how long a `result` with
+ * steers Claude Code has not taken waits for it to take one before the turn ends without them.
+ */
 const EXIT_GRACE_MS = 5_000;
 
 export type RunTurnArgs = {
@@ -136,15 +139,21 @@ export type RunTurnArgs = {
 /**
  * Starts one Claude Code turn and returns its handle at once. `done` records every message, and
  * resolves with the `result` once the child has gone (so a later `resume` never races it).
+ *
+ * Texts pushed into `queue` while the turn runs steer it: each is logged (`promptEvent`, with its uuid) when Claude
+ * Code takes it, which it does into the running turn or, after that turn's `result`, as a turn of its own (an `init`,
+ * then its own `result`). That is still this turn: it ends at a `result` once no steer is left untaken. A steer Claude
+ * Code has not taken `EXIT_GRACE_MS` after a `result` stays untaken in `queue` when the turn ends, unlogged.
  */
 export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKResultMessage> } {
   const { input } = args;
   const taskId = input.manifest.id;
   const record = recorder(args);
   const queue = args.queue ?? new InputQueue();
-  queue.push(args.prompt);
+  const prompt = queue.push(args.prompt);
+  queue.take(prompt);
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
-  record(promptEvent(args.prompt));
+  record(promptEvent(args.prompt, prompt));
 
   const canUseTool: CanUseTool = (toolName, toolInput, options) => args.approvals.ask({
     requestId: options.requestId,
@@ -220,6 +229,13 @@ async function drive(
   let closed = false;
   let logged = false; // a turn_aborted or turn_failed is in the log
   const close = () => { if (!closed) { closed = true; q.close(); } };
+  /** Claude Code went on after the `result`: the turn ends with a later one. */
+  const goOn = () => {
+    if (result === undefined) return;
+    result = undefined;
+    clearTimeout(graceTimer);
+    graceOver = undefined;
+  };
 
   try {
     for (;;) {
@@ -241,11 +257,21 @@ async function drive(
       if (step === "grace") return result!;
       if (step.done) { ended = true; break; }
       const m = step.value;
+      // A steer is logged as Claude Code takes it, ahead of the message that says so.
+      for (const uuid of takenBy(m)) {
+        const text = queue.take(uuid);
+        if (text === null) continue;
+        record(promptEvent(text, uuid));
+        goOn();
+      }
       record(m);
       watch(m);
-      if (m.type === "result" && result === undefined) {
+      // A turn Claude Code starts after a `result` (a steer's own, should Claude Code not say it took the steer).
+      if (m.type === "system" && m.subtype === "init") goOn();
+      else if (m.type === "result" && result === undefined) {
         result = m;
-        queue.end();
+        // With every steer taken the input closes, so the child goes; an untaken one keeps it open for Claude Code.
+        if (queue.untaken().length === 0) queue.end();
         graceOver = new Promise((resolve) => { graceTimer = setTimeout(() => resolve("grace"), EXIT_GRACE_MS); });
       }
     }
@@ -264,6 +290,20 @@ async function drive(
     clearTimeout(graceTimer);
     queue.end();
   }
+}
+
+/**
+ * The uuids of the user messages `m` says Claude Code took: a `command_lifecycle` that started or completed one, and
+ * the `user_message_uuids` its turn's messages list.
+ */
+function takenBy(m: SDKMessage): string[] {
+  const frame = m as { type: string; state?: unknown; command_uuid?: unknown; user_message_uuids?: unknown };
+  const taken: string[] = [];
+  if (frame.type === "command_lifecycle" && (frame.state === "started" || frame.state === "completed") && typeof frame.command_uuid === "string") {
+    taken.push(frame.command_uuid);
+  }
+  if (Array.isArray(frame.user_message_uuids)) taken.push(...frame.user_message_uuids.filter((u): u is string => typeof u === "string"));
+  return taken;
 }
 
 function turnFailed(error: string): MeddleEvent {

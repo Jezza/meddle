@@ -1,11 +1,14 @@
 // Records a real Claude Code session's stream-json frames to test/fixtures/<name>.jsonl.
 // Usage: MEDDLE_LIVE=1 CLAUDE_CODE_OAUTH_TOKEN=... bun run test/fake-claude/record.ts <name> <prompt>
+// `steer-fold` and `steer-turn` send the prompt as a streaming input with a uuid, as meddle does, and steer the turn
+// with `STEER` (priority "next"): `steer-fold` a second into its first tool call (Claude Code folds the steer into the
+// running turn), `steer-turn` once its first text is out (the steer gets a turn of its own after the first `result`).
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transform, Writable } from "node:stream";
-import { query, type Options, type SpawnedProcess, type SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Options, type SDKUserMessage, type SpawnedProcess, type SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 
 type Entry =
   | { dir: "in" | "out"; t: number; line: string }
@@ -14,7 +17,10 @@ type Entry =
 
 const [name, prompt] = process.argv.slice(2);
 if (process.env.MEDDLE_LIVE !== "1") { console.error("record.ts: refusing to run without MEDDLE_LIVE=1"); process.exit(2); }
-if (!name || !prompt || !["hello", "approval"].includes(name)) { console.error("usage: record.ts hello|approval <prompt>"); process.exit(2); }
+if (!name || !prompt || !["hello", "approval", "steer-fold", "steer-turn"].includes(name)) { console.error("usage: record.ts hello|approval|steer-fold|steer-turn <prompt>"); process.exit(2); }
+const steering = name === "steer-fold" || name === "steer-turn";
+/** The steer of the `steer-*` recordings. */
+const STEER = "Also: end your reply with the word PINEAPPLE.";
 const token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
 if (!token) { console.error("record.ts: CLAUDE_CODE_OAUTH_TOKEN is not set"); process.exit(2); }
 
@@ -77,6 +83,8 @@ const options: Options = {
   spawnClaudeCodeProcess: spawnTeed,
   ...(name === "hello"
     ? { permissionMode: "auto", tools: [] }
+    : steering
+    ? { permissionMode: "default", tools: ["Bash"], canUseTool: async (_tool, input) => ({ behavior: "allow", updatedInput: input }) }
     : {
         permissionMode: "default", tools: ["Bash"],
         // echo is read-only and would be auto-allowed; an ask rule forces the can_use_tool request.
@@ -84,9 +92,41 @@ const options: Options = {
         canUseTool: async (_tool, input) => ({ behavior: "allow", updatedInput: input }) }),
 };
 
+/** A streaming input of uuid-stamped user messages, ended by `end`. */
+class Input implements AsyncIterable<SDKUserMessage> {
+  #items: SDKUserMessage[] = [];
+  #ended = false;
+  #wake = () => {};
+  push(text: string) {
+    this.#items.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, session_id: "", priority: "next", uuid: crypto.randomUUID() });
+    this.#wake();
+  }
+  end() { this.#ended = true; this.#wake(); }
+  async *[Symbol.asyncIterator]() {
+    for (;;) {
+      const next = this.#items.shift();
+      if (next !== undefined) { yield next; continue; }
+      if (this.#ended) return;
+      await new Promise<void>(r => { this.#wake = r; });
+    }
+  }
+}
+
 let resultSubtype = "none";
 try {
-  for await (const m of query({ prompt, options })) if (m.type === "result") resultSubtype = m.subtype;
+  const input = new Input();
+  if (steering) input.push(prompt);
+  let steered = false;
+  let results = 0;
+  const steer = () => { if (!steered) { steered = true; input.push(STEER); } };
+  for await (const m of query({ prompt: steering ? input : prompt, options })) {
+    if (m.type === "result") resultSubtype = m.subtype;
+    if (!steering) continue;
+    if (m.type === "assistant" && name === "steer-fold" && m.message.content.some(c => c.type === "tool_use")) setTimeout(steer, 1000);
+    if (m.type === "assistant" && name === "steer-turn" && m.message.content.some(c => c.type === "text")) steer();
+    // The steered session ends with the steer's result: the one turn's (fold), or the second turn's.
+    if (m.type === "result" && ++results === (name === "steer-fold" ? 1 : 2)) input.end();
+  }
   await Promise.race([childExited, new Promise(r => setTimeout(r, 10_000))]);
 } catch (err) {
   console.error(`record.ts: session failed: ${(err as Error).message.split("\n")[0]}`);

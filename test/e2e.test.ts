@@ -165,6 +165,31 @@ test("task prompt follows a turn its token reruns to the rerun's success, and fa
   }
 }, 60_000);
 
+test("task prompt to a busy task waits for the turn that takes its text, not the one running", async () => {
+  const { dir, env } = await home();
+  await writeFile(`${dir}/token`, "tok\n");
+  expect((await meddle(["token", "set", "--file", `${dir}/token`], env)).code).toBe(0);
+  // every turn takes a while to its result; hello's Claude Code never takes a steer, so the second text runs next
+  const node = await startServe({ ...env, MEDDLE_PORT: "0", MEDDLE_FIXTURE_RESULTS_MS: "4000" });
+  const client = { ...env, MEDDLE_PORT: String(node.port) };
+  try {
+    const projectId = (await meddle(["project", "add", `${dir}/repo`], client)).stdout.trim();
+    const taskId = taskIdOf(await meddle(["task", "new", "--title", "t", "--project", projectId], client));
+    const at = { first: 0, second: 0 };
+    const first = meddle(["task", "prompt", taskId, "first"], client).then((r) => { at.first = Date.now(); return r; });
+    await Bun.sleep(1_500); // well into the first turn, which takes 4 s to its result
+    const second = await meddle(["task", "prompt", taskId, "second"], client);
+    at.second = Date.now();
+    expect((await first).code).toBe(0);
+    expect(second.code).toBe(0);
+    expect(second.stderr).toEndWith("result/success\n");
+    // it followed its own turn, which takes another 4 s after the first one's result
+    expect(at.second - at.first).toBeGreaterThan(3_000);
+  } finally {
+    await node.stop();
+  }
+}, 60_000);
+
 test("task prompt fails fast when the turn fails", async () => {
   const { dir, env } = await home();
   await writeFile(`${dir}/token`, "tok\n");

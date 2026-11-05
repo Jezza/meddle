@@ -144,6 +144,30 @@ test("a client sees a pending approval, and approving it lets the turn finish", 
   }
 });
 
+test("a client sees what a busy task was sent and has not started on as queued", async () => {
+  // the turn stalls before its result, so Claude Code takes nothing sent meanwhile
+  const node0 = await startPoolNode("hello.jsonl", { MEDDLE_FIXTURE_STALL: "1" });
+  const { client, close: closeClient } = linkClient(node0.host);
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projectIds: [node0.project.id] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    const session = await client.get(SessionObject, { taskId: manifest.id });
+    expect(task.queued.value).toEqual([]);
+    await task.prompt({ text: "Reply with the single word ok." });
+    await until(session.window, (w) => w.some((e) => (e.message as { type?: string; subtype?: string }).subtype === "init"));
+    await task.prompt({ text: "Also say why." });
+    await task.prompt({ text: "And keep it short." });
+    expect((await until(task.queued, (q) => q.length === 2))).toEqual(["Also say why.", "And keep it short."]);
+    task.release();
+    session.release();
+    node.release();
+  } finally {
+    await closeClient();
+    await node0.close();
+  }
+});
+
 test("a session keeps stream deltas out of its window and in live until the next event", async () => {
   const { client, host, db, project, close } = await connect();
   try {

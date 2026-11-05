@@ -2,18 +2,21 @@
 // Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause before `result` until stdin ends or,
 // as Claude Code ends an interrupted turn, an `interrupt` arrives: then the `result` comes as `error_during_execution`
 // and the stand-in exits),
+// MEDDLE_FIXTURE_RESULTS_MS=<ms> (wait that long before every `result`: slow turns),
+// MEDDLE_FIXTURE_LATER_RESULTS_MS=<ms> (wait that long before each `result` after the first: a slow later turn),
 // MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`),
 // MEDDLE_FIXTURE_BY_TOKEN=<token>=<path>,<token>=<path> (the recording of the entry whose token is the
 // CLAUDE_CODE_OAUTH_TOKEN this run got; MEDDLE_FIXTURE when none is).
 // Any argv is accepted; only `--session-id` / `--resume` are read (see `transcribe`). Dependency-free so it
-// starts fast.
+// starts fast. The recording's user messages' uuids become those of the user messages this run is sent, in order,
+// wherever an `out` line names them (`command_lifecycle`, `user_message_uuids`).
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t: number } | { dir: "exit"; t: number; code: number | null };
-type Frame = { type: string; subtype?: string; message?: { content?: unknown }; request_id?: string; request?: { subtype?: string }; response?: { request_id?: string } };
+type Frame = { type: string; subtype?: string; uuid?: string; message?: { content?: unknown }; request_id?: string; request?: { subtype?: string }; response?: { request_id?: string } };
 type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
-type Step = { need: Need } | { emit: string; frame: Frame };
+type Step = { need: Need; uuid?: string } | { emit: string; frame: Frame };
 
 /** The recording for the token this run got, from MEDDLE_FIXTURE_BY_TOKEN, if it lists that token. */
 function fixtureForToken(): string | undefined {
@@ -28,6 +31,9 @@ const fixture = fixtureForToken() ?? process.env.MEDDLE_FIXTURE;
 if (!fixture) { process.stderr.write("replay.ts: MEDDLE_FIXTURE is not set\n"); process.exit(2); }
 const stall = process.env.MEDDLE_FIXTURE_STALL === "1";
 const memory = process.env.MEDDLE_FIXTURE_MEMORY === "1";
+const laterResultsMs = Number(process.env.MEDDLE_FIXTURE_LATER_RESULTS_MS ?? 0);
+const resultsMs = Number(process.env.MEDDLE_FIXTURE_RESULTS_MS ?? 0);
+let resultsEmitted = 0;
 const EOF_CAP_MS = 5_000;
 
 // Turn the recording into steps: wait for an `in` line, or emit an `out` line. Responses to the
@@ -51,7 +57,7 @@ for (const e of entries) {
   if (e.dir === "in") {
     if (f.type === "control_request") steps.push({ need: { kind: "host", subtype: f.request?.subtype ?? "" } });
     else if (f.type === "control_response") steps.push({ need: { kind: "response" } });
-    else if (f.type === "user") steps.push({ need: { kind: "user" } });
+    else if (f.type === "user") steps.push({ need: { kind: "user" }, ...(f.uuid !== undefined ? { uuid: f.uuid } : {}) });
     else steps.push({ need: { kind: "type", type: f.type } });
     continue;
   }
@@ -170,13 +176,22 @@ function waitForEof(): Promise<void> {
   return eofOrCap ??= Promise.race([new Promise<void>(r => process.stdin.once("end", () => r())), sleep(EOF_CAP_MS)]);
 }
 
+/** The recording's user message uuids, each mapped to that of the user message this run got in its place. */
+const liveUuids = new Map<string, string>();
+/** `line` with every recorded user message uuid this run has a live one for replaced by it. */
+function withLiveUuids(line: string): string {
+  for (const [recorded, live] of liveUuids) line = line.replaceAll(recorded, live);
+  return line;
+}
+
 /** Resolves once an unconsumed arrived frame satisfies `need`; exits if stdin ends first. */
-async function waitFor(need: Need) {
+async function waitFor(need: Need, recordedUuid?: string) {
   for (;;) {
     const hit = arrived.find(a => !a.used && matches(need, a.frame));
     if (hit) {
       hit.used = true;
       if (need.kind === "user") transcribe(hit.frame);
+      if (recordedUuid !== undefined && hit.frame.uuid !== undefined) liveUuids.set(recordedUuid, hit.frame.uuid);
       return;
     }
     if (eof) await finish();
@@ -185,15 +200,18 @@ async function waitFor(need: Need) {
 }
 
 for (const step of steps.slice(0, lastEmit + 1)) {
-  if ("need" in step) { await waitFor(step.need); continue; }
+  if ("need" in step) { await waitFor(step.need, step.uuid); continue; }
+  if (step.frame.type === "result" && resultsMs > 0) await sleep(resultsMs);
+  if (step.frame.type === "result" && resultsEmitted++ > 0 && laterResultsMs > 0) await sleep(laterResultsMs);
+  const line = withLiveUuids(step.emit);
   if (step.frame.type === "result" && stall) {
     stalling = true;
-    heldResult = step.emit;
+    heldResult = line;
     if (eof) await finish();
     await new Promise<never>(() => {}); // still answering control requests; exits on stdin EOF or SIGTERM
   }
   if (step.frame.type === "control_request") lastEmittedRequestId = step.frame.request_id;
-  write(step.emit);
+  write(line);
 }
 if (!exitedOnItsOwn) await waitForEof();
 await finish();

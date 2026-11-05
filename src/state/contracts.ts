@@ -194,6 +194,11 @@ export const TaskObject = remote("meddle.task", {
         manifest: TaskManifestSchema,
         state: TaskStateSchema,
         pending: Type.Array(PendingApprovalSchema),
+        /**
+         * What the task was sent and has not started on, oldest first: steers its running turn has not taken yet, then
+         * prompts waiting for its next turn (one turn each). A text leaves it as it enters the log.
+         */
+        queued: Type.Array(Type.String()),
         lastSeq: Type.Number(),
         permissionMode: Nullable(Type.String()),
         model: Nullable(Type.String()),
@@ -216,7 +221,13 @@ export const TaskObject = remote("meddle.task", {
         activityAt: Type.String(),
       },
       methods: {
-        prompt: method(Type.Object({ text: Type.String() })),
+        /**
+         * Sends the task a text: a steer into its running turn, a prompt for its next turn when the running one can no
+         * longer take it (both `queued` until started), or a new turn when it is idle. Refused only while it is not
+         * live here (moved, archived, being received) or is being archived or restored. `queued`: the text waits to
+         * be taken (logged as a `user` event when it is) rather than starting a turn.
+         */
+        prompt: method(Type.Object({ text: Type.String() }), Type.Object({ queued: Type.Boolean() })),
         /** Renames the task; refused for a blank title and while it is not live here (moving, moved, archived). */
         rename: method(Type.Object({ title: Type.String() })),
         interrupt: method(Type.Object({})),

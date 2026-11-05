@@ -174,6 +174,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const manifests: Subscribable<{ taskId: string }> = {
     subscribe: (cb) => runner.onManifest((taskId) => cb({ taskId })),
   };
+  const queuedChanges: Subscribable<{ taskId: string }> = {
+    subscribe: (cb) => runner.onQueued((taskId) => cb({ taskId })),
+  };
   const moves: Subscribable<{ taskId: string; move: MoveState | null }> = {
     subscribe: (cb) => runner.onMove((taskId, move) => cb({ taskId, move })),
   };
@@ -471,6 +474,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const movedTo = self.state("movedTo", members.movedTo, { init: () => getTask(db, id)?.moved_to ?? null });
     const archivedOn = self.state("archivedOn", members.archivedOn, { init: () => archivedOnNow(id) });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
+    const queued = self.state("queued", members.queued, { init: () => runner.queued(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
     const activityAt = self.state("activityAt", members.activityAt, { init: () => getTask(db, id)?.updated_at ?? "" });
@@ -506,6 +510,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("ticks", headTicks, (_event, ctx) => refreshBookmarks(ctx));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
+    self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) queued.replace(ctx, runner.queued(id)); });
     // What changed between the cells' init and the listeners starting.
     self.task(async (ctx) => {
       state.replace(ctx, runner.state(id));
@@ -513,6 +518,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       movedTo.replace(ctx, getTask(db, id)?.moved_to ?? null);
       archivedOn.replace(ctx, archivedOnNow(id));
       pending.replace(ctx, approvals.pending(id));
+      queued.replace(ctx, runner.queued(id));
       refreshRow(ctx);
       catchUpLog(ctx);
     });
@@ -528,6 +534,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       manifest,
       state,
       pending,
+      queued,
       lastSeq: self.derive([log], (l) => l.lastSeq),
       permissionMode: self.derive([log], (l) => l.permissionMode),
       model: self.derive([log], (l) => l.model),
@@ -538,7 +545,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       archivedOn,
       bookmarks,
       activityAt,
-      prompt: ({ text }) => runner.prompt(id, text),
+      prompt: async ({ text }) => ({ queued: (await runner.prompt(id, text)) === "queued" }),
       rename: async ({ title }) => { await runner.rename(id, title); },
       interrupt: () => runner.interrupt(id),
       retry: () => runner.retry(id),

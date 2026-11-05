@@ -428,6 +428,15 @@ before the task is created); when that fails or takes over 20 seconds, the title
 prompt's first line. With no prompt either, the task gets two adjectives and a noun (`quiet amber otter`). `--project` is repeatable, one project each, the first the primary; with
 none the task has no project.
 
+A message to a busy task is never refused, as in a terminal agent. While a turn runs it goes into that turn, and
+Claude Code takes it at its next step (between tool calls) without cutting the turn short, or, if the turn is
+finishing, runs it as a turn of its own right after; either way it is the same turn to meddle, which ends only once
+every message sent into it has been taken. A message the running turn can no longer take (its result is in, or the
+turn is being created, resumed or retried) waits for the task's next turn, one turn per message, in order, and so does
+one the turn ended without taking (it was killed, say). Until Claude takes it, a message shows as `queued` under the
+task's thread and is not in its log; it enters the log where Claude took it. Interrupt is what cuts a turn short.
+`task prompt` to a busy task waits for the turn that takes its text and follows that one to its end.
+
 `task list` prints a table of every task of the pool, node by node (this node first), the archived ones after the
 others: `ID`, `STATE`, `NODE`, `HOST`, `PROJECTS` (comma-separated, `-` for none) and `TITLE`; nothing when there are
 none. It reads each online member's tasks over the pool, as the dashboard does; an offline member's are not listed,
@@ -854,7 +863,8 @@ versions in the Nodes header.
 
 A task opens beside the sidebar: its title (✎ renames it), state and actions (Interrupt, Retry, Archive; Restore and
 Delete for an archived one), its thread with the assistant's text as Markdown and each run of tool calls folded into
-one line, what waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the composer,
+one line, what waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
+was sent and has not taken yet (`queued`), the composer (Queue while a turn runs, Send otherwise),
 and a bar with its projects, its node, its bookmark, the latest turn's tokens, and its permission mode, effort and
 model. The node in the bar opens the move menu: every other member, those that cannot take the task greyed with why,
 and whether the move waits for the running turn or interrupts it (see [Moving a task](#moving-a-task)); a task that

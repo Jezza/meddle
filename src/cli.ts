@@ -196,7 +196,7 @@ async function runnerDeps(cfg: NodeConfig, env = process.env): Promise<RunnerDep
     });
   }
   const extraEnv: Record<string, string> = {};
-  for (const name of ["MEDDLE_FIXTURE", "MEDDLE_FIXTURE_STALL", "MEDDLE_FIXTURE_MEMORY", "MEDDLE_FIXTURE_BY_TOKEN"]) {
+  for (const name of ["MEDDLE_FIXTURE", "MEDDLE_FIXTURE_STALL", "MEDDLE_FIXTURE_MEMORY", "MEDDLE_FIXTURE_BY_TOKEN", "MEDDLE_FIXTURE_RESULTS_MS", "MEDDLE_FIXTURE_LATER_RESULTS_MS"]) {
     const value = env[name];
     if (value !== undefined) extraEnv[name] = value;
   }
@@ -788,7 +788,9 @@ const QUEUED_FOR_MOVE = "queued; it runs once the task has arrived";
  * `token_fault` that reruns the turn drops it and the rerun is followed; one that does not fails it with the token's
  * notice; the task going idle, or a meddle event other than a `token_fault`, fails it with the result's error. A text
  * the node queued for a task it is moving away (or one that has moved before a `result` came) runs on the other node:
- * that is printed (`QUEUED_FOR_MOVE`) and the command succeeds.
+ * that is printed (`QUEUED_FOR_MOVE`) and the command succeeds. A text sent to a busy task waits to be taken (a steer,
+ * or a prompt for a later turn): until the log shows it taken (a `user` event of that text), what other turns log is
+ * printed but decides nothing, and the task going idle is not the end.
  */
 function taskPrompt(text: string, prompt: string): Promise<number> {
   return withTask(text, (host, socket, id) => promptOn(host, socket, id, prompt));
@@ -807,12 +809,21 @@ async function promptOn(client: Host, socket: WebSocket, id: string, text: strin
     let faulted = false;
     /** The failure an error `result` stands for until a token rerun replaces it. */
     let provisional: Error | null = null;
+    /** Whether what is logged now is the text's turn: not until the node answers, nor while the text waits to be taken. */
+    let ours = false;
+    /** Events logged before the node answered, decided on once it has. */
+    let held: WindowEvent[] | null = [];
     const follow = (events: readonly WindowEvent[]) => {
+      if (held !== null) { held.push(...events); return; }
       for (const { seq, message } of events) {
         if (seq <= printed) continue;
         printed = seq;
         const { type, subtype } = message as { type?: string; subtype?: string };
         console.error(subtype === undefined ? `${type}` : `${type}/${subtype}`);
+        if (!ours) {
+          ours = type === "user" && (message as { message?: { content?: unknown } }).message?.content === text;
+          continue;
+        }
         if (type === "meddle" && subtype === "token_fault" && provisional !== null) {
           const fault = message as { rerun?: unknown };
           if (fault.rerun !== true) return finished.reject(new Error(`the turn ended: ${tokenFaultNotice(message as Record<string, unknown>)}`));
@@ -848,11 +859,16 @@ async function promptOn(client: Host, socket: WebSocket, id: string, text: strin
         // Gone before a `result`: the text went with the task.
         if (state === "moved") finished.resolve("queued");
         else if (state !== "idle") busy = true;
-        else if (busy) settle().catch((err: Error) => finished.reject(err));
+        else if (busy && ours) settle().catch((err: Error) => finished.reject(err));
       }),
     ];
     try {
-      await task.prompt({ text });
+      const { queued } = await task.prompt({ text });
+      // A text that started a turn: everything from here on is its turn's.
+      ours = !queued;
+      const backlog = held;
+      held = null;
+      follow(backlog);
       const state = task.state.value;
       if (state === "moving" || state === "receiving" || task.move.value !== null) finished.resolve("queued");
       if ((await finished.promise) === "queued") console.log(QUEUED_FOR_MOVE);

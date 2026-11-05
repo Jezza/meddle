@@ -10,7 +10,7 @@ import type { NodeConfig } from "../config";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
-import { promptEvent, resultError, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
+import { resultError, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
 import { askTitle } from "../engine/title";
 import { bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceForget } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
@@ -207,6 +207,9 @@ export class TaskRunner {
   #pending = new Set<string>();
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
   #stateListeners = new Set<(taskId: string, state: TaskState) => void>();
+  #queuedListeners = new Set<(taskId: string) => void>();
+  /** Per task, the `queued` its listeners were last told (JSON); none told means `[]`. */
+  #toldQueued = new Map<string, string>();
   /**
    * The moves of tasks running here (decision 11). While a task is in it, its turns do not write its state, prompts are
    * queued and the rest is refused; its row says `moving` for a restart and the dashboard.
@@ -317,12 +320,15 @@ export class TaskRunner {
   }
 
   /**
-   * Steers the live turn, or starts a new durable turn when the task is idle. A task left `running`
-   * with no live turn here is reconciled against the Harness: a turn still pending there refuses the
-   * prompt, a parked one is retried and refuses it too; with none, the task is idle again and the
-   * prompt starts a turn.
+   * Steers the live turn, or starts a new durable turn when the task is idle; a busy task is never refused a prompt.
+   * A steer goes into the turn's input, for Claude Code to take into the running turn at its next chance (or as a
+   * turn of its own once that one ends), and is `queued` until it does. A prompt the live turn can no longer take (its
+   * input closed with its `result`), or for a turn that is being created, resumed by the Harness or retried after it
+   * was parked (which this retries), is queued for the task's next turn. A task left `running` with no turn here or in
+   * the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the text started a turn, `"queued"`
+   * when it waits to be taken (a steer, or a prompt for a later turn).
    */
-  async prompt(taskId: string, text: string): Promise<void> {
+  async prompt(taskId: string, text: string): Promise<"turn" | "queued"> {
     const row = this.#row(taskId);
     if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
     if (this.#archiving.has(taskId)) throw new Error("task is being archived");
@@ -335,35 +341,29 @@ export class TaskRunner {
       // would be left behind.
       if (this.#moving.get(taskId)?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
       this.#enqueue(taskId, text);
-      return;
+      return "queued";
     }
     let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
       if (live !== undefined) {
-        // Sent first: after the turn's `result` its input is closed while the turn is still live, and a steer then
-        // is refused rather than logged as sent.
-        if (live.queue.ended) throw new Error("the turn just ended; send it as a new prompt");
-        this.#send(taskId, live.queue, text, "now");
-        return;
+        // After the turn's `result` its input is closed while the turn is still live: the prompt waits for the next.
+        if (live.queue.ended) return this.#enqueueNext(taskId, text);
+        this.#send(taskId, live.queue, text);
+        return "queued";
       }
       const turn = await this.#durableTurn(taskId);
-      if (turn !== undefined && isParked(turn)) {
-        await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
-        throw new Error("the task's interrupted turn is being retried; send your message again once it is idle");
-      }
-      if (turn !== undefined) throw new Error("task is resuming");
+      if (turn !== undefined && isParked(turn)) await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+      if (turn !== undefined) return this.#enqueueNext(taskId, text);
       stale = true;
     }
     // Prompts queued while the task moved run first, one turn each; this one waits its turn behind them.
     if (queuedOf(this.#row(taskId)).length > 0) {
       if (stale) this.#setState(taskId, "idle");
-      this.#enqueue(taskId, text);
-      await this.startQueued(taskId);
-      return;
+      return this.#enqueueNext(taskId, text);
     }
-    // Reserved before the first await, so a concurrent prompt cannot create a second turn.
-    if (this.#pending.has(taskId)) throw new Error("task has a pending turn");
+    // Reserved before the first await, so a concurrent prompt cannot create a second turn: it waits for the next.
+    if (this.#pending.has(taskId)) return this.#enqueueNext(taskId, text);
     this.#pending.add(taskId);
     try {
       if (stale) this.#setState(taskId, "idle");
@@ -372,6 +372,7 @@ export class TaskRunner {
       this.#pending.delete(taskId);
       throw err;
     }
+    return "turn";
   }
 
   /** Creates the task's next `meddle.turn`; the caller has reserved it in `#pending`. */
@@ -400,11 +401,36 @@ export class TaskRunner {
       this.#pending.delete(taskId);
       throw err;
     }
-    // Only appends happened meanwhile (a prompt joins the tail; this is the one taker, kept single by `#pending`).
+    // This is the one taker, kept single by `#pending`; meanwhile a prompt may join the tail, or the steers a turn
+    // ended without the front, so the first copy of the text goes.
     this.#db.transaction(() => {
-      const rest = queuedOf(this.#row(taskId)).slice(1);
+      const queued = queuedOf(this.#row(taskId));
+      const at = queued.indexOf(head);
+      const rest = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
       updateTask(this.#db, taskId, { queued: rest.length === 0 ? null : JSON.stringify(rest) });
     })();
+    this.#emitQueued(taskId);
+  }
+
+  /** What the task has been sent and not started on, oldest first: its live turn's untaken steers, then its queue. */
+  queued(taskId: string): string[] {
+    const live = this.#live.get(taskId)?.queue.untaken().map((u) => u.text) ?? [];
+    return [...live, ...queuedOf(this.#row(taskId))];
+  }
+
+  /** Called whenever what `queued` answers for a task changes. */
+  onQueued(cb: (taskId: string) => void): () => void {
+    this.#queuedListeners.add(cb);
+    return () => { this.#queuedListeners.delete(cb); };
+  }
+
+  /** Tells the queued listeners when the task's `queued` differs from what they were last told. */
+  #emitQueued(taskId: string): void {
+    const row = getTask(this.#db, taskId);
+    const now = row === null ? "[]" : JSON.stringify(this.queued(taskId));
+    if ((this.#toldQueued.get(taskId) ?? "[]") === now) return;
+    this.#toldQueued.set(taskId, now);
+    notify(this.#queuedListeners, (cb) => cb(taskId));
   }
 
   /** Appends `text` to the task's queued prompts. */
@@ -412,12 +438,28 @@ export class TaskRunner {
     this.#db.transaction(() => {
       updateTask(this.#db, taskId, { queued: JSON.stringify([...queuedOf(this.#row(taskId)), text]) });
     })();
+    this.#emitQueued(taskId);
   }
 
-  /** Sends `text` into a live turn's input and records it as a user event. */
-  #send(taskId: string, queue: InputQueue, text: string, priority: "now" | "next"): void {
-    queue.push(text, priority);
-    this.#record(taskId, promptEvent(text));
+  /** Queues `text` for the task's next turn, which starts now if the task is idle meanwhile. */
+  async #enqueueNext(taskId: string, text: string): Promise<"queued"> {
+    this.#enqueue(taskId, text);
+    await this.startQueued(taskId);
+    return "queued";
+  }
+
+  /** Puts the texts a turn ended without taking ahead of the task's queued prompts, which came after them. */
+  #requeueFront(taskId: string, texts: string[]): void {
+    if (texts.length === 0) return;
+    this.#db.transaction(() => {
+      updateTask(this.#db, taskId, { queued: JSON.stringify([...texts, ...queuedOf(this.#row(taskId))]) });
+    })();
+  }
+
+  /** Sends `text` into a live turn's input, for Claude Code to take at its next chance; it is logged when taken. */
+  #send(taskId: string, queue: InputQueue, text: string): void {
+    queue.push(text, "next");
+    this.#emitQueued(taskId);
   }
 
   /** Appends an event to the task's log and tells the listeners. */
@@ -576,6 +618,7 @@ export class TaskRunner {
         onMessage: (m, seq) => {
           if (m.type === "meddle" && m.subtype === "turn_failed") failureLogged = true;
           notify(this.#eventListeners, (cb) => cb(taskId, seq, m));
+          if (m.type === "user") this.#emitQueued(taskId); // a steer it took is logged
         },
         onTokenFault: (f) => { fault = f; },
       });
@@ -588,8 +631,11 @@ export class TaskRunner {
         if (fault !== null) await this.#markFault(picked.id, fault).catch(() => {});
         throw err;
       } finally {
-        // The task stays in `#primaries` until `finish` has synced its memory.
+        // Steers Claude Code did not take wait for the next turn. The task stays in `#primaries` until `finish` has
+        // synced its memory.
+        this.#requeueFront(taskId, queue.untaken().map((u) => u.text));
         this.#live.delete(taskId);
+        this.#emitQueued(taskId);
       }
       if (fault === null) return "done";
       const marked = await this.#markFault(picked.id, fault);
@@ -1645,6 +1691,8 @@ export class TaskRunner {
 
   #emitState(taskId: string, state: TaskState): void {
     notify(this.#stateListeners, (cb) => cb(taskId, state));
+    // A state change goes with a queue that travelled, arrived or was dropped (a move, an archive).
+    this.#emitQueued(taskId);
   }
 }
 

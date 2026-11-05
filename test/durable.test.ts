@@ -8,7 +8,7 @@ import { initColocated } from "../src/jj";
 import { openHarness } from "../src/tasks/harness";
 import { CARRY_ON_PROMPT, TaskRunner } from "../src/tasks/durable";
 import { appendEvent, listEvents } from "../src/store/events";
-import { getTask, updateTask } from "../src/store/records";
+import { getTask, queuedOf, updateTask } from "../src/store/records";
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import { bookmarkList, jj } from "../src/jj";
@@ -69,28 +69,30 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   await runner.prompt(m.id, "Reply with the single word ok.");
   await initialised;
   expect(runner.state(m.id)).toBe("running");
-  // a steer into the live turn is sent, then recorded and told to listeners
-  const steered: unknown[] = [];
-  runner.onEvent((tid, seq, msg) => { if (tid === m.id && msg.type === "user") steered.push([seq, msg]); });
+  // a steer into the live turn is sent, and queued (told to listeners) until Claude Code takes it: not logged yet
+  const told: string[][] = [];
+  runner.onQueued((tid) => { if (tid === m.id) told.push(runner.queued(m.id)); });
   await runner.prompt(m.id, "Also say why.");
-  const steer = { type: "user", message: { role: "user", content: "Also say why." }, parent_tool_use_id: null };
-  const logged = listEvents(db, m.id).filter(e => (e.message as any).type === "user");
-  expect(logged.map(e => e.message)).toEqual([{ ...steer, message: { role: "user", content: "Reply with the single word ok." } }, steer]);
-  expect(steered).toEqual([[logged[1]!.seq, steer]]);
+  expect(runner.queued(m.id)).toEqual(["Also say why."]);
+  expect(told).toEqual([["Also say why."]]);
+  expect(listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content)).toEqual(["Reply with the single word ok."]);
   await h.close();
   expect(runner.liveQuery(m.id)).toBeNull();
   expect(turnsStarted()).toEqual([false]);
-  // 2. a fresh process reruns the parked phase, which resumes the session and finishes the turn
+  // the turn was killed before Claude Code took the steer: it waits as the task's next prompt
+  expect(queuedOf(getTask(db, m.id)!)).toEqual(["Also say why."]);
+  // 2. a fresh process reruns the parked phase, which resumes the session and finishes the turn; the steer runs next
   const again = await open();
-  const finished = new Promise<void>(res => again.runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "result") res(); }));
-  const idle = new Promise<void>(res => again.runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); }));
-  await finished; await idle;
-  // 3. one fresh start, one resume, and the task is idle again
-  expect(turnsStarted()).toEqual([false, true]);
-  expect(again.runner.state(m.id)).toBe("idle");
+  let results = 0;
+  const finished = new Promise<void>(res => again.runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "result" && ++results === 2) res(); }));
+  await finished;
+  await eventually(() => again.runner.state(m.id) === "idle", () => again.runner.state(m.id));
+  // 3. one fresh start, one resume, then the steer's own turn, and the task is idle again with nothing queued
+  expect(turnsStarted()).toEqual([false, true, true]);
+  expect(again.runner.queued(m.id)).toEqual([]);
   // the close logged turn_aborted, so the rerun told Claude to carry on rather than sending the prompt again
   const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
-  expect(prompts).toEqual(["Reply with the single word ok.", "Also say why.", CARRY_ON_PROMPT]);
+  expect(prompts).toEqual(["Reply with the single word ok.", CARRY_ON_PROMPT, "Also say why."]);
   await again.h.close();
 });
 test("a pending approval makes the task waiting until it is answered", async () => {
@@ -150,19 +152,21 @@ test("a task started without any Claude Code output is reconciled and starts its
   expect(runner.state(m.id)).toBe("idle");
   await h.close();
 });
-test("concurrent prompts start one turn, and throwing listeners do not break it", async () => {
-  const { h, runner, m, turnsStarted, settled } = await setup();
+test("concurrent prompts start one turn and queue the other as the next, and throwing listeners do not break it", async () => {
+  const { db, h, runner, m, turnsStarted } = await setup();
   const logged = spyOn(console, "error").mockImplementation(() => {});
   try {
     runner.onEvent(() => { throw new Error("event listener"); });
     runner.onState(() => { throw new Error("state listener"); });
-    const done = settled(runner);
+    runner.onQueued(() => { throw new Error("queued listener"); });
+    let results = 0;
+    runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "result") results++; });
     const outcomes = await Promise.allSettled([runner.prompt(m.id, "one"), runner.prompt(m.id, "two")]);
-    expect(outcomes.map(o => o.status).sort()).toEqual(["fulfilled", "rejected"]);
-    expect(outcomes.find(o => o.status === "rejected")).toMatchObject({ reason: { message: "task has a pending turn" } });
-    await done;
-    expect(turnsStarted()).toEqual([false]);
-    expect(runner.state(m.id)).toBe("idle");
+    expect(outcomes.map(o => o.status)).toEqual(["fulfilled", "fulfilled"]);
+    await eventually(() => results === 2 && runner.state(m.id) === "idle", () => `${results} results, ${runner.state(m.id)}`);
+    expect(turnsStarted()).toEqual([false, true]);
+    expect(listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content)).toEqual(["one", "two"]);
+    expect(runner.queued(m.id)).toEqual([]);
     expect(logged).toHaveBeenCalled();
   } finally {
     logged.mockRestore();
@@ -222,20 +226,49 @@ test("a turn that fails before it runs logs turn_failed with the reason, and pi-
   }
   await h.close();
 });
-test("a steer after the turn's result is refused and not logged", async () => {
-  const { db, h, runner, m, settled } = await setup();
-  const done = settled(runner);
-  let late: Promise<void> | undefined;
+test("a prompt sent once the turn's input has closed waits, queued, and runs as the next turn", async () => {
+  const { db, h, runner, m, turnsStarted } = await setup();
+  let late: Promise<unknown> | undefined;
+  let queuedThen: string[] | undefined;
+  let results = 0;
   // a microtask after the result's listeners: the turn's input is closed, its child not gone yet
-  runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "result") queueMicrotask(() => { late = runner.prompt(m.id, "too late"); late.catch(() => {}); }); });
+  runner.onEvent((tid, _s, msg: any) => {
+    if (tid !== m.id || msg.type !== "result" || ++results > 1) return;
+    queueMicrotask(() => { late = runner.prompt(m.id, "too late"); late.then(() => { queuedThen = runner.queued(m.id); }, () => {}); });
+  });
   await runner.prompt(m.id, "Reply with the single word ok.");
-  await done;
-  await expect(late!).rejects.toThrow("the turn just ended; send it as a new prompt");
+  await eventually(() => results === 2 && runner.state(m.id) === "idle", () => `${results} results, ${runner.state(m.id)}`);
+  await late;
+  expect(queuedThen).toEqual(["too late"]);
+  expect(turnsStarted()).toEqual([false, true]);
   const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
-  expect(prompts).toEqual(["Reply with the single word ok."]);
+  expect(prompts).toEqual(["Reply with the single word ok.", "too late"]);
+  expect(runner.queued(m.id)).toEqual([]);
   await h.close();
 });
-test("a prompt to a task whose turn is parked retries the turn and asks for the message again", async () => {
+test("a steer Claude Code folds into the running turn is queued until it takes it, then logged there", async () => {
+  const { db, h, runner, m, open } = await setup();
+  await h.close();
+  const steering = await open({ MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/steer-fold.jsonl` });
+  const STEER = "Also: end your reply with the word PINEAPPLE.";
+  const told: string[][] = [];
+  steering.runner.onQueued((tid) => { if (tid === m.id) told.push(steering.runner.queued(m.id)); });
+  let sent: Promise<unknown> | undefined;
+  steering.runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "assistant" && sent === undefined) sent = steering.runner.prompt(m.id, STEER); });
+  for (const p of steering.runner.approvals.pending(m.id)) steering.runner.approvals.answer(p.requestId, { behavior: "allow", updatedInput: p.input });
+  steering.runner.approvals.onChange(() => { for (const p of steering.runner.approvals.pending(m.id)) steering.runner.approvals.answer(p.requestId, { behavior: "allow", updatedInput: p.input }); });
+  const end = turnEnd(steering.runner, m.id);
+  await steering.runner.prompt(m.id, "Run the bash command `sleep 3; echo first`, then say done.");
+  expect((await end.result).result).toBe("done\n\nPINEAPPLE");
+  await end.idle;
+  await sent;
+  expect(told).toEqual([[STEER], []]);
+  const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user" && typeof (e.message as any).message.content === "string").map(e => (e.message as any).message.content);
+  expect(prompts).toEqual(["Run the bash command `sleep 3; echo first`, then say done.", STEER]);
+  expect(listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started")).toHaveLength(1);
+  await steering.h.close();
+});
+test("a prompt to a task whose turn is parked retries the turn and queues the message for after it", async () => {
   const { insertTask } = await import("../src/store/records");
   const home = await mkdtemp("/tmp/meddle-dur-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
@@ -248,8 +281,10 @@ test("a prompt to a task whose turn is parked retries the turn and asks for the 
     retryTask: async (id: string) => { retried.push(id); },
   } as any;
   const runner = new TaskRunner(cfg, db, harness, {});
-  await expect(runner.prompt("t1", "hello")).rejects.toThrow("the task's interrupted turn is being retried; send your message again once it is idle");
+  // the prompt waits, queued, for the retried turn to end
+  await runner.prompt("t1", "hello");
   expect(retried).toEqual(["turn-1"]);
+  expect(runner.queued("t1")).toEqual(["hello"]);
   await runner.retry("t1");
   expect(retried).toEqual(["turn-1", "turn-1"]);
   expect(listEvents(db, "t1")).toEqual([]);

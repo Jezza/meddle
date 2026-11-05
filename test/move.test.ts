@@ -963,7 +963,9 @@ test("a move parked before the receipt is released when its node starts; one par
     expect(getTask(node.db, "commit")).toMatchObject({ state: "moving", queued: JSON.stringify(["after commit"]) });
     // A turn the Harness reruns keeps the task running: no second turn for its session.
     expect(getTask(node.db, "rerun")).toMatchObject({ state: "running", queued: JSON.stringify(["after rerun"]) });
-    await expect(runner.prompt("rerun", "hi")).rejects.toThrow("task is resuming");
+    // a prompt meanwhile waits for the turn after it
+    expect(await runner.prompt("rerun", "hi")).toBe("queued");
+    expect(getTask(node.db, "rerun")).toMatchObject({ state: "running", queued: JSON.stringify(["after rerun", "hi"]) });
     expect(node.created).toHaveLength(2);
     expect(node.created).toContainEqual({ taskId: "prepare", prompt: "after prepare" });
     expect(node.created).toContainEqual({ taskId: "handoff", prompt: "after handoff" });

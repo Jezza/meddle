@@ -64,6 +64,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const manifest = useValue(task.manifest);
   const state = useValue(task.state);
   const pending = useValue(task.pending);
+  const queued = useValue(task.queued);
   const move = useValue(task.move);
   const movedTo = useValue(task.movedTo);
   const archivedOn = useValue(task.archivedOn);
@@ -87,7 +88,10 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
       {state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
       ) : (
-        <Thread session={session} readOnly={archived} working={state === "running"} after={pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)} />
+        <Thread session={session} readOnly={archived} working={state === "running"} after={<>
+          {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
+          {queued.map((text, i) => <Queued key={i} text={text} />)}
+        </>} />
       )}
       {!archived && state !== "moved" && <Composer task={task} running={live} disabled={moving} />}
       <BottomBar task={task} pool={pool} node={node} nodeId={nodeId} archived={archived} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} moving={moving} />
@@ -535,6 +539,19 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 
 // ─── the composer and the bar ───
 
+/** A text the task was sent and has not started on: it joins the thread where Claude takes it. */
+function Queued({ text }: { text: string }) {
+  return (
+    <div class="msg user queued" title="Claude takes it at its next step, or once it is done with the current one">
+      <div class="avatar user" />
+      <div class="msg-body">
+        <div class="user-text">{text}</div>
+        <span class="chip">queued</span>
+      </div>
+    </div>
+  );
+}
+
 function Composer({ task, running, disabled }: { task: TaskRef; running: boolean; disabled: boolean }) {
   const [text, setText] = useState("");
   const action = useAction();
@@ -557,13 +574,13 @@ function Composer({ task, running, disabled }: { task: TaskRef; running: boolean
         rows={1}
         disabled={disabled}
         value={text}
-        placeholder={disabled ? "Moving: prompts wait until it lands" : running ? "Steer the running turn…" : "Reply…"}
+        placeholder={disabled ? "Moving: prompts wait until it lands" : running ? "Message Claude: it takes it at its next step…" : "Reply…"}
         onInput={(e) => setText(e.currentTarget.value)}
         onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); } }}
       />
       <div class="composer-row">
         {action.error !== null ? <span class="error">{action.error}</span> : <span class="muted">Ctrl+Enter sends</span>}
-        <button class="primary" disabled={disabled || action.busy || text.trim() === ""} onClick={send}>{running ? "Steer" : "Send"}</button>
+        <button class="primary" disabled={disabled || action.busy || text.trim() === ""} onClick={send}>{running ? "Queue" : "Send"}</button>
       </div>
     </div>
   );
