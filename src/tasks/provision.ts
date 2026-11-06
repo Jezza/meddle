@@ -1,17 +1,19 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { checkTaskRoot, ensurePrivateDir, paths } from "../paths";
-import { bookmarkDelete, bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceAdd, workspaceForget } from "../jj";
+import {
+  bookmarkForget, bookmarkList, bookmarkSet, commitOf, configSetWorkspace, editIn, isJjRepo, jj, workspaceAdd,
+  workspaceConfigPath, workspaceForget,
+} from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
 import { ensureMemoryReplica, linkMemory } from "../memory";
 import { getProject, type Project } from "../projects/project";
-import { refreshTrunk } from "../projects/replicas";
-import { insertTask, newId } from "../store/records";
+import { getTask, insertTask } from "../store/records";
 import { repoKey, serialised } from "../serial";
 import type { TaskState } from "./durable";
-import { taskNamespace, writeManifest, type TaskManifest } from "./manifest";
+import { taskNamespace, writeManifest, type ReceivedManifest, type Start, type TaskManifest } from "./manifest";
 
 export type SettingSource = "user" | "project" | "local";
 
@@ -55,6 +57,116 @@ export function cwdFor(
   return { cwd: task, settingSources: ["user"] };
 }
 
+/**
+ * What a task's workspace takes as `immutable_heads()` (Decision 2): `base` and everything below it, and every task's
+ * line on the home but task `taskId`'s own. Its agent may rewrite its own line and anything else, as on main. The other
+ * lines are picked by bookmark name, not by subtracting this task's commits: a commit another task's line also holds
+ * stays immutable to it.
+ */
+export function workspaceImmutableHeads(taskId: string, base: string): string {
+  return `present(${base}) | untracked_remote_bookmarks(~glob:"task/${taskId}/*", remote=exact:"meddle")`;
+}
+
+/**
+ * Scopes the workspace `workspace` of task `taskId` to its own line (`workspaceImmutableHeads`), in its own jj config,
+ * and notes where jj keeps workspace configs on this node (`jjWorkspacesNote`), for `unscopeWorkspace`.
+ */
+export async function scopeWorkspace(cfg: NodeConfig, workspace: string, taskId: string, base: string): Promise<void> {
+  await configSetWorkspace(workspace, 'revset-aliases."immutable_heads()"', workspaceImmutableHeads(taskId, base), cfg);
+  const file = await workspaceConfigPath(workspace, cfg);
+  if (jjWorkspaceConfig(file)) await writeFile(paths(cfg).jjWorkspacesNote, dirname(dirname(file))).catch(() => {});
+}
+
+/** Whether the workspace at `workspace` has an `immutable_heads()` of its own (`scopeWorkspace`'s), in its jj config. */
+export async function isScoped(cfg: NodeConfig, workspace: string): Promise<boolean> {
+  const out = await jj(["config", "list", "--workspace", 'revset-aliases."immutable_heads()"'], workspace, cfg);
+  return out.trim() !== "";
+}
+
+/**
+ * Scopes the workspace at `workspace` of task `taskId` when it has no scope of its own (`isScoped`): a task made before
+ * meddle scoped its workspaces. From `base`, or for a main-era manifest without one, the root commit, as
+ * `provisionFromManifest` takes it. Returns whether it scoped it; a workspace that is gone is nothing to scope.
+ */
+export async function scopeIfUnscoped(cfg: NodeConfig, workspace: string, taskId: string, base: string | undefined): Promise<boolean> {
+  if (!(await isJjRepo(workspace)) || (await isScoped(cfg, workspace))) return false;
+  await scopeWorkspace(cfg, workspace, taskId, base ?? (await commitOf(workspace, "root()", cfg)));
+  return true;
+}
+
+/** Whether `file` is where jj keeps a workspace's own config: `…/jj/workspaces/<id>/config.toml`. */
+function jjWorkspaceConfig(file: string): boolean {
+  const workspaces = dirname(dirname(file));
+  return basename(file) === "config.toml" && basename(workspaces) === "workspaces" && basename(dirname(workspaces)) === "jj";
+}
+
+/**
+ * The folder `<id>` under `workspaces` (jj's `…/jj/workspaces`) whose `metadata.binpb` names the workspace at
+ * `workspace` (its `.jj`, the one string field jj writes there), or null when none does.
+ */
+async function configFolderNaming(workspaces: string, workspace: string): Promise<string | null> {
+  const wanted = new Set([join(resolve(workspace), ".jj")]);
+  try {
+    wanted.add(join(await realpath(dirname(workspace)), basename(workspace), ".jj"));
+  } catch {
+    // Its parent is gone too: the path as given.
+  }
+  let entries: string[];
+  try {
+    entries = await readdir(workspaces);
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(await readFile(join(workspaces, entry, "metadata.binpb")));
+    } catch {
+      continue;
+    }
+    // Field 1, length-delimited: 0x0a, the length as a varint, the path.
+    if (bytes[0] !== 0x0a) continue;
+    let length = 0;
+    let shift = 0;
+    let at = 1;
+    while (at < bytes.length && shift < 35) {
+      const byte = bytes[at++]!;
+      length |= (byte & 0x7f) << shift;
+      shift += 7;
+      if ((byte & 0x80) === 0) break;
+    }
+    if (at + length !== bytes.length) continue;
+    if (wanted.has(new TextDecoder().decode(bytes.subarray(at)))) return join(workspaces, entry);
+  }
+  return null;
+}
+
+/**
+ * Removes the jj config `scopeWorkspace` wrote for the workspace at `workspace`: jj keeps it outside the workspace and
+ * `jj workspace forget` leaves it, so this runs first. When the file is where jj keeps a workspace's config,
+ * `…/jj/workspaces/<id>/config.toml`, the folder `<id>` that workspace alone has goes with it (beside it, jj's note of
+ * where the workspace is); any other file, only itself. When the workspace's folder is gone (never asking a repo jj
+ * would find above it), the folder in the `jjWorkspacesNote` dir whose note names the workspace goes instead. None is
+ * no error.
+ */
+export async function unscopeWorkspace(cfg: NodeConfig, workspace: string): Promise<void> {
+  if (!(await isJjRepo(workspace))) {
+    const workspaces = await readFile(paths(cfg).jjWorkspacesNote, "utf8").catch(() => null);
+    if (workspaces === null || basename(workspaces) !== "workspaces" || basename(dirname(workspaces)) !== "jj") return;
+    const folder = await configFolderNaming(workspaces, workspace);
+    if (folder !== null) await rm(folder, { recursive: true, force: true });
+    return;
+  }
+  const file = await workspaceConfigPath(workspace, cfg);
+  await rm(jjWorkspaceConfig(file) ? dirname(file) : file, { recursive: true, force: true });
+}
+
+/** `unscopeWorkspace`, then `workspaceForget`, each best effort: what is already gone is no error. */
+export async function dropWorkspace(cfg: NodeConfig, repo: string, workspaceName: string, workspace: string): Promise<void> {
+  await unscopeWorkspace(cfg, workspace).catch(() => {});
+  await workspaceForget(repo, workspaceName, cfg).catch(() => {});
+}
+
 /** The projects `projectIds` name, in order (none for a task without a project). */
 function resolveProjects(db: Database, projectIds: string[]): Project[] {
   const projects: Project[] = [];
@@ -71,22 +183,45 @@ function resolveProjects(db: Database, projectIds: string[]): Project[] {
   return projects;
 }
 
+/**
+ * Provisions task `taskId` from `starts`, the starts its projects' homes resolved, in order (the first the primary;
+ * none for a task without a project). Each project gets a jj workspace in its repo here: a `line` start's at its
+ * commit, which must be here (the home repo, or the line fetched into the replica), editing it in `edit` mode or a new
+ * change on it in `child` mode; a `sync` start's a new change on `synced[projectId]`, the commit its branch was fetched
+ * at. Each workspace is scoped to the task's line from its base (`scopeWorkspace`), and the task's bookmark
+ * `meddle/task/<id>/<project>` points at its working copy, set without snapshotting the repo's own. On failure, removes
+ * what it made.
+ */
 export async function provisionTask(
   cfg: NodeConfig,
   db: Database,
-  input: { title: string; projectIds: string[]; parents?: Record<string, string> },
+  input: { title: string; taskId: string; starts: Start[]; synced?: Record<string, string> },
 ): Promise<TaskManifest> {
   const root = await checkTaskRoot(cfg);
   if (!root.ok) throw new Error(root.reason);
-  const projects = resolveProjects(db, input.projectIds);
+  const { taskId: id, starts } = input;
+  // The id names folders here, and a failed provision removes the task's folder: never an existing task's.
+  if (!SAFE_ID.test(id)) throw new Error(`invalid task id: ${id}`);
+  if (getTask(db, id) !== null) throw new Error(`task ${id} exists here`);
+  const projects = resolveProjects(db, starts.map((s) => s.projectId));
+  // Each goes into a revset, and a base into the workspace's jj config: nothing but a commit id.
+  const at: string[] = [];
+  const bases: string[] = [];
+  for (const [i, start] of starts.entries()) {
+    const commit = start.kind === "line" ? start.commit : input.synced?.[start.projectId];
+    if (commit === undefined) throw new Error(`no commit for the sync start of ${projects[i]!.name}`);
+    const base = start.kind === "line" ? start.base : commit;
+    for (const c of [commit, base]) if (!COMMIT_ID.test(c)) throw new Error(`invalid commit: ${c}`);
+    at.push(commit);
+    bases.push(base);
+  }
   await seedProfile(cfg);
   await ensurePlugins(cfg);
 
   const p = paths(cfg);
-  const id = newId();
   const task = p.task(id);
   const workspaceName = `meddle-${id}`;
-  const added: string[] = [];
+  const added: Array<{ replica: string; workspace: string }> = [];
   const bookmarks: Array<{ replica: string; name: string }> = [];
   try {
     const configDir = p.taskConfig(id);
@@ -94,16 +229,21 @@ export async function provisionTask(
     await ensurePrivateDir(p.taskMeta(id)); // the transcripts live under it
     await mkdir(configDir, { recursive: true });
     const entries: TaskManifest["projects"] = [];
-    for (const project of projects) {
+    for (const [i, project] of projects.entries()) {
+      const start = starts[i]!;
+      const parent = at[i]!;
+      const base = bases[i]!;
       const workspace = join(task, project.name);
-      // The caller (a runner with a pool) passes the home's trunk; on its own, the project's trunk here (decision 5).
-      const parent = input.parents?.[project.id] ?? (await refreshTrunk(cfg, project.replica)) ?? "root()";
-      added.push(project.replica);
+      added.push({ replica: project.replica, workspace });
       await workspaceAdd(project.replica, workspaceName, workspace, parent, cfg);
+      // Scoped first: on the home, the task's own line holds the commit an edit start works on.
+      await scopeWorkspace(cfg, workspace, id, base);
+      if (start.kind === "line" && start.mode === "edit") await editIn(workspace, parent, cfg);
       const bookmark = `${taskNamespace(id)}${project.name}`;
-      await bookmarkSet(project.replica, bookmark, await changeId(workspace, cfg), cfg);
+      const head = await commitOf(workspace, "@", cfg);
       bookmarks.push({ replica: project.replica, name: bookmark });
-      entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent });
+      await serialised(repoKey(project.replica), () => bookmarkSet(project.replica, bookmark, head, cfg, { ignoreWorkingCopy: true }));
+      entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent, base });
     }
     await linkProfile(configDir, cfg);
     // The primary project's memory; a task without a project has none.
@@ -133,15 +273,18 @@ export async function provisionTask(
     });
     return manifest;
   } catch (err) {
-    for (const { replica, name } of bookmarks) await bookmarkDelete(replica, name, cfg).catch(() => {});
-    for (const replica of added) await workspaceForget(replica, workspaceName, cfg).catch(() => {});
+    for (const { replica, name } of bookmarks) await serialised(repoKey(replica), () => bookmarkForget(replica, `exact:${name}`, cfg, { ignoreWorkingCopy: true })).catch(() => {});
+    for (const { replica, workspace } of added) await dropWorkspace(cfg, replica, workspaceName, workspace);
     await rm(task, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
 }
 
 /** An id from another node (task, session): letters, digits, `-` and `_`. */
-const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+export const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
+/** A commit id from another node (SHA-1 or SHA-256). */
+const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** A folder or project name from another node: one path segment, as `provisionTask` admits. */
 function safeName(name: string): boolean {
@@ -150,9 +293,10 @@ function safeName(name: string): boolean {
 
 /**
  * Throws unless a manifest from another node is safe to provision here: ids and folder names are single path
- * segments, workspaces are distinct, and the primary project is one of the task's (null, for a task without one).
+ * segments, workspaces are distinct, a project's base (when it has one) is a commit id, and the primary project is one
+ * of the task's (null, for a task without one).
  */
-export function checkReceivedManifest(m: TaskManifest): void {
+export function checkReceivedManifest(m: ReceivedManifest): void {
   if (!SAFE_ID.test(m.id)) throw new Error(`invalid task id: ${m.id}`);
   if (!SAFE_ID.test(m.sessionId)) throw new Error(`invalid session id: ${m.sessionId}`);
   const workspaces = new Set<string>();
@@ -161,6 +305,8 @@ export function checkReceivedManifest(m: TaskManifest): void {
     if (!safeName(p.workspace)) throw new Error(`invalid workspace: ${p.workspace}`);
     if (workspaces.has(p.workspace)) throw new Error(`duplicate workspace in task: ${p.workspace}`);
     workspaces.add(p.workspace);
+    // It goes into the workspace's jj config as a revset: nothing but a commit id.
+    if (p.base !== undefined && !COMMIT_ID.test(p.base)) throw new Error(`invalid base: ${p.base}`);
   }
   if (m.projects.length === 0 ? m.primaryProjectId !== null : !m.projects.some((p) => p.id === m.primaryProjectId)) {
     throw new Error("the primary project is not one of the task's");
@@ -169,15 +315,17 @@ export function checkReceivedManifest(m: TaskManifest): void {
 
 /**
  * Provisions a task another node sent: the steps of `provisionTask`, keeping the manifest's id, title, session,
- * primary project, creation time and projects (ids, names, workspaces), with each project's `replica` this node's and
- * its `parent` the change `parents[projectId]` (fetched from the sender), where the workspace starts and the task's
- * bookmark points. Writes `task.json` and the row (`started` 1, `state`, no turns); with `keepRow` (a task restored from
- * its archive on this node, whose row is still here), no row: the caller updates it. On failure, removes what it made.
+ * primary project, creation time and projects (ids, names, workspaces, bases), with each project's `replica` this
+ * node's and its `parent` the revision `parents[projectId]` (fetched from the sender), where the workspace starts and the
+ * task's bookmark points. A project without a `base` (a main-era manifest) takes the root commit as its
+ * base. Each workspace is scoped to the task's line (`scopeWorkspace`). Writes `task.json` and the row (`started` 1,
+ * `state`, no turns); with `keepRow` (a task restored from its archive on this node, whose row is still here), no row:
+ * the caller updates it. On failure, removes what it made.
  */
 export async function provisionFromManifest(
   cfg: NodeConfig,
   db: Database,
-  manifest: TaskManifest,
+  manifest: ReceivedManifest,
   parents: Record<string, string>,
   state: TaskState,
   options: { keepRow?: boolean } = {},
@@ -199,7 +347,7 @@ export async function provisionFromManifest(
   const p = paths(cfg);
   const task = p.task(id);
   const workspaceName = `meddle-${id}`;
-  const added: string[] = [];
+  const added: Array<{ replica: string; workspace: string }> = [];
   /** Bookmarks this call created; one the replica already had (the home's backup) is left alone. */
   const bookmarks: Array<{ replica: string; name: string }> = [];
   try {
@@ -211,15 +359,22 @@ export async function provisionFromManifest(
     for (const [i, entry] of manifest.projects.entries()) {
       const replica = projects[i]!.replica;
       const parent = parents[entry.id]!;
-      added.push(replica);
-      await workspaceAdd(replica, workspaceName, join(task, entry.workspace), parent, cfg);
+      // A main-era manifest has no base, and its `parent` is no safe stand-in: on the home it may name a remote the
+      // home does not have (`<bookmark>@<home short id>`), and for a task that has moved since, it is the commit it
+      // moved at, which would freeze the task's earlier work for its agent. The root commit instead: only other tasks'
+      // lines stay protected from it.
+      const base = entry.base ?? (await commitOf(replica, "root()", cfg));
+      const workspace = join(task, entry.workspace);
+      added.push({ replica, workspace });
+      await workspaceAdd(replica, workspaceName, workspace, parent, cfg);
+      await scopeWorkspace(cfg, workspace, id, base);
       const bookmark = `${taskNamespace(id)}${entry.name}`;
       await serialised(repoKey(replica), async () => {
         const existed = (await bookmarkList(replica, cfg)).some((b) => b.name === bookmark && b.remote === null);
-        await bookmarkSet(replica, bookmark, parent, cfg);
+        await bookmarkSet(replica, bookmark, parent, cfg, { ignoreWorkingCopy: true });
         if (!existed) bookmarks.push({ replica, name: bookmark });
       });
-      entries.push({ ...entry, replica, parent });
+      entries.push({ ...entry, replica, parent, base });
     }
     await linkProfile(configDir, cfg);
     if (manifest.primaryProjectId !== null) {
@@ -242,8 +397,8 @@ export async function provisionFromManifest(
     }
     return received;
   } catch (err) {
-    for (const { replica, name } of bookmarks) await serialised(repoKey(replica), () => bookmarkForget(replica, `exact:${name}`, cfg)).catch(() => {});
-    for (const replica of added) await workspaceForget(replica, workspaceName, cfg).catch(() => {});
+    for (const { replica, name } of bookmarks) await serialised(repoKey(replica), () => bookmarkForget(replica, `exact:${name}`, cfg, { ignoreWorkingCopy: true })).catch(() => {});
+    for (const { replica, workspace } of added) await dropWorkspace(cfg, replica, workspaceName, workspace);
     await rm(task, { recursive: true, force: true }).catch(() => {});
     throw err;
   }

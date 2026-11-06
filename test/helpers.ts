@@ -2,19 +2,25 @@
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { ensureDataDirs, loadConfig, paths } from "../src/config";
-import { initColocated } from "../src/jj";
+import type { Database } from "bun:sqlite";
+import { initColocated, jj } from "../src/jj";
 import { loadOrCreateIdentity } from "../src/pool/identity";
+import type { PoolRuntime } from "../src/pool/runtime";
 import { addProjectFromFolder } from "../src/projects/project";
+import { resolveStarts } from "../src/projects/starts";
 import { openDb } from "../src/store/db";
+import { newId } from "../src/store/records";
 import { TaskRunner, type RunnerHooks } from "../src/tasks/durable";
+import type { TaskManifest } from "../src/tasks/manifest";
 import { openHarness } from "../src/tasks/harness";
 import { addToken } from "../src/token";
 
 export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 
 /**
- * A node in a temp home: data dirs, task root, database, its pool identity (the key a later `startPool` loads), one
- * colocated project added from a folder with this node as its home,
+ * A node in a temp home: data dirs, task root, database, its pool identity (the key a later `startPool` loads; `id`), one
+ * colocated project added from a folder with this node as its home (one commit, `init`, with `@` empty on it: a task
+ * of it starts on `init`),
  * a token (`options.token`, default `"tok"`; `null` adds none), and a Harness with a TaskRunner that runs Claude Code
  * turns from the `fixture` recording (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the
  * environment the config is read from; its `MEDDLE_FIXTURE_MEMORY`, `MEDDLE_FIXTURE_STALL` and `MEDDLE_FIXTURE_BY_TOKEN`
@@ -32,6 +38,8 @@ export async function setupNode(
   const db = openDb(paths(cfg).db);
   const folder = `${home}/a`;
   await initColocated(folder);
+  await writeFile(`${folder}/README`, "a\n");
+  await jj(["commit", "-m", "init"], folder, cfg);
   const { id } = await loadOrCreateIdentity(cfg);
   const project = await addProjectFromFolder(cfg, db, folder, id, "a");
   const token = options.token === undefined ? "tok" : options.token;
@@ -49,7 +57,21 @@ export async function setupNode(
     ...(options.log === undefined ? {} : { log: options.log }),
     ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
   });
-  return { home, cfg, db, project, harness, runner };
+  return { home, cfg, db, id, project, harness, runner };
+}
+
+/**
+ * Creates a task of `projectIds` on `node` itself, as `NodeObject.createTask` does there without placement: a new id,
+ * each project's start resolved on its home (`resolveStarts`: here, or over `node.pool`), then `node.runner.create`.
+ */
+export async function createTask(
+  node: { cfg: ReturnType<typeof loadConfig>; db: Database; id: string; runner: TaskRunner; pool?: PoolRuntime },
+  input: { title: string; projectIds: string[] },
+): Promise<TaskManifest> {
+  const taskId = newId();
+  const deps = { cfg: node.cfg, db: node.db, selfId: node.id, ...(node.pool === undefined ? {} : { pool: node.pool }) };
+  const starts = await resolveStarts(deps, taskId, input.projectIds.map((id) => ({ id })));
+  return node.runner.create({ title: input.title, taskId, starts });
 }
 
 /**

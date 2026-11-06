@@ -10,13 +10,13 @@ import { paths } from "../paths";
 import type { PeerStream, PoolNet } from "../pool/net";
 import { shortId } from "../pool/ids";
 import { getProject } from "../projects/project";
-import { refreshTrunk } from "../projects/replicas";
+import { fetchFromUpstream } from "../projects/replicas";
 import { parseGitHeader, repoName, type GitService, type Repo } from "./wire";
 
 export type GitServeDeps = {
   db: Database;
   cfg: NodeConfig;
-  /** This node's id: a fetch of a project homed here refreshes its `trunk` first. */
+  /** This node's id: a fetch of a url project homed here fetches its sync branches from the upstream first. */
   selfId: string;
   isMember(id: string): boolean;
   /** Where a refused stream is logged (`meddle: git: …`); the runtime passes a deduplicating sink. */
@@ -95,14 +95,16 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
     return refuse(s);
   }
 
-  // A peer fetching a project homed here gets the `trunk` the home itself would start a task from.
-  if (request.service === "upload-pack" && request.repo.kind === "project" && getProject(deps.db, request.repo.id)?.home === deps.selfId) {
-    await refreshTrunk(deps.cfg, repo).catch((err: unknown) => {
-      deps.log?.(`meddle: git: trunk of ${shortId(request.repo.id)} was not refreshed: ${oneLine(err)}`);
+  // A peer fetching a project homed here and cloned from an upstream gets every sync branch as the upstream has it
+  // now. A failure does not refuse the fetch.
+  const homed = request.service === "upload-pack" && request.repo.kind === "project" ? getProject(deps.db, request.repo.id) : null;
+  if (homed !== null && homed.home === deps.selfId && homed.source.kind === "upstream") {
+    await fetchFromUpstream(deps.cfg, repo, homed.sync).catch((err: unknown) => {
+      deps.log?.(`meddle: git: sync branches of ${shortId(request.repo.id)} were not fetched: ${oneLine(err)}`);
     });
   }
 
-  // A push goes through the hook or not at all: a missing hook would let a peer move `trunk` or delete bookmarks.
+  // A push goes through the hook or not at all: a missing hook would let a peer move the home's bookmarks or delete them.
   if (request.service === "receive-pack" && !(await hookReady(deps.cfg))) {
     deps.log?.("meddle: git: update hook missing; refusing receive-pack");
     return reset(s);

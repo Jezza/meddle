@@ -107,7 +107,7 @@ test("PoolObject shows a pool of one, and a linked node that proved the secret a
     expect(poolA.self.value).toBe(A.identity.id);
     expect(poolA.nodes.value).toEqual([{
       nodeId: A.id, hostname: hostname(), status: "member", online: true, version: VERSION, claudeCodeVersion: "2.1.314",
-      hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [{ id: A.project.id, name: "a", home: A.id }],
+      hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [{ id: A.project.id, name: "a", home: A.id, sync: [], upstream: false }],
       lastSeenAt: expect.any(String), gone: false, link: null,
     }]);
     const nodeA = await a!.client.get(NodeObject, {});
@@ -500,7 +500,7 @@ test("a task created on one node shows in the other node's count at once", async
     await until(b!.pool.nodes, (rows) => rows.some((r) => r.nodeId === A.id && r.taskCount === 0));
     const nodeA = await a!.client.get(NodeObject, {});
     const began = Date.now();
-    await nodeA.createTask({ title: "t", projectIds: [A.project.id] });
+    await nodeA.createTask({ title: "t", projects: [{ id: A.project.id }] });
     await until(b!.pool.nodes, (rows) => rows.some((r) => r.nodeId === A.id && r.taskCount === 1));
     expect(Date.now() - began).toBeLessThan(3000);
   });
@@ -525,7 +525,7 @@ test("a node holds a peer's PeerObject: its projects with their home, and projec
     try {
       expect(peer.variant).toBe("peer");
       if (peer.variant !== "peer") return;
-      expect(peer.projects.value).toEqual([{ id: A.project.id, name: A.project.name, home: A.id }]);
+      expect(peer.projects.value).toEqual([{ id: A.project.id, name: A.project.name, home: A.id, sync: [], upstream: false }]);
       expect(typeof peer.claudeCodeVersion.value).toBe("string");
       expect(peer.hostsTasks.value).toBe(true);
 
@@ -533,8 +533,8 @@ test("a node holds a peer's PeerObject: its projects with their home, and projec
       await initColocated(folder);
       const added = await addProjectFromFolder(A.cfg, A.db, folder, A.id, "second");
       const projects = await until(peer.projects, (list) => list.some((p) => p.id === added.id));
-      expect(projects.find((p) => p.id === added.id)).toEqual({ id: added.id, name: "second", home: A.id });
-      expect(await peer.projectInfo({ id: added.id })).toEqual({ id: added.id, name: "second", home: A.id });
+      expect(projects.find((p) => p.id === added.id)).toEqual({ id: added.id, name: "second", home: A.id, sync: [], upstream: false });
+      expect(await peer.projectInfo({ id: added.id })).toEqual({ id: added.id, name: "second", home: A.id, sync: [], upstream: false });
       expect(await peer.projectInfo({ id: "nope" })).toBeNull();
     } finally {
       peer.release();
@@ -563,7 +563,7 @@ test("peerRef rejects for a node this node is not connected to", async () => {
   }
 }, 15_000);
 
-test("a task created for a project a node has never seen clones it from home, starts at the home's trunk, and its turn reaches the home", async () => {
+test("a task created for a project a node has never seen clones it from home, starts on the fork point the home resolves, and its turn reaches the home", async () => {
   const { A, B, close } = await twoPoolNodes({ extraEnv: { MEDDLE_FIXTURE_MEMORY: "1" } });
   const linked = linkClient(B.host);
   try {
@@ -572,19 +572,19 @@ test("a task created for a project a node has never seen clones it from home, st
     const changeOf = async (cfg: typeof A.cfg, repo: string, rev: string) =>
       (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], repo, cfg)).trim();
     await writeFile(`${repoA}/README`, "hello\n");
-    await jj(["commit", "-m", "init"], repoA, A.cfg);
-    await jj(["bookmark", "set", "main", "-r", "@-"], repoA, A.cfg);
-    const main = await changeOf(A.cfg, repoA, "main");
+    await jj(["commit", "-m", "hello"], repoA, A.cfg);
+    // The fork point of A's `@`: the newest ancestor with changes.
+    const fork = await changeOf(A.cfg, repoA, "@-");
     await peerReady(B, A);
     expect(getProject(B.db, id)).toBeNull();
 
     const nodeB = await linked.client.get(NodeObject, {});
     // Here, on B: placement would pick the project's home.
-    const { manifest, nodeId } = await nodeB.createTask({ title: "t", projectIds: [id], node: "here" });
+    const { manifest, nodeId } = await nodeB.createTask({ title: "t", projects: [{ id: id }], node: "here" });
     expect(nodeId).toBe(B.id);
     expect(getProject(B.db, id)?.home).toBe(A.id);
     const workspace = joinPath(paths(B.cfg).task(manifest.id), "a");
-    expect(await changeOf(B.cfg, workspace, "@-")).toBe(main);
+    expect(await changeOf(B.cfg, workspace, "@-")).toBe(fork);
 
     const result = new Promise<any>((res) => B.runner.onEvent((tid, _s, msg: any) => { if (tid === manifest.id && msg.type === "result") res(msg); }));
     const idle = new Promise<void>((res) => B.runner.onState((tid, s) => { if (tid === manifest.id && s === "idle") res(); }));
@@ -592,7 +592,8 @@ test("a task created for a project a node has never seen clones it from home, st
     expect((await result).subtype).toBe("success");
     await idle;
     const change = await changeOf(B.cfg, workspace, "@");
-    const onA = (await bookmarkList(repoA, A.cfg)).find((b) => b.name === `meddle/task/${manifest.id}/a` && b.remote === null);
+    // B's turn end wrote the task's line on A, its home.
+    const onA = (await bookmarkList(repoA, A.cfg)).find((b) => b.name === `task/${manifest.id}/a` && b.remote === "meddle");
     expect(onA?.changeId).toBe(change);
     expect(B.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
 

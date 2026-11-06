@@ -12,7 +12,7 @@ import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
 import { resultError, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
 import { askTitle } from "../engine/title";
-import { bookmarkForget, bookmarkList, bookmarkSet, changeId, workspaceForget } from "../jj";
+import { bookmarkForget, bookmarkList, bookmarkSet, changeId } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
 import { dedupe } from "../pool/report";
@@ -21,7 +21,8 @@ import { loadContext, loadProjectSettings } from "../projects/context";
 import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
 import type { StreamReader } from "../pool/frames";
 import { getProject, listProjects, type Project } from "../projects/project";
-import { ensureRemote, ensureReplica, fetchBookmarks, pushNamespace, trunkFor, type ReplicaDeps } from "../projects/replicas";
+import { fetchLines, giveBackLines, holdLines, releaseOnHome, writeLines } from "../projects/lines";
+import { ensureReplica, fetchSync, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
 import { appendEvent, latestEventOfType, listEventsTail, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
@@ -43,9 +44,9 @@ import { markToken, pickToken } from "../token";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
 import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
-import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type TaskManifest } from "./manifest";
+import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type ReceivedManifest, type Start, type TaskManifest } from "./manifest";
 import { MeddleMove, releaseFolder, type MoveInput } from "./move";
-import { checkReceivedManifest, provisionFromManifest, provisionTask } from "./provision";
+import { checkReceivedManifest, dropWorkspace, provisionFromManifest, provisionTask, SAFE_ID, scopeIfUnscoped } from "./provision";
 import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
 
 export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" | "moved" | "archived";
@@ -71,6 +72,8 @@ export type RunnerHooks = {
   afterActivate?(taskId: string): void | Promise<void>;
   /** Called as `receiveTask` starts its work on the task (after its checks, in the task's serialised section). */
   beforeReceive?(taskId: string): void | Promise<void>;
+  /** Called once `create` made the task, before it answers; a throw fails the call, and the task stays. */
+  afterCreate?(taskId: string): void | Promise<void>;
   /** Called as a failed move restores the task's state; a throw stands for a failure there. */
   beforeRestore?(taskId: string): void | Promise<void>;
   /**
@@ -92,7 +95,7 @@ export type RunnerDeps = {
   claudeRuntime?: "bun" | "node";
   extraEnv?: Record<string, string>;
   /**
-   * The node's pool. With it, tasks replicate projects homed elsewhere, start from the home's trunk, push their
+   * The node's pool. With it, tasks replicate projects homed elsewhere, start where their homes resolve, push their
    * bookmarks to the home and sync memory around turns; without it, the runner keeps to this node.
    */
   pool?: PoolRuntime;
@@ -227,6 +230,8 @@ export class TaskRunner {
   #archiving = new Set<string>();
   /** Tasks being restored here (`restoreHere`): no restore-move of them starts meanwhile. */
   #restoring = new Set<string>();
+  /** Tasks whose last write of their line failed: written again when the home comes online (`#pushAgain`). */
+  #unpushed = new Set<string>();
 
   constructor(cfg: NodeConfig, db: Database, harness: Harness, deps: RunnerDeps) {
     this.#cfg = cfg;
@@ -242,7 +247,39 @@ export class TaskRunner {
     slot.bound = true;
     slot.resolve(this);
     this.approvals.onChange(() => this.#syncWaiting());
-    if (this.#pool !== undefined) this.#sweepOrphans();
+    this.scopeUnscoped().catch((err: unknown) => this.#log(`meddle: could not scope the workspaces of older tasks: ${messageOf(err)}`));
+    if (this.#pool !== undefined) {
+      this.#watchHomes(this.#pool);
+      this.#sweepOrphans();
+    }
+  }
+
+  /**
+   * Scopes every workspace of each live task here that has no scope of its own (`scopeIfUnscoped`): a task made before
+   * meddle scoped its workspaces, whose agent jj's default `immutable_heads()` would forbid its own work once a turn end
+   * writes it to the task's line. Runs as the runner starts, each task under its key; a workspace that fails is logged.
+   */
+  async scopeUnscoped(): Promise<void> {
+    for (const { id } of listLiveTasks(this.#db)) {
+      await serialised(taskKey(id), async () => {
+        const row = getTask(this.#db, id);
+        if (row === null || row.state === "moved" || row.state === "receiving" || row.state === "archived") return;
+        let projects: ReceivedManifest["projects"];
+        try {
+          projects = (JSON.parse(row.manifest) as ReceivedManifest).projects ?? [];
+        } catch {
+          return;
+        }
+        for (const p of projects) {
+          const workspace = join(paths(this.#cfg).task(id), p.workspace);
+          try {
+            if (await scopeIfUnscoped(this.#cfg, workspace, id, p.base)) this.#log(`meddle: scoped the workspace ${workspace} of the older task ${id} to its line`);
+          } catch (err) {
+            this.#log(`meddle: could not scope the workspace ${workspace} of task ${id}: ${messageOf(err)}`);
+          }
+        }
+      });
+    }
   }
 
   /**
@@ -253,29 +290,51 @@ export class TaskRunner {
     if (this.#pool === pool) return;
     if (this.#pool !== undefined) throw new Error("this TaskRunner already has a pool");
     this.#pool = pool;
+    this.#watchHomes(pool);
     this.#sweepOrphans();
   }
 
   /**
-   * Provisions a task (with no project, or several). With a pool, each project is first replicated here when it is
-   * homed elsewhere and unknown (cloned from its home), and the task starts from the home's trunk; from the trunk last
-   * fetched from the home when the home cannot be reached now (`#startOf`).
+   * Provisions task `taskId` (with no project, or several) from the starts its projects' homes resolved (`startAt`),
+   * in order, the first the primary. With a pool, each project is first replicated here when it is homed elsewhere and
+   * unknown (cloned from its home); a `line` start on a project homed elsewhere fetches the task's line from the home
+   * (`fetchLines`), which brings its commit; a `sync` start takes the commit `fetchSync` gives (the copy fetched last
+   * when the home is offline). Refused for an id that is not one path segment, or that a task here already has.
    */
-  async create(input: { title: string; projectIds: string[] }): Promise<TaskManifest> {
+  async create(input: { title: string; taskId: string; starts: Start[] }): Promise<TaskManifest> {
+    const { taskId, starts } = input;
+    if (!SAFE_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
+    if (getTask(this.#db, taskId) !== null) throw new Error(`task ${taskId} exists here`);
     if ((await pickToken(this.#cfg, this.#db)) === null) throw new Error("no usable token");
     const deps = this.#replicaDeps();
+    /** Commits of the sync starts, by project. */
+    const synced: Record<string, string> = {};
+    /** The replicas the task's line was fetched into: forgotten there again when the create fails. */
+    const fetched: string[] = [];
     let manifest: TaskManifest;
-    if (deps === null) manifest = await provisionTask(this.#cfg, this.#db, input);
-    else {
-      const parents: Record<string, string> = {};
-      for (const id of input.projectIds) {
-        if (id in parents) continue; // provisionTask refuses the duplicate
-        parents[id] = await this.#startOf(deps, await ensureReplica(deps, id));
+    try {
+      for (const start of starts) {
+        const project = deps === null ? getProject(this.#db, start.projectId) : await ensureReplica(deps, start.projectId);
+        if (project === null) throw new Error(`unknown project: ${start.projectId}`);
+        if (start.kind === "sync") {
+          if (deps === null) throw new Error(`${project.name}: a sync start needs the pool`);
+          synced[start.projectId] = await fetchSync(deps, project, start.branch);
+        } else if (deps !== null && project.home !== deps.pool.identity.id) {
+          fetched.push(project.replica);
+          const lines = await fetchLines(this.#cfg, project.replica, project, project.home, taskId, "home");
+          if (!lines.some((l) => l.name === project.name && l.commitId === start.commit)) {
+            throw new Error(`the line of ${project.name} on ${shortId(project.home)} is not at ${start.commit.slice(0, 12)}`);
+          }
+        }
       }
-      manifest = await provisionTask(this.#cfg, this.#db, { ...input, parents });
+      manifest = await provisionTask(this.#cfg, this.#db, { title: input.title, taskId, starts, synced });
+    } catch (err) {
+      for (const replica of fetched) await this.#forgetBookmarks(replica, taskId).catch(() => {});
+      throw err;
     }
     // The new task is live here: whoever lists this node's tasks hears of it, whichever node asked for it.
     this.#emitState(manifest.id, "idle");
+    await this.#deps.hooks?.afterCreate?.(manifest.id);
     return manifest;
   }
 
@@ -293,25 +352,6 @@ export class TaskRunner {
       ...(this.#deps.claudeRuntime === undefined ? {} : { claudeRuntime: this.#deps.claudeRuntime }),
       ...(this.#deps.extraEnv === undefined ? {} : { extraEnv: this.#deps.extraEnv }),
     });
-  }
-
-  /**
-   * Where a new task of `project` starts: `trunkFor`. When that fails for a project homed on another node (the home is
-   * offline, or the fetch failed) and this replica has fetched the home's `trunk` before, that `trunk@<home>` instead,
-   * logged: placement may pick a node holding a replica because the home is down.
-   */
-  async #startOf(deps: ReplicaDeps, project: Project): Promise<string> {
-    try {
-      return await trunkFor(deps, project);
-    } catch (err) {
-      if (project.home === deps.pool.identity.id) throw err;
-      const remote = shortId(project.home);
-      const known = await serialised(repoKey(project.replica), () => bookmarkList(project.replica, this.#cfg)).catch(() => []);
-      const last = known.find((b) => b.name === "trunk" && b.remote === remote);
-      if (last === undefined || last.conflicted || last.changeId === "") throw err;
-      this.#log(`meddle: project ${project.name}: home unreachable; starting from the last fetched trunk`);
-      return `trunk@${remote}`;
-    }
   }
 
   /** How many of this node's tasks are in state `running` or `waiting`. */
@@ -658,25 +698,25 @@ export class TaskRunner {
   }
 
   /**
-   * The `finish` phase of `meddle.turn`: moves the task's bookmarks; with a pool, pushes each to its project's home
-   * when that is another node and syncs the primary project's memory, unless another task of that project is live
-   * here (decision 15: the last of them to end commits for all). A failed push or sync is logged, never thrown: the
-   * turn completed, and the next turn end tries again. Not for callers outside this module.
+   * The `finish` phase of `meddle.turn`: moves the task's bookmarks; with a pool, writes the task's line on each
+   * project's home and gives back what the task no longer keeps (`#pushLinesOf`), and syncs the primary project's
+   * memory, unless another task of that project is live here (decision 15: the last of them to end commits for all). A
+   * failed write or sync is logged, never thrown: the turn completed, a write is made again when the home comes online,
+   * and the next turn end tries again. Not for callers outside this module.
    */
   async finishTurnPhase(taskId: string, context: Context): Promise<void> {
     try {
       let manifest: TaskManifest;
-      let moved: TaskBookmark[];
       try {
         manifest = await readManifest(this.#cfg, taskId);
-        moved = await this.setTaskBookmarks(manifest);
+        await this.setTaskBookmarks(manifest);
       } catch (err) {
         this.#failTurn(taskId, context);
         throw err;
       }
       const deps = this.#replicaDeps();
       if (deps === null) return;
-      for (const m of moved) await this.#pushToHome(deps, manifest.id, m);
+      await this.#pushLinesOf(deps, manifest, true);
       const primary = manifest.primaryProjectId;
       if (primary === null) return; // no project: no bookmarks moved, no memory
       const live = this.#projectLiveElsewhere(taskId, primary);
@@ -694,34 +734,117 @@ export class TaskRunner {
     return [...this.#primaries].some(([id, p]) => id !== taskId && p === projectId);
   }
 
-  /** Points each of the task's bookmarks at its workspace's working-copy change; what it set. */
-  async setTaskBookmarks(manifest: TaskManifest): Promise<TaskBookmark[]> {
-    const set: TaskBookmark[] = [];
+  /** Points each of the task's project bookmarks at its workspace's working-copy change. */
+  async setTaskBookmarks(manifest: TaskManifest): Promise<void> {
     for (const p of manifest.projects) {
       const workspace = join(paths(this.#cfg).task(manifest.id), p.workspace);
       const bookmark = `${taskNamespace(manifest.id)}${p.name}`;
       const change = await changeId(workspace, this.#cfg);
-      // Not under another task's push to the same replica (pushNamespace takes the same key).
-      await serialised(repoKey(p.replica), () => bookmarkSet(p.replica, bookmark, change, this.#cfg));
-      set.push({ projectId: p.id, replica: p.replica, bookmark, change });
+      // Not under a write of the line from the same repo (`holdLines` takes the same key). Without a snapshot: on the
+      // home, the replica is the user's own checkout.
+      await serialised(repoKey(p.replica), () => bookmarkSet(p.replica, bookmark, change, this.#cfg, { ignoreWorkingCopy: true }));
     }
-    return set;
   }
 
   /**
-   * Pushes every bookmark under the task's namespace in `m`'s project (the project bookmark at `m.change`) to the
-   * project's home when that is another node: the home never fetches, so this is its backup. A failure is logged as
-   * `meddle: push: …`; what the home accepted has landed, and the next turn end pushes again.
+   * Writes task `taskId`'s line from its bookmarks here to each project's home (`holdLines`: on the home itself, the
+   * home repo's line; elsewhere a forced push): what a turn end writes, and what a move writes as it begins (its caller
+   * sets the bookmarks first). Nothing without a pool, or for a task whose row is gone, `receiving` or `moved`: a former
+   * holder never writes over its receiver's newer line. A failed write is logged as `meddle: push: …` and made again
+   * when that home comes online.
    */
-  async #pushToHome(deps: ReplicaDeps, taskId: string, m: TaskBookmark): Promise<void> {
-    const home = getProject(this.#db, m.projectId)?.home;
-    if (home === undefined || home === "" || home === deps.pool.identity.id) return;
-    try {
-      if (!deps.pool.net.isOnline(home)) throw new Error(`home ${shortId(home)} is offline`);
-      await pushNamespace(this.#cfg, m.replica, home, taskId, { name: m.bookmark, changeId: m.change });
-    } catch (err) {
-      const message = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
-      this.#log(`meddle: push: ${taskNamespace(taskId)}* to ${shortId(home)} failed: ${message}`);
+  async pushTaskLines(taskId: string): Promise<void> {
+    const deps = this.#replicaDeps();
+    const row = getTask(this.#db, taskId);
+    if (deps === null || row === null) return;
+    await this.#pushLinesOf(deps, JSON.parse(row.manifest) as TaskManifest, false);
+  }
+
+  /**
+   * `pushTaskLines` of `manifest`'s task, and with `giveBack` (a turn end), for each project whose write went through,
+   * the release on the home of what the task no longer keeps (`giveBackLines`; a failure is logged as
+   * `meddle: give back: …`). The task is remembered while a write of it has failed (`#unpushed`), and forgotten once one
+   * writes every project.
+   */
+  async #pushLinesOf(deps: ReplicaDeps, manifest: TaskManifest, giveBack: boolean): Promise<void> {
+    const taskId = manifest.id;
+    const state = getTask(this.#db, taskId)?.state;
+    if (state === undefined || state === "receiving" || state === "moved") {
+      this.#unpushed.delete(taskId);
+      return;
+    }
+    const self = deps.pool.identity.id;
+    let failed = false;
+    for (const p of manifest.projects) {
+      const project = getProject(this.#db, p.id);
+      if (project === null || project.home === "") continue;
+      const { home } = project;
+      try {
+        if (home !== self && !deps.pool.net.isOnline(home)) throw new Error(`home ${shortId(home)} is offline`);
+        await holdLines(this.#cfg, self, p.replica, project, taskId);
+      } catch (err) {
+        failed = true;
+        this.#log(`meddle: push: ${taskNamespace(taskId)}* to ${shortId(home)} failed: ${messageOf(err)}`);
+        continue;
+      }
+      if (!giveBack) continue;
+      await giveBackLines(deps, p.replica, project, taskId, p.name).catch((err: unknown) => {
+        this.#log(`meddle: give back: ${taskNamespace(taskId)}* on ${shortId(home)} failed: ${messageOf(err)}`);
+      });
+    }
+    if (failed) this.#unpushed.add(taskId);
+    else this.#unpushed.delete(taskId);
+  }
+
+  /**
+   * Once home `home` comes online: writes again the line of each task whose last write failed and that has a project
+   * homed there (`pushTaskLines`), unless it is moving (the move writes it) or gone from this node.
+   */
+  async #pushAgain(home: string): Promise<void> {
+    for (const taskId of [...this.#unpushed]) {
+      const row = getTask(this.#db, taskId);
+      if (row === null) {
+        this.#unpushed.delete(taskId);
+        continue;
+      }
+      if (this.#isMoving(row)) continue;
+      const manifest = JSON.parse(row.manifest) as TaskManifest;
+      if (!manifest.projects.some((p) => getProject(this.#db, p.id)?.home === home)) continue;
+      await this.pushTaskLines(taskId);
+    }
+  }
+
+  /**
+   * Writes a task's line again when one of its homes comes online (`#pushAgain`). Which writes failed before this
+   * runner started is not known: every live task with a project homed on another node is written again when that home
+   * comes online, as if its last write had failed.
+   */
+  #watchHomes(pool: PoolRuntime): void {
+    const self = pool.identity.id;
+    const elsewhere = (projectId: string) => {
+      const home = getProject(this.#db, projectId)?.home ?? "";
+      return home !== "" && home !== self;
+    };
+    for (const row of listLiveTasks(this.#db)) {
+      if (((JSON.parse(row.manifest) as Partial<TaskManifest>).projects ?? []).some((p) => elsewhere(p.id))) this.#unpushed.add(row.id);
+    }
+    pool.net.onPeer((peer, online) => {
+      if (!online) return;
+      this.#pushAgain(peer).catch((err: unknown) => this.#log(`meddle: push: could not push again to ${shortId(peer)}: ${messageOf(err)}`));
+    });
+  }
+
+  /**
+   * Before a move's handoff: sets the task's bookmarks (`setTaskBookmarks`) and, for each project homed on this node,
+   * writes its line (`writeLines`), which the target fetches: this node serves the target the home's line. Throws when
+   * such a write fails: the target would fetch an older line.
+   */
+  async setHandoffBookmarks(manifest: TaskManifest): Promise<void> {
+    const self = this.#pool?.identity.id;
+    await this.setTaskBookmarks(manifest);
+    for (const p of manifest.projects) {
+      if (self === undefined || getProject(this.#db, p.id)?.home !== self) continue;
+      await writeLines(this.#cfg, p.replica, manifest.id);
     }
   }
 
@@ -731,9 +854,10 @@ export class TaskRunner {
    * Prepares to receive task `manifest.id` from node `from`: refused unless both report the same, known Claude Code
    * version, this node hosts tasks and has a pool, and no other copy of the task is here (a partial one still being
    * received from `from` is abandoned first: the sender's handoff ran again). Replicates each project (from its home),
-   * fetches the task's bookmarks from `from`, and provisions the task at the fetched changes as `receiving`.
+   * fetches the task's bookmarks from `from` (`#fetchLine`), and provisions the task at the fetched commits as
+   * `receiving`.
    */
-  async receiveTask(manifest: TaskManifest, from: string, version: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  async receiveTask(manifest: ReceivedManifest, from: string, version: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const ours = claudeCodeVersion();
     if (version !== ours || ours === "unknown" || version === "unknown") return { ok: false, reason: `claude code ${ours} here, ${version} there` };
     const hosting = await checkTaskRoot(this.#cfg);
@@ -757,54 +881,44 @@ export class TaskRunner {
       } else {
         await this.#clearLeftovers(manifest);
       }
-      /** Side bookmarks this receive created; forgotten again when it fails. */
-      const created: Array<{ replica: string; name: string }> = [];
+      /** The replicas this receive fetched the task's bookmarks into: forgotten there again when it fails. */
+      const fetched: string[] = [];
       try {
         const parents: Record<string, string> = {};
         for (const p of manifest.projects) {
           const project = await ensureReplica(deps, p.id);
-          const fetched = await this.#fetchTaskChange(project, from, taskId, `${taskNamespace(taskId)}${p.name}`);
-          parents[p.id] = fetched.change;
-          created.push(...fetched.created.map((name) => ({ replica: project.replica, name })));
+          fetched.push(project.replica);
+          parents[p.id] = await this.#fetchLine(project, from, taskId, p.name);
         }
         await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "receiving");
         updateTask(this.#db, taskId, { receiving_from: from });
         return { ok: true };
       } catch (err) {
-        for (const { replica, name } of created) {
-          await serialised(repoKey(replica), () => bookmarkForget(replica, `exact:${name}`, this.#cfg)).catch(() => {});
-        }
+        for (const replica of fetched) await this.#forgetBookmarks(replica, taskId).catch(() => {});
         return { ok: false, reason: messageOf(err) };
       }
     });
   }
 
   /**
-   * Fetches every bookmark under task `taskId`'s namespace from node `from` into the project's replica (never
-   * tracking them); `bookmark`, the task's project bookmark, must be there. Each side bookmark becomes a local one
-   * here at the sender's change (the project bookmark is set as the workspace is provisioned). The project bookmark's
-   * change, and the side bookmarks that did not exist here before.
+   * Fetches task `taskId`'s bookmarks from node `from` into the project's replica here, as its local bookmarks under the
+   * task's namespace (`fetchLines`, which drops the ones `from` does not have): from the project's home, the task's
+   * line, or failing that the home repo's own bookmarks of the task (where an older meddle kept a task archived before
+   * lines); from another node, that holder's own bookmarks. The project's bookmark `meddle/task/<id>/<name>` must be
+   * there (else `bookmark <b> not found on <short>`). Its commit.
    */
-  async #fetchTaskChange(project: Project, from: string, taskId: string, bookmark: string): Promise<{ change: string; created: string[] }> {
-    const remote = shortId(from);
-    const ns = taskNamespace(taskId);
-    return serialised(repoKey(project.replica), async () => {
-      await ensureRemote(this.#cfg, project.replica, from, { kind: "project", id: project.id });
-      await fetchBookmarks(this.#cfg, project.replica, from, [`exact:${bookmark}`, taskGlob(taskId)]);
-      const listed = await bookmarkList(project.replica, this.#cfg);
-      const found = listed.find((b) => b.name === bookmark && b.remote === remote);
-      if (found === undefined || found.conflicted || found.changeId === "") throw new Error(`bookmark ${bookmark}@${remote} is conflicted`);
-      const created: string[] = [];
-      for (const b of listed) {
-        if (b.remote !== remote || !b.name.startsWith(ns) || b.name === bookmark || b.conflicted || b.changeId === "") continue;
-        const here = listed.find((l) => l.name === b.name && l.remote === null);
-        if (here !== undefined && !here.conflicted && here.changeId === b.changeId) continue;
-        // Without a snapshot: on the home, the replica is the user's own checkout.
-        await bookmarkSet(project.replica, b.name, b.changeId, this.#cfg, { ignoreWorkingCopy: true });
-        if (here === undefined) created.push(b.name);
-      }
-      return { change: found.changeId, created };
-    });
+  async #fetchLine(project: Project, from: string, taskId: string, name: string): Promise<string> {
+    const fromHome = from === project.home;
+    let lines = await fetchLines(this.#cfg, project.replica, project, from, taskId, fromHome ? "home" : "holder");
+    if (fromHome && !lines.some((l) => l.name === name)) lines = await fetchLines(this.#cfg, project.replica, project, from, taskId, "holder");
+    const commit = lines.find((l) => l.name === name)?.commitId;
+    if (commit === undefined) throw new Error(`bookmark ${taskNamespace(taskId)}${name} not found on ${shortId(from)}`);
+    return commit;
+  }
+
+  /** Forgets every bookmark under task `taskId`'s namespace in `repo`, never snapshotting its working copy. */
+  async #forgetBookmarks(repo: string, taskId: string): Promise<void> {
+    await serialised(repoKey(repo), () => bookmarkForget(repo, taskGlob(taskId), this.#cfg, { ignoreWorkingCopy: true }));
   }
 
   /**
@@ -830,7 +944,8 @@ export class TaskRunner {
 
   /**
    * Makes a task received from `from` live here (`idle`); a follow-up joins the front of its queued prompts, which
-   * then run one turn each, in order (`startQueued`). A task already activated is a no-op: the sender's commit ran
+   * then run one turn each, in order (`startQueued`), and writes its line on its homes (`pushTaskLines`). A task
+   * already activated is a no-op: the sender's commit ran
    * again, also when this node has moved the task on since. Refused `forbidden` when this node has no copy of the
    * task or is receiving it from another node. Every answer is definite, so the sender can tell it from a lost one:
    * `ok: true` when this node activated the task, `ok: false` when activating it failed and it did not (its received
@@ -865,6 +980,10 @@ export class TaskRunner {
         this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
       }
       await this.#deps.hooks?.afterActivate?.(taskId);
+      // The line as it came, to its homes: the sender's last write may have failed, and once its row says `moved` it
+      // never writes again. A home that is offline gets it when it comes back (`#unpushed`). Not awaited: the sender
+      // waits for this answer.
+      void this.pushTaskLines(taskId).catch((err: unknown) => this.#log(`meddle: push: ${taskNamespace(taskId)}* failed: ${messageOf(err)}`));
       return { ok: true };
     });
   }
@@ -960,12 +1079,12 @@ export class TaskRunner {
    * provisioning left of a task this node has no row for, or what an archive stopped between its row update and the
    * folder's removal left of an archived one (cleared before a restore).
    */
-  async #clearLeftovers(manifest: TaskManifest): Promise<void> {
+  async #clearLeftovers(manifest: ReceivedManifest): Promise<void> {
     const task = paths(this.#cfg).task(manifest.id);
     if (!existsSync(task)) return;
     for (const p of manifest.projects) {
       const replica = getProject(this.#db, p.id)?.replica;
-      if (replica !== undefined) await workspaceForget(replica, `meddle-${manifest.id}`, this.#cfg).catch(() => {});
+      if (replica !== undefined) await dropWorkspace(this.#cfg, replica, `meddle-${manifest.id}`, join(task, p.workspace));
     }
     await rm(task, { recursive: true, force: true });
   }
@@ -975,7 +1094,7 @@ export class TaskRunner {
     const manifest = JSON.parse(row.manifest) as TaskManifest;
     const self = this.#pool?.identity.id;
     for (const p of manifest.projects) {
-      await workspaceForget(p.replica, `meddle-${row.id}`, this.#cfg).catch(() => {});
+      await dropWorkspace(this.#cfg, p.replica, `meddle-${row.id}`, join(paths(this.#cfg).task(row.id), p.workspace));
       if (self !== undefined && getProject(this.#db, p.id)?.home === self) continue;
       await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(row.id), this.#cfg)).catch(() => {});
     }
@@ -988,12 +1107,12 @@ export class TaskRunner {
   /**
    * Archives idle task `taskId` on this node (spec 21.4): refused (`task is <state>`, `task has queued prompts`) unless
    * its row is `idle` with nothing queued and no turn of it is live, pending or in the Harness, and it is not moving.
-   * Sets its bookmarks; for each project homed on another node, the home must be online (else `cannot archive: home
-   * <short> of <project> is offline`) and takes the push of the task's namespace (`pushNamespace`, whose failure
-   * rejects the archive): once this node forgets them, the home's copy is the only one. Then writes the archive to
-   * `<data>/archives/<id>.json.gz`, records the row `archived` here (its event and transcript rows stay) and takes the
-   * folder off this node (`releaseFolder`: on a project's home its bookmarks stay). A refused or failed archive leaves
-   * the task idle and in place.
+   * Sets its bookmarks; a project's home on another node must be online (else `cannot archive: home <short> of
+   * <project> is offline`), and each home takes the task's line (`holdLines`, whose failure rejects the archive): once
+   * a node off the home forgets the task's bookmarks, the home's line is the only copy, and it stays there while the
+   * task is archived. Then writes the archive to `<data>/archives/<id>.json.gz`, records the row `archived` here (its
+   * event and transcript rows stay) and takes the folder off this node (`releaseFolder`: on a project's home its
+   * bookmarks stay). A refused or failed archive leaves the task idle and in place.
    */
   async archive(taskId: string): Promise<void> {
     const pool = this.#pool;
@@ -1009,18 +1128,18 @@ export class TaskRunner {
         if ((await this.#durableTurn(taskId)) !== undefined) throw new Error("task is running");
         this.#refuseArchive(this.#row(taskId));
         const manifest = await readManifest(this.#cfg, taskId);
-        const homes = new Map<string, string>();
+        const holds: Array<{ project: Project; replica: string }> = [];
         for (const p of manifest.projects) {
-          const home = getProject(this.#db, p.id)?.home;
-          if (home === undefined || home === "") throw new Error(`cannot archive: project ${p.name} has no known home`);
-          if (home === self) continue;
-          if (!pool.net.isOnline(home)) throw new Error(`cannot archive: home ${shortId(home)} of ${p.name} is offline`);
-          homes.set(p.id, home);
+          const project = getProject(this.#db, p.id);
+          if (project === null || project.home === "") throw new Error(`cannot archive: project ${p.name} has no known home`);
+          if (project.home !== self && !pool.net.isOnline(project.home)) {
+            throw new Error(`cannot archive: home ${shortId(project.home)} of ${p.name} is offline`);
+          }
+          holds.push({ project, replica: p.replica });
         }
-        for (const b of await this.setTaskBookmarks(manifest)) {
-          const home = homes.get(b.projectId);
-          if (home !== undefined) await pushNamespace(this.#cfg, b.replica, home, taskId, { name: b.bookmark, changeId: b.change });
-        }
+        await this.setTaskBookmarks(manifest);
+        for (const { project, replica } of holds) await holdLines(this.#cfg, self, replica, project, taskId);
+        this.#unpushed.delete(taskId);
         await writeArchive(this.#cfg, this.#db, taskId, paths(this.#cfg).archiveFile(taskId));
         // Recorded before the folder goes: a node that stops in between has an archived task whose leftovers a
         // restore clears, never an idle one without its folder.
@@ -1049,8 +1168,9 @@ export class TaskRunner {
 
   /**
    * Restores task `taskId`, archived on this node, here: each project's workspace starts on the task's project bookmark
-   * (on the project's home, the local one; elsewhere, fetched from the home with the rest of the task's namespace, which
-   * must be online: else `cannot restore: home <short> of <project> is offline`), the folder is provisioned from the
+   * (on the project's home, the local one; elsewhere, fetched from the home's line with the rest of the task's
+   * bookmarks (`#fetchLine`), and the home must be online: else `cannot restore: home <short> of <project> is
+   * offline`), the folder is provisioned from the
    * manifest and the archive's files are unpacked into it (a task without a project's transcript into this node's
    * slot). The row is `idle` again, no longer archived, and the archive is deleted. On failure, what it made is taken
    * off again and the task stays archived. While it runs, another restore of the task is refused (`task is being
@@ -1079,7 +1199,7 @@ export class TaskRunner {
       if (this.#moving.has(taskId)) throw new Error("task is moving");
       if (row.state !== "archived") throw new Error(`task is ${row.state}`);
       if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
-      const manifest = JSON.parse(row.manifest) as TaskManifest;
+      const manifest = JSON.parse(row.manifest) as ReceivedManifest;
       const file = paths(this.#cfg).archiveFile(taskId);
       const archive = await readArchive(file);
       // What a node that stopped while archiving it left.
@@ -1096,7 +1216,7 @@ export class TaskRunner {
             continue;
           }
           if (!pool.net.isOnline(project.home)) throw new Error(`cannot restore: home ${shortId(project.home)} of ${p.name} is offline`);
-          parents[p.id] = (await this.#fetchTaskChange(project, project.home, taskId, bookmark)).change;
+          parents[p.id] = await this.#fetchLine(project, project.home, taskId, p.name);
         }
         restored = await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "idle", { keepRow: true });
         await unpackArchiveFiles(this.#cfg, taskId, archive);
@@ -1196,41 +1316,25 @@ export class TaskRunner {
   }
 
   /**
-   * Stages an archived task's namespace for its restore-move (decision 8): for each project homed on another node, the
-   * home must be online (else `home <short> of <project> is offline`, checked for all before any fetch); what is left
-   * here under the task's namespace is forgotten (an earlier unstage that failed), then every bookmark under it is
-   * fetched from the home (at least one must be there) and set as a local bookmark at the home's
-   * change, so the target's `receiveTask` fetches them from here. On a project's home they are local already.
+   * Stages an archived task's bookmarks for its restore-move (decision 8): for each project homed on another node, the
+   * home must be online (else `home <short> of <project> is offline`, checked for all before any fetch); the task's
+   * line is fetched from the home into the project's replica here as its local bookmarks (`#fetchLine`, which drops
+   * what an earlier unstage that failed left; the project's own must be there), so the target's `receiveTask` fetches
+   * them from here. On a project's home, the target fetches the home's line.
    */
   async stageNamespace(manifest: TaskManifest): Promise<void> {
     const deps = this.#replicaDeps();
     if (deps === null) throw new Error("this node has no pool");
     const self = deps.pool.identity.id;
-    const homes: Array<{ project: Project; home: string }> = [];
+    const homes: Array<{ project: Project; name: string }> = [];
     for (const p of manifest.projects) {
       const project = getProject(this.#db, p.id);
       if (project === null) throw new Error(`unknown project: ${p.id}`);
       if (project.home === self) continue;
       if (!deps.pool.net.isOnline(project.home)) throw new Error(`home ${shortId(project.home)} of ${p.name} is offline`);
-      homes.push({ project, home: project.home });
+      homes.push({ project, name: p.name });
     }
-    const ns = taskNamespace(manifest.id);
-    for (const { project, home } of homes) {
-      const remote = shortId(home);
-      await serialised(repoKey(project.replica), async () => {
-        // What an earlier unstage that failed left: only the home's copy is staged.
-        await bookmarkForget(project.replica, taskGlob(manifest.id), this.#cfg);
-        await ensureRemote(this.#cfg, project.replica, home, { kind: "project", id: project.id });
-        await fetchBookmarks(this.#cfg, project.replica, home, [taskGlob(manifest.id)], { requireMatch: true });
-        const listed = await bookmarkList(project.replica, this.#cfg);
-        for (const b of listed) {
-          if (b.remote !== remote || !b.name.startsWith(ns) || b.conflicted || b.changeId === "") continue;
-          const here = listed.find((l) => l.name === b.name && l.remote === null);
-          if (here !== undefined && !here.conflicted && here.changeId === b.changeId) continue;
-          await bookmarkSet(project.replica, b.name, b.changeId, this.#cfg, { ignoreWorkingCopy: true });
-        }
-      });
-    }
+    for (const { project, name } of homes) await this.#fetchLine(project, project.home, manifest.id, name);
   }
 
   /**
@@ -1249,8 +1353,10 @@ export class TaskRunner {
   /**
    * Deletes task `taskId` from this node: only an `archived` or `moved` one (else `task is <state>`). What is left of its
    * folder goes first (an archive whose folder removal was cut short, a move whose cleanup has not run: the folder, the
-   * workspaces and, off a project's home, the task's bookmarks), then its archive (or a move's leftover), then its row,
-   * event log and transcript rows.
+   * workspaces and, off a project's home, the task's bookmarks), then, with a pool, its bookmarks in each project's
+   * repo here (on the home too) and, for an archived task (a moved one lives on elsewhere), its whole line on each home
+   * (`releaseOnHome`: a home that is offline, or whose release fails, is left to its janitor, logged), then its archive
+   * (or a move's leftover), then its row, event log and transcript rows.
    */
   async deleteTask(taskId: string): Promise<void> {
     await serialised(taskKey(taskId), async () => {
@@ -1259,9 +1365,12 @@ export class TaskRunner {
       if (row.state !== "archived" && row.state !== "moved") {
         throw new Error(`task is ${row.state}${row.state === "idle" ? "; only an archived task is deleted: archive it first" : ""}`);
       }
-      const self = this.#pool?.identity.id;
-      if (self !== undefined) await releaseFolder(this.#cfg, this.#db, self, taskId);
-      else await this.#clearLeftovers(JSON.parse(row.manifest) as TaskManifest);
+      const deps = this.#replicaDeps();
+      const manifest = JSON.parse(row.manifest) as TaskManifest;
+      if (deps !== null) {
+        await releaseFolder(this.#cfg, this.#db, deps.pool.identity.id, taskId);
+        await this.#releaseTask(deps, manifest, row.state === "archived");
+      } else await this.#clearLeftovers(manifest);
       const p = paths(this.#cfg);
       await rm(p.archiveFile(taskId), { force: true });
       await rm(p.movedFile(taskId), { force: true });
@@ -1269,6 +1378,24 @@ export class TaskRunner {
       // Told with the state it had: whoever lists this node's tasks reads them again.
       this.#emitState(taskId, row.state as TaskState);
     });
+  }
+
+  /**
+   * What `deleteTask` takes off the projects' repos, with a pool: the task's bookmarks in each, and, with `release`, its
+   * line on each home (logged when that fails or the home is offline).
+   */
+  async #releaseTask(deps: ReplicaDeps, manifest: TaskManifest, release: boolean): Promise<void> {
+    const taskId = manifest.id;
+    this.#unpushed.delete(taskId);
+    for (const p of manifest.projects) {
+      const project = getProject(this.#db, p.id);
+      if (project === null) continue;
+      await this.#forgetBookmarks(p.replica, taskId).catch(() => {});
+      if (!release || project.home === "") continue;
+      await releaseOnHome(deps, project, taskId, []).catch((err: unknown) => {
+        this.#log(`meddle: delete: the line of ${taskId} on ${shortId(project.home)} was not released (its janitor will): ${messageOf(err)}`);
+      });
+    }
   }
 
   // ─── moving a task to another node ───
@@ -1557,7 +1684,7 @@ export class TaskRunner {
 
   /** What the replica and memory functions need, or null without a pool. */
   #replicaDeps(): ReplicaDeps | null {
-    return this.#pool === undefined ? null : { cfg: this.#cfg, db: this.#db, pool: this.#pool };
+    return this.#pool === undefined ? null : { cfg: this.#cfg, db: this.#db, pool: this.#pool, log: this.#log };
   }
 
   /** After the turn's terminal commit: count it and make the task idle. Not for callers outside this module. */
@@ -1706,8 +1833,6 @@ function refuseMoved(row: TaskRow): void {
   if (row.state === "moved") throw new Error(`task has moved to ${shortId(row.moved_to ?? "")}`);
 }
 
-/** One task bookmark `setTaskBookmarks` set. */
-type TaskBookmark = { projectId: string; replica: string; bookmark: string; change: string };
 
 /** Calls each listener; one that throws is logged and never reaches the turn that told it. */
 function notify<T>(listeners: Set<T>, call: (cb: T) => void): void {

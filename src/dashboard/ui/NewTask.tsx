@@ -43,7 +43,7 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
     if (prompt.trim() === "" || action.busy) return;
     let created: { taskId: string; nodeId: string } | undefined;
     const ok = await action.run(async () => {
-      const { manifest, nodeId } = await node.createTask({ projectIds: chosen, node: where?.nodeId ?? null, prompt });
+      const { manifest, nodeId } = await node.createTask({ projects: chosen.map((id) => ({ id })), node: where?.nodeId ?? null, prompt });
       created = { taskId: manifest.id, nodeId };
     });
     if (ok && created !== undefined) open(created.nodeId, created.taskId);

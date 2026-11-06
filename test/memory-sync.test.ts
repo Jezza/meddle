@@ -5,7 +5,7 @@ import { bookmarkList, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
 import { ensureReplica, type ReplicaDeps } from "../src/projects/replicas";
-import { setupNode } from "./helpers";
+import { createTask, setupNode } from "./helpers";
 import { peerReady, startPoolNode, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 const depsOf = (n: GitPoolNode): ReplicaDeps => ({ cfg: n.cfg, db: n.db, pool: n.pool });
@@ -137,9 +137,10 @@ test("the home's turn-end sync after a peer's push keeps the peer's commit under
 }, 15_000);
 
 test("with MEDDLE_FIXTURE_MEMORY=1 the stand-in appends the first prompt to the task's MEMORY.md", async () => {
-  const { cfg, project, runner, harness } = await setupNode(undefined, { MEDDLE_FIXTURE_MEMORY: "1" });
+  const node = await setupNode(undefined, { MEDDLE_FIXTURE_MEMORY: "1" });
+  const { cfg, project, runner, harness } = node;
   try {
-    const m = await runner.create({ title: "t", projectIds: [project.id] });
+    const m = await createTask(node, { title: "t", projectIds: [project.id] });
     const idle = new Promise<void>((res) => runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); }));
     await runner.prompt(m.id, "Remember the tide tables.");
     await idle;
@@ -198,8 +199,8 @@ test("two tasks of one project whose turns start and end together sync memory on
     const id = A.project.id;
     const mem = paths(A.cfg).memory(id);
     const tasks = [
-      await A.runner.create({ title: "one", projectIds: [id] }),
-      await A.runner.create({ title: "two", projectIds: [id] }),
+      await createTask(A, { title: "one", projectIds: [id] }),
+      await createTask(A, { title: "two", projectIds: [id] }),
     ];
     for (let round = 0; round < 2; round++) {
       const idle = tasks.map((m) => new Promise<void>((res) => A.runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); })));
@@ -224,8 +225,8 @@ test("a turn that ends while another task of the project is live here leaves mem
   try {
     const id = A.project.id;
     const mem = paths(A.cfg).memory(id);
-    const one = await A.runner.create({ title: "one", projectIds: [id] });
-    const two = await A.runner.create({ title: "two", projectIds: [id] });
+    const one = await createTask(A, { title: "one", projectIds: [id] });
+    const two = await createTask(A, { title: "two", projectIds: [id] });
     const idleOf = (taskId: string) =>
       new Promise<void>((res) => { const off = A.runner.onState((tid, s) => { if (tid === taskId && s === "idle") { off(); res(); } }); });
     /** Waits until the task's turn is live and its prompt is in the memory working copy. */

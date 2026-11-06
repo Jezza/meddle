@@ -5,15 +5,50 @@ import type { NodeConfig } from "../config";
 import { claudeSlot } from "../memory";
 import { paths } from "../paths";
 
+/** One project of a task: its workspace in the project's repo here (`replica`), and where the task started. */
+export type ManifestProject = {
+  id: string;
+  name: string;
+  replica: string;
+  workspace: string;
+  /** The revision the workspace was made on here: the commit its start named. */
+  parent: string;
+  /**
+   * The commit the task's work is measured from: its workspace may rewrite nothing at or below it
+   * (`scopeWorkspace`). Its start's base: a `line` start's `base`, a `sync` start's commit.
+   */
+  base: string;
+};
+
 export type TaskManifest = {
   id: string;
   title: string;
   sessionId: string;
-  projects: Array<{ id: string; name: string; replica: string; workspace: string; parent: string }>;
+  projects: ManifestProject[];
   /** The first project's id; null for a task without a project. */
   primaryProjectId: string | null;
   createdAt: string;
 };
+
+/**
+ * A manifest as another node sends it, or as a row written before meddle recorded bases holds it: a project may lack
+ * its `base`, resolved from its `parent` then.
+ */
+export type ReceivedManifest = Omit<TaskManifest, "projects"> & {
+  projects: Array<Omit<ManifestProject, "base"> & { base?: string }>;
+};
+
+/** How a task takes a revision it starts at: `edit` works on it in place, `child` on a new change on top of it. */
+export type HandoffMode = "edit" | "child";
+
+/**
+ * Where one project of a task starts, as the project's home resolved it (commit ids): a `line` start at a revision
+ * (its line is written at `commit`; `base` is the commit the task's work is measured from), or a `sync` start from one
+ * of the project's sync branches, which writes no line.
+ */
+export type Start =
+  | { projectId: string; kind: "line"; mode: HandoffMode; commit: string; base: string }
+  | { projectId: string; kind: "sync"; branch: string };
 
 /**
  * Every bookmark of task `taskId` is under `meddle/task/<taskId>/`: its project's bookmark `<project name>` and the

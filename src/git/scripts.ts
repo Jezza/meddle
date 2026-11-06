@@ -40,7 +40,7 @@ case "$3" in
   *) echo "meddle: deleting $ref is not accepted here" >&2; exit 1 ;;
 esac
 case "$MEDDLE_REPO_KIND:$ref" in
-  project:refs/heads/meddle/task/*) exit 0 ;;
+  project:refs/remotes/meddle/task/*) exit 0 ;;
   memory:refs/heads/memory) exit 0 ;;
 esac
 echo "meddle: ref $ref is not accepted here" >&2
@@ -48,9 +48,9 @@ exit 1
 `;
 
 /**
- * Writes `<data>/git-hooks/update`: it refuses deletions and admits only `refs/heads/meddle/task/*` into a project
- * repo and `refs/heads/memory` into a memory repo (`MEDDLE_REPO_KIND`), refusing every other ref with
- * `meddle: ref <ref> is not accepted here`.
+ * Writes `<data>/git-hooks/update`: it refuses deletions (`meddle: deleting <ref> is not accepted here`) and admits
+ * only a task's line, `refs/remotes/meddle/task/*`, into a project repo and `refs/heads/memory` into a memory repo
+ * (`MEDDLE_REPO_KIND`), refusing every other ref with `meddle: ref <ref> is not accepted here`.
  */
 export async function writeUpdateHook(cfg: NodeConfig): Promise<string> {
   return writeScript(paths(cfg).hookUpdate, UPDATE_HOOK);

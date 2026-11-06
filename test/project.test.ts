@@ -72,7 +72,7 @@ test("registerReplica stores the home's project id, name and home, and fires pro
     const p = registerReplica(db, { id: "0123456789ab", name: "theirs", home: HOME_B, replica: `${home}/replica` });
     expect(p).toEqual({
       id: "0123456789ab", name: "theirs", home: HOME_B, replica: `${home}/replica`,
-      source: { kind: "upstream", url: `meddle://${HOME_B}/project/0123456789ab` },
+      source: { kind: "upstream", url: `meddle://${HOME_B}/project/0123456789ab` }, sync: [], upstream: false,
     });
     expect(getProject(db, "0123456789ab")).toEqual(p);
     expect(fired).toBe(1);

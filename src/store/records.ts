@@ -15,6 +15,10 @@ export type ProjectRow = {
   created_at: string;
   /** The home's node id; NULL in a row from before homes, until the node claims it (`claimHomelessProjects`). */
   home: string | null;
+  /** The sync branches as a JSON array of names; NULL for none. */
+  sync: string | null;
+  /** 1 when the project's default start is its first sync branch, else 0; NULL in a row from before. */
+  upstream: 0 | 1 | null;
 };
 
 export type TaskRow = {
@@ -46,7 +50,7 @@ export type TaskSettings = { model?: string; effort?: string; permissionMode?: P
 
 export function insertProject(db: Database, row: ProjectRow): void {
   db.query(
-    "INSERT INTO projects (id, name, source_kind, source, replica, created_at, home) VALUES ($id, $name, $source_kind, $source, $replica, $created_at, $home)",
+    "INSERT INTO projects (id, name, source_kind, source, replica, created_at, home, sync, upstream) VALUES ($id, $name, $source_kind, $source, $replica, $created_at, $home, $sync, $upstream)",
   ).run({
     $id: row.id,
     $name: row.name,
@@ -55,7 +59,19 @@ export function insertProject(db: Database, row: ProjectRow): void {
     $replica: row.replica,
     $created_at: row.created_at,
     $home: row.home,
+    $sync: row.sync,
+    $upstream: row.upstream,
   });
+}
+
+/** Records whether the project's default start is its first sync branch. */
+export function setProjectUpstreamRow(db: Database, id: string, upstream: boolean): void {
+  db.query("UPDATE projects SET upstream = ? WHERE id = ?").run(upstream ? 1 : 0, id);
+}
+
+/** Replaces the project's sync branches (a JSON array of names, or NULL for none). */
+export function setProjectSyncRow(db: Database, id: string, sync: string | null): void {
+  db.query("UPDATE projects SET sync = ? WHERE id = ?").run(sync, id);
 }
 
 /** Gives every project without a home (added before projects had one) the home `nodeId`: this node. */

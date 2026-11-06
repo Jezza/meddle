@@ -24,6 +24,9 @@ async function home(lighthouseUrl: string) {
   const dir = await mkdtemp("/tmp/meddle-e2e-plan4-");
   await mkdir(`${dir}/t`, { recursive: true });
   await initColocated(`${dir}/repo`);
+  // A first commit, `@` empty on it: a task of the repo starts there.
+  await writeFile(`${dir}/repo/README`, "repo\n");
+  await jj(["commit", "-m", "init"], `${dir}/repo`);
   const env = {
     HOME: dir,
     MEDDLE_DATA_DIR: `${dir}/d`,
@@ -173,7 +176,7 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     );
     expect(author).toBe("Pool Person <pool@meddle.invalid>");
 
-    // task new with a prompt on A for A's project, asked onto B; a side bookmark made in its workspace on B reaches A after a turn
+    // task new with a prompt on A for A's project, asked onto B; a side bookmark made in its workspace on B reaches A's line after a turn
     const spawned = taskOn(await meddle(["task", "new", "Reply", "with", "ok.", "--project", pa, "--node", shortId(B.id)], atA), B.id);
     await idle(B.port, spawned);
     const spike = `meddle/task/${spawned}/pa.spike`;
@@ -183,8 +186,8 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     expect(second.stderr.trim().split("\n").at(-1)).toBe("result/success");
     await idle(B.port, spawned);
     // read through git, so the test runs no jj operation in a repo A's serve is using
-    const refsOnA = async () => (await Bun.$`git -C ${a.dir}/repo for-each-ref ${"--format=%(refname)"} refs/heads/meddle/task/${spawned}/`.quiet().text());
-    await untilValue(`${spike} on A`, refsOnA, (out) => out.split("\n").includes(`refs/heads/${spike}`));
+    const refsOnA = async () => (await Bun.$`git -C ${a.dir}/repo for-each-ref ${"--format=%(refname)"} refs/remotes/meddle/task/${spawned}/`.quiet().text());
+    await untilValue(`${spike} on A`, refsOnA, (out) => out.split("\n").includes(`refs/remotes/meddle/task/${spawned}/pa.spike`));
 
     // archive it on B; restore it from B with no node: placement picks pa's home A, the printed node is where it is
     await until(["status"], atB, /^tasks 2$/m);

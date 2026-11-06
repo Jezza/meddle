@@ -37,7 +37,9 @@ export type EngineInput = {
 };
 
 /**
- * The environment of a task's Claude Code: `PATH`, `HOME` and the passthrough names from `jjEnv`, the pool's settings
+ * The environment of a task's Claude Code: `PATH`, `HOME`, `XDG_CONFIG_HOME` (when meddle has one: the agent's jj reads
+ * its workspace's config, `scopeWorkspace`, from where meddle's jj wrote it) and the passthrough names from `jjEnv`, the
+ * pool's settings
  * (`cfg.poolEnv`), then the names meddle sets itself (which a pool setting can never replace), the projects' context
  * env and `extraEnv`.
  */
@@ -45,7 +47,7 @@ export function buildEnv(i: EngineInput): Record<string, string> {
   const env: Record<string, string> = {};
   // PATH with `<data>/bin` first: jj and git inside a task find the remote helper for meddle:// remotes.
   const meddle = jjEnv(i.cfg);
-  for (const name of ["PATH", "HOME", ...i.cfg.envPassthrough]) {
+  for (const name of ["PATH", "HOME", "XDG_CONFIG_HOME", ...i.cfg.envPassthrough]) {
     const value = meddle[name];
     if (value !== undefined) env[name] = value;
   }

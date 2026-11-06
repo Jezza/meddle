@@ -6,7 +6,8 @@ import { dirname, join } from "node:path";
 import type { SendStream } from "@number0/iroh";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { paths } from "../src/config";
-import { bookmarkList, jj } from "../src/jj";
+import { bookmarkList, git, jj, JjError, workspaceConfigPath } from "../src/jj";
+import { homeLines } from "../src/projects/lines";
 import { shortId } from "../src/pool/ids";
 import { NodeObject, SessionObject, TaskObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
@@ -18,7 +19,7 @@ import { taskKey } from "../src/tasks/durable";
 import { serialised } from "../src/serial";
 import { claudeCodeVersion } from "../src/version";
 import { transcriptPath, type TaskManifest } from "../src/tasks/manifest";
-import { setupNode } from "./helpers";
+import { createTask, setupNode } from "./helpers";
 import { endpointPair, linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** Sends `text` to the task on `node` and waits for the turn to end. */
@@ -74,7 +75,7 @@ test("an idle task archived on its project's home keeps its rows and bookmarks, 
   const A = nodes[0]!;
   const owner = linkClient(A.host);
   try {
-    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     await promptAndWait(A, m.id, "Reply with the single word ok.");
     // A real transcript row is kept with the events.
     A.db.query("INSERT INTO transcript (project_key, session_id, subpath, seq, uuid, ts, json) VALUES (?, ?, '', 1, NULL, 0, '{}')").run(m.primaryProjectId, m.sessionId);
@@ -163,11 +164,51 @@ test("an idle task archived on its project's home keeps its rows and bookmarks, 
   }
 }, 30_000);
 
+test("deleting a task archived on the home releases its line and its workspace config, and the user's commit under it is mutable and visible again (Review Focus 5)", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const home = A.project.replica;
+    const log = async (rev: string, template: string) =>
+      (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", template], home, A.cfg)).trim();
+    await writeFile(join(home, "mine"), "mine\n");
+    await jj(["commit", "-m", "mine"], home, A.cfg);
+    await jj(["bookmark", "set", "main", "-r", "@-"], home, A.cfg);
+    const mine = await log("main", "commit_id");
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    const workspace = join(paths(A.cfg).task(m.id), "a");
+    const config = await workspaceConfigPath(workspace, A.cfg);
+    expect(existsSync(config)).toBe(true);
+    await writeFile(join(workspace, "work"), "work\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    const head = (await homeLines(A.cfg, home, m.id))[0]!.commitId;
+    expect(await log(`${head}-`, "commit_id")).toBe(mine);
+    expect(await log(mine, "immutable")).toBe("true");
+    const refused = await jj(["--ignore-working-copy", "describe", "-r", mine, "-m", "mine, reworded"], home, A.cfg).catch((err: unknown) => err);
+    expect(refused).toBeInstanceOf(JjError);
+
+    await A.runner.archive(m.id);
+    expect(await homeLines(A.cfg, home, m.id)).toEqual([{ taskId: m.id, name: "a", commitId: head }]);
+    await A.runner.deleteTask(m.id);
+    expect(getTask(A.db, m.id)).toBeNull();
+    expect(await homeLines(A.cfg, home, m.id)).toEqual([]);
+    expect(existsSync(config)).toBe(false);
+    expect(await namespace(A, home, m.id)).toEqual({ local: [], remote: 0 });
+    // Nothing was abandoned: the user's commit and the task's work are still there, and the user's is theirs again.
+    expect(await log(`${mine} | ${head}`, 'commit_id ++ " " ++ immutable ++ "\\n"')).toBe(`${head} false\n${mine} false`);
+    expect(await log(`visible_heads() & ${head}`, "commit_id")).toBe(head);
+    await jj(["--ignore-working-copy", "describe", "-r", mine, "-m", "mine, reworded"], home, A.cfg);
+    expect(A.logs.filter((l) => l.startsWith("meddle: delete:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 30_000);
+
 test("a task without a project archives and restores here with its transcript in this node's slot", async () => {
   const { nodes, close } = await poolNodes(1);
   const A = nodes[0]!;
   try {
-    const m = await A.runner.create({ title: "loose", projectIds: [] });
+    const m = await createTask(A, { title: "loose", projectIds: [] });
     await promptAndWait(A, m.id, "Reply with the single word ok.");
     await A.runner.archive(m.id);
     expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
@@ -181,20 +222,28 @@ test("a task without a project archives and restores here with its transcript in
   }
 }, 20_000);
 
-test("archiving on a node that is not the project's home pushes the task's namespace to the home first, and is refused while the home is offline", async () => {
+test("archiving on a node that is not the project's home pushes the task's line to the home first, restoring fetches it from there, and archiving is refused while the home is offline", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     // A is the home; the task lives on B, which made a change and a side bookmark no turn end has pushed yet.
-    const m = await B.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
     const replicaB = paths(B.cfg).replica(A.project.id);
     const workspaceB = join(paths(B.cfg).task(m.id), "a");
     await writeFile(join(workspaceB, "note.txt"), "made on B\n");
     await jj(["bookmark", "create", `meddle/task/${m.id}/a.spike`, "-r", "@"], workspaceB, B.cfg);
     const change = await changeAt(B, workspaceB, "@");
-    expect((await namespace(A, A.project.replica, m.id)).local).toEqual([]);
+    // The home holds the line its start wrote, at the task's start; no turn end has moved it yet.
+    expect(await homeLines(A.cfg, A.project.replica, m.id)).toEqual([{ taskId: m.id, name: "a", commitId: m.projects[0]!.base }]);
 
     await B.runner.archive(m.id);
-    expect((await namespace(A, A.project.replica, m.id)).local).toEqual([`meddle/task/${m.id}/a ${change}`, `meddle/task/${m.id}/a.spike ${change}`]);
+    // The home holds the task's line, and nothing under its own bookmarks: the restore can only come from the line.
+    const commit = await jj(["log", "--ignore-working-copy", "-r", `task/${m.id}/a@meddle`, "--no-graph", "-T", "commit_id"], A.project.replica, A.cfg);
+    expect(await homeLines(A.cfg, A.project.replica, m.id)).toEqual([
+      { taskId: m.id, name: "a", commitId: commit },
+      { taskId: m.id, name: "a.spike", commitId: commit },
+    ]);
+    expect(await changeAt(A, A.project.replica, commit)).toBe(change);
+    expect(await git(["for-each-ref", `refs/heads/meddle/task/${m.id}`], A.project.replica, A.cfg)).toBe("");
     expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
     expect(existsSync(paths(B.cfg).task(m.id))).toBe(false);
     expect(getTask(B.db, m.id)).toMatchObject({ state: "archived", archived_on: B.id });
@@ -207,7 +256,7 @@ test("archiving on a node that is not the project's home pushes the task's names
     expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", archived_on: null });
 
     // With the home offline, the archive is refused and nothing changes.
-    const other = await B.runner.create({ title: "u", projectIds: [A.project.id] });
+    const other = await createTask(B, { title: "u", projectIds: [A.project.id] });
     A.net.unwatch(B.id, "bye");
     B.net.unwatch(A.id, "bye");
     await until("A online to B", () => B.net.isOnline(A.id), false);
@@ -224,7 +273,7 @@ test("archiving is refused while a turn runs, while prompts are queued, and whil
   const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }] });
   const A = nodes[0]!;
   try {
-    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     // By its init, the stand-in has read the prompt and stalls before its result until interrupted.
     const initialised = new Promise<void>((res) => {
       const off = A.runner.onEvent((id, _seq, msg) => {
@@ -257,7 +306,7 @@ test("archiving is refused while a turn runs, while prompts are queued, and whil
 test("writeArchive returns with the archive whole and readable and no partial write left; serve's sweep removes a stray partial write", async () => {
   const node = await setupNode();
   try {
-    const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
     const dir = paths(node.cfg).archives;
     const file = await writeArchive(node.cfg, node.db, m.id, paths(node.cfg).archiveFile(m.id));
     expect(await readdir(dir)).toEqual([`${m.id}.json.gz`]);
@@ -282,21 +331,21 @@ test("deleting an archived task whose archive stopped before its folder was remo
   const { nodes, close } = await poolNodes(1);
   const A = nodes[0]!;
   try {
-    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     // The state an archive leaves when the node stops between the row update and `releaseFolder`.
     await writeArchive(A.cfg, A.db, m.id, paths(A.cfg).archiveFile(m.id));
     updateTask(A.db, m.id, { state: "archived", archived_on: A.id, archived_at: new Date().toISOString() });
     expect(existsSync(join(paths(A.cfg).task(m.id), "a"))).toBe(true);
     expect((await workspaces(A, A.project.replica)).includes(`meddle-${m.id}`)).toBe(true);
-    const bookmarks = await namespace(A, A.project.replica, m.id);
+    expect((await namespace(A, A.project.replica, m.id)).local).toHaveLength(1);
 
     await A.runner.deleteTask(m.id);
     expect(getTask(A.db, m.id)).toBeNull();
     expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
     expect((await workspaces(A, A.project.replica)).includes(m.id)).toBe(false);
     expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(false);
-    // On the project's home its bookmarks stay, as for any archived task.
-    expect(await namespace(A, A.project.replica, m.id)).toEqual(bookmarks);
+    // The task is gone: on the project's home too, its bookmarks go with it.
+    expect(await namespace(A, A.project.replica, m.id)).toEqual({ local: [], remote: 0 });
   } finally {
     await close();
   }
@@ -358,7 +407,7 @@ test("exportArchive sends an archived task as exportTask sent it before: importT
   const R1 = await setupNode();
   const R2 = await setupNode();
   try {
-    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     await promptAndWait(A, m.id, "Reply with the single word ok.");
     A.db.query("INSERT INTO transcript (project_key, session_id, subpath, seq, uuid, ts, json) VALUES (?, ?, '', 1, NULL, 0, '{}')").run(m.primaryProjectId, m.sessionId);
     A.db.query("INSERT INTO transcript (project_key, session_id, subpath, seq, uuid, ts, json) VALUES (?, ?, 'subagents/x', 1, 'u', 0, '{\"a\":1}')").run(m.primaryProjectId, m.sessionId);
@@ -386,7 +435,7 @@ test("restore with no node named lands a task archived off its project's home on
   const owner = linkClient(A.host);
   try {
     // B is the project's home; the task ran and is archived on A.
-    const m = await A.runner.create({ title: "t", projectIds: [B.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [B.project.id] });
     await promptAndWait(A, m.id, "Reply with the single word ok.");
     const replicaA = paths(A.cfg).replica(B.project.id);
     const workspaceA = join(paths(A.cfg).task(m.id), "a");
@@ -437,7 +486,7 @@ test("restore on a named node from a node that is not the project's home stages 
   const { A, B, close } = await twoPoolNodes();
   try {
     // A is the home; the task lives on B, with a side bookmark, and is archived there (pushed to A).
-    const m = await B.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
     const replicaB = paths(B.cfg).replica(A.project.id);
     const workspaceB = join(paths(B.cfg).task(m.id), "a");
     await writeFile(join(workspaceB, "note.txt"), "made on B\n");
@@ -445,7 +494,9 @@ test("restore on a named node from a node that is not the project's home stages 
     const change = await changeAt(B, workspaceB, "@");
     await B.runner.archive(m.id);
     const both = [`meddle/task/${m.id}/a ${change}`, `meddle/task/${m.id}/a.spike ${change}`];
-    expect((await namespace(A, A.project.replica, m.id)).local).toEqual(both);
+    // On the home it is the task's line: B stages from there.
+    expect((await homeLines(A.cfg, A.project.replica, m.id)).map((l) => l.name)).toEqual(["a", "a.spike"]);
+    expect((await namespace(A, A.project.replica, m.id)).local).toEqual([]);
     expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
     await peerReady(B, A);
 
@@ -459,7 +510,7 @@ test("restore on a named node from a node that is not the project's home stages 
     expect(getTask(B.db, m.id)).toMatchObject({ state: "moved", moved_to: A.id });
     expect(existsSync(paths(B.cfg).archiveFile(m.id))).toBe(false);
     expect(existsSync(paths(B.cfg).movedFile(m.id))).toBe(true);
-    // The home keeps them, and the task runs there on the archived change.
+    // The home has them from B now, and the task runs there on the archived change.
     expect((await namespace(A, A.project.replica, m.id)).local).toEqual(both);
     expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
     const workspaceA = join(paths(A.cfg).task(m.id), "a");
@@ -474,7 +525,7 @@ test("a restore-move the target refuses leaves the task archived on the source w
   const { A, B, close } = await twoPoolNodes();
   try {
     // B is the project's home; the task is archived on A.
-    const m = await A.runner.create({ title: "t", projectIds: [B.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [B.project.id] });
     await promptAndWait(A, m.id, "Reply with the single word ok.");
     await A.runner.archive(m.id);
     const replicaA = paths(A.cfg).replica(B.project.id);
@@ -516,7 +567,7 @@ test("a restore-move the target refuses leaves the task archived on the source w
 test("while a task is being restored here, a restore elsewhere is refused; the task ends idle here with no move", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
-    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     await A.runner.archive(m.id);
     await peerReady(A, B);
     // The restore here is reserved at once and then waits for the task's key, held here.
@@ -544,7 +595,7 @@ test("automatic placement for a restore leaves out a node running another Claude
   const { A, B, close } = await twoPoolNodes();
   try {
     // B is the project's home, which placement would pick; A's roster says B runs another Claude Code.
-    const m = await A.runner.create({ title: "t", projectIds: [B.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [B.project.id] });
     await A.runner.archive(m.id);
     const summary = A.store.row(B.id)!.summary!;
     A.db.query("UPDATE roster SET summary = ? WHERE node_id = ?").run(JSON.stringify({ ...summary, claudeCodeVersion: "0.0.1-other" }), B.id);

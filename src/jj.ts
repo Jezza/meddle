@@ -33,7 +33,7 @@ export function jjEnv(cfg: NodeConfig): Record<string, string> {
 const NETWORK_TIMEOUT_MS = 120_000;
 
 /** The time limit of a jj command that talks to a peer: the config's, or the default. */
-function networkMs(cfg?: NodeConfig): number {
+export function networkMs(cfg?: NodeConfig): number {
   return cfg?.jjNetworkTimeoutMs ?? NETWORK_TIMEOUT_MS;
 }
 
@@ -48,8 +48,31 @@ export type JjOptions = {
 
 /** Runs jj in `cwd`; with `cfg`, in `jjEnv(cfg)` so that `meddle://` remotes work. Rejects a `JjError` on failure. */
 export async function jj(args: string[], cwd: string, cfg?: NodeConfig, options: JjOptions = {}): Promise<string> {
+  return run(["jj", "--no-pager", "--color", "never"], "jj", (code, stderr) => new JjError(args, code, stderr), args, cwd, cfg, options);
+}
+
+export class GitError extends Error {
+  constructor(
+    public args: string[],
+    public code: number,
+    public stderr: string,
+  ) {
+    super(`git ${args.join(" ")} exited with code ${code}: ${stderr.trim()}`);
+    this.name = "GitError";
+  }
+}
+
+/** Runs git in `cwd`, as `jj` runs jj (same environment, same time limit). Rejects a `GitError` on failure. */
+export async function git(args: string[], cwd: string, cfg?: NodeConfig, options: JjOptions = {}): Promise<string> {
+  return run(["git"], "git", (code, stderr) => new GitError(args, code, stderr), args, cwd, cfg, options);
+}
+
+async function run(
+  command: string[], name: string, fail: (code: number, stderr: string) => Error,
+  args: string[], cwd: string, cfg: NodeConfig | undefined, options: JjOptions,
+): Promise<string> {
   const { timeoutMs } = options;
-  const proc = Bun.spawn(["jj", "--no-pager", "--color", "never", ...args], {
+  const proc = Bun.spawn([...command, ...args], {
     cwd,
     env: cfg === undefined ? process.env : jjEnv(cfg),
     stdin: "ignore",
@@ -73,7 +96,7 @@ export async function jj(args: string[], cwd: string, cfg?: NodeConfig, options:
         } catch {
           proc.kill("SIGKILL");
         }
-        reject(new Error(`jj ${args.join(" ")} timed out after ${timeoutMs} ms`));
+        reject(new Error(`${name} ${args.join(" ")} timed out after ${timeoutMs} ms`));
       }, timeoutMs);
     });
   // Once timed out, the outputs end whenever the killed processes' pipes close; nobody waits for them.
@@ -84,7 +107,7 @@ export async function jj(args: string[], cwd: string, cfg?: NodeConfig, options:
   } finally {
     clearTimeout(timer);
   }
-  if (code !== 0) throw new JjError(args, code, stderr);
+  if (code !== 0) throw fail(code, stderr);
   return stdout;
 }
 
@@ -120,8 +143,48 @@ export async function workspaceAdd(repo: string, name: string, path: string, rev
   await jj(["workspace", "add", "--colocate", "--name", name, "-r", revision, path], repo, cfg);
 }
 
+/** Makes `revision` the working copy of the workspace at `workspace` (`jj edit`). */
+export async function editIn(workspace: string, revision: string, cfg?: NodeConfig): Promise<void> {
+  await jj(["edit", revision], workspace, cfg);
+}
+
+/** Forgets workspace `name` of `repo`, without snapshotting `repo`'s own working copy (the user's, on a home). */
 export async function workspaceForget(repo: string, name: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["workspace", "forget", name], repo, cfg);
+  await jj(["--ignore-working-copy", "workspace", "forget", name], repo, cfg);
+}
+
+/**
+ * Sets `name` to `value` in the jj config of the workspace at `workspace` alone (`jj config set --workspace`), which jj
+ * keeps in the user's config directory, not in the workspace (`workspaceConfigPath`).
+ */
+export async function configSetWorkspace(workspace: string, name: string, value: string, cfg?: NodeConfig): Promise<void> {
+  await jj(["config", "set", "--workspace", name, value], workspace, cfg);
+}
+
+/** The file holding the jj config of the workspace at `workspace` (`jj config path --workspace`); it may not exist. */
+export async function workspaceConfigPath(workspace: string, cfg?: NodeConfig): Promise<string> {
+  return (await jj(["config", "path", "--workspace"], workspace, cfg)).trim();
+}
+
+/**
+ * The one commit `revision` names in `repo`, read without snapshotting the working copy; rejects
+ * `no revision <revision>` or `<revision> names <n> revisions`.
+ */
+export async function commitOf(repo: string, revision: string, cfg?: NodeConfig): Promise<string> {
+  const out = await jj(["log", "--ignore-working-copy", "-r", `present(${revision})`, "--no-graph", "-T", 'commit_id ++ "\\n"'], repo, cfg);
+  const commits = out.split("\n").filter(Boolean);
+  if (commits.length === 0) throw new Error(`no revision ${revision}`);
+  if (commits.length > 1) throw new Error(`${revision} names ${commits.length} revisions`);
+  return commits[0]!;
+}
+
+/** The changes `revset` selects, each with the commit it has now, in `jj log` order. Never snapshots the working copy. */
+export async function changesIn(repo: string, revset: string, cfg?: NodeConfig): Promise<Array<{ changeId: string; commitId: string }>> {
+  const out = await jj(["log", "--ignore-working-copy", "-r", revset, "--no-graph", "-T", 'change_id ++ " " ++ commit_id ++ "\\n"'], repo, cfg);
+  return out.split("\n").filter(Boolean).map((line) => {
+    const [changeId = "", commitId = ""] = line.split(" ");
+    return { changeId, commitId };
+  });
 }
 
 /**
@@ -141,10 +204,14 @@ export async function bookmarkDelete(repo: string, name: string, cfg?: NodeConfi
 
 /**
  * Forgets the bookmarks `pattern` (a jj string pattern, `exact:` or `glob:`) selects here and their remote entries,
- * leaving nothing for a push to delete (decision 19). No match is no error.
+ * leaving nothing for a push to delete (decision 19). No match is no error. With `ignoreWorkingCopy`, without
+ * snapshotting the working copy first: for a repo that is the user's own checkout.
  */
-export async function bookmarkForget(repo: string, pattern: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["bookmark", "forget", "--include-remotes", pattern], repo, cfg);
+export async function bookmarkForget(
+  repo: string, pattern: string, cfg?: NodeConfig, options: { ignoreWorkingCopy?: boolean } = {},
+): Promise<void> {
+  const args = ["bookmark", "forget", "--include-remotes", pattern];
+  await jj(options.ignoreWorkingCopy === true ? ["--ignore-working-copy", ...args] : args, repo, cfg);
 }
 
 export async function changeId(workspace: string, cfg?: NodeConfig): Promise<string> {

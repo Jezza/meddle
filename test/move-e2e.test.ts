@@ -3,7 +3,7 @@
 import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
-import { initColocated } from "../src/jj";
+import { initColocated, jj } from "../src/jj";
 import { shortId } from "../src/pool/ids";
 import { TaskObject } from "../src/state/contracts";
 import { startFakeLighthouse } from "./fake-lighthouse";
@@ -18,6 +18,9 @@ async function home(lighthouseUrl: string) {
   const dir = await mkdtemp("/tmp/meddle-move-e2e-");
   await mkdir(`${dir}/t`, { recursive: true });
   await initColocated(`${dir}/repo`);
+  // A first commit, `@` empty on it: a task of the repo starts there.
+  await writeFile(`${dir}/repo/README`, "repo\n");
+  await jj(["commit", "-m", "init"], `${dir}/repo`);
   const env = {
     HOME: dir,
     MEDDLE_DATA_DIR: `${dir}/d`,

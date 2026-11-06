@@ -151,9 +151,13 @@ tool calls Claude Code asks about, Interrupt, a composer for the next message, a
 permission mode. A task needs no project: `meddle task new "Compare these two libraries for me"` starts in a scratch
 folder of its own with your user layer only.
 
-The work lands in the project's own repo, on the bookmark `meddle/task/<task id>/myproject`, pointed at the
-workspace's working copy at the end of every turn. Landing it on `main` is yours to do in jj, or Claude's inside the
-task; meddle never merges anything. The task's folder, with a jj workspace per project, is under the task root.
+The task starts on the newest commit under your folder's `@` that has changes (its fork point), so commit or `jj new`
+first: while `@` itself has changes, `task new` is refused (`@ has changes; move off it first`), as meddle never moves
+your working copy. `--rev <rev>` starts it on another revision, and `--rev <rev> --edit` has it work on that revision
+itself ([Where a task starts](../README.md#where-a-task-starts)). The work lands in the project's own repo as the
+task's line, the read-only bookmark `task/<task id>/myproject@meddle`, written at the end of every turn. Taking it is
+yours to do in jj (`jj new task/<task id>/myproject@meddle`, or a rebase of your work onto it); meddle never merges
+anything. The task's folder, with a jj workspace per project, is under the task root.
 
 ### 7. Run it as a service
 
@@ -224,7 +228,7 @@ otherwise. Nothing needs opening in a firewall for that. If you want a fixed UDP
 
 ## Day to day
 
-**Starting work.** `meddle task new "<prompt>" [--project <name>]...` from any machine, or New task in the
+**Starting work.** `meddle task new "<prompt>" [--project <name> [--rev <rev>] [--edit]]...` from any machine, or New task in the
 dashboard's sidebar (under a project, or under Tasks for none or several): the composer takes the projects, the node
 and the first prompt. Without a prompt `task new` creates a task that waits idle;
 `meddle task prompt <id> "<text>"` sends one and waits for the turn to end, so it is the command for scripts. A message

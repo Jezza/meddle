@@ -85,8 +85,13 @@ const MIGRATIONS = [
 const ADDED_COLUMNS = [
   // A task's model, effort and permission mode overrides, as JSON (`TaskSettings`); NULL for none.
   { table: "tasks", column: "settings", type: "TEXT" },
-  // The node id of the project's home: the node whose `trunk` is the project's.
+  // The node id of the project's home: the node whose repo is the project's.
   { table: "projects", column: "home", type: "TEXT" },
+  // The project's sync branches, in order, as a JSON array of bookmark names; NULL for none.
+  { table: "projects", column: "sync", type: "TEXT" },
+  // 1 when the project's default start is its first sync branch (added from an upstream URL on its home), else 0;
+  // NULL in a row from before, read from the row's source.
+  { table: "projects", column: "upstream", type: "INTEGER" },
   // Prompts sent while the task was moving, as a JSON array of strings; NULL for none.
   { table: "tasks", column: "queued", type: "TEXT" },
   // The node a `moved` task went to.

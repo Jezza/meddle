@@ -10,7 +10,7 @@ import { getTask } from "../src/store/records";
 import { SqliteSessionStore } from "../src/store/session-store";
 import type { TaskManifest } from "../src/tasks/manifest";
 import { exportTask, importTask, receiptsMatch, type TransferFrame } from "../src/tasks/transfer";
-import { setupNode } from "./helpers";
+import { createTask, setupNode } from "./helpers";
 import { endpointPair } from "./pool-helpers";
 
 type Node = Awaited<ReturnType<typeof setupNode>>;
@@ -21,7 +21,7 @@ type ProjectTask = TaskManifest & { primaryProjectId: string };
 
 async function turnedNode(): Promise<{ node: Node; m: ProjectTask }> {
   const node = await setupNode();
-  const m = await node.runner.create({ title: "t", projectIds: [node.project.id] });
+  const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
   const idle = new Promise<void>((res) => node.runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); }));
   await node.runner.prompt(m.id, "Reply with the single word ok.");
   await idle;

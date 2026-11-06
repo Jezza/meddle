@@ -18,6 +18,13 @@ export const TaskStateSchema = Type.Union([
   Type.Literal("archived"),
 ]);
 
+export const HandoffModeSchema = Type.Union([Type.Literal("edit"), Type.Literal("child")]);
+
+export const StartSchema = Type.Union([
+  Type.Object({ projectId: Type.String(), kind: Type.Literal("line"), mode: HandoffModeSchema, commit: Type.String(), base: Type.String() }),
+  Type.Object({ projectId: Type.String(), kind: Type.Literal("sync"), branch: Type.String() }),
+]);
+
 export const TaskManifestSchema = Type.Object({
   id: Type.String(),
   title: Type.String(),
@@ -28,6 +35,8 @@ export const TaskManifestSchema = Type.Object({
     replica: Type.String(),
     workspace: Type.String(),
     parent: Type.String(),
+    /** Absent from an older node's manifest. */
+    base: Type.Optional(Type.String()),
   })),
   /** Null for a task without a project. */
   primaryProjectId: Nullable(Type.String()),
@@ -77,10 +86,23 @@ export const ProjectSchema = Type.Object({
   replica: Type.String(),
   /** The node id of the project's home. */
   home: Type.String(),
+  /** The project's sync branches, in order: the bookmarks a task can start from. */
+  sync: Type.Array(Type.String()),
+  /** Whether its default start is its first sync branch (added from an upstream URL on its home). */
+  upstream: Type.Optional(Type.Boolean()),
 });
 
-/** A project as another node sees it. */
-export const ProjectInfoSchema = Type.Object({ id: Type.String(), name: Type.String(), home: Type.String() });
+/**
+ * A project as another node sees it. `upstream`: whether its default start is its first sync branch (added from an
+ * upstream URL on its home). A node of an older meddle sends neither `sync` nor `upstream` (read as none, and false).
+ */
+export const ProjectInfoSchema = Type.Object({
+  id: Type.String(),
+  name: Type.String(),
+  home: Type.String(),
+  sync: Type.Optional(Type.Array(Type.String())),
+  upstream: Type.Optional(Type.Boolean()),
+});
 
 export const EventSchema = Type.Object({ seq: Type.Number(), message: Type.Unknown() });
 
@@ -119,21 +141,33 @@ const nodeState = {
 const nodeMethods = {
   /**
    * Creates a task on the node `node` names: absent or null, the one placement picks (`place`); `"here"`, this node;
-   * else that node id, a member of the pool. `prompt`, when given, starts its first turn there. `title` absent or
+   * else that node id, a member of the pool. It mints the task's id, asks each project's home for its start, and creates
+   * the task there from those starts; when a start or the creation certainly failed, the lines already written are
+   * released. `prompt`, when given, starts its first turn there. `title` absent or
    * blank: Haiku's title for the prompt, else its first line, or two adjectives and a noun (`taskTitle`). Answers the manifest and the node the
    * task is on.
    */
   createTask: method(
     Type.Object({
       title: Type.Optional(Type.String()),
-      projectIds: Type.Array(Type.String()),
+      /**
+       * The task's projects, the first the primary, each starting where its home resolves (`PeerObject.startAt`): at
+       * `rev` (`child` mode unless `mode` says `edit`), or, without one, at its default start.
+       */
+      projects: Type.Array(Type.Object({
+        id: Type.String(),
+        rev: Type.Optional(Type.String()),
+        mode: Type.Optional(HandoffModeSchema),
+      })),
       prompt: Type.Optional(Nullable(Type.String())),
       node: Type.Optional(Nullable(Type.String())),
     }),
     Type.Object({ manifest: TaskManifestSchema, nodeId: Type.String() }),
   ),
-  addProjectFromFolder: method(Type.Object({ path: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
-  addProjectFromUpstream: method(Type.Object({ url: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
+  addProjectFromFolder: method(Type.Object({ path: Type.String(), name: Type.Optional(Type.String()), sync: Type.Optional(Type.Array(Type.String())) }), ProjectSchema),
+  addProjectFromUpstream: method(Type.Object({ url: Type.String(), name: Type.Optional(Type.String()), sync: Type.Optional(Type.Array(Type.String())) }), ProjectSchema),
+  /** Replaces the sync branches of project `projectId`, homed on this node (`not the home of <project>` otherwise). */
+  setProjectSync: method(Type.Object({ projectId: Type.String(), sync: Type.Array(Type.String()) }), ProjectSchema),
   dismiss: method(Type.Object({ id: Type.String() })),
 };
 
@@ -468,12 +502,39 @@ export const PeerObject = remote("meddle.peer", {
         /** Removes a task still being received from the caller. */
         abandonTask: method(Type.Object({ taskId: Type.String() })),
         /**
-         * Creates a task here for the caller (a member; anyone else is refused `forbidden`), then starts its first
-         * turn with `prompt` when one is given. Refused like a local create: no task root, no usable token, ….
+         * Creates task `taskId` here for the caller (a member; anyone else is refused `forbidden`) from the starts its
+         * projects' homes resolved, then starts its first turn with `prompt` when one is given. Refused like a local
+         * create: no task root, no usable token, a task `taskId` already here, ….
          */
-        createTask: method(
-          Type.Object({ title: Type.String(), projectIds: Type.Array(Type.String()), prompt: Nullable(Type.String()) }),
+        createTaskAt: method(
+          Type.Object({ title: Type.String(), taskId: Type.String(), starts: Type.Array(StartSchema), prompt: Nullable(Type.String()) }),
           Type.Object({ manifest: TaskManifestSchema }),
+        ),
+        /** Whether this node has task `id` (a `moved` row, left by a task that went on, is not having it). */
+        taskHeld: method(Type.Object({ id: Type.String() }), Type.Boolean()),
+        /**
+         * On the home of project `projectId`, releases every line of task `taskId` whose name is not in `keep` (a member
+         * only; `forbidden` otherwise) and returns the names released; refused `not the home of <project>` on any other
+         * node, and `invalid task id: <id>` for an id that is not one safe path segment.
+         */
+        releaseLines: method(
+          Type.Object({ projectId: Type.String(), taskId: Type.String(), keep: Type.Array(Type.String()) }),
+          Type.Object({ released: Type.Array(Type.String()) }),
+        ),
+        /**
+         * On the home of project `projectId` (a member only; `forbidden` otherwise), resolves where task `taskId`
+         * starts in it: `rev` (null: the default start) taken as `mode`. A line start writes the task's line there.
+         * Refused with the reason when the start cannot be made, `invalid task id: <id>` for an id that is not one safe
+         * path segment, and `a task's start is resolved on its project's home, <short id>` on any other node.
+         */
+        startAt: method(
+          Type.Object({
+            projectId: Type.String(),
+            taskId: Type.String(),
+            rev: Nullable(Type.String()),
+            mode: HandoffModeSchema,
+          }),
+          StartSchema,
         ),
       },
     },

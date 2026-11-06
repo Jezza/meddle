@@ -179,18 +179,30 @@ const GROUPS: Group[] = [
     commands: [
       {
         name: "project add",
-        usage: ["project add <path-or-url> [--name <n>]"],
+        usage: ["project add <path-or-url> [--name <n>] [--sync <bookmark>]..."],
         summary: "Add a project from a folder on this node or an upstream URL; this node becomes its home.",
         details:
-          "A folder is used in place (made a jj repo, colocated with git, if it is not one); a URL is cloned. The home keeps the " +
-          "project's `trunk`, where new tasks start, and receives every task's work as bookmarks " +
-          "`meddle/task/<task id>/<project>`. Other nodes fetch it from the home when they need it. --name names it " +
-          "(else after the folder, or the repo in the URL). Prints the project id. Needs the node running.",
+          "A folder is used in place (made a jj repo, colocated with git, if it is not one); a URL is cloned. The home " +
+          "resolves where each new task of the project starts, and holds every task's work read-only as its line, " +
+          "`task/<task id>/<project>@meddle`. Other nodes fetch it from the home when they need it. --name names it " +
+          "(else after the folder, or the repo in the URL). --sync adds a sync branch (a bookmark tasks can start from; " +
+          "repeatable; see `project sync`). Prints the project id. Needs the node running.",
+      },
+      {
+        name: "project sync",
+        usage: ["project sync <id|name> [<bookmark>...]"],
+        summary: "Set the sync branches of a project homed on this node, replacing its list.",
+        details:
+          "A project's sync branches are the bookmarks a task can start from, in order; the first is the default. `project " +
+          "add <url>` starts the list with the upstream's default branch and `project add <folder>` with none; each " +
+          "`--sync <bookmark>` of `project add` adds one. With no bookmark, the list is emptied. Nothing polls them: a " +
+          "task fetches its branch from the project's home as it is created (the home fetches a URL project's sync " +
+          "branches from the upstream first). Refused on a node that is not the project's home. Needs the node running.",
       },
       {
         name: "project list",
         usage: ["project list"],
-        summary: "List the pool's projects: id, name, home and the nodes holding a copy.",
+        summary: "List the pool's projects: id, name, home, the nodes holding a copy and sync branches.",
         details: "Works while a holder is offline (it reads the roster). Needs the node running.",
       },
     ],
@@ -200,12 +212,20 @@ const GROUPS: Group[] = [
     commands: [
       {
         name: "task new",
-        usage: ["task new [<prompt>] [--title <t>] [--project <id|name>]... [--node <id|prefix> | --here]"],
+        usage: ["task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]"],
         summary: "Create a task and, given a prompt, start its first turn; without one it waits idle for one.",
         details:
           "--project takes one project (an id, or a name one project of the pool has) and can be given again, the first " +
           "being the primary; with none the task has no project and works in a scratch folder. Each project gets a jj " +
-          "workspace starting at the project's trunk. Without --node or --here meddle picks an online node that hosts " +
+          "workspace where the project's home says it starts: --rev <rev> (for the --project before it) starts it on a " +
+          "new change on that revision, and with --edit too it works on the revision itself (one with changes, nothing " +
+          "on top of it and no workspace on it). A --rev naming one of the project's sync branches starts it from that " +
+          "branch as the home has it. Without --rev, a folder project starts on the fork point of the folder's `@` (the " +
+          "newest ancestor with changes; refused while `@` itself has changes, as meddle never moves your working copy) " +
+          "and a URL project from its first sync branch. A start at a revision is held read-only on the home from then " +
+          "on, as the task's line `task/<task id>/<project>@meddle`. Creating needs each project's home online, except " +
+          "for a sync start (a --rev naming a sync branch, or a URL project without --rev): that starts from the copy " +
+          "the task's node fetched last. Without --node or --here meddle picks an online node that hosts " +
           "tasks and has room, preferring the primary project's home. Without --title, Claude Haiku names the task from " +
           "its prompt (the first 60 characters of the prompt's first line when it cannot), or with no prompt it gets " +
           "two adjectives and a noun. With a prompt it returns once the " +

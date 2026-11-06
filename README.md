@@ -406,10 +406,12 @@ With the node running (see [Dashboard](#dashboard)), add a project from an exist
 create a task on it and send it a prompt, or do both at once with `task new <prompt>`:
 
 ```sh
-bun run src/cli.ts project add ~/src/myproject [--name myproject]   # prints the project id
+bun run src/cli.ts project add ~/src/myproject [--name myproject] [--sync <bookmark>]...   # prints the project id
+bun run src/cli.ts project sync <project-id|name> [<bookmark>...]   # replaces the project's sync branches
 bun run src/cli.ts project list
 bun run src/cli.ts task new "Find out why test_sync is flaky and fix it" --project myproject   # prints: task <id> on <node>
 bun run src/cli.ts task new --title "Fix the flaky test" --project <project-id|name>   # no prompt: it waits idle
+bun run src/cli.ts task new "Finish this" --project myproject --rev <rev> --edit   # works on that revision itself
 bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fix it"
 bun run src/cli.ts task list   # every task of the pool, with its state and node
 bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
@@ -419,14 +421,16 @@ bun run src/cli.ts task restore <task-id> [--node <id|prefix> | --here]   # brin
 bun run src/cli.ts task delete <task-id>    # deletes an archived or moved task's log and archive
 ```
 
-`task new [<prompt>] [--title <t>] [--project <id|name>]... [--node <id|prefix> | --here]` creates a task, placed as
+`task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]` creates a task, placed as
 [Where a new task runs](#where-a-new-task-runs) says. Given a prompt (the words that are not options), it sends it as
 the task's first turn, which starts on the node chosen, and prints `task <id> on <short id>` once the turn has
 started, not when it ends (follow it in the dashboard, or send the next prompt with `task prompt`); without one the
 task waits idle. Without `--title`, Claude Haiku names the task from its prompt (one short query with the node's token,
 before the task is created); when that fails or takes over 20 seconds, the title is the first 60 characters of the
 prompt's first line. With no prompt either, the task gets two adjectives and a noun (`quiet amber otter`). `--project` is repeatable, one project each, the first the primary; with
-none the task has no project.
+none the task has no project. `--rev <rev>` and `--edit` apply to the `--project` before them and say where that
+project starts (see [Where a task starts](#where-a-task-starts)); either one before any `--project` is a usage error,
+and so is `--edit` without `--rev` (`meddle: --edit needs --rev`).
 
 A message to a busy task is never refused, as in a terminal agent. While a turn runs it goes into that turn, and
 Claude Code takes it at its next step (between tool calls) without cutting the turn short, or, if the turn is
@@ -444,7 +448,17 @@ and a line on stderr says how many it had when last heard of (or that a member o
 
 `project list` prints one line per project of the pool, from what each node's summary in the roster says (this node
 included), so it works while a holder is offline: `<id>  <name>  home <short id>  on <short id>,<short id>,…`, named as
-its home names it, with the nodes that hold a copy after `on`. `--project` (of `task new`) takes a
+its home names it, with the nodes that hold a copy after `on`, and `  sync <bookmark>,<bookmark>,…` after them when the
+project has sync branches.
+
+A project's sync branches are an ordered list of its bookmarks that a task can start from; the first is a URL project's
+default. `project add <url>` starts the list with the upstream's default branch (none when it has none) and `project
+add <folder>` with none; each `--sync <bookmark>` appends one (each name once). `project sync <project> <bookmark>...`
+replaces the list on the project's home (`not the home of <project>` anywhere else) and with no bookmark empties it.
+Nothing polls the branches: a node fetches the one it needs from the project's home when it creates a task from it,
+and the home first fetches every sync branch of a URL project from the upstream when another node fetches the project.
+With the home offline, a node uses the copy it fetched last, and refuses `home <short id> is offline` when it has none.
+Other nodes learn a project's list from its home. `--project` (of `task new`) takes a
 project's id, or a name exactly one project of the pool has: `ambiguous project name: <name>` when several have it,
 `unknown project: <x>` when none does (pass the id then). An id the roster does not list yet (12 hex digits) is
 passed on to the node, which asks the online members for it. A task is
@@ -504,14 +518,61 @@ Projects view) asks the online members which of them holds it, then clones the p
 `<data dir>/replicas/<id>` and its memory into `<data dir>/memory/<id>`. The dashboard's new-task form offers every
 project the online members hold.
 
-A new task starts from the home's `trunk`. On the home, meddle keeps a local `trunk` bookmark in the project's repo
-(your own folder, for a folder project) at the newest of jj's `trunk()` (the upstream's main, master or trunk) and
-the local `trunk`, `main` and `master` bookmarks. It moves it when the project is added, when a task is created on
-the home, and before another node fetches the project. Another node fetches `trunk` from the home as it creates a
-task, so creating a task of a project homed elsewhere needs the home online (`home <short id> is offline`
-otherwise), unless this node has fetched the home's `trunk` before: it then starts the task from that `trunk@<short
-id>` and logs `meddle: project <name>: home unreachable; starting from the last fetched trunk`. A project with nothing
-trunk-like starts its tasks at the root.
+### Where a task starts
+
+Each project of a new task starts where the project's home says, resolved as the task is created:
+
+- `--rev <rev>` after its `--project`: that revision of the home repo (a change or commit id, a bookmark, any revset
+  that names one revision). The task's workspace is a new change on it, and the task's work is measured from it.
+- `--rev <rev> --edit`: the workspace works on that revision W itself, and the task's work is measured from W's fork
+  point (the newest ancestor below W with changes). It is refused, in this order: `<W> is immutable` (another task's
+  line holds it, or your jj config does), `<W> is <workspace>'s working copy; move off it first` (any workspace, yours
+  included), `<W> has revisions on top of it`, `nothing to hand off: <W> has no changes`, `no fork point below <W>`,
+  `<W> has <n> fork points`.
+- `--rev` naming one of the project's sync branches: the branch as the home has it, a sync start (see below); with
+  `--edit` it is refused `--edit takes a revision, not the sync branch <branch>`.
+- No `--rev`, a folder project: the fork point of your folder's `@`, the newest ancestor of `@` with changes
+  (`heads(::@ ~ (empty() ~ merges()))`), read as jj last recorded `@`: an edit on disk that no jj command has seen yet
+  stays yours. When that is `@` itself (your `@` has changes), the create is refused `@ has changes; move off it
+  first`, since meddle never moves your working copy: `jj new` first.
+- No `--rev`, a URL project: its first sync branch (`<project> has no sync branch` when it has none).
+
+Any start also refuses `no revision <rev> in <project>`, `<rev> names <n> revisions in <project>` and, for a new
+change on it, `cannot start a task on the root commit` (a folder with no commit yet). Each refusal starts with
+`project <name>: `.
+
+A start at a revision writes the task's line on the home before the task exists: the git ref
+`refs/remotes/meddle/task/<task id>/<project>` in the project's repo (your own folder, for a folder project), which jj
+shows as the bookmark `task/<task id>/<project>@meddle`. jj holds it and every commit below it immutable for you (its
+default `immutable_heads()`), so the revision a task works on is not rewritten under it, and two tasks cannot both be
+given one revision to edit. Only the node holding the task moves its line (see below), and the task's own workspace
+may rewrite its line but nothing at or below the commit its work is measured from, nor any commit another task's line
+holds (a jj config of that workspace alone). A task made before meddle scoped its workspaces is scoped when its node
+starts, from the root commit when its record has no such commit: only other tasks' lines are protected from it. A sync
+start writes no line: the task's first turn end does.
+
+The home must be online to resolve a start: creating a task of a project homed elsewhere is refused `home <short id>
+is offline` otherwise, except for a sync start: `--rev <branch>` naming one of its sync branches, or no `--rev` for a
+URL project (its first sync branch; `<project> has no sync branch` when it has none). That starts from the copy the
+task's node fetched last (logged `meddle: project <name>: home offline; starting from <branch> as fetched last`), or
+is refused `home <short id> is offline` when it has none. Other nodes learn from the home which projects are URL
+projects, with their sync branches.
+
+The node you ask makes the task's id, asks each project's home for its start, then creates the task on the node
+chosen. When a later start, or the creation, fails, the lines the earlier starts wrote are released again. When the
+node it asked to create the task did not answer (the connection dropped), it asks that node whether it has the task,
+and keeps the lines when it does or cannot tell: once the task is gone from every node, the home's daily janitor
+releases them.
+
+### Taking a task's work
+
+A task's work is its line, and taking it is yours, in your own repo on the home: `jj new task/<task id>/<project>@meddle`
+to go on from it, or a rebase of your own work onto it (`jj rebase -s <your change> -d
+task/<task id>/<project>@meddle`). meddle never moves your working copy, and reads and sets bookmarks in the home repo
+without snapshotting it (every such jj command passes `--ignore-working-copy`); only adding a task's workspace to the
+repo does (see [Known limits](#known-limits)). Take a task's work once its turn has ended, or once it is archived: while
+the task can still run on the home, its line's head is the agent's working copy, which the agent's next snapshot
+rewrites, and jj then rebases your change onto the rewritten commit and reports your workspace as stale.
 
 A task's bookmarks all live under its namespace, `meddle/task/<task id>/`, in each project's repo: the project's own
 bookmark `meddle/task/<task id>/<project name>`, and any side bookmark the agent (or you) adds as
@@ -522,21 +583,20 @@ when the task moves (see [What travels](#what-travels)) and is listed in the tas
 after the namespace and its change id; re-read when the task changes state and every 60 s); bookmarks outside it are
 not backed up and stay behind on a move.
 
-At the end of every completed turn meddle points the task's project bookmark at its workspace's working copy, and a
-node that is not the project's home pushes the whole namespace to the home. That push is the backup: the home never
-fetches a task's bookmarks itself. What the node holding the task changed since its last push wins: its positions
-replace the home's, sideways or backwards too. A bookmark it did not change follows the home: one deleted or moved
-in the home's repo is deleted or moved on the holder at the next turn end, so a side bookmark is deleted on the home.
-The home refuses deletions pushed to it, so a side bookmark deleted on the holder comes back from the home's copy at
-the next turn end: while the task is on a node that is not the home, delete a side bookmark in the home's repo. A
-push that fails (the home offline, no jj identity: see [Install](#install), a bookmark git refuses, such as one with
-a slash after the project name, which fails every turn end's push until it is deleted) does not fail the turn: it is
-logged as `meddle: push: meddle/task/<task id>/* to <short id> failed: …` (each distinct line at most once a minute,
-so a missing identity does not fill the log), and the next turn end pushes again. When the home refuses one
-bookmark, the others still land. A turn that fails pushes nothing; the next completed turn pushes its work too.
+At the end of every completed turn meddle points the task's project bookmark at its workspace's working copy and
+writes every bookmark under the namespace to the task's line on the home: on the home itself by updating the line's
+refs, from another node by a forced push of `refs/heads/meddle/task/<task id>/*` to
+`refs/remotes/meddle/task/<task id>/*` there. That is the backup, and the node holding the task is the line's only
+writer: its positions replace the line's, sideways or backwards too. A side bookmark the agent (or you) deleted, on
+whichever node holds the task, is given back at the next turn end: its line is released on the home (the project's own
+line is always kept). A push that fails (the home offline, no jj
+identity: see [Install](#install), a bookmark git refuses, such as one with a slash after the project name) does not
+fail the turn: it is logged as `meddle: push: meddle/task/<task id>/* to <short id> failed: …` (each distinct line at
+most once a minute, so a missing identity does not fill the log), and is made again when the home comes online. A
+turn that fails pushes nothing; the next completed turn pushes its work too.
 
 A replica names its remote for another node after that node's short id, the first 10 characters of its node id, so
-on a node that is not the home `trunk@<short id>` is the home's trunk.
+on a node that is not the home `main@<short id>` is the home's `main`.
 
 The dashboard's Projects view lists every project of the pool once, merged across the online nodes that hold a copy:
 its home, the nodes holding it, and each node's bookmarks (`name`, `name@<short id>`, or `name@origin` for a project
@@ -597,21 +657,21 @@ offline or does not hold the repo with `meddle: <short id> did not serve <repo> 
 
 A node serves only members of its pool, only the repos it holds, and only fetches (`upload-pack`) and pushes
 (`receive-pack`); it logs a request for a repo it does not hold as `meddle: git: unknown repo <repo>`. A push runs
-under the `update` hook, which accepts task bookmarks (`refs/heads/meddle/task/*`) into a project repo and the
+under the `update` hook, which accepts task lines (`refs/remotes/meddle/task/*`) into a project repo and the
 `memory` bookmark into a memory repo, and refuses deletions (`meddle: deleting <ref> is not accepted here`) and every
-other ref (`meddle: ref <ref> is not accepted here`). So `trunk` and your own bookmarks change only on the home,
+other ref (`meddle: ref <ref> is not accepted here`). So your own bookmarks change only on the home,
 whatever another node, or a model pushing from inside a task, sends it. While the hook is missing or cannot run, the
 node refuses every push, logging `meddle: git: update hook missing; refusing receive-pack` (`serve` writes it again
 at start). A push it took is imported into jj without snapshotting the repo's working copy, and a fetch of a project
-homed here moves `trunk` the same way: your edits in a folder project are never recorded by another node's fetch or
+homed here writes nothing into it: your edits in a folder project are never recorded by another node's fetch or
 push. One consequence: if your own `@` on the home is built on a running task's bookmark and the task's next push
 rewrites that commit, jj reports your working copy as stale at your next command; `jj workspace update-stale`
 brings it back.
 
-What a member can push: the whole `refs/heads/meddle/task/*` namespace of every project repo and `refs/heads/memory`
+What a member can push: every task's line, `refs/remotes/meddle/task/*`, of every project repo and `refs/heads/memory`
 of every memory repo, on any node that holds them. So a model inside any task on any node can push over another
-task's bookmark on the home (its backup) or move `memory` there. The task's owner sets and pushes its bookmark again
-at its next turn end, the next memory sync builds on whatever `memory` then is, and jj's operation log on the home
+task's line on the home (its backup) or move `memory` there. The task's holder writes its line again at its next turn
+end, the next memory sync builds on whatever `memory` then is, and jj's operation log on the home
 keeps every earlier target (`jj op log`), so nothing is lost; but within the pool, task bookmarks and memory are not
 protected from each other.
 
@@ -786,8 +846,12 @@ command prints `restoring to <short id>` once the move has started and returns; 
 and the task's view in the dashboard shows how it goes (`status` does not).
 
 `task delete <task-id>` (or Delete) deletes an archived task's archive, row, event log and transcript rows; it is
-refused for a task that is not archived or moved (`task is idle`, …). The bookmarks the home keeps for the task stay;
-`jj bookmark delete 'glob:meddle/task/<task id>/*'` in the project's repo on the home removes them.
+refused for a task that is not archived or moved (`task is idle`, …). It also forgets the task's bookmarks
+(`meddle/task/<task id>/*`) in each project's repo on this node and, for an archived task, releases its line on each
+project's home, so its commits are mutable there again unless another line holds them (a moved task lives on
+elsewhere: its line stays). A home that is offline, or whose release fails, is left to its daily janitor, which
+releases the line once the task is gone from every node; it is logged as `meddle: delete: the line of <task id> on
+<short id> was not released (its janitor will): …`.
 
 ## Known limits
 
@@ -804,7 +868,7 @@ refused for a task that is not archived or moved (`task is idle`, …). The book
   a node from reaching members it is not already connected to, and learns which nodes hold the secret, since the
   dialer's proof goes first.
 - A project's home cannot be moved to another node yet (left for a later plan). While the home is offline, other nodes
-  cannot clone its projects, and create tasks of them only from the `trunk` they fetched last; their tasks' turns still run, and their pushes and memory syncs
+  cannot clone its projects, and create tasks of them only from a sync branch they fetched before; their tasks' turns still run, and their pushes and memory syncs
   are logged and retried at the next turn end.
 - When a node's last push of a project's memory to the home failed, the memory commits it has not pushed do not
   travel with a task that moves away: the target syncs memory from the home. They stay in this node's memory repo
@@ -823,12 +887,16 @@ refused for a task that is not archived or moved (`task is idle`, …). The book
 - The commits meddle makes no longer need a jj user config on each node: the pool's `jj.user` and `jj.email` settings
   give every node one identity (see [Install](#install)). Without them, and without a node's own config, pushes to a
   project's home fail.
-- A side bookmark cannot be deleted on a node that is not the project's home while the task is there: the home
-  refuses deletions and the next turn end restores it. Delete it in the home's repo. A bookmark name git refuses (a
-  slash after the project name) fails every turn end's push, and every archive of the task off the home, until it is
-  deleted.
-- Deleting a task leaves its bookmarks in each project's repo on the home; `jj bookmark delete
-  'glob:meddle/task/<task id>/*'` there removes them.
+- A bookmark name git refuses (a slash after the project name) fails every turn end's push, and every archive of the
+  task off the home, until it is deleted.
+- A line whose release failed (its home offline when the task was deleted, or a start whose creation's answer was
+  lost) stays on the home until its daily janitor finds the task gone from every node; while a node that may hold it
+  is offline, it stays.
+- A child start at another task's line head is allowed. If that other task runs off the home, its next push can
+  rewrite the commit the new task builds on and leave a divergent change in the home repo, for you to resolve.
+- Adding a task's workspace to a project's repo on its home (`jj workspace add`) snapshots your working copy there:
+  jj refuses `--ignore-working-copy` for that command. An edit on disk that no jj command had seen is then recorded in
+  your `@`; nothing is moved. Every other jj command meddle runs in the home repo leaves your working copy alone.
 - Archiving on a node that is not a project's home needs every such home online: the push to the home is the archive's
   precondition. Files git ignores inside a workspace are lost on archive; only committed work and the conversation are
   kept.

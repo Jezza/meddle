@@ -251,7 +251,7 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
     taskCount: () => listLiveTasks(db).length,
     running: () => countRunningTasks(db),
-    projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home })),
+    projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home, sync: p.sync, upstream: p.upstream })),
   };
 }
 

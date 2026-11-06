@@ -16,7 +16,7 @@ async function setup() {
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
   await ensureDataDirs(cfg); await mkdir(`${home}/t/abc/a/.jj`, { recursive: true }); await mkdir(`${home}/t/abc/.meddle/claude`, { recursive: true });
   const db = openDb(":memory:");
-  const manifest = { id: "abc", title: "t", sessionId: crypto.randomUUID(), primaryProjectId: "p1", createdAt: "", projects: [{ id: "p1", name: "a", replica: `${home}/t/abc/a`, workspace: "a", parent: "root()" }] };
+  const manifest = { id: "abc", title: "t", sessionId: crypto.randomUUID(), primaryProjectId: "p1", createdAt: "", projects: [{ id: "p1", name: "a", replica: `${home}/t/abc/a`, workspace: "a", parent: "root()", base: "0000000000000000000000000000000000000000" }] };
   const fixture = (name: string) => ({ MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/${name}.jsonl` });
   return { cfg, db, manifest, fixture, input: { cfg, manifest, projectSettings: [], contexts: [DEFAULT_CONTEXT], token: "tok", sessionStore: new SqliteSessionStore(db), resume: false, claudePath: replay, claudeRuntime: "bun" as const } };
 }

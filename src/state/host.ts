@@ -9,17 +9,21 @@ import { checkTaskRoot, type NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
 import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
-import { peerOf, servePool } from "../pool/object";
+import { peerOf, remoteReason, servePool } from "../pool/object";
 import type { PoolRuntime } from "../pool/runtime";
 import { acceptPeerLinks } from "../pool/sync";
 import { bookmarkList } from "../jj";
 import { loadContext } from "../projects/context";
-import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, type Project } from "../projects/project";
+import { releaseLines } from "../projects/lines";
+import { releaseStarts, resolveStarts, startAt } from "../projects/starts";
+import { repoKey, serialised } from "../serial";
+import { addProjectFromFolder, addProjectFromUpstream, checkSyncNames, getProject, listProjects, projectChanges, setProjectSync, type Project } from "../projects/project";
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
-import { claimHomelessProjects, getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks } from "../store/records";
+import { claimHomelessProjects, getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
-import { taskNamespace, type TaskManifest } from "../tasks/manifest";
+import { taskNamespace, type ReceivedManifest, type Start, type TaskManifest } from "../tasks/manifest";
 import { taskTitle } from "../tasks/names";
+import { SAFE_ID } from "../tasks/provision";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
@@ -62,7 +66,10 @@ const HEADS_REFRESH_MS = 60_000;
 const WINDOW_SIZE = 200;
 
 export type PeerObjectDeps = {
+  cfg: NodeConfig;
   db: Database;
+  /** This node's id: a project's lines are released only on its home. */
+  selfId: string;
   claudeCodeVersion: string;
   hostsTasks(): Promise<boolean>;
   /** Fires after a project was added or registered on this node. */
@@ -76,8 +83,8 @@ export type PeerObjectDeps = {
 };
 
 /** A project as another node sees it. */
-function projectInfo(p: Project): { id: string; name: string; home: string } {
-  return { id: p.id, name: p.name, home: p.home };
+function projectInfo(p: Project): { id: string; name: string; home: string; sync: string[]; upstream: boolean } {
+  return { id: p.id, name: p.name, home: p.home, sync: p.sync, upstream: p.upstream };
 }
 
 /** Serves `PeerObject` on `host` to `peer:<nodeId>` principals; anyone else is refused `forbidden`. */
@@ -117,10 +124,29 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
       },
       activateTask: ({ taskId, followUp }) => deps.runner.activateTask(taskId, from, followUp),
       abandonTask: ({ taskId }) => deps.runner.abandonTask(taskId, from),
-      // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
-      createTask: async ({ title, projectIds, prompt }) => {
+      taskHeld: ({ id }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
-        const manifest = await deps.runner.create({ title, projectIds });
+        // A `moved` row is what a task that went on left here: it holds nothing.
+        const row = getTask(db, id);
+        return row !== null && row.state !== "moved";
+      },
+      releaseLines: async ({ projectId, taskId, keep }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        // It goes into a jj pattern: never a glob naming other tasks' lines.
+        if (!SAFE_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
+        const project = getProject(db, projectId);
+        if (project === null || project.home !== deps.selfId) throw new Error(`not the home of ${shortId(projectId)}`);
+        const released = await serialised(repoKey(project.replica), () => releaseLines(deps.cfg, project.replica, taskId, keep));
+        return { released };
+      },
+      startAt: ({ projectId, taskId, rev, mode }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return startAt(deps, projectId, taskId, rev, mode);
+      },
+      // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
+      createTaskAt: async ({ title, taskId, starts, prompt }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        const manifest = await deps.runner.create({ title, taskId, starts });
         if (prompt !== null) await deps.runner.prompt(manifest.id, prompt);
         return { manifest };
       },
@@ -194,7 +220,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const host = createHost({ name: "node", self: "node" });
   servePool(host, pool.objectDeps);
   servePeer(host, {
+    cfg,
     db,
+    selfId: pool.identity.id,
     claudeCodeVersion: deps.claudeCodeVersion,
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
     changes: projectChanges,
@@ -343,45 +371,63 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       models,
       notifications,
       efforts,
-      createTask: async ({ title: given, projectIds: ids, prompt, node }, ctx) => {
+      createTask: async ({ title: given, projects, prompt, node }, ctx) => {
         // Named here, before it goes anywhere, so that a peer of any version gets a title; Haiku names it from its
         // prompt when it can.
         const title = await taskTitle(given, prompt, (p) => runner.askTitle(p));
         const selfId = pool.identity.id;
-        const target = node === "here" ? selfId : node ?? await placeTask(ids);
+        const target = node === "here" ? selfId : node ?? await placeTask(projects.map((p) => p.id));
+        if (target !== selfId && !pool.store.isMember(target)) throw new Error(`no such node: ${target}`);
+        // Each home writes the line of a start at a revision now, before the task exists (Decision 7): a creation that
+        // certainly failed releases them; one the target may have made all the same (its answer was lost) keeps them
+        // while the target holds the task, for the janitor to release once it is gone from every node.
+        const taskId = newId();
+        const deps = { cfg, db, selfId, pool };
+        const starts = await resolveStarts(deps, taskId, projects);
+        const text = prompt ?? null;
         if (target === selfId) {
-          const manifest = await runner.create({ title, projectIds: ids });
+          let manifest: TaskManifest;
+          try {
+            manifest = await runner.create({ title, taskId, starts });
+          } catch (err) {
+            // A task made all the same (a failure after it) keeps its lines.
+            if (getTask(db, taskId) !== null) throw err;
+            throw await releaseStarts(deps, taskId, starts, err);
+          }
           if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
           // The pool sees the new task count now, not at the next periodic refresh.
           void pool.refresh();
-          if (prompt !== undefined && prompt !== null) await runner.prompt(manifest.id, prompt);
+          if (text !== null) await runner.prompt(manifest.id, text);
           return { manifest, nodeId: selfId };
         }
-        if (!pool.store.isMember(target)) throw new Error(`no such node: ${target}`);
-        const peer = await pool.peerRef(target, PeerObject);
         try {
-          if (peer.variant !== "peer") throw new Error(`${shortId(target)} did not serve the peer variant of PeerObject`);
-          let manifest: TaskManifest;
-          try {
-            ({ manifest } = await peer.createTask({ title, projectIds: ids, prompt: prompt ?? null }));
-          } catch (err) {
-            // Said here, the peer's reason (no task root, no usable token, …) would read as this node's own.
-            throw new Error(`${shortId(target)}: ${remoteReason(err)}`);
+          return { manifest: await createOn(target, { title, taskId, starts, prompt: text }), nodeId: target };
+        } catch (err) {
+          if (err instanceof CreationSent) {
+            const held = await heldOn(target, taskId);
+            if (held !== false) {
+              const why = held ? `${shortId(target)} has task ${taskId} all the same` : `${shortId(target)} may have task ${taskId}`;
+              throw new Error(`${err.message}; ${why}: its lines stay until the janitor releases them`);
+            }
           }
-          return { manifest, nodeId: target };
-        } finally {
-          peer.release();
+          throw await releaseStarts(deps, taskId, starts, err);
         }
       },
-      addProjectFromFolder: async ({ path, name }, ctx) => {
-        const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name);
+      addProjectFromFolder: async ({ path, name, sync }, ctx) => {
+        const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name, sync);
         projectIds.replace(ctx, projectIdsNow());
         return project;
       },
-      addProjectFromUpstream: async ({ url, name }, ctx) => {
-        const project = await addProjectFromUpstream(cfg, db, url, pool.identity.id, name);
+      addProjectFromUpstream: async ({ url, name, sync }, ctx) => {
+        const project = await addProjectFromUpstream(cfg, db, url, pool.identity.id, name, sync);
         projectIds.replace(ctx, projectIdsNow());
         return project;
+      },
+      setProjectSync: async ({ projectId, sync }) => {
+        const held = getProject(db, projectId);
+        if (held === null || held.home !== pool.identity.id) throw new Error(`not the home of ${held?.name ?? shortId(projectId)}`);
+        await checkSyncNames(cfg, sync);
+        return setProjectSync(db, projectId, sync) ?? held;
       },
       dismiss: ({ id }, ctx) => {
         notifications.replace(ctx, notifications.value.filter((n) => n.id !== id));
@@ -414,6 +460,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       createTask: (input, ctx) => store.createTask(input, ctx),
       addProjectFromFolder: (input, ctx) => store.addProjectFromFolder(input, ctx),
       addProjectFromUpstream: (input, ctx) => store.addProjectFromUpstream(input, ctx),
+      setProjectSync: (input, ctx) => store.setProjectSync(input, ctx),
       dismiss: (input, ctx) => store.dismiss(input, ctx),
     };
   });
@@ -459,6 +506,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       source: self.derive([project], (p) => p.source),
       replica: self.derive([project], (p) => p.replica),
       home: self.derive([project], (p) => p.home),
+      sync: self.derive([project], (p) => p.sync),
+      upstream: self.derive([project], (p) => p.upstream ?? false),
       contextLoaded: self.derive([project], (p) => p.contextLoaded),
       heads,
     };
@@ -644,6 +693,45 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     return (JSON.parse(row.manifest) as TaskManifest).projects.some((p) => p.id === projectId);
   }
 
+  /**
+   * Creates task `input.taskId` on member `target` (`PeerObject.createTaskAt`), its first prompt with it. Rejects
+   * `CreationSent` once the request went out: the target may have made the task all the same.
+   */
+  async function createOn(
+    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null },
+  ): Promise<ReceivedManifest> {
+    const peer = await pool.peerRef(target, PeerObject);
+    try {
+      if (peer.variant !== "peer") throw new Error(`${shortId(target)} did not serve the peer variant of PeerObject`);
+      try {
+        return (await peer.createTaskAt(input)).manifest;
+      } catch (err) {
+        // Said here, the peer's reason (no task root, no usable token, …) would read as this node's own.
+        throw new CreationSent(`${shortId(target)}: ${remoteReason(err)}`);
+      }
+    } finally {
+      peer.release();
+    }
+  }
+
+  /** Whether node `target` holds task `taskId` (`PeerObject.taskHeld`); null when it cannot say. */
+  async function heldOn(target: string, taskId: string): Promise<boolean | null> {
+    if (!pool.net.isOnline(target)) return null;
+    let peer: Awaited<ReturnType<typeof pool.peerRef<typeof PeerObject>>>;
+    try {
+      peer = await pool.peerRef(target, PeerObject);
+    } catch {
+      return null;
+    }
+    try {
+      return peer.variant === "peer" ? await peer.taskHeld({ id: taskId }) : null;
+    } catch {
+      return null;
+    } finally {
+      peer.release();
+    }
+  }
+
   /** The node `place` picks for a new task of `projectIds`, from the roster and this node's live numbers. */
   async function placeTask(projectIds: string[]): Promise<string> {
     return runner.chooseNode(projectIds);
@@ -754,10 +842,10 @@ function foldSession(view: SessionView, events: EventRecord[]): SessionView {
   return { lastSeq: events.at(-1)?.seq ?? view.lastSeq, window, live };
 }
 
-/** A peer's error as it said it: without the `<code>: ` (or `<code>/<reason>: `) a chord error's message starts with. */
-function remoteReason(err: unknown): string {
-  if (!(err instanceof Error)) return String(err);
-  const code = (err as { code?: unknown }).code;
-  if (typeof code === "string" && err.message.startsWith(code)) return err.message.replace(/^[^:]*: /, "");
-  return err.message;
+/** A create sent to another node that failed: the target may have made the task all the same (its answer lost). */
+class CreationSent extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CreationSent";
+  }
 }

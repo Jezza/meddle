@@ -2,8 +2,11 @@ import type { Database } from "bun:sqlite";
 import { shortId } from "./ids";
 import { DEFAULT_POOL_NAME, poolKey } from "./secret";
 
-/** A project a node holds (its own or a replica), as the rest of the pool sees it. */
-export type NodeProject = { id: string; name: string; home: string };
+/**
+ * A project a node holds (its own or a replica), as the rest of the pool sees it. `upstream`: its default start is its
+ * first sync branch; absent (an older node's summary) reads as false.
+ */
+export type NodeProject = { id: string; name: string; home: string; sync: string[]; upstream?: boolean };
 
 /**
  * What a node reports about itself to the rest of the pool. `running`: its tasks in state `running` or `waiting`;
@@ -16,11 +19,13 @@ export type NodeSummary = {
 };
 
 /** A summary as a peer may send it: an older meddle's has no `running`, `limit` or `projects`. */
-export type WireSummary = Omit<NodeSummary, "running" | "limit" | "projects"> & Partial<Pick<NodeSummary, "running" | "limit" | "projects">>;
+export type WireSummary = Omit<NodeSummary, "running" | "limit" | "projects"> & {
+  running?: number; limit?: number; projects?: Array<Omit<NodeProject, "sync"> & { sync?: string[] }>;
+};
 
-/** A summary with what an older peer left out filled in: nothing running, no limit, no projects. */
+/** A summary with what an older peer left out filled in: nothing running, no limit, no projects, no sync branches. */
 export function withSummaryDefaults(s: WireSummary): NodeSummary {
-  return { ...s, running: s.running ?? 0, limit: s.limit ?? 0, projects: s.projects ?? [] };
+  return { ...s, running: s.running ?? 0, limit: s.limit ?? 0, projects: (s.projects ?? []).map((p) => ({ ...p, sync: p.sync ?? [] })) };
 }
 
 /** An iroh endpoint address in JSON form: `id` is the node id. */

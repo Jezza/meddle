@@ -39,6 +39,19 @@ test("a command's help says what it does in full, asked either way; a group's li
   expect((await meddle(["help", "token", "set"], await env())).stdout).toContain("usage: meddle token add");
 });
 
+test("project add and project sync are documented with their sync branches", async () => {
+  const add = await meddle(["help", "project", "add"], await env());
+  expect(add.stdout).toStartWith("usage: meddle project add <path-or-url> [--name <n>] [--sync <bookmark>]...\n");
+  expect(add.stdout).toContain("--sync adds a sync branch");
+  const sync = await meddle(["project", "sync", "--help"], await env());
+  expect(sync.code).toBe(0);
+  expect(sync.stdout).toStartWith("usage: meddle project sync <id|name> [<bookmark>...]\n");
+  expect(sync.stdout).toContain("the list is emptied");
+  const usage = await meddle(["project"], await env());
+  expect(usage.code).toBe(2);
+  expect(usage.stderr).toContain("meddle project sync <id|name> [<bookmark>...]");
+});
+
 test("help for no such command says so on stderr and exits 2; a usage error points at help", async () => {
   const out = await meddle(["help", "frob"], await env());
   expect(out.code).toBe(2);
@@ -90,4 +103,22 @@ test("help is coloured on a terminal or with FORCE_COLOR, plain otherwise or wit
   const out = await meddle(["help"], await env({ FORCE_COLOR: "1" }));
   expect(out.stdout).toContain(`${ESC}1;36mpool peer${ESC}22;39m ${ESC}32m<node id>${ESC}39m`);
   expect(out.stdout).toContain(`${ESC}94m      Tell this node of another`);
+});
+
+test("task new documents each project's start, and neither the help nor the README mentions trunk", async () => {
+  const usage = "task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]";
+  const asked = await meddle(["help", "task", "new"], await env());
+  expect(asked.code).toBe(0);
+  expect(asked.stdout).toStartWith(`usage: meddle ${usage}\n`);
+  expect(asked.stdout).toContain("fork point");
+  expect(asked.stdout).toContain("--edit");
+  const all = await meddle(["help"], await env());
+  expect(all.stdout).toContain(`  meddle ${usage}`);
+  expect(all.stdout.toLowerCase()).not.toContain("trunk");
+  for (const command of ["task new", "project add", "project sync"]) {
+    expect((await meddle(["help", ...command.split(" ")], await env())).stdout.toLowerCase()).not.toContain("trunk");
+  }
+  const readme = await Bun.file(`${import.meta.dir}/../README.md`).text();
+  expect(readme).toContain(usage);
+  expect(readme.toLowerCase()).not.toContain("trunk");
 });

@@ -12,6 +12,7 @@ import { gitRemote } from "./git/remote-main";
 import { writeHelperWrapper, writeUpdateHook } from "./git/scripts";
 import { acceptGitStreams } from "./git/serve";
 import { JANITOR_INTERVAL_MS, runJanitor, sweepArchiveTemps } from "./tasks/archive";
+import { releaseGoneLines } from "./projects/lines";
 import { acceptBlobStreams } from "./tasks/blob";
 import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
@@ -51,8 +52,9 @@ const USAGE = `usage: meddle --version
        meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
        meddle token move <id|label> --before <id|label> | meddle token move <id|label> --after <id|label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
-       meddle project add <path-or-url> [--name <n>] | meddle project list
-       meddle task new [<prompt>] [--title <t>] [--project <id|name>]... [--node <id|prefix> | --here]
+       meddle project add <path-or-url> [--name <n>] [--sync <bookmark>]...
+       meddle project sync <id|name> [<bookmark>...] | meddle project list
+       meddle task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]
        meddle task list
        meddle task prompt <id> <text> | meddle task retry <id>
        meddle task move <id> <node> [--now] | meddle task move <id> --now | meddle task move <id> --cancel
@@ -81,7 +83,7 @@ type OpenNode = {
   stopBlobs?: () => void;
   /** The unix socket this node's git remote helper connects to. */
   gitSocket?: GitSocket;
-  /** The daily run of the archive janitor. */
+  /** The daily run of the archive and line janitors. */
   janitor?: ReturnType<typeof setInterval>;
 };
 
@@ -140,7 +142,7 @@ async function serve(): Promise<number> {
       hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
       taskCount: () => listLiveTasks(db).length,
       running: () => countRunningTasks(db),
-      projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home })),
+      projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home, sync: p.sync, upstream: p.upstream })),
     }));
     const gitSocket = (node.gitSocket = new GitSocket(cfg, pool.net));
     await gitSocket.start();
@@ -149,9 +151,13 @@ async function serve(): Promise<number> {
     const harness = (node.harness = await openHarness(cfg, createRegistry()));
     const runner = new TaskRunner(cfg, db, harness.harness, { ...claude, pool });
     node.stopBlobs = acceptBlobStreams(pool.net, runner);
-    // Archives of tasks that moved away are kept for seven days (decision 18).
-    const janitor = () => runJanitor(cfg).catch((err: unknown) => console.error("meddle: archive janitor:", err));
-    void janitor();
+    // Archives of tasks that moved away are kept for seven days (decision 18). The lines this node holds as a home of
+    // tasks gone from every node are released (a task deleted while its home was offline).
+    const janitor = () => {
+      runJanitor(cfg).catch((err: unknown) => console.error("meddle: archive janitor:", err));
+      releaseGoneLines({ cfg, db, pool }).catch((err: unknown) => console.error("meddle: line janitor:", err));
+    };
+    janitor();
     node.janitor = setInterval(janitor, JANITOR_INTERVAL_MS);
     node.janitor.unref();
     const metrics = (node.metrics = new MetricsSampler({
@@ -550,16 +556,39 @@ function configList(): Promise<number> {
   });
 }
 
-/** Adds an existing directory as a folder project, anything else as an upstream URL; prints the project id. */
-function projectAdd(source: string, name: string | undefined): Promise<number> {
+/**
+ * Adds an existing directory as a folder project, anything else as an upstream URL, with the sync branches `sync` (after
+ * the upstream's default branch, for a URL); prints the project id.
+ */
+function projectAdd(source: string, name: string | undefined, sync: string[]): Promise<number> {
   return withNode(async (client) => {
     const node = await client.get(NodeObject, {});
     const named = name === undefined ? {} : { name };
     const isFolder = await stat(source).then((s) => s.isDirectory(), () => false);
     const project = isFolder
-      ? await node.addProjectFromFolder({ path: resolve(source), ...named })
-      : await node.addProjectFromUpstream({ url: source, ...named });
+      ? await node.addProjectFromFolder({ path: resolve(source), ...named, sync })
+      : await node.addProjectFromUpstream({ url: source, ...named, sync });
     console.log(project.id);
+    return 0;
+  });
+}
+
+/** Replaces the sync branches of project `project` (an id or name of the pool, homed on this node) with `branches`. */
+function projectSync(project: string, branches: string[]): Promise<number> {
+  return withNode(async (client) => {
+    const pool = await poolView(client);
+    let projectId: string;
+    try {
+      projectId = resolveProject(poolProjects(pool.nodes.value), project);
+    } finally {
+      pool.release();
+    }
+    const node = await client.get(NodeObject, {});
+    try {
+      await node.setProjectSync({ projectId, sync: branches });
+    } finally {
+      node.release();
+    }
     return 0;
   });
 }
@@ -583,20 +612,23 @@ function projectList(): Promise<number> {
 /** Where a new task goes: `auto` (placement picks it), `here` (this node), or a node's id or unique prefix. */
 type Where = { node: string } | "here" | "auto";
 
+/** A project of `task new` as given: an id or name, and the revision it starts at and how (`--rev`, `--edit`). */
+type ProjectArg = { project: string; rev?: string; mode?: "edit" };
+
 /**
  * Creates a task of the projects `projects` names (each an id or a name one project of the pool has, see
- * `resolveProject`; none for a task without a project) on the node `where` names, with `prompt` as its first turn when
- * given. Prints `task <id> on <node>`.
+ * `resolveProject`, with the revision it starts at; none for a task without a project) on the node `where` names,
+ * with `prompt` as its first turn when given. Prints `task <id> on <node>`.
  */
-function createTask(title: string | undefined, projects: string[], where: Where, prompt: string | null): Promise<number> {
+function createTask(title: string | undefined, projects: ProjectArg[], where: Where, prompt: string | null): Promise<number> {
   return withNode(async (client) => {
     let node: string | null = where === "here" ? "here" : null;
-    let projectIds: string[] = [];
+    let chosen: Array<{ id: string; rev?: string; mode?: "edit" }> = [];
     if (typeof where === "object" || projects.length > 0) {
       const pool = await poolView(client);
       try {
         const known = poolProjects(pool.nodes.value);
-        projectIds = projects.map((x) => resolveProject(known, x));
+        chosen = projects.map(({ project, ...start }) => ({ id: resolveProject(known, project), ...start }));
         if (typeof where === "object") node = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), where.node);
       } finally {
         pool.release();
@@ -604,7 +636,7 @@ function createTask(title: string | undefined, projects: string[], where: Where,
     }
     const ref = await client.get(NodeObject, {});
     try {
-      const { manifest, nodeId } = await ref.createTask({ ...(title === undefined ? {} : { title }), projectIds, node, prompt });
+      const { manifest, nodeId } = await ref.createTask({ ...(title === undefined ? {} : { title }), projects: chosen, node, prompt });
       const pool = await poolView(client);
       try {
         console.log(`task ${manifest.id} on ${nodeLabel(pool.nodes.value, nodeId)}`);
@@ -1055,19 +1087,40 @@ function pairArgs(args: string[], names: string[]): Record<string, string> | nul
   return out;
 }
 
+/** `<path-or-url> [--name <n>] [--sync <bookmark>]...`; null for anything else. */
+function projectAddArgs(args: string[]): { source: string; name: string | undefined; sync: string[] } | null {
+  const [source, ...flags] = args;
+  if (source === undefined || source.startsWith("--")) return null;
+  let name: string | undefined;
+  const sync: string[] = [];
+  for (let i = 0; i < flags.length; i += 2) {
+    const value = flags[i + 1];
+    if (value === undefined) return null;
+    if (flags[i] === "--name" && name === undefined) name = value;
+    else if (flags[i] === "--sync") sync.push(value);
+    else return null;
+  }
+  return { source, name, sync };
+}
+
 /**
  * `[<prompt>]` (the words that are not options, joined by spaces; none for a task that waits for one), `--title <t>`,
- * `--project <id|name>` (repeatable, one each) and at most one of `--node <id|prefix>` and `--here` (neither: `auto`).
+ * `--project <id|name>` (repeatable, one each), each optionally followed by its `--rev <rev>` and `--edit` (once each),
+ * and at most one of `--node <id|prefix>` and `--here` (neither: `auto`). Null for a usage error; `problem` for
+ * `--edit` without `--rev`.
  */
-function taskNewArgs(args: string[]): { prompt: string | null; title: string | undefined; projects: string[]; where: Where } | null {
+function taskNewArgs(args: string[]): { prompt: string | null; title: string | undefined; projects: ProjectArg[]; where: Where } | { problem: string } | null {
   let title: string | undefined;
-  const projects: string[] = [];
+  const projects: ProjectArg[] = [];
   const words: string[] = [];
   let where: Where = "auto";
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
+    const last = projects.at(-1);
     if (arg === "--title" && i + 1 < args.length && title === undefined) title = args[++i];
-    else if (arg === "--project" && i + 1 < args.length) projects.push(args[++i]!);
+    else if (arg === "--project" && i + 1 < args.length) projects.push({ project: args[++i]! });
+    else if (arg === "--rev" && i + 1 < args.length && last !== undefined && last.rev === undefined) last.rev = args[++i]!;
+    else if (arg === "--edit" && last !== undefined && last.mode === undefined) last.mode = "edit";
     else if (arg === "--node" && i + 1 < args.length && where === "auto") where = { node: args[++i]! };
     else if (arg === "--here" && where === "auto") where = "here";
     else if (arg.startsWith("--")) return null;
@@ -1075,6 +1128,7 @@ function taskNewArgs(args: string[]): { prompt: string | null; title: string | u
   }
   const prompt = words.join(" ").trim() === "" ? null : words.join(" ");
   if (title !== undefined && title.trim() === "") return null;
+  if (projects.some((p) => p.mode === "edit" && p.rev === undefined)) return { problem: "--edit needs --rev" };
   // No title: the node names the task (`taskTitle`).
   return { prompt, title, projects, where };
 }
@@ -1111,11 +1165,15 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "config" && sub === "set" && rest.length === 2) return () => configSet(rest[0]!, rest[1]!);
   if (command === "config" && sub === "unset" && rest.length === 1) return () => configUnset(rest[0]!);
   if (command === "config" && sub === "list" && rest.length === 0) return configList;
-  if (command === "project" && sub === "add" && rest.length === 1) return () => projectAdd(rest[0]!, undefined);
-  if (command === "project" && sub === "add" && rest.length === 3 && rest[1] === "--name") return () => projectAdd(rest[0]!, rest[2]);
+  if (command === "project" && sub === "add") {
+    const parsed = projectAddArgs(rest);
+    return parsed === null ? null : () => projectAdd(parsed.source, parsed.name, parsed.sync);
+  }
+  if (command === "project" && sub === "sync" && rest.length >= 1) return () => projectSync(rest[0]!, rest.slice(1));
   if (command === "project" && sub === "list" && rest.length === 0) return projectList;
   if (command === "task" && sub === "new") {
     const parsed = taskNewArgs(rest);
+    if (parsed !== null && "problem" in parsed) return async () => (console.error(`meddle: ${parsed.problem}`), 2);
     return parsed === null ? null : () => createTask(parsed.title, parsed.projects, parsed.where, parsed.prompt);
   }
   if (command === "task" && sub === "list" && rest.length === 0) return taskList;

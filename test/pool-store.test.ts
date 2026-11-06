@@ -166,3 +166,16 @@ test("seen updates summary, lastSeenAt and lastAddr without touching updatedAt; 
   expect(store.merge([{ ...before, lastSeenAt: t4, summary: summary("beta", 9), lastAddr: null }])).toBe(true);
   expect(store.row(B)).toEqual({ ...before, lastSeenAt: t4, summary: summary("beta", 9), lastAddr: null });
 });
+
+test("a stored or received summary whose projects lack sync reads them as having none", () => {
+  const db = openDb(":memory:");
+  const store = new PoolStore(db);
+  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  store.upsert(row(B, "member", t1));
+  const older = JSON.stringify({ ...summary("beta", 2), projects: [{ id: "p1", name: "x", home: B }] });
+  db.query("UPDATE roster SET summary = ? WHERE node_id = ?").run(older, B);
+  expect(store.row(B)!.summary!.projects).toEqual([{ id: "p1", name: "x", home: B, sync: [] }]);
+  const received = { ...summary("beta", 3), projects: [{ id: "p2", name: "y", home: B }] };
+  store.seen(B, t3, received as unknown as NodeSummary, null);
+  expect(store.row(B)!.summary!.projects).toEqual([{ id: "p2", name: "y", home: B, sync: [] }]);
+});

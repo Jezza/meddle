@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { initColocated } from "../src/jj";
+import { initColocated, jj } from "../src/jj";
 import { shortId } from "../src/pool/ids";
 import { tokenId } from "../src/token";
 import { closedPort, errorResultFixture, meddle, replay, startServe } from "./helpers";
@@ -16,6 +16,9 @@ async function home() {
   const dir = await mkdtemp("/tmp/meddle-e2e-");
   await mkdir(`${dir}/t`, { recursive: true });
   await initColocated(`${dir}/repo`);
+  // A first commit, `@` empty on it: a task of the repo starts there.
+  await writeFile(`${dir}/repo/README`, "repo\n");
+  await jj(["commit", "-m", "init"], `${dir}/repo`);
   const env = {
     HOME: dir,
     MEDDLE_DATA_DIR: `${dir}/d`,

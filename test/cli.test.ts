@@ -7,7 +7,7 @@ import { PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
 import { getTask } from "../src/store/records";
 import { markToken, tokenId } from "../src/token";
-import { childEnv, closedPort, meddle } from "./helpers";
+import { childEnv, closedPort, createTask, meddle } from "./helpers";
 import { linkClient, peerReady, twoPoolNodes } from "./pool-helpers";
 
 /** The env a CLI child runs with: no inherited MEDDLE_* and a port nothing listens on. */
@@ -47,7 +47,7 @@ test("task prompt to a task being moved queues the text, says so and exits 0 rat
   const { A, B, close } = await twoPoolNodes({ nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }, {}] });
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
   try {
-    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     await peerReady(A, B);
     const running = new Promise<void>((res) => A.runner.onState((id, s) => { if (id === m.id && s === "running") res(); }));
     await A.runner.prompt(m.id, "Reply with the single word ok.");
@@ -243,12 +243,68 @@ test("task new --here creates the task on this node and says so; an unknown --no
   }
 }, 30_000);
 
-test("the usage text lists task new's prompt, title, projects and node choice, and task list", async () => {
+test("the usage text lists task new's prompt, title, projects with their starts and node choice, and task list", async () => {
   const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
-  expect(out.stderr).toContain("meddle task new [<prompt>] [--title <t>] [--project <id|name>]... [--node <id|prefix> | --here]");
+  expect(out.stderr).toContain("meddle task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]");
   expect(out.stderr).toContain("meddle task list");
   expect(out.stderr).not.toContain("spawn");
 });
+
+test("task new: --rev and --edit belong to the --project before them; --edit needs --rev", async () => {
+  const env = { MEDDLE_PORT: String(await closedPort()) };
+  const run = (args: string[]) => meddle(["task", "new", "hi", ...args], env);
+  for (const args of [["--rev", "x"], ["--edit"], ["--rev", "x", "--project", "a"], ["--project", "a", "--rev", "x", "--rev", "y"], ["--project", "a", "--rev", "x", "--edit", "--edit"], ["--project", "a", "--rev"]]) {
+    const out = await run(args);
+    expect(out.code).toBe(2);
+    expect(out.stderr).toContain("usage: meddle task new");
+  }
+  const noRev = await run(["--project", "a", "--edit"]);
+  expect(noRev.code).toBe(2);
+  expect(noRev.stderr).toBe("meddle: --edit needs --rev\n");
+});
+
+test("task new --project a --rev X --edit --project b sends a's revision to edit and b with none", async () => {
+  const { writeFile: write, mkdir } = await import("node:fs/promises");
+  const { jj } = await import("../src/jj");
+  const { addProjectFromFolder } = await import("../src/projects/project");
+  const { paths } = await import("../src/config");
+  const { A, B, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    const read = async (n: typeof A, repo: string, rev: string) =>
+      (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", "commit_id"], repo, n.cfg)).trim();
+    // a (A's): W on its fork point P, `@` back on P. b (B's): one commit, `@` empty on it.
+    const a = A.project.replica;
+    const P = await read(A, a, "@-");
+    await write(`${a}/w`, "w\n");
+    await jj(["commit", "-m", "W"], a, A.cfg);
+    const W = await read(A, a, "@-");
+    await jj(["new", P], a, A.cfg);
+    const bRepo = `${B.home}/b`;
+    await mkdir(bRepo);
+    const b = await addProjectFromFolder(B.cfg, B.db, bRepo, B.id, "b");
+    await write(`${bRepo}/b`, "b\n");
+    await jj(["commit", "-m", "b"], bRepo, B.cfg);
+    const fork = await read(B, bRepo, "@-");
+    await peerReady(A, B);
+    await eventually(() => A.store.row(B.id)?.summary?.projects.some((p) => p.id === b.id) === true, () => "A to hear of b");
+
+    const port = new URL(dashboard.url).port;
+    const out = await meddle(["task", "new", "--title", "t", "--project", A.project.id, "--rev", W, "--edit", "--project", "b", "--here"], { HOME: A.home, MEDDLE_PORT: port });
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    const id = /^task (\S+) on/.exec(out.stdout)![1]!;
+    const manifest = JSON.parse(getTask(A.db, id)!.manifest) as { projects: Array<{ name: string; base: string }> };
+    expect(manifest.projects.map((p) => [p.name, p.base])).toEqual([["a", P], ["b", fork]]);
+    const task = paths(A.cfg).task(id);
+    // a's workspace edits W; b's is a new change on b's fork point.
+    expect(await read(A, `${task}/a`, "@")).toBe(W);
+    expect(await read(A, `${task}/b`, "@-")).toBe(fork);
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);
 
 /** Waits until `cond` holds, or fails with `what()`. */
 async function eventually(cond: () => boolean, what: () => string, ms = 15_000): Promise<void> {
@@ -314,7 +370,7 @@ test("project list shows every project in the pool and who holds it; --project t
     const env = { HOME: A.home, MEDDLE_PORT: port };
     await peerReady(A, B);
     // A holds a replica of B's project (both are named "a").
-    await A.runner.create({ title: "r", projectIds: [B.project.id] });
+    await createTask(A, { title: "r", projectIds: [B.project.id] });
     await eventually(
       () => A.store.row(B.id)?.summary?.projects.some((p) => p.id === B.project.id) === true,
       () => `A to hear of B's project: ${JSON.stringify(A.store.row(B.id)?.summary)}`,
@@ -339,6 +395,9 @@ test("project list shows every project in the pool and who holds it; --project t
 
     await mkdir(`${A.home}/solo`);
     await initColocated(`${A.home}/solo`);
+    // A first commit: a task of `solo` starts on it.
+    await writeFile(`${A.home}/solo/README`, "solo\n");
+    await (await import("../src/jj")).jj(["commit", "-m", "solo"], `${A.home}/solo`);
     const added = await meddle(["project", "add", `${A.home}/solo`, "--name", "solo"], env);
     expect(added.code).toBe(0);
     const soloId = added.stdout.trim();
@@ -347,6 +406,58 @@ test("project list shows every project in the pool and who holds it; --project t
     expect(created.code).toBe(0);
     const id = /^task (\S+) on/.exec(created.stdout)![1]!;
     expect(JSON.parse(getTask(A.db, id)!.manifest).projects.map((p: { id: string }) => p.id)).toEqual([soloId]);
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);
+
+test("project add --sync and project sync set a project's sync branches, which project list shows", async () => {
+  const { mkdir } = await import("node:fs/promises");
+  const { initColocated } = await import("../src/jj");
+  const { getProject } = await import("../src/projects/project");
+  const { A, B, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    const env = { HOME: A.home, MEDDLE_PORT: new URL(dashboard.url).port };
+    await peerReady(A, B);
+    await mkdir(`${A.home}/solo`);
+    await initColocated(`${A.home}/solo`);
+    // A first commit: a task of `solo` starts on it.
+    await writeFile(`${A.home}/solo/README`, "solo\n");
+    await (await import("../src/jj")).jj(["commit", "-m", "solo"], `${A.home}/solo`);
+    const added = await meddle(["project", "add", `${A.home}/solo`, "--sync", "dev", "--name", "solo", "--sync", "main"], env);
+    expect(added.stderr).toBe("");
+    expect(added.code).toBe(0);
+    const id = added.stdout.trim();
+    expect(getProject(A.db, id)!.sync).toEqual(["dev", "main"]);
+
+    const set = await meddle(["project", "sync", "solo", "main", "release/1.2"], env);
+    expect(set).toEqual({ stdout: "", stderr: "", code: 0 });
+    expect(getProject(A.db, id)!.sync).toEqual(["main", "release/1.2"]);
+    const sa = shortId(A.id);
+    await eventually(
+      () => A.store.row(A.id)?.summary?.projects.find((p) => p.id === id)?.sync.join(",") === "main,release/1.2",
+      () => `A's summary: ${JSON.stringify(A.store.row(A.id)?.summary?.projects)}`,
+    );
+    const listed = await meddle(["project", "list"], env);
+    expect(listed.stdout.split("\n")).toContain(`${id}  solo  home ${sa}  on ${sa}  sync main,release/1.2`);
+
+    expect(await meddle(["project", "sync", "solo"], env)).toEqual({ stdout: "", stderr: "", code: 0 });
+    expect(getProject(A.db, id)!.sync).toEqual([]);
+    const bad = await meddle(["project", "sync", "solo", "main", "-x"], env);
+    expect(bad).toEqual({ stdout: "", stderr: 'meddle: invalid sync branch name "-x"\n', code: 1 });
+    expect((await meddle(["project", "add", `${A.home}/solo`, "--sync", ""], env)).stderr).toBe('meddle: invalid sync branch name ""\n');
+    expect(getProject(A.db, id)!.sync).toEqual([]);
+    // B is not the home of A's project.
+    const dashboardB = await startDashboard({ ...B.cfg, port: 0 }, B.host, B.pool);
+    try {
+      const refused = await meddle(["project", "sync", id, "x"], { HOME: B.home, MEDDLE_PORT: new URL(dashboardB.url).port });
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toContain("not the home of");
+    } finally {
+      await dashboardB.stop();
+    }
   } finally {
     await dashboard.stop();
     await close();
@@ -365,9 +476,9 @@ test("task list prints every task of the pool, this node's first, archived ones 
     const empty = await meddle(["task", "list"], env);
     expect(empty).toMatchObject({ code: 0, stdout: "", stderr: "" });
 
-    const first = await A.runner.create({ title: "first on A", projectIds: [A.project.id] });
-    const loose = await A.runner.create({ title: "no project", projectIds: [] });
-    const onB = await B.runner.create({ title: "on B", projectIds: [B.project.id] });
+    const first = await createTask(A, { title: "first on A", projectIds: [A.project.id] });
+    const loose = await createTask(A, { title: "no project", projectIds: [] });
+    const onB = await createTask(B, { title: "on B", projectIds: [B.project.id] });
     await A.runner.archive(loose.id);
     const out = await meddle(["task", "list"], env);
     expect(out.stderr).toBe("");
@@ -430,7 +541,7 @@ test("task archive, restore and delete go through the running node; restore take
   const { A, B, close } = await twoPoolNodes();
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
   try {
-    const m = await A.runner.create({ title: "t", projectIds: [A.project.id] });
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     const port = new URL(dashboard.url).port;
     const run = (args: string[]) => meddle(["task", ...args], { HOME: A.home, MEDDLE_PORT: port });
     const label = (id: string) => `${shortId(id)} (${A.store.row(id)!.hostname})`;
@@ -450,7 +561,7 @@ test("task archive, restore and delete go through the running node; restore take
     expect(getTask(A.db, m.id)).toBeNull();
 
     // On another node, named by a prefix: the move starts and the node runs it.
-    const n = await A.runner.create({ title: "u", projectIds: [A.project.id] });
+    const n = await createTask(A, { title: "u", projectIds: [A.project.id] });
     expect(await run(["archive", n.id])).toEqual({ stdout: `archived ${n.id}\n`, stderr: "", code: 0 });
     expect(await run(["restore", n.id, "--node", B.id.slice(0, 10)])).toEqual({ stdout: `restoring to ${label(B.id)}\n`, stderr: "", code: 0 });
     const deadline = Date.now() + 15_000;
@@ -486,9 +597,9 @@ test("ids resolve by a unique prefix, and each id's shortest unique prefix is wh
 test("a project is named by its id, its name, or a unique prefix of its id", async () => {
   const { resolveProject } = await import("../src/pool/projects");
   const projects = [
-    { id: "aaaa11112222", name: "alpha", home: "h", holders: [] },
-    { id: "aaab33334444", name: "beta", home: "h", holders: [] },
-    { id: "cccc55556666", name: "aaaa", home: "h", holders: [] },
+    { id: "aaaa11112222", name: "alpha", home: "h", sync: [], holders: [] },
+    { id: "aaab33334444", name: "beta", home: "h", sync: [], holders: [] },
+    { id: "cccc55556666", name: "aaaa", home: "h", sync: [], holders: [] },
   ];
   expect(resolveProject(projects, "aaaa1")).toBe("aaaa11112222");
   expect(resolveProject(projects, "c")).toBe("cccc55556666");

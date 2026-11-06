@@ -51,7 +51,7 @@ test("a client follows a task through a prompted turn over a link", async () => 
     expect(node.claudeCodeVersion.value).toBe("2.1.314");
     expect(node.token.value.present).toBe(true);
 
-    const { manifest } = await node.createTask({ title: "t", projectIds: [project.id] });
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
     await until(node.taskIds, (ids) => ids.includes(manifest.id));
 
     const task = await client.get(TaskObject, { id: manifest.id });
@@ -102,7 +102,7 @@ test("renaming a task updates its manifest for every client, its row and its fol
   const { client, project, cfg, db, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
-    const { manifest } = await node.createTask({ title: "before", projectIds: [project.id] });
+    const { manifest } = await node.createTask({ title: "before", projects: [{ id: project.id }] });
     const task = await client.get(TaskObject, { id: manifest.id });
     const other = await client.get(TaskObject, { id: manifest.id });
     expect(task.activityAt.value).not.toBe("");
@@ -124,7 +124,7 @@ test("a client sees a pending approval, and approving it lets the turn finish", 
   const { client, project, close } = await connect("approval.jsonl");
   try {
     const node = await client.get(NodeObject, {});
-    const { manifest } = await node.createTask({ title: "t", projectIds: [project.id] });
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
     const task = await client.get(TaskObject, { id: manifest.id });
 
     await task.prompt({ text: "Run: echo hi" });
@@ -150,7 +150,7 @@ test("a client sees what a busy task was sent and has not started on as queued",
   const { client, close: closeClient } = linkClient(node0.host);
   try {
     const node = await client.get(NodeObject, {});
-    const { manifest } = await node.createTask({ title: "t", projectIds: [node0.project.id] });
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: node0.project.id }] });
     const task = await client.get(TaskObject, { id: manifest.id });
     const session = await client.get(SessionObject, { taskId: manifest.id });
     expect(task.queued.value).toEqual([]);
@@ -172,7 +172,7 @@ test("a session keeps stream deltas out of its window and in live until the next
   const { client, host, db, project, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
-    const { id } = (await node.createTask({ title: "t", projectIds: [project.id] })).manifest;
+    const { id } = (await node.createTask({ title: "t", projects: [{ id: project.id }] })).manifest;
     const delta = (type: string, field: string, value: string) =>
       ({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type, [field]: value } } });
     appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "default", model: "m" });
@@ -203,7 +203,7 @@ test("a session's live says which block streams, a thinking block with no text a
   const { client, host, db, project, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
-    const { id } = (await node.createTask({ title: "t", projectIds: [project.id] })).manifest;
+    const { id } = (await node.createTask({ title: "t", projects: [{ id: project.id }] })).manifest;
     const start = (block: Record<string, unknown>) => ({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: block } });
     appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "default", model: "m" });
     appendEvent(db, id, start({ type: "thinking", thinking: "" }));
@@ -229,7 +229,7 @@ test("a turn whose result is an error is notified as failed", async () => {
   const { client, project, close } = await connect(await errorResultFixture("error_max_turns"));
   try {
     const node = await client.get(NodeObject, {});
-    const { manifest } = await node.createTask({ title: "t", projectIds: [project.id] });
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
     const task = await client.get(TaskObject, { id: manifest.id });
     await task.prompt({ text: "Reply with the single word ok." });
     const notes = await until(node.notifications, (n) => n.some((x) => x.taskId === manifest.id && x.kind === "failed"));
@@ -246,7 +246,7 @@ test("a task's activation reads its log summary from the newest events, and its 
   const { client, db, project, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
-    const { id } = (await node.createTask({ title: "t", projectIds: [project.id] })).manifest;
+    const { id } = (await node.createTask({ title: "t", projects: [{ id: project.id }] })).manifest;
     appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "default", model: "old" });
     appendEvent(db, id, { type: "result", subtype: "success", usage: { input_tokens: 1 } });
     appendEvent(db, id, { type: "system", subtype: "init", permissionMode: "auto", model: "new" });
@@ -279,7 +279,7 @@ test("a project's heads list its replica's bookmarks and follow a turn's end of 
     const node = await client.get(NodeObject, {});
     const view = await client.get(ProjectObject, { id: project.id });
     expect(view.heads.value.some((h) => h.name.startsWith("meddle/task/"))).toBe(false);
-    const { manifest } = await node.createTask({ title: "t", projectIds: [project.id] });
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
     const task = await client.get(TaskObject, { id: manifest.id });
     await task.prompt({ text: "Reply with the single word ok." });
     const bookmark = `meddle/task/${manifest.id}/${project.name}`;
@@ -296,7 +296,7 @@ test("a task's bookmarks are listed without waiting for a push holding its repli
   const { client, project, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
-    const { manifest } = await node.createTask({ title: "t", projectIds: [project.id] });
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
     let release = () => {};
     const held = new Promise<void>((res) => { release = res; });
     let locked = () => {};

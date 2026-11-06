@@ -1,12 +1,13 @@
 // The sending side of moving a task to another node: the durable `meddle.move` (decisions 10, 11, 16, 18, 19).
 import { existsSync } from "node:fs";
 import { rename, rm, utimes } from "node:fs/promises";
+import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { isChordError, type Ref } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, withAbortSignal, type Context } from "@earendil-works/chord/context";
 import { defineTask, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
-import { bookmarkForget, workspaceForget } from "../jj";
+import { bookmarkForget } from "../jj";
 import { ensurePrivateDir, paths } from "../paths";
 import { shortId } from "../pool/ids";
 import type { PeerStream } from "../pool/net";
@@ -19,6 +20,7 @@ import { claudeCodeVersion } from "../version";
 import { readArchive, writeArchive } from "./archive";
 import { runnerFor, type MeddleHooks, type TaskRunner } from "./durable";
 import { taskGlob, type TaskManifest } from "./manifest";
+import { dropWorkspace } from "./provision";
 import { exportArchive, exportTask, receiptsMatch, type Receipt } from "./transfer";
 
 /**
@@ -67,9 +69,11 @@ function stopping(runtime: MoveRuntime, context: Context): boolean {
 }
 
 /**
- * Moves a task to another node. `prepare` checks the move again (decision 16), marks the task `moving` and waits for its
- * turn to end (or interrupts it with `now`); `handoff` sets the task bookmarks, has the target fetch them and provision
- * the task (`receiveTask`), sends the task over a `blob` stream and compares receipts; `commit` activates the task on the
+ * Moves a task to another node. `prepare` checks the move again (decision 16), marks the task `moving`, waits for its
+ * turn to end (or interrupts it with `now`) and writes the task's line on its homes (`pushTaskLines`, best effort: a
+ * home that is offline gets the target's push); `handoff` sets the task bookmarks (and writes the line of a project
+ * homed here, which the target fetches), has the target fetch them and provision the task (`receiveTask`), sends the
+ * task over a `blob` stream and compares receipts; `commit` activates the task on the
  * target and records it here as `moved`; `cleanup` archives and removes the local copy. A restore-move (`fromArchive`,
  * spec 21.4, decision 8) moves a task archived here: no turn to wait for, the namespace staged from the projects' homes
  * instead of set from a workspace, the archive sent instead of the live task, no follow-up, and the archive kept as the
@@ -94,7 +98,12 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       runner.enterMove(taskId, to, "prepare");
       await runner.moveDeps().hooks?.afterEnterMove?.(taskId, runtime.signal);
       // Remembered before the interrupt: a rerun after a crash still knows it cut the turn. An archived task has no turn.
-      if (!fromArchive) await runner.awaitTurnEnd(taskId, now, context, async () => { await runtime.memo(CUT_MEMO, true, context); });
+      if (!fromArchive) {
+        await runner.awaitTurnEnd(taskId, now, context, async () => { await runtime.memo(CUT_MEMO, true, context); });
+        // The task's line reaches its homes while this node still holds it: once the row says `moved`, it never writes.
+        await runner.setTaskBookmarks(JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest);
+        await runner.pushTaskLines(taskId);
+      }
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "handoff" } }), context);
     }),
     handoff: (task, runtime, phaseContext) => step("handoff", task.input, runtime, phaseContext, async (runner, context) => {
@@ -111,7 +120,7 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       } else {
         // Nothing is set or sent under a turn: one that is running here ends first.
         await runner.awaitTurnEnd(taskId, false, context, async () => {});
-        await runner.setTaskBookmarks(manifest);
+        await runner.setHandoffBookmarks(manifest);
       }
       // A rerun of this step finds its partial copy there: the target replaces it.
       // No time limit: the target may clone the project from its home first. A dropped link still fails it at once.
@@ -385,17 +394,17 @@ async function removeArchivedCopy(cfg: NodeConfig, db: Database, self: string, t
 }
 
 /**
- * Takes task `taskId`'s folder off this node (`selfId`): forgets its workspaces and, in each replica of a project whose
- * home is not this node, every bookmark under the task's namespace (on the home they stay, as the backup); removes the
- * task folder with its Claude Code config dir. Writes no archive and leaves the rows alone. A task without a row, and
- * pieces already gone, are no-ops.
+ * Takes task `taskId`'s folder off this node (`selfId`): removes its workspaces' jj config and forgets them
+ * (`dropWorkspace`) and, in each replica of a project whose home is not this node, every bookmark under the task's
+ * namespace (on the home they stay, beside the task's line); removes the task folder with its Claude Code config dir.
+ * Writes no archive and leaves the rows alone. A task without a row, and pieces already gone, are no-ops.
  */
 export async function releaseFolder(cfg: NodeConfig, db: Database, selfId: string, taskId: string): Promise<void> {
   const row = getTask(db, taskId);
   if (row === null) return;
   const manifest = JSON.parse(row.manifest) as TaskManifest;
   for (const p of manifest.projects) {
-    await workspaceForget(p.replica, `meddle-${taskId}`, cfg).catch(() => {});
+    await dropWorkspace(cfg, p.replica, `meddle-${taskId}`, join(paths(cfg).task(taskId), p.workspace));
     if (getProject(db, p.id)?.home === selfId) continue;
     await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(taskId), cfg)).catch(() => {});
   }

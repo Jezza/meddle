@@ -1,22 +1,25 @@
 // Replicas of projects homed on other nodes: cloned from the home over the pool's git transport, with the home's
-// remote named after its shortId; task bookmarks pushed to the home; the parent of a new task (the home's `trunk`).
+// remote named after its shortId; a project's sync branches, fetched as a task starts from one. A task's bookmarks
+// reach the home as its line (`lines.ts`).
 import { rm } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { paths, type NodeConfig } from "../config";
 import { repoName, type Repo } from "../git/wire";
-import { bookmarkList, bookmarkRefs, bookmarkSet, cloneColocated, fetch, gitImport, isJjRepo, jj, JjError, push, remoteAdd, remoteList, track, type BookmarkRef } from "../jj";
+import { bookmarkList, bookmarkSet, cloneColocated, commitOf, fetch, gitImport, isJjRepo, jj, push, remoteAdd, remoteList, track } from "../jj";
 import { cloneMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
 import { repoKey, serialised } from "../serial";
 import type { PoolRuntime } from "../pool/runtime";
 import { PeerObject } from "../state/contracts";
-import { taskGlob } from "../tasks/manifest";
-import { getProject, registerReplica, type Project } from "./project";
+import { checkSyncNames, getProject, registerReplica, setProjectSync, setProjectUpstream, type Project } from "./project";
 
-export type ReplicaDeps = { cfg: NodeConfig; db: Database; pool: PoolRuntime };
+export type ReplicaDeps = { cfg: NodeConfig; db: Database; pool: PoolRuntime; log?: (line: string) => void };
 
-/** The project a peer reports holding: its id, name and home. */
-type ProjectInfo = { id: string; name: string; home: string };
+/**
+ * The project a peer reports holding: its id, name, home, sync branches, and whether its default start is its first
+ * sync branch (`upstream`; absent from an older node, read as false).
+ */
+export type ProjectInfo = { id: string; name: string; home: string; sync?: string[]; upstream?: boolean };
 
 /** The URL of `repo` on node `nodeId`. */
 export function meddleUrl(nodeId: string, repo: Repo): string {
@@ -24,24 +27,29 @@ export function meddleUrl(nodeId: string, repo: Repo): string {
 }
 
 /** Asks each online member's PeerObject about `projectId` until one knows it; null when none does. */
-async function findProject(pool: PoolRuntime, projectId: string): Promise<ProjectInfo | null> {
+export async function findProject(pool: PoolRuntime, projectId: string): Promise<ProjectInfo | null> {
   for (const member of pool.store.members()) {
     if (member.nodeId === pool.identity.id || !pool.net.isOnline(member.nodeId)) continue;
-    let ref: Awaited<ReturnType<typeof pool.peerRef<typeof PeerObject>>>;
-    try {
-      ref = await pool.peerRef(member.nodeId, PeerObject);
-    } catch {
-      continue;
-    }
-    try {
-      if (ref.variant !== "peer") continue;
-      const info = await ref.projectInfo({ id: projectId }).catch(() => null);
-      if (info !== null && info.home !== "") return info;
-    } finally {
-      ref.release();
-    }
+    const info = await askProject(pool, member.nodeId, projectId);
+    if (info !== null && info.home !== "") return info;
   }
   return null;
+}
+
+/** What node `nodeId` says of project `projectId`; null when it holds none or cannot be asked. */
+async function askProject(pool: PoolRuntime, nodeId: string, projectId: string): Promise<ProjectInfo | null> {
+  let ref: Awaited<ReturnType<typeof pool.peerRef<typeof PeerObject>>>;
+  try {
+    ref = await pool.peerRef(nodeId, PeerObject);
+  } catch {
+    return null;
+  }
+  try {
+    if (ref.variant !== "peer") return null;
+    return await ref.projectInfo({ id: projectId }).catch(() => null);
+  } finally {
+    ref.release();
+  }
 }
 
 /** One `ensureReplica` at a time per project and data dir: a second caller waits for the first. */
@@ -50,7 +58,8 @@ const cloning = new Map<string, Promise<Project>>();
 /**
  * The project `projectId` on this node. When this node has no working replica of it, clones it and its memory from
  * the home (named by the project row, or else by any online member that holds the project), naming the home's
- * remote `shortId(home)`, and registers the replica. Rejects `home <shortId> is offline` when the home cannot be
+ * remote `shortId(home)`, and registers the replica. A replica already here takes the sync branches and `upstream` its
+ * home (when online) gives now. Rejects `home <shortId> is offline` when the home cannot be
  * reached, and `no online node holds project <shortId>` when nobody knows the project.
  */
 export async function ensureReplica(deps: ReplicaDeps, projectId: string): Promise<Project> {
@@ -65,7 +74,17 @@ export async function ensureReplica(deps: ReplicaDeps, projectId: string): Promi
 async function replicate(deps: ReplicaDeps, projectId: string): Promise<Project> {
   const { cfg, db, pool } = deps;
   const row = getProject(db, projectId);
-  if (row !== null && (await isJjRepo(row.replica))) return row;
+  if (row !== null && (await isJjRepo(row.replica))) {
+    if (row.home === pool.identity.id || !pool.net.isOnline(row.home)) return row;
+    const info = await askProject(pool, row.home, projectId);
+    if (info === null) return row;
+    let now = row;
+    const upstream = info.upstream ?? false;
+    if (upstream !== now.upstream) now = setProjectUpstream(db, projectId, upstream) ?? now;
+    const sync = info.sync ?? [];
+    if (sync.join("\0") !== now.sync.join("\0")) now = setProjectSync(db, projectId, sync) ?? now;
+    return now;
+  }
   if (row !== null && row.home === pool.identity.id) throw new Error(`the replica of project ${shortId(projectId)} is missing`);
   const info = row ?? (await findProject(pool, projectId));
   if (info === null) throw new Error(`no online node holds project ${shortId(projectId)}`);
@@ -77,7 +96,7 @@ async function replicate(deps: ReplicaDeps, projectId: string): Promise<Project>
   await rm(replica, { recursive: true, force: true });
   await cloneColocated(meddleUrl(home, { kind: "project", id: projectId }), replica, cfg, shortId(home));
   await cloneMemoryReplica(cfg, projectId, home);
-  return row ?? registerReplica(db, { id: projectId, name: info.name, home, replica });
+  return row ?? registerReplica(db, { id: projectId, name: info.name, home, replica, sync: info.sync ?? [], upstream: info.upstream ?? false });
 }
 
 /**
@@ -145,88 +164,6 @@ export async function pushBookmark(cfg: NodeConfig, replica: string, home: strin
   });
 }
 
-/**
- * What a failed jj command says, as an Error: its `Error:` line, followed by the updates the remote rejected (when it
- * names them). Anything that is not a jj failure (a time limit) is returned as it is.
- */
-function jjFailure(err: unknown): unknown {
-  if (!(err instanceof JjError)) return err;
-  const lines = err.stderr.split("\n");
-  const errorLine = lines.find((l) => l.startsWith("Error: "))?.slice("Error: ".length).trim()
-    ?? lines.map((l) => l.trim()).filter(Boolean).at(-1)
-    ?? err.message;
-  const rejected: string[] = [];
-  const from = lines.findIndex((l) => l.includes("rejected the following updates"));
-  if (from >= 0) for (const l of lines.slice(from + 1)) {
-    if (!l.startsWith("  ")) break;
-    rejected.push(l.trim());
-  }
-  return new Error(rejected.length === 0 ? errorLine : `${errorLine}: ${rejected.join(", ")}`);
-}
-
-/**
- * Pushes every bookmark under task `taskId`'s namespace in `replica` to the project's home `home` (spec 21.5; the
- * home never fetches, so this push is the backup), first pointing the task's project bookmark `primary` at its change
- * when given. Under the repo lock:
- * 1. Notes what this node changed since its last push: each local bookmark of the namespace whose commit differs from
- *    its tracked `<name>@<home>` entry, or that tracks no such entry.
- * 2. Fetches the namespace from the home (nothing there is fine: a task's first push) and tracks it there; then notes
- *    `primary` at the commit its change has now (resolved after the fetch, never before it: a caller that did not
- *    set the bookmark first must not pin it to a commit the fetch has since rewritten).
- * 3. Puts back what it noted, by commit id (a commit the fetch hid still resolves by it): this node's changes win,
- *    sideways or backwards too. A bookmark it did not change keeps what the fetch made of it: deleted or moved on the
- *    home, it is deleted or moved here.
- * 4. Restores, at the home's commit, a bookmark the home has that is deleted or conflicted here (deleted here and
- *    moved on the home): the home refuses deletions, and jj refuses to push a conflicted bookmark, so either would
- *    fail every push.
- * 5. Pushes the namespace.
- * Rejects on a failed fetch or push with jj's error line; when the home refuses one bookmark, the ones it accepted
- * have still landed.
- */
-export async function pushNamespace(
-  cfg: NodeConfig, replica: string, home: string, taskId: string, primary: { name: string; changeId: string } | null,
-): Promise<void> {
-  const remote = shortId(home);
-  const glob = taskGlob(taskId);
-  await serialised(repoKey(replica), async () => {
-    try {
-      const before = await bookmarkRefs(replica, glob, cfg);
-      const atHome = (refs: BookmarkRef[], name: string) => refs.find((r) => r.name === name && r.remote === remote);
-      const changed = new Map<string, string>();
-      for (const b of before) {
-        if (b.remote !== null || b.conflicted) continue;
-        const h = atHome(before, b.name);
-        if (h === undefined || !h.tracked || h.conflicted || h.commitId !== b.commitId) changed.set(b.name, b.commitId);
-      }
-      await fetchBookmarks(cfg, replica, home, [glob], { requireMatch: false });
-      await track(replica, glob, remote, cfg);
-      if (primary !== null) changed.set(primary.name, await commitOf(cfg, replica, primary.changeId));
-      const after = await bookmarkRefs(replica, glob, cfg);
-      const local = new Map(after.filter((b) => b.remote === null).map((b) => [b.name, b]));
-      const want = new Map(changed);
-      for (const h of after) {
-        if (h.remote !== remote || h.conflicted || want.has(h.name)) continue;
-        const here = local.get(h.name);
-        if (here === undefined || here.conflicted) want.set(h.name, h.commitId);
-      }
-      for (const [name, commit] of want) {
-        const here = local.get(name);
-        if (here === undefined || here.conflicted || here.commitId !== commit) {
-          await bookmarkSet(replica, name, commit, cfg, { ignoreWorkingCopy: true });
-        }
-      }
-      await push(replica, remote, glob, cfg);
-    } catch (err) {
-      throw jjFailure(err);
-    }
-  });
-}
-
-/** The commit id change `changeId` resolves to in `repo`, without snapshotting the working copy. */
-async function commitOf(cfg: NodeConfig, repo: string, changeId: string): Promise<string> {
-  return (await jj(["log", "--ignore-working-copy", "-r", changeId, "--no-graph", "-T", "commit_id"], repo, cfg)).trim();
-}
-
 /** The remote bookmarks `replica` knows, with the change each points at ("" and `conflicted` when conflicted). */
 export async function remoteHeads(cfg: NodeConfig, replica: string): Promise<Array<{ name: string; remote: string; changeId: string; conflicted: boolean }>> {
   const heads: Array<{ name: string; remote: string; changeId: string; conflicted: boolean }> = [];
@@ -236,47 +173,73 @@ export async function remoteHeads(cfg: NodeConfig, replica: string): Promise<Arr
   return heads;
 }
 
-/**
- * The home's latest trunk-like revision: jj's `trunk()` (a remote's main/master/trunk) or a local `trunk`, `main` or
- * `master` bookmark.
- */
-const HOME_TRUNK = 'latest(trunk() ~ root() | bookmarks(exact:"trunk") | bookmarks(exact:"main") | bookmarks(exact:"master"))';
-
-/**
- * On a project's home: points the local `trunk` bookmark at the latest trunk-like revision (`HOME_TRUNK`), so that
- * other nodes, which fetch only `trunk`, start tasks where the home would. Never snapshots the working copy, and adds
- * no operation when `trunk` is already there. Returns that change id, or null (and leaves the bookmarks alone) when
- * nothing resolves.
- */
-export async function refreshTrunk(cfg: NodeConfig, replica: string): Promise<string | null> {
-  // What git moved (a pull or commit in the checkout, a push from a peer) first, then a read that never snapshots the
-  // working copy: a folder project's replica is the user's own checkout.
-  await gitImport(replica, cfg);
-  const resolve = async (revset: string) =>
-    (await jj(["log", "--ignore-working-copy", "-r", revset, "--no-graph", "-T", 'change_id ++ "\\n"'], replica, cfg)).split("\n").filter(Boolean);
-  const [change] = await resolve(HOME_TRUNK);
-  if (change === undefined) return null;
-  // Set only when it moves, and then without a snapshot either: a peer's every fetch runs this.
-  const current = await resolve('bookmarks(exact:"trunk")');
-  if (current.length !== 1 || current[0] !== change) await bookmarkSet(replica, "trunk", change, cfg, { ignoreWorkingCopy: true });
-  return change;
+/** `name` as a jj string literal. */
+function quoted(name: string): string {
+  return `"${name.replace(/[\\"]/g, "\\$&")}"`;
 }
 
 /**
- * The revision a new task of `project` starts from: on the home, the change `refreshTrunk` resolves (`root()` when
- * nothing does); elsewhere `trunk@<shortId(home)>` after fetching it (`root()` when the home has no `trunk`).
- * Rejects `home <shortId> is offline` on another node while the home cannot be reached.
+ * The commit of bookmark `branch` on `remote` (the local bookmark when `remote` is null) in `replica`, read without
+ * snapshotting the working copy; null when there is none.
  */
-export async function trunkFor(deps: ReplicaDeps, project: Project): Promise<string> {
-  const { cfg, pool } = deps;
-  if (project.home === pool.identity.id) return (await refreshTrunk(cfg, project.replica)) ?? "root()";
-  const remote = shortId(project.home);
-  if (!pool.net.isOnline(project.home)) throw new Error(`home ${remote} is offline`);
+async function bookmarkCommit(cfg: NodeConfig, replica: string, branch: string, remote: string | null): Promise<string | null> {
+  await gitImport(replica, cfg);
+  const revset = remote === null
+    ? `bookmarks(exact:${quoted(branch)})`
+    : `remote_bookmarks(exact:${quoted(branch)}, exact:${quoted(remote)})`;
   try {
-    await fetchBookmarks(cfg, project.replica, project.home, ["exact:trunk"]);
+    return await commitOf(replica, revset, cfg);
   } catch (err) {
-    if (err instanceof Error && err.message === `bookmark trunk not found on ${remote}`) return "root()";
+    if (err instanceof Error && err.message.startsWith("no revision ")) return null;
     throw err;
   }
-  return `trunk@${remote}`;
+}
+
+/**
+ * Fetches `branches` from the `origin` of a url project's replica and makes each a local bookmark at the upstream's
+ * commit (tracking `<b>@origin`, so that a node cloning from this replica sees it as a branch). Rejects
+ * `bookmark <b> not found on origin` for one the upstream lacks. Only for a replica meddle cloned itself.
+ */
+export async function fetchFromUpstream(cfg: NodeConfig, replica: string, branches: string[]): Promise<void> {
+  if (branches.length === 0) return;
+  const patterns = branches.map((b) => `exact:${b}`);
+  await serialised(repoKey(replica), async () => {
+    await fetch(replica, "origin", patterns, cfg);
+    const present = (await bookmarkList(replica, cfg)).filter((b) => b.remote === "origin").map((b) => b.name);
+    const missing = branches.find((b) => !present.includes(b));
+    for (const b of branches.filter((x) => present.includes(x))) await track(replica, `exact:${b}`, "origin", cfg);
+    if (missing !== undefined) throw new Error(`bookmark ${missing} not found on origin`);
+  });
+}
+
+/**
+ * The commit sync branch `branch` of `project` (one of its `sync`; rejects `<branch> is not a sync branch of <project>`,
+ * and `invalid sync branch name "<branch>"` for one `checkSyncNames` refuses) points at for a task created now. On the
+ * home: for a url project, after fetching it from `origin`; for a folder project, the local bookmark. Elsewhere `<branch>@<shortId(home)>` after fetching it from the home, or, with the home
+ * offline, the copy fetched last (logged `meddle: project <name>: home offline; starting from <branch> as fetched
+ * last`); rejects `home <shortId> is offline` when there is none.
+ */
+export async function fetchSync(deps: ReplicaDeps, project: Project, branch: string): Promise<string> {
+  const { cfg, pool } = deps;
+  const sync = getProject(deps.db, project.id)?.sync ?? project.sync;
+  if (!sync.includes(branch)) throw new Error(`${branch} is not a sync branch of ${project.name}`);
+  // A replica stores the names its home lists as they came: none reaches git or jj unless it is a legal branch name.
+  await checkSyncNames(cfg, [branch]);
+  if (project.home === pool.identity.id) {
+    if (project.source.kind === "upstream") await fetchFromUpstream(cfg, project.replica, [branch]);
+    const commit = await bookmarkCommit(cfg, project.replica, branch, null);
+    if (commit === null) throw new Error(`no bookmark ${branch} in ${project.name}`);
+    return commit;
+  }
+  const remote = shortId(project.home);
+  if (!pool.net.isOnline(project.home)) {
+    const last = await bookmarkCommit(cfg, project.replica, branch, remote);
+    if (last === null) throw new Error(`home ${remote} is offline`);
+    (deps.log ?? ((line) => console.error(line)))(`meddle: project ${project.name}: home offline; starting from ${branch} as fetched last`);
+    return last;
+  }
+  await fetchBookmarks(cfg, project.replica, project.home, [`exact:${branch}`]);
+  const commit = await bookmarkCommit(cfg, project.replica, branch, remote);
+  if (commit === null) throw new Error(`bookmark ${branch} not found on ${remote}`);
+  return commit;
 }
