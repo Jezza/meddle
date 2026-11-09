@@ -26,7 +26,7 @@ import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, ty
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
 import { taskNamespace, type Start, type TaskManifest } from "../tasks/manifest";
-import { taskTitle } from "../tasks/names";
+import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
@@ -85,7 +85,7 @@ export type PeerObjectDeps = {
   /** Whether a node is a member of this node's pool: only a member may create a task here. */
   isMember(nodeId: string): boolean;
   /** Receives tasks other nodes move here (each call names the calling node), and creates tasks members place here. */
-  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt">;
+  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt">;
 };
 
 /** A project as another node sees it. */
@@ -141,9 +141,10 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         return row !== null && row.state !== "moved";
       },
       // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
-      createTaskAt: async ({ title, taskId, starts, prompt }) => {
+      createTaskAt: async ({ title, taskId, starts, prompt, nameFromPrompt }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
         const manifest = await deps.runner.create({ title, taskId, starts });
+        if (prompt !== null && nameFromPrompt === true) void deps.runner.nameFromPrompt(manifest.id, title, prompt);
         if (prompt !== null) await deps.runner.prompt(manifest.id, prompt);
         return { manifest };
       },
@@ -379,9 +380,10 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       notifications,
       efforts,
       createTask: async ({ title: given, projects, prompt, node }, ctx) => {
-        // Named here, before it goes anywhere, so that a peer of any version gets a title; Haiku names it from its
-        // prompt when it can.
-        const title = await taskTitle(given, prompt, (p) => runner.askTitle(p));
+        // Named here, before it goes anywhere, so that a peer of any version gets a title. Untitled, it starts with a
+        // made-up name, not waiting on Haiku: the node it is on names it from its prompt afterwards.
+        const title = initialTitle(given);
+        const nameFromPrompt = title !== given;
         const selfId = pool.identity.id;
         const target = node === "here" ? selfId : node ?? await placeTask(projects.map((p) => p.id));
         if (target !== selfId && !pool.store.isMember(target)) throw new Error(`no such node: ${target}`);
@@ -411,11 +413,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
           // The pool sees the new task count now, not at the next periodic refresh.
           void pool.refresh();
+          if (text !== null && nameFromPrompt) void runner.nameFromPrompt(manifest.id, title, text);
           if (text !== null) await runner.prompt(manifest.id, text);
           return { manifest, nodeId: selfId };
         }
         try {
-          return { manifest: await createOn(target, { title, taskId, starts, prompt: text }), nodeId: target };
+          return { manifest: await createOn(target, { title, taskId, starts, prompt: text, nameFromPrompt }), nodeId: target };
         } catch (err) {
           if (err instanceof CreationSent) {
             const held = await heldOn(target, taskId);
@@ -733,7 +736,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
    * `CreationSent` once the request went out: the target may have made the task all the same.
    */
   async function createOn(
-    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null },
+    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null; nameFromPrompt: boolean },
   ): Promise<TaskManifest> {
     const peer = await pool.peerRef(target, PeerObject);
     try {

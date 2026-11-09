@@ -1,5 +1,5 @@
-// src/tasks/names.ts — a new task's title when it is given none: from its prompt (named by a model, else its first
-// line), or two adjectives and a noun.
+// src/tasks/names.ts — a new task's title when it is given none: two adjectives and a noun at first, then, with a
+// prompt, the title a model gives it (else its first line).
 import { randomInt } from "node:crypto";
 
 const ADJECTIVES = [
@@ -52,20 +52,19 @@ export function cleanTitle(reply: string | null | undefined): string | null {
   return line === "" ? null : clip(line);
 }
 
+/** A new task's title as it is created: `title` when it has one (not blank), else two adjectives and a noun (`taskName`). */
+export function initialTitle(title: string | null | undefined): string {
+  return title != null && title.trim() !== "" ? title : taskName();
+}
+
 /**
- * A new task's title: `title` when it has one (not blank); else, with a prompt, what `ask` (a model asked to name the
- * prompt, see `askTitle`) answers, cleaned (`cleanTitle`), or when it answers nothing usable or throws, the first
- * `TITLE_CHARS` characters of the prompt's first line; else, with no prompt either, two adjectives and a noun
- * (`taskName`).
+ * The title a task's first prompt gives it (in place of the name `initialTitle` made up): what `ask` (a model asked to
+ * name the prompt, see `askTitle`) answers, cleaned (`cleanTitle`), or when it answers nothing usable or throws, the
+ * first `TITLE_CHARS` characters of the prompt's first line; null for a blank prompt.
  */
-export async function taskTitle(
-  title: string | null | undefined,
-  prompt: string | null | undefined,
-  ask?: (prompt: string) => Promise<string | null>,
-): Promise<string> {
-  if (title != null && title.trim() !== "") return title;
-  const text = prompt?.trim() ?? "";
-  if (text === "") return taskName();
+export async function promptTitle(prompt: string, ask?: (prompt: string) => Promise<string | null>): Promise<string | null> {
+  const text = prompt.trim();
+  if (text === "") return null;
   if (ask !== undefined) {
     const asked = cleanTitle(await ask(text).catch(() => null));
     if (asked !== null) return asked;

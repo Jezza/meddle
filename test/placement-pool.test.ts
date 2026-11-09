@@ -107,6 +107,13 @@ test("a prompt given with the task runs as its first turn on the node chosen", a
       expect(prompts).toEqual(["Reply with the single word ok."]);
       expect(messages().find((m) => m.type === "result")?.subtype).toBe("success");
       expect(listEvents(A.db, id)).toEqual([]);
+      expect(getTask(B.db, id)?.title).toBe("t");
+
+      // Untitled: made with a made-up name, which B replaces with Haiku's title (the stand-in's reply, `ok`).
+      const untitled = await nodeA.createTask({ projects: [{ id: B.project.id }], node: B.id, prompt: "Reply with the single word ok." });
+      expect(untitled.manifest.title).toMatch(/^[a-z]+ [a-z]+ [a-z]+$/);
+      const titleOnB = () => getTask(B.db, untitled.manifest.id)?.title;
+      await eventually(() => titleOnB() === "ok", () => `Haiku's title on B, not ${titleOnB()}`, 20_000);
     } finally {
       nodeA.release();
     }
@@ -135,6 +142,7 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
       abandonTask: async () => {},
       create: async (input) => { created.push(input); throw new Error("not reached"); },
       prompt: async () => { created.push("prompt"); return "turn" as const; },
+      nameFromPrompt: async () => {},
     },
   });
   const [down, up] = memoryLinkPair();

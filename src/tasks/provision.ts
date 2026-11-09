@@ -21,16 +21,12 @@ export type SettingSource = "user" | "project" | "local";
 export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string {
   if (projects.length === 0) {
     return [
-      `# Task: ${m.title}`,
-      "",
       "This task has no project attached. This folder is scratch space; it travels with the task.",
       "",
     ].join("\n");
   }
   const lines = projects.map((p) => `- ${p.name}/: jj workspace of project ${p.name}`);
   return [
-    `# Task: ${m.title}`,
-    "",
     ...lines,
     "",
     "This folder is a meddle task. Each project is a jj workspace; commit with jj.",

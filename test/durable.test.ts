@@ -499,3 +499,25 @@ test("a turn started fresh after a seq sends its prompt, though the log before i
   await h.close();
 });
 
+test("a task created with a made-up title is named from its prompt, unless it was renamed first", async () => {
+  const { cfg, db, h, runner, m } = await setup();
+  const { readManifest } = await import("../src/tasks/manifest");
+  const manifests: string[] = [];
+  runner.onManifest((tid, manifest) => { if (tid === m.id) manifests.push(manifest.title); });
+  // The stand-in Claude Code replays a recording whose reply is `ok`: that is Haiku's title.
+  await runner.nameFromPrompt(m.id, "t", "Say hello");
+  expect(getTask(db, m.id)?.title).toBe("ok");
+  expect(JSON.parse(getTask(db, m.id)!.manifest).title).toBe("ok");
+  expect((await readManifest(cfg, m.id)).title).toBe("ok");
+  expect(manifests).toEqual(["ok"]);
+  // Renamed while Haiku is asked: the rename stands.
+  await runner.rename(m.id, "first");
+  const naming = runner.nameFromPrompt(m.id, "first", "Say hello");
+  await runner.rename(m.id, "Mine");
+  await naming;
+  expect(getTask(db, m.id)?.title).toBe("Mine");
+  expect((await readManifest(cfg, m.id)).title).toBe("Mine");
+  // A task that cannot be renamed keeps its title, and naming it does not reject.
+  await runner.nameFromPrompt("nonexistent", "t", "Say hello");
+  await h.close();
+});

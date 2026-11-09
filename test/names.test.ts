@@ -1,4 +1,4 @@
-// test/names.test.ts — the name a task gets with neither a title nor a prompt.
+// test/names.test.ts — the title a task gets when it is given none.
 import { test, expect } from "bun:test";
 import { taskName } from "../src/tasks/names";
 
@@ -14,24 +14,26 @@ test("a task name is two different adjectives and a noun", () => {
   expect(taskName(() => picks.shift()!)).toBe("amber ancient beacon");
 });
 
-test("a task's title: the one given, else the model's name for its prompt, else the prompt's first line, else a generated name", async () => {
-  const { taskTitle } = await import("../src/tasks/names");
+test("a new task's title is the one given, else a generated name", async () => {
+  const { initialTitle } = await import("../src/tasks/names");
+  expect(initialTitle("Mine")).toBe("Mine");
+  for (const none of [undefined, null, "", "   "]) expect(initialTitle(none)).toMatch(/^[a-z]+ [a-z]+ [a-z]+$/);
+});
+
+test("a prompt's title: the model's name for it, else its first line; none for a blank prompt", async () => {
+  const { promptTitle } = await import("../src/tasks/names");
   const asked: string[] = [];
   const ask = (reply: string | null) => async (prompt: string) => { asked.push(prompt); return reply; };
-  // A title given: no model is asked.
-  expect(await taskTitle("Mine", "Do the thing", ask("Other"))).toBe("Mine");
-  expect(asked).toEqual([]);
-  // A prompt: the model's title, cleaned; it is shown the trimmed prompt.
-  expect(await taskTitle(undefined, "  Do the thing\nand more ", ask('"Doing the thing."'))).toBe("Doing the thing");
+  // The model's title, cleaned; it is shown the trimmed prompt.
+  expect(await promptTitle("  Do the thing\nand more ", ask('"Doing the thing."'))).toBe("Doing the thing");
   expect(asked).toEqual(["Do the thing\nand more"]);
   // The model says nothing usable, fails or is not there: the prompt's first line, 60 characters at most.
-  expect(await taskTitle(undefined, "  Do the thing\nand more", ask("  \n"))).toBe("Do the thing");
-  expect(await taskTitle(null, "Do the thing", async () => { throw new Error("no"); })).toBe("Do the thing");
-  expect(await taskTitle("  ", `${"x".repeat(70)}`)).toBe("x".repeat(60));
-  // No prompt: a generated name, and no model asked.
+  expect(await promptTitle("  Do the thing\nand more", ask("  \n"))).toBe("Do the thing");
+  expect(await promptTitle("Do the thing", async () => { throw new Error("no"); })).toBe("Do the thing");
+  expect(await promptTitle(`${"x".repeat(70)}`)).toBe("x".repeat(60));
+  // A blank prompt: no title, and no model asked.
   asked.length = 0;
-  expect(await taskTitle(null, null, ask("x"))).toMatch(/^[a-z]+ [a-z]+ [a-z]+$/);
-  expect(await taskTitle("", "   ", ask("x"))).toMatch(/^[a-z]+ [a-z]+ [a-z]+$/);
+  expect(await promptTitle("   ", ask("x"))).toBeNull();
   expect(asked).toEqual([]);
 });
 

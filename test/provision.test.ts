@@ -65,7 +65,7 @@ test("provision creates workspaces, config dir links and CLAUDE.md, seeding the 
   expect(await readFile(`${task}/a/.claude/settings.json`, "utf8")).toBe('{"env":{"FROM":"project"}}\n');
   expect(await readlink(`${task}/.meddle/claude/skills`)).toBe(`${paths(cfg).profile}/skills`);
   expect(await readlink(`${task}/.meddle/claude/projects/${pa.id}/memory`)).toBe(paths(cfg).memory(pa.id));
-  expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toContain("# Task: t");
+  expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toStartWith("- a/: jj workspace of project a\n");
   expect(await isJjRepo(paths(cfg).profile)).toBe(true);
   expect(pa.replica).not.toBe(a);
   expect(m.projects[0]).toMatchObject({ id: pa.id, name: "a", replica: pa.replica, workspace: "a" });
@@ -105,7 +105,7 @@ test("a two-project task gets a workspace per project and runs from the task fol
   const [ca, cb] = [await changeId(`${task}/a`), await changeId(`${task}/b`)];
   expect(ca).not.toBe(cb);
   expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toBe(
-    "# Task: pair\n\n- a/: jj workspace of project a\n- b/: jj workspace of project b\n\n" +
+    "- a/: jj workspace of project a\n- b/: jj workspace of project b\n\n" +
       "This folder is a meddle task. Each project is a jj workspace; commit with jj.\n\n" +
       `To keep a side branch, give it a bookmark named meddle/task/${m.id}/<project>.<label> (for example meddle/task/${m.id}/<project>.spike). ` +
       "Bookmarks outside that namespace are not backed up and do not travel, and git refuses a name with a slash after the project name.\n",
@@ -359,7 +359,7 @@ test("a task without a project is scratch space: no workspace, no primary, no me
   expect(await Bun.file(`${paths(cfg).taskConfig(m.id)}/projects`).exists()).toBe(false);
   expect(await readdir(paths(cfg).taskConfig(m.id))).not.toContain("projects");
   expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toBe(
-    "# Task: loose\n\nThis task has no project attached. This folder is scratch space; it travels with the task.\n",
+    "This task has no project attached. This folder is scratch space; it travels with the task.\n",
   );
   expect(cwdFor(m, cfg)).toEqual({ cwd: task, projectConfigRoot: null, settingSources: ["user"] });
   const env = buildEnv({

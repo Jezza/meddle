@@ -284,9 +284,9 @@ const GROUPS: Group[] = [
           "work is kept as the side line `meddle/task/<task id>/<project>.before-<n>`, archived and kept when the task " +
           "is accepted without it; a rebase keeps none. " +
           "Without --node or --here meddle picks an online node that hosts " +
-          "tasks and has room, preferring the primary project's home. Without --title, Claude Haiku names the task from " +
-          "its prompt (the first 60 characters of the prompt's first line when it cannot), or with no prompt it gets " +
-          "two adjectives and a noun. With a prompt it returns once the " +
+          "tasks and has room, preferring the primary project's home. Without --title, the task gets two adjectives and " +
+          "a noun at once, and with a prompt Claude Haiku then names it from the prompt (the first 60 characters of " +
+          "the prompt's first line when it cannot), unless it was renamed by then. With a prompt it returns once the " +
           "turn has started, not when it ends: follow it in the dashboard, or send the next prompt with `task prompt`. " +
           "Prints `task <id> on <short id>`.",
       },

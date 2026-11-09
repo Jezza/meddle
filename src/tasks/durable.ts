@@ -49,6 +49,7 @@ import { acceptanceOf, branchTips, type Acceptance, type BranchTips, type LineNa
 import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
 import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type Start, type TaskManifest } from "./manifest";
 import { MeddleMove, releaseFolder, type MoveInput } from "./move";
+import { promptTitle } from "./names";
 import { checkReceivedManifest, dropWorkspace, provisionFromManifest, provisionTask, SAFE_ID } from "./provision";
 import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
 
@@ -573,14 +574,41 @@ export class TaskRunner {
    * (moving, moved, being received or archived) and for a blank title. Answers the new manifest.
    */
   async rename(taskId: string, title: string): Promise<TaskManifest> {
-    const trimmed = title.trim();
-    if (trimmed === "") throw new Error("a task's title cannot be blank");
-    this.#refuseElsewhere(taskId);
-    const manifest: TaskManifest = { ...(JSON.parse(this.#row(taskId).manifest) as TaskManifest), title: trimmed };
-    await writeManifest(this.#cfg, manifest);
-    updateTask(this.#db, taskId, { title: trimmed, manifest: JSON.stringify(manifest) });
-    notify(this.#manifestListeners, (cb) => cb(taskId, manifest));
-    return manifest;
+    return (await this.#rename(taskId, title))!;
+  }
+
+  /**
+   * Names task `taskId`, created with the made-up title `placeholder` (`initialTitle`), from its first prompt
+   * (`promptTitle`: Haiku's title, else the prompt's first line) once that answers, unless the task was renamed
+   * meanwhile (its title is no longer `placeholder`). Never rejects: a task that moved or was archived meanwhile keeps
+   * the title it has.
+   */
+  async nameFromPrompt(taskId: string, placeholder: string, prompt: string): Promise<void> {
+    try {
+      const title = await promptTitle(prompt, (p) => this.askTitle(p));
+      if (title !== null) await this.#rename(taskId, title, placeholder);
+    } catch (err) {
+      this.#log(`meddle: could not name task ${taskId} from its prompt: ${messageOf(err)}`);
+    }
+  }
+
+  /**
+   * `rename`, one at a time per task, so that a rename's check and its write are not split by another's; with `from`,
+   * only while the title is still `from` (null otherwise, and nothing changes).
+   */
+  #rename(taskId: string, title: string, from?: string): Promise<TaskManifest | null> {
+    return serialised(`title\0${taskId}`, async () => {
+      const trimmed = title.trim();
+      if (trimmed === "") throw new Error("a task's title cannot be blank");
+      this.#refuseElsewhere(taskId);
+      const row = this.#row(taskId);
+      if (from !== undefined && row.title !== from) return null;
+      const manifest: TaskManifest = { ...(JSON.parse(row.manifest) as TaskManifest), title: trimmed };
+      await writeManifest(this.#cfg, manifest);
+      updateTask(this.#db, taskId, { title: trimmed, manifest: JSON.stringify(manifest) });
+      notify(this.#manifestListeners, (cb) => cb(taskId, manifest));
+      return manifest;
+    });
   }
 
   onManifest(cb: (taskId: string, manifest: TaskManifest) => void): () => void {

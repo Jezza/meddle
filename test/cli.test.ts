@@ -335,7 +335,7 @@ async function eventually(cond: () => boolean, what: () => string, ms = 15_000):
   }
 }
 
-test("task new with a prompt sends it as the first turn; Haiku names it from the prompt, or with no prompt it gets two adjectives and a noun", async () => {
+test("task new with a prompt sends it as the first turn; Haiku names it from the prompt afterwards, or with no prompt it keeps two adjectives and a noun", async () => {
   const { listEvents } = await import("../src/store/events");
   const { A, close } = await twoPoolNodes();
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
@@ -349,9 +349,10 @@ test("task new with a prompt sends it as the first turn; Haiku names it from the
     expect(match?.[2]).toBe(shortId(A.id));
     const id = match![1]!;
     const row = getTask(A.db, id);
-    // The stand-in Claude Code replays a recording whose reply is `ok`: that is Haiku's title.
-    expect(row?.title).toBe("ok");
     expect(JSON.parse(row!.manifest).projects).toEqual([]);
+    // Made with a made-up name, not waiting on Haiku; the stand-in Claude Code replays a recording whose reply is
+    // `ok`: that is Haiku's title, which replaces it.
+    await eventually(() => getTask(A.db, id)?.title === "ok", () => `Haiku's title, not ${getTask(A.db, id)?.title}`);
     const prompts = () => listEvents(A.db, id)
       .map((e) => e.message as { type?: string; message?: { content?: unknown } })
       .filter((m) => m.type === "user" && typeof m.message?.content === "string")

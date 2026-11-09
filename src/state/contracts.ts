@@ -138,9 +138,11 @@ const nodeMethods = {
    * Creates a task on the node `node` names: absent or null, the one placement picks (`place`); `"here"`, this node;
    * else that node id, a member of the pool. It mints the task's id, resolves each project's start here (`startAt`,
    * which writes the task's line row), and creates the task there from those starts; when a start or the creation
-   * certainly failed, the line rows already written are released. `prompt`, when given, starts its first turn there. `title` absent or
-   * blank: Haiku's title for the prompt, else its first line, or two adjectives and a noun (`taskTitle`). Answers the manifest and the node the
-   * task is on.
+   * certainly failed, the line rows already written are released. `prompt`, when given, starts its first turn there.
+   * `title` absent or blank: the task is created as two adjectives and a noun (`initialTitle`), and with a prompt the
+   * node it is on renames it to Haiku's title for the prompt, else its first line, once that answers, unless it was
+   * renamed meanwhile (`nameFromPrompt`). Answers the manifest and the node the task is on, without waiting for that
+   * title.
    */
   createTask: method(
     Type.Object({
@@ -551,10 +553,18 @@ export const PeerObject = remote("meddle.peer", {
         /**
          * Creates task `taskId` here for the caller (a member; anyone else is refused `forbidden`) from the starts the
          * caller resolved, then starts its first turn with `prompt` when one is given. Refused like a local
-         * create: no task root, no usable token, a task `taskId` already here, ….
+         * create: no task root, no usable token, a task `taskId` already here, …. `nameFromPrompt`: `title` is made
+         * up, and the task is renamed from `prompt` once Haiku answers, unless it was renamed meanwhile
+         * (`TaskRunner.nameFromPrompt`); a node older than this field keeps `title`.
          */
         createTaskAt: method(
-          Type.Object({ title: Type.String(), taskId: Type.String(), starts: Type.Array(StartSchema), prompt: Nullable(Type.String()) }),
+          Type.Object({
+            title: Type.String(),
+            taskId: Type.String(),
+            starts: Type.Array(StartSchema),
+            prompt: Nullable(Type.String()),
+            nameFromPrompt: Type.Optional(Type.Boolean()),
+          }),
           Type.Object({ manifest: TaskManifestSchema }),
         ),
         /**
