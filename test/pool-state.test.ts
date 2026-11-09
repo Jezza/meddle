@@ -7,6 +7,7 @@ import { hexOf, shortId } from "../src/pool/identity";
 import { PeerClosed, PoolNet } from "../src/pool/net";
 import { fromEndpoint, openEndpoint } from "../src/pool/net";
 import { PoolStore } from "../src/pool/store";
+import { listLineRows, writeBranchRow } from "../src/pool/rows";
 import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
 import { NodeObject, PeerObject, PoolObject } from "../src/state/contracts";
@@ -21,6 +22,7 @@ import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { getProject } from "../src/projects/project";
 import { syncMemoryBefore } from "../src/projects/memory-sync";
+import { applyProject } from "../src/projects/applier";
 
 type Node = Awaited<ReturnType<typeof startPoolNode>>;
 
@@ -107,7 +109,7 @@ test("PoolObject shows a pool of one, and a linked node that proved the secret a
     expect(poolA.self.value).toBe(A.identity.id);
     expect(poolA.nodes.value).toEqual([{
       nodeId: A.id, hostname: hostname(), status: "member", online: true, version: VERSION, claudeCodeVersion: "2.1.314",
-      hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [{ id: A.project.id, name: "a", home: A.id, sync: [], upstream: false }],
+      hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [{ id: A.project.id, name: "a", home: A.id, defaultBranch: "main" }],
       lastSeenAt: expect.any(String), gone: false, link: null,
     }]);
     const nodeA = await a!.client.get(NodeObject, {});
@@ -525,7 +527,7 @@ test("a node holds a peer's PeerObject: its projects with their home, and projec
     try {
       expect(peer.variant).toBe("peer");
       if (peer.variant !== "peer") return;
-      expect(peer.projects.value).toEqual([{ id: A.project.id, name: A.project.name, home: A.id, sync: [], upstream: false }]);
+      expect(peer.projects.value).toEqual([{ id: A.project.id, name: A.project.name, home: A.id, defaultBranch: "main" }]);
       expect(typeof peer.claudeCodeVersion.value).toBe("string");
       expect(peer.hostsTasks.value).toBe(true);
 
@@ -533,8 +535,8 @@ test("a node holds a peer's PeerObject: its projects with their home, and projec
       await initColocated(folder);
       const added = await addProjectFromFolder(A.cfg, A.db, folder, A.id, "second");
       const projects = await until(peer.projects, (list) => list.some((p) => p.id === added.id));
-      expect(projects.find((p) => p.id === added.id)).toEqual({ id: added.id, name: "second", home: A.id, sync: [], upstream: false });
-      expect(await peer.projectInfo({ id: added.id })).toEqual({ id: added.id, name: "second", home: A.id, sync: [], upstream: false });
+      expect(projects.find((p) => p.id === added.id)).toEqual({ id: added.id, name: "second", home: A.id, defaultBranch: null });
+      expect(await peer.projectInfo({ id: added.id })).toEqual({ id: added.id, name: "second", home: A.id, defaultBranch: null });
       expect(await peer.projectInfo({ id: "nope" })).toBeNull();
     } finally {
       peer.release();
@@ -563,7 +565,7 @@ test("peerRef rejects for a node this node is not connected to", async () => {
   }
 }, 15_000);
 
-test("a task created for a project a node has never seen clones it from home, starts on the fork point the home resolves, and its turn reaches the home", async () => {
+test("a task created for a project a node has never seen gets a service repo, starts on the default branch as its rows have it, and its turn reaches the home", async () => {
   const { A, B, close } = await twoPoolNodes({ extraEnv: { MEDDLE_FIXTURE_MEMORY: "1" } });
   const linked = linkClient(B.host);
   try {
@@ -571,10 +573,15 @@ test("a task created for a project a node has never seen clones it from home, st
     const repoA = A.project.replica;
     const changeOf = async (cfg: typeof A.cfg, repo: string, rev: string) =>
       (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], repo, cfg)).trim();
+    // `main`, the default branch, moves on in A's service repo.
+    await jj(["new", "main"], repoA, A.cfg);
     await writeFile(`${repoA}/README`, "hello\n");
     await jj(["commit", "-m", "hello"], repoA, A.cfg);
-    // The fork point of A's `@`: the newest ancestor with changes.
-    const fork = await changeOf(A.cfg, repoA, "@-");
+    await jj(["bookmark", "set", "main", "-r", "@-"], repoA, A.cfg);
+    const fork = await changeOf(A.cfg, repoA, "main");
+    // Its row too: a start reads the branch from its rows.
+    const main = (await jj(["log", "--ignore-working-copy", "-r", "main", "--no-graph", "-T", "commit_id"], repoA, A.cfg)).trim();
+    writeBranchRow(A.db, A.id, { project: id, branch: "main", commit: main, drops: [] });
     await peerReady(B, A);
     expect(getProject(B.db, id)).toBeNull();
 
@@ -592,7 +599,10 @@ test("a task created for a project a node has never seen clones it from home, st
     expect((await result).subtype).toBe("success");
     await idle;
     const change = await changeOf(B.cfg, workspace, "@");
-    // B's turn end wrote the task's line on A, its home.
+    // B's turn end wrote the task's line as a row, which pool sync carries to A, its home. These nodes run no applier
+    // (`startApplier`, which `serve` starts): apply A's rows as its applier would once the row arrives.
+    await eventually(() => listLineRows(A.db, id, manifest.id).some((r) => r.name === "a" && r.holder === B.id));
+    expect(await applyProject({ cfg: A.cfg, db: A.db, pool: A.pool }, id)).toEqual({ pending: [] });
     const onA = (await bookmarkList(repoA, A.cfg)).find((b) => b.name === `task/${manifest.id}/a` && b.remote === "meddle");
     expect(onA?.changeId).toBe(change);
     expect(B.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);

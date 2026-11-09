@@ -5,7 +5,7 @@ import type { Database } from "bun:sqlite";
 import { SecretKey, type Connection, type Endpoint } from "@number0/iroh";
 import { createHost, memoryLinkPair, type Host, type Subscribable } from "@earendil-works/chord";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "../src/config";
-import { writeHelperWrapper, writeUpdateHook } from "../src/git/scripts";
+import { writeHelperWrapper, writePreReceiveHook } from "../src/git/scripts";
 import { acceptGitStreams } from "../src/git/serve";
 import { GitSocket } from "../src/git/socket";
 import { acceptBlobStreams } from "../src/tasks/blob";
@@ -17,6 +17,7 @@ import { servePool, type PoolObjectDeps } from "../src/pool/object";
 import { DEFAULT_POOL_NAME, poolKey, proofFor, verifyProof, type PoolKey } from "../src/pool/secret";
 import { PoolStore, type NodeSummary } from "../src/pool/store";
 import { startPool, type PoolSummaryDeps } from "../src/pool/runtime";
+import { rowChanges } from "../src/pool/rows";
 import { PoolSettings } from "../src/pool/settings";
 import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
 import { PeerObject } from "../src/state/contracts";
@@ -95,7 +96,10 @@ export type PoolNode = {
   summary: NodeSummary;
   /** What `servePool` was given; `tokenChanged` refreshes the self row and tells the pool. */
   deps: PoolObjectDeps;
-  /** Fires `deps.changes`, as the node does when its roster, a peer's online state or its tokens changed. */
+  /**
+   * Fires `deps.changes`, as the node does when its roster, a peer's online state or its tokens changed. Rows written
+   * or merged fire it on their own (`rowChanges`), as `startPool` wires them.
+   */
   changed(): void;
   /** Everything reported to the net's, the sync's and the host's `onError`. */
   errors: unknown[];
@@ -110,7 +114,7 @@ function notInThisTest(): never {
 async function poolNode(
   name: string,
   servePeers = true,
-): Promise<{ node: PoolNode; frames: TappedFrame[]; servePeers: () => void; stopAccepting: () => void }> {
+): Promise<{ node: PoolNode; frames: TappedFrame[]; servePeers: () => void; stopAccepting: () => void; stopRows: () => void }> {
   const home = await mkdtemp(`/tmp/meddle-pool-${name}-`);
   const cfg = loadConfig({
     HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t`,
@@ -137,6 +141,8 @@ async function poolNode(
     },
   };
   const changed = () => { for (const cb of [...listeners]) cb(null); };
+  // As `startPool` does: a row written or merged is served to the peers at once.
+  const stopRows = rowChanges.subscribe(() => changed());
 
   const net = new PoolNet({
     endpoint, selfId: id, ...proofDeps(id), admit: (peer) => store.ensureMember(peer, id) === "member", onError, backoff: fast,
@@ -182,6 +188,7 @@ async function poolNode(
     frames,
     servePeers: serve,
     stopAccepting: () => stopAccepting(),
+    stopRows,
   };
 }
 
@@ -225,10 +232,59 @@ export async function twoNodes(options: { start?: boolean; offerAddresses?: bool
     framesOf: (node) => (node === a ? made[0].frames : made[1].frames),
     async close() {
       await Promise.all([a.sync.stop(), b.sync.stop()]);
-      for (const m of made) m.stopAccepting();
+      for (const m of made) {
+        m.stopAccepting();
+        m.stopRows();
+      }
       await Promise.all([a.host.close(), b.host.close()]);
       await Promise.all([a.net.stop(), b.net.stop()]);
       for (const n of [a, b]) {
+        if (!n.net.endpoint.isClosed()) await n.net.endpoint.close();
+        n.db.close();
+        await rm(n.home, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+/** A pair of `threeNodes` linked to each other. */
+export type ThreeNodeLink = readonly ["a" | "b" | "c", "a" | "b" | "c"];
+
+/**
+ * Three pool nodes as `twoNodes` makes two, started. Only the nodes of each of `links` (default: every pair) are
+ * members of each other's roster, offered each other's address and dialing each other; a node learns of the others
+ * from its peers' rosters but never dials them. `close()` stops everything and removes the homes.
+ */
+export async function threeNodes(options: { links?: readonly ThreeNodeLink[] } = {}): Promise<{
+  a: PoolNode; b: PoolNode; c: PoolNode;
+  close(): Promise<void>;
+}> {
+  const made = [await poolNode("a"), await poolNode("b"), await poolNode("c")] as const;
+  const [a, b, c] = [made[0].node, made[1].node, made[2].node];
+  const byName = { a, b, c };
+  const links = options.links ?? [["a", "b"], ["b", "c"], ["a", "c"]];
+  for (const [x, y] of links) {
+    for (const [self, other] of [[byName[x], byName[y]], [byName[y], byName[x]]] as const) {
+      self.store.upsert({ ...self.store.row(self.id)!, nodeId: other.id, hostname: other.summary.hostname });
+      self.net.watch(other.id);
+      self.net.offerAddress(fromEndpoint(other.net.endpoint));
+    }
+  }
+  for (const n of [a, b, c]) {
+    n.net.start();
+    n.sync.start();
+  }
+  return {
+    a, b, c,
+    async close() {
+      await Promise.all([a.sync.stop(), b.sync.stop(), c.sync.stop()]);
+      for (const m of made) {
+        m.stopAccepting();
+        m.stopRows();
+      }
+      await Promise.all([a.host.close(), b.host.close(), c.host.close()]);
+      await Promise.all([a.net.stop(), b.net.stop(), c.net.stop()]);
+      for (const n of [a, b, c]) {
         if (!n.net.endpoint.isClosed()) await n.net.endpoint.close();
         n.db.close();
         await rm(n.home, { recursive: true, force: true });
@@ -251,7 +307,7 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
     hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
     taskCount: () => listLiveTasks(db).length,
     running: () => countRunningTasks(db),
-    projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home, sync: p.sync, upstream: p.upstream })),
+    projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home, defaultBranch: p.defaultBranch })),
   };
 }
 
@@ -285,6 +341,7 @@ export async function startPoolNode(fixture?: string, extraEnv: Record<string, s
     id: pool.identity.id, identity: pool.identity, store: pool.store, net: pool.net,
     async close() {
       metrics.stop();
+      runner.close();
       await pool.stop();
       await host.close();
       await node.harness.close();
@@ -317,9 +374,9 @@ export async function linkNodes(a: GitPoolNode, b: GitPoolNode): Promise<void> {
 
 /**
  * `count` whole nodes (`startPoolNode`, with `extraEnv` and the node's own `nodes[i]`), all with `POOL_SECRET`, linked
- * to each other (`linkNodes`) and all online to each other, each with the git remote helper's wrapper and the update
- * hook written, a `GitSocket` started, `acceptGitStreams` (logging to the node's `logs`) and `acceptBlobStreams`
- * registered. `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
+ * to each other (`linkNodes`) and all online to each other, each with the git remote helper's wrapper and the
+ * pre-receive hook written, a `GitSocket` started, `acceptGitStreams` (logging to the node's `logs`) and
+ * `acceptBlobStreams` registered. `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
  */
 export async function poolNodes(
   count: number,
@@ -341,13 +398,13 @@ export async function poolNodes(
       const node = await startPoolNode(own.fixture, { ...options.extraEnv, ...own.extraEnv }, own.token === undefined ? {} : { token: own.token });
       nodes.push(node);
       await writeHelperWrapper(node.cfg);
-      await writeUpdateHook(node.cfg);
+      await writePreReceiveHook(node.cfg);
       const socket = new GitSocket(node.cfg, node.net);
       await socket.start();
       stops.push(() => socket.stop());
       if (own.serveGit !== false) {
         const stopAccepting = acceptGitStreams(node.net, {
-          db: node.db, cfg: node.cfg, selfId: node.id, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
+          db: node.db, cfg: node.cfg, pool: node.pool, selfId: node.id, isMember: (id) => node.store.isMember(id), log: (line) => node.logs.push(line),
         });
         stops.push(async () => stopAccepting());
       }

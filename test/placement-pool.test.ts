@@ -144,7 +144,7 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
     const peer = await client.get(PeerObject, {});
     if (peer.variant !== "peer") throw new Error("expected the peer variant");
     let refusal: unknown = null;
-    await peer.createTaskAt({ title: "t", taskId: "0123456789ab", starts: [{ projectId: "p", kind: "sync", branch: "main" }], prompt: "hi" })
+    await peer.createTaskAt({ title: "t", taskId: "0123456789ab", starts: [{ projectId: "p", mode: "child", commit: "1".repeat(40), base: ["1".repeat(40)] }], prompt: "hi" })
       .catch((err: unknown) => { refusal = err; });
     expect(refusal).toMatchObject({ code: "forbidden" });
     expect(created).toEqual([]);
@@ -155,38 +155,36 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
   }
 });
 
-test("with the home unreachable, placement picks a node holding a replica, which starts the task from the sync branch it last fetched", async () => {
+test("with the home unreachable, placement picks a node holding a replica, which starts the task from the default branch as its rows have it", async () => {
   const { writeFile } = await import("node:fs/promises");
   const { jj } = await import("../src/jj");
   const { paths } = await import("../src/config");
-  const { setProjectSync } = await import("../src/projects/project");
+  const { writeBranchRow } = await import("../src/pool/rows");
   const { A, B, close } = await twoPoolNodes();
   const linked = linkClient(B.host);
   try {
-    // A is the home of its project, whose sync branch is `main`.
+    // A is the home of its project, whose default branch `main` A moved on (its row too).
     const repo = A.project.replica;
+    await jj(["new", "main"], repo, A.cfg);
     await writeFile(`${repo}/README`, "hello\n");
     await jj(["commit", "-m", "hello"], repo, A.cfg);
     await jj(["bookmark", "set", "main", "-r", "@-"], repo, A.cfg);
-    setProjectSync(A.db, A.project.id, ["main"]);
     const main = (await jj(["log", "-r", "main", "--no-graph", "-T", "commit_id"], repo, A.cfg)).trim();
+    writeBranchRow(A.db, A.id, { project: A.project.id, branch: "main", commit: main, drops: [] });
     await peerReady(B, A);
     const nodeB = await linked.client.get(NodeObject, {});
     try {
-      // B fetches `main` as it creates a first task from it.
-      const first = await nodeB.createTask({ title: "first", projects: [{ id: A.project.id, rev: "main" }], node: "here" });
-      expect(first.manifest.projects[0]!.base).toBe(main);
+      // B catches up on `main`'s rows and commit as it creates a first task from it.
+      const first = await nodeB.createTask({ title: "first", projects: [{ id: A.project.id }], node: "here" });
+      expect(first.manifest.projects[0]!.base).toEqual([main]);
 
       await A.net.stop();
       await eventually(() => !B.net.isOnline(A.id), () => "B to see A offline");
-      const placed = await nodeB.createTask({ title: "second", projects: [{ id: A.project.id, rev: "main" }], node: null });
+      const placed = await nodeB.createTask({ title: "second", projects: [{ id: A.project.id }], node: null });
       expect(placed.nodeId).toBe(B.id);
-      expect(placed.manifest.projects[0]!.base).toBe(main);
+      expect(placed.manifest.projects[0]!.base).toEqual([main]);
       const workspace = `${paths(B.cfg).task(placed.manifest.id)}/a`;
       expect((await jj(["log", "-r", "@-", "--no-graph", "-T", "commit_id"], workspace, B.cfg)).trim()).toBe(main);
-      expect(B.logs.filter((l) => l.includes("home offline"))).toEqual([
-        "meddle: project a: home offline; starting from main as fetched last",
-      ]);
     } finally {
       nodeB.release();
     }

@@ -1,18 +1,21 @@
 // Serves PoolObject: the pool as dashboards and the CLI see it (`default`), and as other nodes sync it (`peer`): the
-// roster, the tokens' metadata and the settings.
+// roster, the tokens' metadata, the settings and (to peers) the line and branch rows.
 import type { Database } from "bun:sqlite";
 import Type from "typebox";
 import { forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
-import { NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema, TokenMetaSchema } from "../state/contracts";
+import {
+  BranchRowSchema, LineRowSchema, NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema, TokenMetaSchema,
+} from "../state/contracts";
 import { TOKEN_ID, enableToken, listTokens, moveToken, pickToken, tokenRow, tokenValue, type TokenMeta } from "../token";
 import { isNodeId } from "./identity";
+import { allBranchRows, listLineRows } from "./rows";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore, WireRosterRow } from "./store";
 
 export type PoolObjectDeps = {
   store: PoolStore;
-  /** The node's database: the token rows are read from it. */
+  /** The node's database: the token, line and branch rows are read from it. */
   db: Database;
   cfg: NodeConfig;
   selfId: string;
@@ -37,7 +40,10 @@ export type PoolObjectDeps = {
   setSetting(key: string, value: string): Promise<void>;
   /** Unsets a setting here and tells the pool. */
   unsetSetting(key: string): Promise<void>;
-  /** Fires whenever the roster, a peer's online state, the tokens or the settings changed, and on each self refresh. */
+  /**
+   * Fires whenever the roster, a peer's online state, the tokens, the settings or the rows changed, and on each self
+   * refresh.
+   */
   changes: Subscribable<null>;
 };
 
@@ -128,16 +134,22 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
     if (peer !== null) {
       const rows = self.state("settings", Type.Array(SettingRowSchema), { init: () => settings.rows() });
       const tokens = self.state("tokens", Type.Array(TokenMetaSchema), { init: () => listTokens(db, { includeRemoved: true }) });
+      const lineRows = self.state("lineRows", Type.Array(LineRowSchema), { init: () => listLineRows(db) });
+      const branchRows = self.state("branchRows", Type.Array(BranchRowSchema), { init: () => allBranchRows(db) });
       self.on("changes", deps.changes, (_event, ctx) => {
         roster.replace(ctx, store.roster());
         rows.replace(ctx, settings.rows());
         tokens.replace(ctx, listTokens(db, { includeRemoved: true }));
+        lineRows.replace(ctx, listLineRows(db));
+        branchRows.replace(ctx, allBranchRows(db));
       });
       return {
         variant: "peer",
         roster,
         settings: rows,
         tokens,
+        lineRows,
+        branchRows,
         fetchToken: async ({ id }) => {
           if (!store.isMember(peer)) throw forbidden("not a member");
           // The table first: an id this node does not list never reaches the filesystem.

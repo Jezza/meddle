@@ -1,6 +1,6 @@
 // Pool sync: each node holds every online peer's PoolObject (peer variant) over a chord link on iroh, merges the
-// peer's roster, settings and token rows into its own, pulls the value of each token it lists but lacks, by id, and
-// deletes the value of each token the pool removed.
+// peer's roster, settings, token rows and line and branch rows into its own (and so relays them), pulls the value of
+// each token it lists but lacks, by id, and deletes the value of each token the pool removed.
 import type { Database } from "bun:sqlite";
 import { createHost, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
@@ -10,12 +10,13 @@ import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
 import { fromEndpoint, remoteAddrOf, type PoolNet } from "./net";
 import { PEER_PRINCIPAL_PREFIX } from "./object";
+import { mergeBranchRows, mergeLineRows } from "./rows";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore } from "./store";
 
 export type SyncDeps = {
   cfg: NodeConfig;
-  /** The node's database: a peer's token rows are merged into it. */
+  /** The node's database: a peer's token, line and branch rows are merged into it. */
   db: Database;
   store: PoolStore;
   net: PoolNet;
@@ -23,7 +24,7 @@ export type SyncDeps = {
   /** The pool's settings: a peer's are merged in, then applied. */
   settings: PoolSettings;
   summary(): NodeSummary | Promise<NodeSummary>;
-  /** The roster, the tokens or the settings changed because of a peer, or the self row was refreshed. */
+  /** The roster, the tokens, the settings or the rows changed because of a peer, or the self row was refreshed. */
   onChange(): void;
   onError?(err: unknown): void;
   /** Log lines (a peer's token rows this node dropped); default `console.error`. */
@@ -274,6 +275,12 @@ export class PoolSync {
         for (const id of merged.removedValues) this.serially(() => this.dropValue(id), current);
         for (const id of merged.missingValues) this.serially(() => this.pull(id, () => view.fetchToken!(id), current), current);
         if (merged.changed) this.deps.onChange();
+      });
+      pool.lineRows.subscribe((rows) => {
+        if (current() && mergeLineRows(this.deps.db, rows).changed.length > 0) this.deps.onChange();
+      });
+      pool.branchRows.subscribe((rows) => {
+        if (current() && mergeBranchRows(this.deps.db, rows).changed.length > 0) this.deps.onChange();
       });
     } catch (err) {
       if (!current()) return;

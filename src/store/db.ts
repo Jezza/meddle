@@ -79,6 +79,32 @@ const MIGRATIONS = [
     updated_at TEXT NOT NULL,
     removed INTEGER NOT NULL DEFAULT 0
   )`,
+  // Where each task's line points (src/pool/rows.ts): written by the task's holder, the greater (epoch, seq) wins.
+  // commit_id NULL is released; base is a JSON array of commit ids; seen_seq is the highest seq seen for the line.
+  `CREATE TABLE IF NOT EXISTS line_rows (
+    project TEXT NOT NULL,
+    task TEXT NOT NULL,
+    name TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    commit_id TEXT NULL,
+    base TEXT NOT NULL,
+    archived INTEGER NOT NULL,
+    seen_seq INTEGER NOT NULL,
+    PRIMARY KEY (project, task, name)
+  )`,
+  // Where each node puts each branch (src/pool/rows.ts): written by that node, the greater seq wins. commit_id NULL is
+  // deleted; drops is a JSON array of the `{ node, seq }` rows it replaced.
+  `CREATE TABLE IF NOT EXISTS branch_rows (
+    project TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    node TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    commit_id TEXT NULL,
+    drops TEXT NOT NULL,
+    PRIMARY KEY (project, branch, node)
+  )`,
 ];
 
 /** Columns added to a table after its first release: each is added to a database that lacks it. */
@@ -87,11 +113,11 @@ const ADDED_COLUMNS = [
   { table: "tasks", column: "settings", type: "TEXT" },
   // The node id of the project's home: the node whose repo is the project's.
   { table: "projects", column: "home", type: "TEXT" },
-  // The project's sync branches, in order, as a JSON array of bookmark names; NULL for none.
+  // `sync` and `upstream` belong to a removed feature: kept so older databases match, read and written by nothing.
   { table: "projects", column: "sync", type: "TEXT" },
-  // 1 when the project's default start is its first sync branch (added from an upstream URL on its home), else 0;
-  // NULL in a row from before, read from the row's source.
   { table: "projects", column: "upstream", type: "INTEGER" },
+  // The project's default branch: what a task starts from when no revision is named; NULL for none.
+  { table: "projects", column: "default_branch", type: "TEXT" },
   // Prompts sent while the task was moving, as a JSON array of strings; NULL for none.
   { table: "tasks", column: "queued", type: "TEXT" },
   // The node a `moved` task went to.

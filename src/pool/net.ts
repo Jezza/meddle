@@ -5,6 +5,7 @@ import {
 import type { NodeConfig } from "../config";
 import { ALPN_POOL, StreamReader, parseHeader, writeLine, type StreamHeader } from "./frames";
 import { endpointIdOf, hexOf, shortId, type Identity } from "./identity";
+import { loopbackPair } from "./loopback";
 import { SESSION, newSession } from "./secret";
 import type { WireAddr } from "./store";
 
@@ -210,6 +211,8 @@ export class PoolNet {
   private readonly streamListeners = new Set<(s: PeerStream) => boolean>();
   private started = false;
   private stopped = false;
+  /** Settles once the net stops: the `closed` of the streams this node opens to itself. */
+  private readonly ended = Promise.withResolvers<string>();
 
   constructor(private readonly deps: NetDeps) {
     this.endpoint = deps.endpoint;
@@ -229,6 +232,7 @@ export class PoolNet {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    this.ended.resolve("bye");
     for (const d of this.dials.values()) {
       d.cancel = { code: 0n, reason: "bye" };
       d.wake();
@@ -323,12 +327,25 @@ export class PoolNet {
     return () => this.streamListeners.delete(cb);
   }
 
+  /**
+   * A stream to `peerId` opening with `header`. One to this node itself (a checkout here fetching from its own node)
+   * never leaves the process: its other end goes to this node's own listeners, as a peer's stream would.
+   */
   async openStream(peerId: string, header: StreamHeader): Promise<PeerStream> {
+    if (peerId === this.deps.selfId) return this.loopback(header);
     const link = this.links.get(peerId);
     if (!link) throw new Error(`not connected to ${shortId(peerId)}`);
     const stream = await link.conn.openBi();
     await writeLine(stream.send, JSON.stringify(header));
     return { peerId, header, stream, reader: new StreamReader(stream.recv), closed: link.closed };
+  }
+
+  private loopback(header: StreamHeader): PeerStream {
+    if (this.stopped) throw new Error("not connected to this node: it is stopping");
+    const [mine, theirs] = loopbackPair();
+    const closed = this.ended.promise;
+    this.emitStream({ peerId: this.deps.selfId, header, stream: theirs, reader: new StreamReader(theirs.recv), closed });
+    return { peerId: this.deps.selfId, header, stream: mine, reader: new StreamReader(mine.recv), closed };
   }
 
   /** Keeps a running task (its failure reported) so that `stop()` can wait for the ones still running. */

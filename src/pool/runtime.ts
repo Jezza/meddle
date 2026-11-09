@@ -11,6 +11,7 @@ import { DialFailed, PeerClosed, PoolNet, fromEndpoint, openEndpoint, type Refus
 import type { PoolObjectDeps } from "./object";
 import { Presence } from "./presence";
 import { dedupe } from "./report";
+import { rowChanges } from "./rows";
 import { poolKey, proofFor, verifyProof, type PoolKey } from "./secret";
 import { PoolSettings, discoveryLighthouseUrl } from "./settings";
 import { PoolStore, newestAddr, type NodeProject, type NodeSummary, type PoolIdentity, type WireAddr } from "./store";
@@ -55,8 +56,8 @@ export type PoolRuntime = {
    */
   refresh(): Promise<void>;
   /**
-   * Fires whenever the roster, a peer's online state, the tokens or the settings changed, and on each self refresh.
-   * Returns the unsubscribe.
+   * Fires whenever the roster, a peer's online state, the tokens, the settings or the line and branch rows changed, and
+   * on each self refresh. Returns the unsubscribe.
    */
   onChange(cb: () => void): () => void;
   /**
@@ -154,6 +155,8 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     listeners.add(cb);
     return () => { listeners.delete(cb); };
   };
+  // A row written here (or merged from a peer) is served to the peers at once, so that it spreads without waiting.
+  const stopRows = rowChanges.subscribe(() => notify());
 
   /** The members this node keeps a connection with, and the address it last offered for each. */
   const followed = new Map<string, string | null>();
@@ -495,6 +498,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
       stopped = true;
       // Nobody hears of the connections closing below: the node is shutting down.
       listeners.clear();
+      stopRows();
       await sync.stop();
       await discovery?.stop();
       await net.stop();

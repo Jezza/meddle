@@ -112,10 +112,10 @@ test("placementCandidates: the roster's other members as their summaries say, ol
 
 test("nodeOf defaults an older peer's summary the same way", () => {
   const older = { hostname: "b", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 4 };
-  const live = { summary: { ...older, hostname: "a", running: 1, limit: 2, projects: [{ id: "q", name: "q", home: A, sync: [] }] }, at: "t" };
+  const live = { summary: { ...older, hostname: "a", running: 1, limit: 2, projects: [{ id: "q", name: "q", home: A }] }, at: "t" };
   expect(nodeOf(row(B, older), A, live, [B])).toMatchObject({ nodeId: B, online: true, taskCount: 4, running: 0, limit: 0, projects: [] });
   expect(nodeOf(row(C, null), A, live, [])).toMatchObject({ nodeId: C, online: false, running: 0, limit: 0, projects: [] });
-  expect(nodeOf(row(A, older), A, live, [])).toMatchObject({ nodeId: A, running: 1, limit: 2, projects: [{ id: "q", name: "q", home: A, sync: [] }] });
+  expect(nodeOf(row(A, older), A, live, [])).toMatchObject({ nodeId: A, running: 1, limit: 2, projects: [{ id: "q", name: "q", home: A }] });
 });
 
 test("a roster row merged from an older peer reads back with running 0, limit 0 and no projects", async () => {

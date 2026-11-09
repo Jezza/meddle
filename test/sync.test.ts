@@ -1,10 +1,14 @@
 import { test, expect } from "bun:test";
-import { stat } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { createHost, memoryLinkPair } from "@earendil-works/chord";
+import { ensureDataDirs, loadConfig, paths } from "../src/config";
+import { startPool } from "../src/pool/runtime";
 import { PoolObject } from "../src/state/contracts";
+import { openDb } from "../src/store/db";
 import { addToken, listTokens, tokenFile, tokenId, tokenValue } from "../src/token";
+import { listBranchRows, writeBranchRow, writeLineRow } from "../src/pool/rows";
 import { HoldFailed } from "../src/pool/sync";
-import { twoNodes, type PoolNode, type TappedFrame } from "./pool-helpers";
+import { POOL_ENV, poolSummaryOf, threeNodes, twoNodes, type PoolNode, type TappedFrame } from "./pool-helpers";
 
 const C = "c".repeat(64);
 const TOKENS = ["tok2", "tok3"];
@@ -144,5 +148,44 @@ test("a peer's older row for a token does not overwrite a newer local one, and a
     expect(fetches).toEqual([]);
   } finally {
     await close();
+  }
+}, 15_000);
+
+test("a branch row written on one node reaches a node it is not linked to, relayed by the node between", async () => {
+  const { a, b, c, close } = await threeNodes({ links: [["a", "b"], ["b", "c"]] });
+  try {
+    // No `changed()`: the write itself tells the pool.
+    const written = writeBranchRow(a.db, a.id, { project: "p", branch: "main", commit: "d".repeat(40), drops: [] });
+    await until(() => JSON.stringify(listBranchRows(c.db, "p")) === JSON.stringify([written]));
+    expect(listBranchRows(b.db, "p")).toEqual([written]);
+    expect(a.net.isOnline(c.id) || c.net.isOnline(a.id)).toBe(false);
+    expect([...a.errors, ...b.errors, ...c.errors].map(String)).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a row written on a node fires its pool's change notification at once", async () => {
+  const home = await mkdtemp("/tmp/meddle-rows-");
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t`, ...POOL_ENV });
+  await ensureDataDirs(cfg);
+  const db = openDb(paths(cfg).db);
+  const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { log: () => {} });
+  try {
+    let fired = 0;
+    const off = pool.onChange(() => fired++);
+    // Counted with no await in between, so that a periodic refresh cannot pass for the write's notification.
+    writeBranchRow(db, pool.identity.id, { project: "p", branch: "main", commit: "d".repeat(40), drops: [] });
+    const afterBranch = fired;
+    writeLineRow(db, {
+      project: "p", task: "t", name: "w", holder: pool.identity.id, epoch: 0, commit: "d".repeat(40), base: [], archived: false,
+    });
+    const afterLine = fired;
+    off();
+    expect([afterBranch, afterLine]).toEqual([1, 2]);
+  } finally {
+    await pool.stop();
+    db.close();
+    await rm(home, { recursive: true, force: true });
   }
 }, 15_000);
