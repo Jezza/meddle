@@ -9,10 +9,12 @@ import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } fro
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { gitRemote } from "./git/remote-main";
-import { writeHelperWrapper, writeUpdateHook } from "./git/scripts";
+import { gitPreReceive } from "./git/pre-receive";
+import { writeHelperWrapper, writePreReceiveHook } from "./git/scripts";
 import { acceptGitStreams } from "./git/serve";
+import { startApplier } from "./projects/applier";
+import { branchText, conflictFix } from "./projects/branches";
 import { JANITOR_INTERVAL_MS, runJanitor, sweepArchiveTemps } from "./tasks/archive";
-import { releaseGoneLines } from "./projects/lines";
 import { acceptBlobStreams } from "./tasks/blob";
 import { GitSocket } from "./git/socket";
 import { findTaskPids, MetricsSampler } from "./metrics";
@@ -25,9 +27,10 @@ import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
 import { resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
-import { PoolObject } from "./state/contracts";
+import { PoolObject, ProjectObject } from "./state/contracts";
 import { createNodeHost, NodeObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
+import { attachCheckout, checkHelperOnPath, checkoutAt, colocate, fetchCheckout, makeCheckout, pushStart } from "./projects/checkouts";
 import { listProjects } from "./projects/project";
 import { countRunningTasks, listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
@@ -52,8 +55,11 @@ const USAGE = `usage: meddle --version
        meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
        meddle token move <id|label> --before <id|label> | meddle token move <id|label> --after <id|label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
-       meddle project add <path-or-url> [--name <n>] [--sync <bookmark>]...
-       meddle project sync <id|name> [<bookmark>...] | meddle project list
+       meddle project add <path-or-url> [--name <n>] [--no-fetch]
+       meddle project list
+       meddle project set-default <id|name> <branch>
+       meddle project status <id|name>
+       meddle checkout <id|name> [<dir>]
        meddle task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]
        meddle task list
        meddle task prompt <id> <text> | meddle task retry <id>
@@ -83,17 +89,23 @@ type OpenNode = {
   stopBlobs?: () => void;
   /** The unix socket this node's git remote helper connects to. */
   gitSocket?: GitSocket;
-  /** The daily run of the archive and line janitors. */
+  /** The daily run of the archive janitor. */
   janitor?: ReturnType<typeof setInterval>;
+  /** Stops applying rows to the service repos and their views. */
+  stopApplier?: () => void;
+  /** Stops checking whether tasks' work is accepted (`TaskRunner.close`). */
+  stopAccepting?: () => void;
 };
 
 /**
- * Closes whatever of the node is open: the dashboard, the tunnels, git (the acceptor, then the socket and its file),
- * the pool, metrics, the harness, the host, then the database.
+ * Closes whatever of the node is open: the dashboard, the applier, the acceptance checks, the tunnels, git (the
+ * acceptor, then the socket and its file), the pool, metrics, the harness, the host, then the database.
  */
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
   clearInterval(node.janitor);
+  node.stopApplier?.();
+  node.stopAccepting?.();
   node.stopTunnels?.();
   node.stopBlobs?.();
   node.stopGit?.();
@@ -114,9 +126,9 @@ async function serve(): Promise<number> {
 
   const cfg = loadConfig();
   await ensureDataDirs(cfg);
-  // Before anything runs jj: git finds the helper for meddle:// remotes, and a push from a peer meets the hook.
+  // Before anything runs jj: git finds the helper for meddle:// remotes, and a push meets its hook.
   await writeHelperWrapper(cfg);
-  await writeUpdateHook(cfg);
+  await writePreReceiveHook(cfg);
   await seedProfile(cfg);
   await ensurePlugins(cfg);
   const root = await checkTaskRoot(cfg);
@@ -142,20 +154,19 @@ async function serve(): Promise<number> {
       hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
       taskCount: () => listLiveTasks(db).length,
       running: () => countRunningTasks(db),
-      projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home, sync: p.sync, upstream: p.upstream })),
+      projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home, defaultBranch: p.defaultBranch })),
     }));
     const gitSocket = (node.gitSocket = new GitSocket(cfg, pool.net));
     await gitSocket.start();
     const logGit = dedupe((line) => console.error(line));
-    node.stopGit = acceptGitStreams(pool.net, { db, cfg, selfId: pool.identity.id, isMember: (id) => pool.store.isMember(id), log: logGit });
+    node.stopGit = acceptGitStreams(pool.net, { db, cfg, pool, selfId: pool.identity.id, isMember: (id) => pool.store.isMember(id), log: logGit });
     const harness = (node.harness = await openHarness(cfg, createRegistry()));
     const runner = new TaskRunner(cfg, db, harness.harness, { ...claude, pool });
+    node.stopAccepting = () => runner.close();
     node.stopBlobs = acceptBlobStreams(pool.net, runner);
-    // Archives of tasks that moved away are kept for seven days (decision 18). The lines this node holds as a home of
-    // tasks gone from every node are released (a task deleted while its home was offline).
+    // Archives of tasks that moved away are kept for seven days (decision 18).
     const janitor = () => {
       runJanitor(cfg).catch((err: unknown) => console.error("meddle: archive janitor:", err));
-      releaseGoneLines({ cfg, db, pool }).catch((err: unknown) => console.error("meddle: line janitor:", err));
     };
     janitor();
     node.janitor = setInterval(janitor, JANITOR_INTERVAL_MS);
@@ -169,6 +180,8 @@ async function serve(): Promise<number> {
     const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();
+    // Every project of the pool kept here, its rows applied to its service repo and view as they change.
+    node.stopApplier = startApplier({ cfg, db, pool });
     node.stopTunnels = acceptDashboardStreams(pool.net, host, (id) => pool.store.isMember(id));
     node.dashboard = await startDashboard(cfg, host, pool);
   } catch (err) {
@@ -557,38 +570,91 @@ function configList(): Promise<number> {
 }
 
 /**
- * Adds an existing directory as a folder project, anything else as an upstream URL, with the sync branches `sync` (after
- * the upstream's default branch, for a URL); prints the project id.
+ * Adds an existing directory as a folder project, anything else as an upstream URL; prints the project id. A folder is
+ * first made a colocated jj repo when it is not a jj repo, and, once the node has built the project's service repo from
+ * it, attached to it as a checkout (`attachCheckout`; with `fetch` false, without fetching). Both happen here, in the
+ * folder the user named; the node only reads it.
  */
-function projectAdd(source: string, name: string | undefined, sync: string[]): Promise<number> {
+function projectAdd(source: string, name: string | undefined, fetch: boolean): Promise<number> {
   return withNode(async (client) => {
-    const node = await client.get(NodeObject, {});
+    const cfg = loadConfig();
     const named = name === undefined ? {} : { name };
     const isFolder = await stat(source).then((s) => s.isDirectory(), () => false);
-    const project = isFolder
-      ? await node.addProjectFromFolder({ path: resolve(source), ...named, sync })
-      : await node.addProjectFromUpstream({ url: source, ...named, sync });
-    console.log(project.id);
+    const node = await client.get(NodeObject, {});
+    try {
+      if (!isFolder) {
+        console.log((await node.addProjectFromUpstream({ url: source, ...named })).id);
+        return 0;
+      }
+      const folder = resolve(source);
+      // Refused before anything is added: a project whose folder could not be attached would be left behind.
+      checkHelperOnPath(cfg);
+      await colocate(cfg, folder);
+      const project = await node.addProjectFromFolder({ path: folder, ...named });
+      await attachCheckout(cfg, project.home, folder, { id: project.id, defaultBranch: project.defaultBranch ?? null }, process.env, { fetch });
+      console.log(project.id);
+      return 0;
+    } finally {
+      node.release();
+    }
+  });
+}
+
+/** The id of project `project` (an id or name of the pool, see `resolveProject`) and this node's id. */
+async function poolProjectOf(client: Host, project: string): Promise<{ projectId: string; name: string; self: string }> {
+  const pool = await poolView(client);
+  try {
+    const rows = poolProjects(pool.nodes.value);
+    const projectId = resolveProject(rows, project);
+    return { projectId, name: rows.find((p) => p.id === projectId)?.name ?? projectId, self: pool.self.value };
+  } finally {
+    pool.release();
+  }
+}
+
+/** Sets the default branch of project `project` (an id or name of the pool) on this node to `branch`. */
+function projectSetDefault(project: string, branch: string): Promise<number> {
+  return withNode(async (client) => {
+    const { projectId } = await poolProjectOf(client, project);
+    const node = await client.get(NodeObject, {});
+    try {
+      await node.setDefaultBranch({ projectId, branch });
+    } finally {
+      node.release();
+    }
     return 0;
   });
 }
 
-/** Replaces the sync branches of project `project` (an id or name of the pool, homed on this node) with `branches`. */
-function projectSync(project: string, branches: string[]): Promise<number> {
+/**
+ * Each branch of project `project` (an id or name of the pool) as this node computes it, one line each, the default
+ * branch first and marked: `<b>  <commit>`; a conflicted one followed by its siblings and how to resolve it, as a
+ * refused push says it (`conflictFix`).
+ */
+function projectStatus(project: string): Promise<number> {
   return withNode(async (client) => {
-    const pool = await poolView(client);
-    let projectId: string;
+    const { projectId, name } = await poolProjectOf(client, project);
+    const ref = await client.get(ProjectObject, { id: projectId });
     try {
-      projectId = resolveProject(poolProjects(pool.nodes.value), project);
+      const defaultBranch = ref.defaultBranch.value;
+      const branches = [...ref.branches.value].sort((x, y) => Number(y.name === defaultBranch) - Number(x.name === defaultBranch));
+      if (branches.length === 0) console.log(`${name} has no branches`);
+      for (const b of branches) {
+        console.log(`${b.name}  ${branchText(b)}${b.name === defaultBranch ? " (default)" : ""}`);
+        if (b.state === "conflicted") console.log(conflictFix(b.name, b.siblings));
+      }
     } finally {
-      pool.release();
+      ref.release();
     }
-    const node = await client.get(NodeObject, {});
-    try {
-      await node.setProjectSync({ projectId, sync: branches });
-    } finally {
-      node.release();
-    }
+    return 0;
+  });
+}
+
+/** Clones project `project` (an id or name of the pool) from this node into `dir` as a checkout; prints its path. */
+function checkout(project: string, dir: string | undefined): Promise<number> {
+  return withNode(async (client) => {
+    const { projectId, name, self } = await poolProjectOf(client, project);
+    console.log(await makeCheckout(loadConfig(), self, { id: projectId, name }, dir));
     return 0;
   });
 }
@@ -618,18 +684,44 @@ type ProjectArg = { project: string; rev?: string; mode?: "edit" };
 /**
  * Creates a task of the projects `projects` names (each an id or a name one project of the pool has, see
  * `resolveProject`, with the revision it starts at; none for a task without a project) on the node `where` names,
- * with `prompt` as its first turn when given. Prints `task <id> on <node>`.
+ * with `prompt` as its first turn when given. Prints `task <id> on <node>`. Run in a checkout of a project on this
+ * node, `projects` empty means that project, started as `loose` says (the `--rev`/`--edit` given before any
+ * `--project`), and its start is the checkout's (`pushStart`: its revision, else the fork
+ * point of its `@`, checked there and pushed to this node); the checkout fetches the task's line once the task exists.
  */
-function createTask(title: string | undefined, projects: ProjectArg[], where: Where, prompt: string | null): Promise<number> {
+function createTask(
+  title: string | undefined, projects: ProjectArg[], where: Where, prompt: string | null, loose: Omit<ProjectArg, "project"> | null = null,
+): Promise<number> {
   return withNode(async (client) => {
+    const cfg = loadConfig();
     let node: string | null = where === "here" ? "here" : null;
-    let chosen: Array<{ id: string; rev?: string; mode?: "edit" }> = [];
-    if (typeof where === "object" || projects.length > 0) {
+    let chosen: Array<{ id: string; rev?: string; mode?: "edit"; checkout?: string }> = [];
+    let checkout: string | null = null;
+    const found = await checkoutAt(cfg, process.cwd());
+    if (typeof where === "object" || projects.length > 0 || found !== null) {
       const pool = await poolView(client);
       try {
         const known = poolProjects(pool.nodes.value);
-        chosen = projects.map(({ project, ...start }) => ({ id: resolveProject(known, project), ...start }));
+        const here = found !== null && found.nodeId === pool.self.value ? found : null;
+        // In a checkout of this node, no --project is the checkout's project, with the `--rev`/`--edit` given before any.
+        if (loose !== null && here === null) throw new Error("--rev and --edit without --project need a checkout of this node");
+        chosen = projects.length === 0 && here !== null
+          ? [{ id: here.projectId, ...(loose ?? {}) }]
+          : projects.map(({ project, ...start }) => ({ id: resolveProject(known, project), ...start }));
         if (typeof where === "object") node = resolveNodeId(pool.nodes.value.map((n) => n.nodeId), where.node);
+        if (here !== null) {
+          for (const [i, p] of chosen.entries()) {
+            if (p.id !== here.projectId) continue;
+            const name = known.find((k) => k.id === p.id)?.name ?? p.id;
+            const { commit, moved } = await pushStart(cfg, here.dir, name, p.rev ?? null, p.mode ?? "child").catch((err: unknown) => {
+              // Refused as the node refuses a start.
+              throw new Error(`project ${name}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+            if (moved !== null) console.log(moved);
+            chosen[i] = { ...p, rev: commit, checkout: here.dir };
+            checkout = here.dir;
+          }
+        }
       } finally {
         pool.release();
       }
@@ -637,6 +729,8 @@ function createTask(title: string | undefined, projects: ProjectArg[], where: Wh
     const ref = await client.get(NodeObject, {});
     try {
       const { manifest, nodeId } = await ref.createTask({ ...(title === undefined ? {} : { title }), projects: chosen, node, prompt });
+      // The task's line, held by this node now: the revision is read-only in the checkout before this returns.
+      if (checkout !== null) await fetchCheckout(cfg, checkout);
       const pool = await poolView(client);
       try {
         console.log(`task ${manifest.id} on ${nodeLabel(pool.nodes.value, nodeId)}`);
@@ -1087,31 +1181,39 @@ function pairArgs(args: string[], names: string[]): Record<string, string> | nul
   return out;
 }
 
-/** `<path-or-url> [--name <n>] [--sync <bookmark>]...`; null for anything else. */
-function projectAddArgs(args: string[]): { source: string; name: string | undefined; sync: string[] } | null {
+/** `<path-or-url> [--name <n>] [--no-fetch]`; null for anything else. */
+function projectAddArgs(args: string[]): { source: string; name: string | undefined; fetch: boolean } | null {
   const [source, ...flags] = args;
   if (source === undefined || source.startsWith("--")) return null;
   let name: string | undefined;
-  const sync: string[] = [];
-  for (let i = 0; i < flags.length; i += 2) {
-    const value = flags[i + 1];
+  let fetch = true;
+  for (let i = 0; i < flags.length; i++) {
+    if (flags[i] === "--no-fetch" && fetch) {
+      fetch = false;
+      continue;
+    }
+    const value = flags[++i];
     if (value === undefined) return null;
-    if (flags[i] === "--name" && name === undefined) name = value;
-    else if (flags[i] === "--sync") sync.push(value);
+    if (flags[i - 1] === "--name" && name === undefined) name = value;
     else return null;
   }
-  return { source, name, sync };
+  return { source, name, fetch };
 }
 
 /**
  * `[<prompt>]` (the words that are not options, joined by spaces; none for a task that waits for one), `--title <t>`,
  * `--project <id|name>` (repeatable, one each), each optionally followed by its `--rev <rev>` and `--edit` (once each),
- * and at most one of `--node <id|prefix>` and `--here` (neither: `auto`). Null for a usage error; `problem` for
- * `--edit` without `--rev`.
+ * and at most one of `--node <id|prefix>` and `--here` (neither: `auto`). With no `--project` at all, `--rev` and
+ * `--edit` are `loose`: the start of the checkout's project, when `task new` runs in a checkout (else a usage error,
+ * which `createTask` cannot tell yet). Null for a usage error; `problem` for `--edit` without `--rev` after a
+ * `--project`.
  */
-function taskNewArgs(args: string[]): { prompt: string | null; title: string | undefined; projects: ProjectArg[]; where: Where } | { problem: string } | null {
+function taskNewArgs(
+  args: string[],
+): { prompt: string | null; title: string | undefined; projects: ProjectArg[]; loose: Omit<ProjectArg, "project"> | null; where: Where } | { problem: string } | null {
   let title: string | undefined;
   const projects: ProjectArg[] = [];
+  const loose: Omit<ProjectArg, "project"> = {};
   const words: string[] = [];
   let where: Where = "auto";
   for (let i = 0; i < args.length; i++) {
@@ -1121,6 +1223,8 @@ function taskNewArgs(args: string[]): { prompt: string | null; title: string | u
     else if (arg === "--project" && i + 1 < args.length) projects.push({ project: args[++i]! });
     else if (arg === "--rev" && i + 1 < args.length && last !== undefined && last.rev === undefined) last.rev = args[++i]!;
     else if (arg === "--edit" && last !== undefined && last.mode === undefined) last.mode = "edit";
+    else if (arg === "--rev" && i + 1 < args.length && last === undefined && loose.rev === undefined) loose.rev = args[++i]!;
+    else if (arg === "--edit" && last === undefined && loose.mode === undefined) loose.mode = "edit";
     else if (arg === "--node" && i + 1 < args.length && where === "auto") where = { node: args[++i]! };
     else if (arg === "--here" && where === "auto") where = "here";
     else if (arg.startsWith("--")) return null;
@@ -1128,9 +1232,12 @@ function taskNewArgs(args: string[]): { prompt: string | null; title: string | u
   }
   const prompt = words.join(" ").trim() === "" ? null : words.join(" ");
   if (title !== undefined && title.trim() === "") return null;
+  const hasLoose = loose.rev !== undefined || loose.mode !== undefined;
+  // Before a --project, they belong to no project.
+  if (hasLoose && projects.length > 0) return null;
   if (projects.some((p) => p.mode === "edit" && p.rev === undefined)) return { problem: "--edit needs --rev" };
   // No title: the node names the task (`taskTitle`).
-  return { prompt, title, projects, where };
+  return { prompt, title, projects, loose: hasLoose ? loose : null, where };
 }
 
 /** The subcommand `args` names, or null for a usage error. */
@@ -1167,14 +1274,30 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "config" && sub === "list" && rest.length === 0) return configList;
   if (command === "project" && sub === "add") {
     const parsed = projectAddArgs(rest);
-    return parsed === null ? null : () => projectAdd(parsed.source, parsed.name, parsed.sync);
+    return parsed === null ? null : () => projectAdd(parsed.source, parsed.name, parsed.fetch);
   }
-  if (command === "project" && sub === "sync" && rest.length >= 1) return () => projectSync(rest[0]!, rest.slice(1));
+  if (command === "project" && sub === "set-default" && rest.length === 2) return () => projectSetDefault(rest[0]!, rest[1]!);
+  if (command === "checkout" && sub !== undefined && rest.length <= 1 && !sub.startsWith("--")) return () => checkout(sub, rest[0]);
   if (command === "project" && sub === "list" && rest.length === 0) return projectList;
+  if (command === "project" && sub === "status" && rest.length === 1) return () => projectStatus(rest[0]!);
   if (command === "task" && sub === "new") {
     const parsed = taskNewArgs(rest);
     if (parsed !== null && "problem" in parsed) return async () => (console.error(`meddle: ${parsed.problem}`), 2);
-    return parsed === null ? null : () => createTask(parsed.title, parsed.projects, parsed.where, parsed.prompt);
+    if (parsed === null) return null;
+    const { loose } = parsed;
+    if (loose === null) return () => createTask(parsed.title, parsed.projects, parsed.where, parsed.prompt);
+    return async () => {
+      // `--rev`/`--edit` with no `--project` name the checkout's project: outside a checkout, a usage error as ever.
+      if ((await checkoutAt(loadConfig(), process.cwd())) === null) {
+        console.error(usageFor(args) ?? USAGE);
+        return 2;
+      }
+      if (loose.mode === "edit" && loose.rev === undefined) {
+        console.error("meddle: --edit needs --rev");
+        return 2;
+      }
+      return createTask(parsed.title, parsed.projects, parsed.where, parsed.prompt, loose);
+    };
   }
   if (command === "task" && sub === "list" && rest.length === 0) return taskList;
   if (command === "task" && sub === "prompt" && rest.length >= 2) return () => taskPrompt(rest[0]!, rest.slice(1).join(" "));
@@ -1192,6 +1315,8 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "task" && sub === "delete" && rest.length === 1) return () => taskDelete(rest[0]!);
   // git runs a helper as `git-remote-<scheme> <remote> [<url>]`; without a url, the remote is the url.
   if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);
+  // git's pre-receive hook, as `writePreReceiveHook` writes it for the compiled binary.
+  if (args.length === 1 && command === "git-pre-receive") return () => gitPreReceive();
   if (command === "service" && sub === "install" && rest.length === 0) return () => serviceInstall(false);
   if (command === "service" && sub === "install" && rest.length === 1 && rest[0] === "--dry-run") return () => serviceInstall(true);
   return null;

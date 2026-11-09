@@ -7,8 +7,8 @@ import type {
   SDKUserMessage,
   SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
+import { delimiter, resolve } from "node:path";
 import type { NodeConfig } from "../config";
-import { jjEnv } from "../jj";
 import { paths } from "../paths";
 import { composeEnv, composeSettings, type Context } from "../projects/context";
 import type { TaskManifest } from "../tasks/manifest";
@@ -34,27 +34,39 @@ export type EngineInput = {
   claudePath?: string;
   claudeRuntime?: "bun" | "node";
   extraEnv?: Record<string, string>;
+  /**
+   * Called after each of the agent's tool calls that may change its files (Edit, Write, Bash: Claude Code's
+   * `PostToolUse` hook): the task's lines are written from its workspaces soon after. Without it, no such hook.
+   */
+  onFilesChanged?: () => void;
 };
+
+/** The tools whose calls may change the task's files: `onFilesChanged` follows each (a `PostToolUse` matcher). */
+export const FILE_TOOLS_MATCHER = "Edit|Write|Bash";
 
 /**
  * The environment of a task's Claude Code: `PATH`, `HOME`, `XDG_CONFIG_HOME` (when meddle has one: the agent's jj reads
- * its workspace's config, `scopeWorkspace`, from where meddle's jj wrote it) and the passthrough names from `jjEnv`, the
- * pool's settings
- * (`cfg.poolEnv`), then the names meddle sets itself (which a pool setting can never replace), the projects' context
- * env and `extraEnv`.
+ * its workspace's config, `scopeWorkspace`, from where meddle's jj wrote it) and the passthrough names, from this
+ * process's environment, then the pool's settings (`cfg.poolEnv`), the names meddle sets itself (which a pool setting
+ * can never replace), the projects' context env and `extraEnv`.
+ *
+ * An agent can't reach `meddle://` remotes: its `PATH` has no `<data>/bin` (the remote helper), even when this
+ * process's has, and it gets no `MEDDLE_GIT_SOCKET`. Its lines and branches reach other nodes as rows, and a push
+ * through this node's own git socket would count as one of your checkouts'.
  */
 export function buildEnv(i: EngineInput): Record<string, string> {
   const env: Record<string, string> = {};
-  // PATH with `<data>/bin` first: jj and git inside a task find the remote helper for meddle:// remotes.
-  const meddle = jjEnv(i.cfg);
   for (const name of ["PATH", "HOME", "XDG_CONFIG_HOME", ...i.cfg.envPassthrough]) {
-    const value = meddle[name];
-    if (value !== undefined) env[name] = value;
+    const value = process.env[name];
+    if (value !== undefined && name !== "MEDDLE_GIT_SOCKET") env[name] = value;
+  }
+  if (env.PATH !== undefined) {
+    const bin = resolve(paths(i.cfg).bin);
+    env.PATH = env.PATH.split(delimiter).filter((dir) => dir === "" || resolve(dir) !== bin).join(delimiter);
   }
   return {
     ...env,
     ...i.cfg.poolEnv,
-    MEDDLE_GIT_SOCKET: meddle.MEDDLE_GIT_SOCKET!,
     CLAUDE_CONFIG_DIR: paths(i.cfg).taskConfig(i.manifest.id),
     // Without a project, Claude Code names the project dir after the folder it runs in, as it does on its own.
     ...(typeof i.manifest.primaryProjectId === "string" ? { CLAUDE_CODE_PROJECT_DIR_NAME: i.manifest.primaryProjectId } : {}),
@@ -92,6 +104,15 @@ export function buildOptions(i: EngineInput): Options {
           return { continue: true };
         }],
       }],
+      ...(i.onFilesChanged === undefined ? {} : {
+        PostToolUse: [{
+          matcher: FILE_TOOLS_MATCHER,
+          hooks: [async () => {
+            i.onFilesChanged?.();
+            return { continue: true };
+          }],
+        }],
+      }),
     },
     sessionStore: i.sessionStore,
     persistSession: true,

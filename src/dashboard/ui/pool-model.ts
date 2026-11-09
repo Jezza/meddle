@@ -1,4 +1,5 @@
 // What the pool-wide views compute from their objects' values. Pure: no Preact, no DOM.
+import { branchText, siblingRef, type ProjectBranch } from "../../projects/branches";
 
 /** What a move target is chosen by: a row of `PoolObject.nodes`. */
 export type MoveCandidate = {
@@ -50,17 +51,23 @@ export function projectChoices(nodes: readonly ProjectLister[]): ListedProject[]
 /** A bookmark of a project's replica, as `ProjectObject.heads` carries it. */
 export type Head = { name: string; remote: string | null; changeId: string; conflicted: boolean };
 
-/** One node's copy of a project. */
-export type HeldProject = { nodeId: string; id: string; name: string; home: string; heads: readonly Head[]; contextLoaded: boolean };
+/** One node's copy of a project, with its branches as that node computes them (`ProjectObject.branches`). */
+export type HeldProject = {
+  nodeId: string; id: string; name: string; home: string; defaultBranch: string | null;
+  heads: readonly Head[]; branches: readonly ProjectBranch[]; contextLoaded: boolean;
+};
 
 export type Holder = { nodeId: string; heads: readonly Head[]; contextLoaded: boolean };
 
-/** A project across the pool: the nodes holding a copy of it. */
-export type PoolProject = { id: string; name: string; home: string; holders: Holder[] };
+/** A project across the pool: the nodes holding a copy of it, and its branches as one of them computes them. */
+export type PoolProject = {
+  id: string; name: string; home: string; defaultBranch: string | null; branches: readonly ProjectBranch[]; holders: Holder[];
+};
 
 /**
- * One row per project id, by name (then id); its name and home are the home's copy's (another holder's when the home's
- * is not among them), its holders in `nodeOrder`.
+ * One row per project id, by name (then id); its name, home, default branch and branches are the home's copy's
+ * (another holder's when the home's is not among them; every node computes the same branches once it has the same
+ * rows), its holders in `nodeOrder`.
  */
 export function mergeProjects(held: readonly HeldProject[], nodeOrder: readonly string[]): PoolProject[] {
   const rank = (nodeId: string) => {
@@ -77,6 +84,8 @@ export function mergeProjects(held: readonly HeldProject[], nodeOrder: readonly 
       id,
       name: named.name,
       home: named.home,
+      defaultBranch: named.defaultBranch,
+      branches: named.branches,
       holders: copies.map((c) => ({ nodeId: c.nodeId, heads: c.heads, contextLoaded: c.contextLoaded })),
     });
   }
@@ -87,4 +96,19 @@ export function mergeProjects(held: readonly HeldProject[], nodeOrder: readonly 
 export function headText(head: Head): string {
   const where = head.remote === null ? head.name : `${head.name}@${head.remote}`;
   return `${where} ${head.conflicted ? "(conflicted)" : head.changeId.slice(0, 8)}`;
+}
+
+/** A branch as the project page lists it: `text` says where it is; a conflicted one names its `siblings`. */
+export type BranchLine = { name: string; isDefault: boolean; conflicted: boolean; text: string; siblings: string[] };
+
+/**
+ * The project's branches as its page lists them: the default branch first, then by name. A conflicted branch is
+ * marked, with its siblings as a checkout fetches them (`meddle/conflict/<b>/<id>@meddle`).
+ */
+export function branchLines(branches: readonly ProjectBranch[], defaultBranch: string | null): BranchLine[] {
+  const lines = branches.map((b): BranchLine => {
+    const siblings = b.siblings.map((s) => siblingRef(b.name, s));
+    return { name: b.name, isDefault: b.name === defaultBranch, conflicted: b.state === "conflicted", text: branchText(b), siblings };
+  });
+  return lines.sort((x, y) => Number(y.isDefault) - Number(x.isDefault) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 }

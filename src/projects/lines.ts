@@ -1,272 +1,249 @@
-// A task's line on its project's home: the home holds each of the task's bookmarks `meddle/task/<id>/<name>` as the
-// git ref `refs/remotes/meddle/task/<id>/<name>`, which jj shows as `task/<id>/<name>@meddle` (an untracked bookmark
-// of a remote that is not configured) and so treats as immutable, with everything below it. The holder writes it (on
-// the home by `git update-ref`, elsewhere by a forced push); it goes away only through jj (`releaseLines`): a raw git
-// deletion would make jj abandon every commit only that ref kept, the user's own included.
+// A task's lines are rows (`src/pool/rows.ts`), written only by the node holding the task: one per bookmark
+// `meddle/task/<id>/<name>` of each of its projects (`writeLineRows`), as its agent works and at every turn end. Every
+// node's applier keeps the refs from them: a line held elsewhere is the git ref `refs/remotes/meddle/task/<id>/<name>`,
+// which jj shows as `task/<id>/<name>@meddle` (an untracked bookmark of a remote that is not configured) and so treats
+// as immutable, with everything below it. A released line goes only through jj (`bookmark forget --include-remotes`):
+// a raw git deletion would make jj abandon every commit only that ref kept.
+import { join } from "node:path";
+import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
-import { bookmarkRefs, git, gitImport, jj, networkMs } from "../jj";
+import { bookmarkRefs, bookmarkSet, changeId, changesIn, jj } from "../jj";
+import { paths } from "../paths";
 import { shortId } from "../pool/ids";
-import { PeerObject } from "../state/contracts";
-import { getTask } from "../store/records";
+import { listLineRows, writeLineRow, type LineRow } from "../pool/rows";
 import { repoKey, serialised } from "../serial";
-import { taskNamespace } from "../tasks/manifest";
-import { listProjects, type Project } from "./project";
-import { meddleUrl, type ReplicaDeps } from "./replicas";
+import { taskGlob, taskNamespace, type TaskManifest } from "../tasks/manifest";
+import { containedIn, effectiveHead } from "../tasks/accept";
+import { applyProject, catchUp } from "./applier";
+import { getProject } from "./project";
+import type { ReplicaDeps } from "./replicas";
 
-/** The remote, never configured, whose untracked bookmarks hold the task lines on a home. */
+/** The remote, never configured, whose untracked bookmarks hold the task lines held elsewhere. */
 export const LINE_REMOTE = "meddle";
 
-/** Where the home keeps task `taskId`'s line: `refs/remotes/meddle/task/<taskId>/`. */
+/** Where a node keeps task `taskId`'s lines held elsewhere: `refs/remotes/meddle/task/<taskId>/`. */
 export function linePrefix(taskId: string): string {
   return `refs/remotes/${LINE_REMOTE}/task/${taskId}/`;
 }
 
-/** A line's bookmark name on the home (`task/<taskId>/<name>`), split. */
-const LINE_BOOKMARK = /^task\/([^/]+)\/(.+)$/;
-
 /**
- * Points task `taskId`'s line `name` at `commit` on the home (`git update-ref`), then imports it, so that jj shows
- * `task/<taskId>/<name>@meddle` and holds the commit and its ancestors immutable. The caller holds `repoKey(homeRepo)`.
+ * Writes the rows of `manifest`'s task, held by this node: for each of its projects, snapshots the task's workspace
+ * there and points the project's bookmark `meddle/task/<id>/<name>` at its working-copy change, then writes one row per
+ * bookmark under the task's namespace in this node's repo of the project, with this node its holder, at the bookmark's
+ * commit. Each row is written at the task's epoch: that of the project's line (1 for a line with no row yet). A row
+ * already there as written is left alone; a conflicted bookmark's row keeps its commit (and is still written, or
+ * archived). With `archived`, every row says so (a task archived by hand: kept, but out of the view). Then releases
+ * each row of the task's in the project whose bookmark is gone (a side line the agent deleted); the project's own line
+ * is always kept. When the project's own line moves off work of its own that it neither goes on from nor rewrote (the
+ * agent started over, say with `jj new main`: `leftBehind`), that work first gets the side bookmark
+ * `meddle/task/<id>/<name>.before-<n>` (`n` the next number free), logged, so it stays a line, archived and kept when
+ * the task's work is accepted without it. Without a snapshot of anything but the task's own workspaces.
+ *
+ * Only the holder writes: a project whose line another node holds (the task moved on, or a rollback took it back from
+ * here) is left alone, its workspace, bookmarks and rows untouched, and so is any row another node holds at the task's
+ * epoch or above; each such line is logged (`meddle: line: … not written here`). A row another node holds below it (a
+ * side line its sender released) is taken at the task's epoch.
  */
-export async function writeLine(cfg: NodeConfig, homeRepo: string, taskId: string, name: string, commit: string): Promise<void> {
-  await git(["update-ref", `${linePrefix(taskId)}${name}`, commit], homeRepo, cfg);
-  await gitImport(homeRepo, cfg);
-}
-
-/**
- * The lines the home holds (the `@meddle` bookmarks under `task/`), of task `taskId` or of every task, in jj's order
- * (by name), each with its head commit ("" when conflicted). Imports git's refs first; never snapshots the working
- * copy. The caller holds `repoKey(homeRepo)`.
- */
-export async function homeLines(cfg: NodeConfig, homeRepo: string, taskId?: string): Promise<Array<{ taskId: string; name: string; commitId: string }>> {
-  const pattern = taskId === undefined ? "glob:task/*" : `glob:task/${taskId}/*`;
-  const lines: Array<{ taskId: string; name: string; commitId: string }> = [];
-  for (const ref of await bookmarkRefs(homeRepo, pattern, cfg)) {
-    if (ref.remote !== LINE_REMOTE) continue;
-    const match = LINE_BOOKMARK.exec(ref.name);
-    if (match === null) continue;
-    lines.push({ taskId: match[1]!, name: match[2]!, commitId: ref.commitId });
+export async function writeLineRows(deps: ReplicaDeps, manifest: TaskManifest, options: { archived?: boolean } = {}): Promise<void> {
+  const { cfg, db, pool } = deps;
+  const self = pool.identity.id;
+  const taskId = manifest.id;
+  const namespace = taskNamespace(taskId);
+  const archived = options.archived ?? false;
+  /** The epoch this node writes a project's `rows` at (its line `name`'s), or null when another node holds the line. */
+  const heldAt = (rows: Map<string, LineRow>, name: string): number | null => {
+    const own = rows.get(name);
+    if (own === undefined) return 1;
+    return own.holder === self ? own.epoch : null;
+  };
+  const rowsOf = (projectId: string) => new Map(listLineRows(db, projectId, taskId).map((r) => [r.name, r]));
+  const log = deps.log ?? ((line: string) => console.error(line));
+  /** Says that line row `r`, held by another node, is not written here. */
+  const skip = (r: LineRow) => {
+    log(`meddle: line: ${taskId}'s line ${shortId(r.project)}/${r.name} is held by ${shortId(r.holder)} at epoch ${r.epoch}; not written here`);
+  };
+  for (const p of manifest.projects) {
+    const before = rowsOf(p.id);
+    if (heldAt(before, p.name) === null) {
+      skip(before.get(p.name)!);
+      continue;
+    }
+    // The task's own workspace: meddle's, so snapshotting it is fine.
+    const change = await changeId(join(paths(cfg).task(taskId), p.workspace), cfg);
+    const bookmarks = await serialised(repoKey(p.replica), async () => {
+      await bookmarkSet(p.replica, `${namespace}${p.name}`, change, cfg, { ignoreWorkingCopy: true });
+      const list = async () => (await bookmarkRefs(p.replica, taskGlob(taskId), cfg)).filter((b) => b.remote === null);
+      const listed = await list();
+      // The line moved off work of its own (the agent started over, `jj new main`): that work stays a side line.
+      const prev = before.get(p.name);
+      const own = listed.find((b) => b.name === `${namespace}${p.name}`);
+      if (prev?.holder !== self || prev.commit === null || own === undefined || own.conflicted || own.commitId === "") return listed;
+      let left: string | null;
+      try {
+        left = await leftBehind(cfg, p.replica, prev, own.commitId);
+      } catch (err) {
+        log(`meddle: line: whether ${taskId}'s line ${shortId(p.id)}/${p.name} left work behind is not known: ${messageOf(err)}`);
+        return listed;
+      }
+      if (left === null) return listed;
+      const side = beforeName(p.name, [...listed.map((b) => b.name.slice(namespace.length)), ...before.keys()]);
+      await bookmarkSet(p.replica, `${namespace}${side}`, left, cfg, { ignoreWorkingCopy: true });
+      log(`meddle: line: ${taskId}'s line ${shortId(p.id)}/${p.name} moved off its work at ${left.slice(0, 12)}; kept as ${side}`);
+      return list();
+    });
+    // Read again after the snapshot, and nothing awaited from here on: a row that came in meanwhile counts.
+    const rows = rowsOf(p.id);
+    const taskEpoch = heldAt(rows, p.name);
+    if (taskEpoch === null) {
+      skip(rows.get(p.name)!);
+      continue;
+    }
+    const kept = [p.name];
+    for (const r of rows.values()) if (r.holder !== self && r.epoch >= taskEpoch) kept.push(r.name);
+    for (const b of bookmarks) {
+      const name = b.name.slice(namespace.length);
+      // A name git can't hold as one ref component under the namespace is no line.
+      if (name === "" || name.includes("/")) continue;
+      kept.push(name);
+      const row = rows.get(name);
+      if (row !== undefined && row.holder !== self && row.epoch >= taskEpoch) {
+        skip(row);
+        continue;
+      }
+      // A conflicted bookmark names no one commit: its row keeps the one it had (and a line it never had waits).
+      const commit = b.conflicted || b.commitId === "" ? row?.commit ?? null : b.commitId;
+      if (commit === null) continue;
+      if (row !== undefined && row.holder === self && row.commit === commit && row.archived === archived) continue;
+      const epoch = row?.holder === self ? Math.max(row.epoch, taskEpoch) : taskEpoch;
+      const base = row?.base ?? (name === p.name ? p.base : []);
+      writeLineRow(db, { project: p.id, task: taskId, name, holder: self, epoch, commit, base, archived });
+    }
+    releaseLineRows(db, taskId, kept, p.id);
   }
-  return lines;
+}
+
+function messageOf(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+}
+
+/** How many generations below a line's new head `leftBehind` looks for a rewrite of the old one. */
+const REWRITE_DEPTH = 100;
+
+/**
+ * The work a project's own line leaves behind as it moves from row `prev` to commit `next`, or null when it leaves
+ * none: `prev`'s effective head (`effectiveHead`), unless that is at or below `next` (the line went on from it) or a
+ * base of the line (no work of its own), or `next`'s ancestry holds a rewrite of it. A rewrite (a rebase, an amend, a
+ * squash into another commit) is told two ways: a commit of the same change id below `next` (also one rewritten
+ * elsewhere, such as in your checkout, and fetched back), or the old head among the evolution of a commit up to
+ * `REWRITE_DEPTH` generations below `next` that is not below a base (`jj evolog`, which also follows a squash, where
+ * the change id goes away).
+ */
+async function leftBehind(cfg: NodeConfig, repo: string, prev: LineRow, next: string): Promise<string | null> {
+  if (prev.commit === null || prev.commit === next) return null;
+  const head = await effectiveHead(cfg, repo, prev.commit);
+  if (await containedIn(cfg, repo, head, [next, ...prev.base])) return null;
+  const change = (await jj(["log", "--ignore-working-copy", "-r", head, "--no-graph", "-T", "change_id"], repo, cfg)).trim();
+  const same = await jj(["log", "--ignore-working-copy", "-r", `change_id(${change}) & ::${next}`, "--no-graph", "-T", "commit_id"], repo, cfg);
+  if (same.trim() !== "") return null;
+  const own = prev.base.length === 0 ? `ancestors(${next}, ${REWRITE_DEPTH})` : `ancestors(${next}, ${REWRITE_DEPTH}) ~ ::(${prev.base.join(" | ")})`;
+  const evolved = await jj(["evolog", "--ignore-working-copy", "-r", own, "--no-graph", "-T", 'commit.commit_id() ++ "\n"'], repo, cfg);
+  return evolved.split("\n").includes(head) ? null : head;
+}
+
+/** The name of the next side line `<name>.before-<n>` that keeps work a line left behind: `n` one above any in `taken`. */
+function beforeName(name: string, taken: Iterable<string>): string {
+  const prefix = `${name}.before-`;
+  let n = 0;
+  for (const t of taken) {
+    if (!t.startsWith(prefix)) continue;
+    const k = Number(t.slice(prefix.length));
+    if (Number.isInteger(k) && k > n) n = k;
+  }
+  return `${prefix}${n + 1}`;
 }
 
 /**
- * Releases every line of task `taskId` on the home whose name is not in `keep`, through jj
- * (`bookmark forget --include-remotes`, never a git deletion): its commits stay visible and become mutable again,
- * unless another line still holds them. Returns the names released. The caller holds `repoKey(homeRepo)`.
+ * Takes task `taskId`'s live line rows as this node's (`selfId`), as they are: each row another node held is written
+ * with this node its holder, one epoch up, and each archived one live again; a row already so is left alone. What a
+ * node that received the task writes as it activates it, and what a restore here writes. Returns the names written.
  */
-export async function releaseLines(cfg: NodeConfig, homeRepo: string, taskId: string, keep: string[]): Promise<string[]> {
+export function holdLineRows(db: Database, selfId: string, taskId: string): string[] {
+  const written: string[] = [];
+  for (const row of listLineRows(db, undefined, taskId)) {
+    if (row.commit === null || (row.holder === selfId && !row.archived)) continue;
+    const epoch = row.holder === selfId ? row.epoch : row.epoch + 1;
+    writeLineRow(db, { project: row.project, task: row.task, name: row.name, holder: selfId, epoch, commit: row.commit, base: row.base, archived: false });
+    written.push(row.name);
+  }
+  return written;
+}
+
+/**
+ * Takes task `taskId`'s live line rows back as this node's (`selfId`) after its move to another node rolled back, at an
+ * epoch above any the target could have written: the target takes the lines one epoch up only as it activates the
+ * task (`holdLineRows`), so a row this node held goes two up, and one the target holds (it activated the task, but its
+ * answer was lost) one up from the target's. Each row keeps its commit; `archived` says whether the task is archived
+ * here again (a restore-move's). Returns the names written.
+ */
+export function reclaimLineRows(db: Database, selfId: string, taskId: string, archived: boolean): string[] {
+  const written: string[] = [];
+  for (const row of listLineRows(db, undefined, taskId)) {
+    if (row.commit === null) continue;
+    const epoch = row.holder === selfId ? row.epoch + 2 : row.epoch + 1;
+    writeLineRow(db, { project: row.project, task: row.task, name: row.name, holder: selfId, epoch, commit: row.commit, base: row.base, archived });
+    written.push(row.name);
+  }
+  return written;
+}
+
+/**
+ * Writes released (`commit` null) every line row of task `taskId` (of project `projectId` only, when given) whose name
+ * is not in `keep` and that is not released already, each keeping its holder and epoch. Returns the names released.
+ */
+export function releaseLineRows(db: Database, taskId: string, keep: string[], projectId?: string): string[] {
   const released: string[] = [];
-  for (const { name } of await homeLines(cfg, homeRepo, taskId)) {
-    if (keep.includes(name)) continue;
-    await jj(["--ignore-working-copy", "bookmark", "forget", "--include-remotes", `exact:task/${taskId}/${name}`], homeRepo, cfg);
-    released.push(name);
+  for (const row of listLineRows(db, projectId, taskId)) {
+    if (row.commit === null || keep.includes(row.name)) continue;
+    writeLineRow(db, { project: row.project, task: row.task, name: row.name, holder: row.holder, epoch: row.epoch, commit: null, base: [], archived: row.archived });
+    released.push(row.name);
   }
   return released;
 }
 
-/** The git refs under `prefix` (ending in `/`) in `repo`: each name after the prefix, with its commit. */
-async function refsUnder(cfg: NodeConfig, repo: string, prefix: string): Promise<Array<{ name: string; commitId: string }>> {
-  // A pattern matches from the start up to a slash: `…/t1` names `…/t1/x`, never `…/t10/x`.
-  const out = await git(["for-each-ref", "--format=%(refname)%09%(objectname)", prefix.slice(0, -1)], repo, cfg);
-  return out.split("\n").filter(Boolean).map((line) => {
-    const [ref = "", commitId = ""] = line.split("\t");
-    return { name: ref.slice(prefix.length), commitId };
-  });
-}
+/** How often `awaitLine` looks again at first; each catch-up that brought no row doubles it, up to the most. */
+const AWAIT_LINE_POLL_MS = 100;
+const AWAIT_LINE_POLL_MAX_MS = 2000;
+/** The most `awaitLine` gives one catch-up with the peers before it looks again. */
+const AWAIT_LINE_CATCH_UP_MS = 5000;
 
 /**
- * Pushes task `taskId`'s bookmarks `meddle/task/<id>/*` of `repo` (a replica of `project` on another node) to the
- * project's home as its line, forced: `+refs/heads/meddle/task/<id>/*:refs/remotes/meddle/task/<id>/*`, under
- * `repoKey(repo)`. No such bookmark is nothing to push. The home imports what it gets when its git server finishes
- * the push.
+ * Task `taskId`'s line `name` of project `projectId` as this node's service repo has it: resolves its row's commit once
+ * jj there knows it. Until then it catches up on the project (`catchUp`, while no row has the line) or applies its rows
+ * (`applyProject`, which fetches the commit), and rejects `line <t>/<n> is not here yet` after `timeoutMs`.
  */
-export async function pushLines(cfg: NodeConfig, repo: string, project: Project, taskId: string): Promise<void> {
-  const local = `refs/heads/${taskNamespace(taskId)}`;
-  await serialised(repoKey(repo), async () => {
-    if ((await refsUnder(cfg, repo, local)).length === 0) return;
-    const url = meddleUrl(project.home, { kind: "project", id: project.id });
-    await git(["push", "--force", url, `+${local}*:${linePrefix(taskId)}*`], repo, cfg, { timeoutMs: networkMs(cfg) });
-  });
-}
-
-/**
- * On the home: writes each of task `taskId`'s bookmarks `meddle/task/<id>/*` of `homeRepo` that its line does not have
- * at the same commit to the line (`writeLine`), under `repoKey(homeRepo)`. Never releases a line: a bookmark gone here
- * is given back by `giveBackLines`.
- */
-export async function writeLines(cfg: NodeConfig, homeRepo: string, taskId: string): Promise<void> {
-  await serialised(repoKey(homeRepo), async () => {
-    const lines = new Map((await refsUnder(cfg, homeRepo, linePrefix(taskId))).map((l) => [l.name, l.commitId]));
-    for (const { name, commitId } of await refsUnder(cfg, homeRepo, `refs/heads/${taskNamespace(taskId)}`)) {
-      if (lines.get(name) !== commitId) await writeLine(cfg, homeRepo, taskId, name, commitId);
+export async function awaitLine(deps: ReplicaDeps, projectId: string, taskId: string, name: string, timeoutMs: number): Promise<string> {
+  const { cfg, db } = deps;
+  const deadline = Date.now() + timeoutMs;
+  let wait = AWAIT_LINE_POLL_MS;
+  for (;;) {
+    const row = listLineRows(db, projectId, taskId).find((r) => r.name === name);
+    const project = getProject(db, projectId);
+    if (row?.commit != null && project !== null) {
+      const known = await changesIn(project.replica, `present(${row.commit})`, cfg).catch(() => []);
+      if (known.length > 0) return row.commit;
     }
-  });
-}
-
-/**
- * The holder's write of task `taskId`'s line in `project` from its bookmarks in `repo`, this node's repo of the project
- * (Decision 3): on the home (`selfId`), `writeLines`; elsewhere `pushLines`.
- */
-export async function holdLines(cfg: NodeConfig, selfId: string, repo: string, project: Project, taskId: string): Promise<void> {
-  if (project.home === selfId) await writeLines(cfg, repo, taskId);
-  else await pushLines(cfg, repo, project, taskId);
-}
-
-/**
- * Releases task `taskId`'s lines on `project`'s home whose name is not in `keep` (`releaseLines`): here when this node
- * is the home, else through the home's `PeerObject.releaseLines`, refused `home <short> is offline` while it cannot
- * be reached. Returns the names released.
- */
-export async function releaseOnHome(deps: ReplicaDeps, project: Project, taskId: string, keep: string[]): Promise<string[]> {
-  const { cfg, pool } = deps;
-  if (project.home === pool.identity.id) return serialised(repoKey(project.replica), () => releaseLines(cfg, project.replica, taskId, keep));
-  if (!pool.net.isOnline(project.home)) throw new Error(`home ${shortId(project.home)} is offline`);
-  const ref = await pool.peerRef(project.home, PeerObject);
-  try {
-    if (ref.variant !== "peer") throw new Error(`${shortId(project.home)} did not serve the peer variant of PeerObject`);
-    return (await ref.releaseLines({ projectId: project.id, taskId, keep })).released;
-  } finally {
-    ref.release();
-  }
-}
-
-/**
- * Gives back what the holder of task `taskId` no longer keeps (Decision 3): any line on `project`'s home (read from the
- * home repo here, or with `git ls-remote` from another node) whose name `repo`, this node's repo of the project, no
- * longer has as a bookmark under the task's namespace is released there (`releaseOnHome`), so its commits are mutable
- * on the home again unless another line still holds them. The agent gives a side line back by deleting its bookmark.
- * The project's own line (`name`) is always kept. Returns the names released.
- */
-export async function giveBackLines(deps: ReplicaDeps, repo: string, project: Project, taskId: string, name: string): Promise<string[]> {
-  const { cfg, pool } = deps;
-  const prefix = linePrefix(taskId);
-  const { lines, local } = await serialised(repoKey(repo), async () => {
-    const local = (await refsUnder(cfg, repo, `refs/heads/${taskNamespace(taskId)}`)).map((r) => r.name);
-    if (project.home === pool.identity.id) return { lines: (await refsUnder(cfg, repo, prefix)).map((r) => r.name), local };
-    const url = meddleUrl(project.home, { kind: "project", id: project.id });
-    const listed = await git(["ls-remote", url, `${prefix}*`], repo, cfg, { timeoutMs: networkMs(cfg) });
-    const lines = listed.split("\n").filter(Boolean).map((line) => line.split("\t")[1] ?? "")
-      .filter((ref) => ref.startsWith(prefix)).map((ref) => ref.slice(prefix.length));
-    return { lines, local };
-  });
-  const keep = local.includes(name) ? local : [...local, name];
-  if (lines.every((n) => keep.includes(n))) return [];
-  return releaseOnHome(deps, project, taskId, keep);
-}
-
-/** How long the janitor leaves a line `startAt` wrote alone: the task it is for may still be being created. */
-export const STARTING_MS = 60 * 60_000;
-
-/** The lines `startAt` wrote on this node, by `<home repo>\0<task id>`, with when (ms). */
-const starting = new Map<string, number>();
-
-/**
- * Notes that `startAt` wrote task `taskId`'s line in `homeRepo` at `at` (ms; now by default): until `STARTING_MS` later,
- * `releaseGoneLines` leaves the task's lines there alone, though no node holds the task yet.
- */
-export function noteStarting(homeRepo: string, taskId: string, at = Date.now()): void {
-  starting.set(`${homeRepo}\0${taskId}`, at);
-}
-
-/** Whether `startAt` wrote task `taskId`'s line in `homeRepo` less than `STARTING_MS` before `now`; forgets older notes. */
-function isStarting(homeRepo: string, taskId: string, now: number): boolean {
-  for (const [key, at] of starting) if (now - at >= STARTING_MS) starting.delete(key);
-  return starting.has(`${homeRepo}\0${taskId}`);
-}
-
-/**
- * The home's janitor: for every project homed on this node, releases the whole line of each task in `homeLines` that
- * `whereIs` finds gone from every node (one an offline node may hold keeps its line). A line `startAt` wrote here less
- * than `STARTING_MS` before `now` is left alone (`noteStarting`): its task may still be being created on another node,
- * after the start released `handoff:<projectId>`. Each project's pass runs under `handoff:<projectId>`, so a start
- * running now is not taken for a gone task either. A task whose line could not be released is logged, and the pass goes
- * on. Returns how many tasks it released.
- */
-export async function releaseGoneLines(
-  deps: ReplicaDeps, log: (line: string) => void = (line) => console.error(line), now = Date.now(),
-): Promise<number> {
-  const { cfg, db, pool } = deps;
-  const released = new Set<string>();
-  const where = new Map<string, Awaited<ReturnType<typeof whereIs>>>();
-  for (const project of listProjects(db)) {
-    if (project.home !== pool.identity.id) continue;
-    const repo = project.replica;
-    await serialised(`handoff:${project.id}`, async () => {
-      const lines = await serialised(repoKey(repo), () => homeLines(cfg, repo));
-      for (const taskId of new Set(lines.map((l) => l.taskId))) {
-        if (isStarting(repo, taskId, now)) continue;
-        try {
-          if (!where.has(taskId)) where.set(taskId, await whereIs(deps, taskId));
-          if (where.get(taskId) !== "gone") continue;
-          await serialised(repoKey(repo), () => releaseLines(cfg, repo, taskId, []));
-          released.add(taskId);
-        } catch (err) {
-          log(`meddle: line janitor: the line of ${taskId} on ${project.name} was not released: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-    });
-  }
-  return released.size;
-}
-
-/**
- * Fetches task `taskId`'s line from node `from` into `repo`'s local bookmarks `meddle/task/<id>/*`, pruning the ones
- * `from` does not have, and imports them (mutable there): from the home's line (`refs/remotes/meddle/task/<id>/*`,
- * `source` "home") or from a holder's own bookmarks (`refs/heads/meddle/task/<id>/*`, `source` "holder"). Under
- * `repoKey(repo)`. Returns the bookmarks there now, by name after the namespace.
- */
-export async function fetchLines(
-  cfg: NodeConfig, repo: string, project: Project, from: string, taskId: string, source: "home" | "holder",
-): Promise<Array<{ name: string; commitId: string }>> {
-  const local = `refs/heads/${taskNamespace(taskId)}`;
-  const src = source === "home" ? linePrefix(taskId) : local;
-  return serialised(repoKey(repo), async () => {
-    const url = meddleUrl(from, { kind: "project", id: project.id });
-    await git(["fetch", "--prune", url, `+${src}*:${local}*`], repo, cfg, { timeoutMs: networkMs(cfg) });
-    await gitImport(repo, cfg);
-    return refsUnder(cfg, repo, local);
-  });
-}
-
-/**
- * Where task `taskId` is: on this node or an online member, maybe on an offline member, or gone from them all. A
- * `moved` row (what a task that went on to another node left) holds nothing, here or on a member (`taskHeld`).
- */
-export async function whereIs(deps: ReplicaDeps, taskId: string): Promise<"held" | "offline" | "gone"> {
-  const { db, pool } = deps;
-  const row = getTask(db, taskId);
-  if (row !== null && row.state !== "moved") return "held";
-  let offline = false;
-  for (const member of pool.store.members()) {
-    if (member.nodeId === pool.identity.id) continue;
-    if (!pool.net.isOnline(member.nodeId)) {
-      offline = true;
-      continue;
-    }
-    let ref: Awaited<ReturnType<typeof pool.peerRef<typeof PeerObject>>>;
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`line ${taskId}/${name} is not here yet`);
     try {
-      ref = await pool.peerRef(member.nodeId, PeerObject);
+      if (row?.commit != null) await applyProject(deps, projectId, left);
+      else {
+        await catchUp(deps, projectId, Math.min(left, AWAIT_LINE_CATCH_UP_MS));
+        // Caught up, and still no row: no peer has it yet, so look again less often.
+        if (!listLineRows(db, projectId, taskId).some((r) => r.name === name)) wait = Math.min(wait * 2, AWAIT_LINE_POLL_MAX_MS);
+      }
     } catch {
-      offline = true;
-      continue;
+      // A service repo still being made, or a peer that did not answer: the next look tells.
     }
-    try {
-      if (ref.variant !== "peer") {
-        offline = true;
-        continue;
-      }
-      let answer: boolean;
-      try {
-        answer = await ref.taskHeld({ id: taskId });
-      } catch {
-        offline = true;
-        continue;
-      }
-      if (answer) return "held";
-    } finally {
-      ref.release();
-    }
+    await Bun.sleep(Math.min(wait, Math.max(0, deadline - Date.now())));
   }
-  return offline ? "offline" : "gone";
 }

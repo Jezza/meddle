@@ -7,8 +7,8 @@ import type { SendStream } from "@number0/iroh";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { paths } from "../src/config";
 import { bookmarkList, git, jj, JjError, workspaceConfigPath } from "../src/jj";
-import { homeLines } from "../src/projects/lines";
 import { shortId } from "../src/pool/ids";
+import { listLineRows, writeBranchRow } from "../src/pool/rows";
 import { NodeObject, SessionObject, TaskObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
 import { getTask, listArchivedTasks, listLiveTasks, updateTask } from "../src/store/records";
@@ -66,11 +66,16 @@ async function namespace(node: GitPoolNode, replica: string, taskId: string): Pr
   };
 }
 
+/** Task `taskId`'s line refs in `repo` (`refs/remotes/meddle/task/<id>/*`, from its rows): `<ref> <commit>` each. */
+async function lineRefs(node: GitPoolNode, repo: string, taskId: string): Promise<string[]> {
+  return (await git(["for-each-ref", "--format=%(refname) %(objectname)", `refs/remotes/meddle/task/${taskId}`], repo, node.cfg)).split("\n").filter(Boolean);
+}
+
 async function changeAt(node: GitPoolNode, dir: string, rev: string): Promise<string> {
   return (await jj(["log", "-r", rev, "--no-graph", "-T", "change_id"], dir, node.cfg)).trim();
 }
 
-test("an idle task archived on its project's home keeps its rows and bookmarks, serves its window read-only, restores here and resumes, and deletes", async () => {
+test("an idle task archived keeps its rows and its lines, held here and out of the view, serves its window read-only, restores here and resumes, and deletes", async () => {
   const { nodes, close } = await poolNodes(1);
   const A = nodes[0]!;
   const owner = linkClient(A.host);
@@ -82,6 +87,7 @@ test("an idle task archived on its project's home keeps its rows and bookmarks, 
     const before = countRows(A, m);
     const bookmarksBefore = await namespace(A, A.project.replica, m.id);
     expect(bookmarksBefore.local).toHaveLength(1);
+    const head = (await jj(["log", "--ignore-working-copy", "-r", `meddle/task/${m.id}/a`, "--no-graph", "-T", "commit_id"], A.project.replica, A.cfg)).trim();
     const node = await owner.client.get(NodeObject, {});
     const task = await owner.client.get(TaskObject, { id: m.id });
     try {
@@ -92,8 +98,11 @@ test("an idle task archived on its project's home keeps its rows and bookmarks, 
 
       expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
       expect((await workspaces(A, A.project.replica)).includes(m.id)).toBe(false);
-      // The home keeps the task's bookmarks: they are the backup.
-      expect(await namespace(A, A.project.replica, m.id)).toEqual(bookmarksBefore);
+      // Its bookmarks go with its folder; its line stays, a row held here and archived, which the repo keeps as a ref.
+      expect(await namespace(A, A.project.replica, m.id)).toEqual({ local: [], remote: 0 });
+      expect(listLineRows(A.db, A.project.id, m.id)).toMatchObject([{ name: "a", holder: A.id, commit: head, archived: true }]);
+      expect(await lineRefs(A, A.project.replica, m.id)).toEqual([`refs/remotes/meddle/task/${m.id}/a ${head}`]);
+      expect(await git(["for-each-ref", `refs/namespaces/view/refs/heads/meddle/task/${m.id}`], A.project.replica, A.cfg)).toBe("");
       expect(countRows(A, m)).toEqual(before);
       expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", archived_on: A.id });
       expect(Date.parse(getTask(A.db, m.id)!.archived_at!)).toBeGreaterThan(Date.now() - 60_000);
@@ -138,6 +147,10 @@ test("an idle task archived on its project's home keeps its rows and bookmarks, 
       await until("the task's archivedOn", () => task.archivedOn.value, null);
       await until("the node's archivedIds", () => node.archivedIds.value, []);
       await until("the node's taskIds", () => node.taskIds.value.includes(m.id), true);
+      // Its bookmark is back, and its row is live again: the line is the bookmark here, and in the view.
+      expect(await namespace(A, A.project.replica, m.id)).toEqual(bookmarksBefore);
+      expect(listLineRows(A.db, A.project.id, m.id)).toMatchObject([{ name: "a", holder: A.id, commit: head, archived: false }]);
+      expect(await lineRefs(A, A.project.replica, m.id)).toEqual([]);
       await promptAndWait(A, m.id, "Again.");
       const events = listEvents(A.db, m.id);
       const started = events.filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
@@ -164,34 +177,62 @@ test("an idle task archived on its project's home keeps its rows and bookmarks, 
   }
 }, 30_000);
 
-test("deleting a task archived on the home releases its line and its workspace config, and the user's commit under it is mutable and visible again (Review Focus 5)", async () => {
+test("a restored task keeps the meddle context captured at its start, not one its agent committed into its line", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    expect(m.projects[0]!.context).toBeNull();
+    // The agent writes a context.toml that would fail a turn; its turn end puts it in the task's line.
+    const workspace = join(paths(A.cfg).task(m.id), "a");
+    await mkdir(join(workspace, ".meddle"), { recursive: true });
+    await writeFile(join(workspace, ".meddle", "context.toml"), "[claude]\nallwo = []\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await A.runner.archive(m.id);
+    await A.runner.restoreHere(m.id);
+    expect(existsSync(join(workspace, ".meddle", "context.toml"))).toBe(true);
+    expect((JSON.parse(getTask(A.db, m.id)!.manifest) as TaskManifest).projects[0]!.context).toBeNull();
+    await promptAndWait(A, m.id, "Again.");
+    const messages = listEvents(A.db, m.id).map((e) => e.message as { type?: string; subtype?: string });
+    expect(messages.filter((msg) => msg.subtype === "turn_failed")).toEqual([]);
+    expect(messages.filter((msg) => msg.type === "result").map((msg) => msg.subtype)).toEqual(["success", "success"]);
+  } finally {
+    await close();
+  }
+}, 30_000);
+
+test("deleting an archived task releases its line and its workspace config, and the commit under it is mutable and visible again", async () => {
   const { nodes, close } = await poolNodes(1);
   const A = nodes[0]!;
   try {
     const home = A.project.replica;
     const log = async (rev: string, template: string) =>
       (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", template], home, A.cfg)).trim();
+    await jj(["new", "main"], home, A.cfg);
     await writeFile(join(home, "mine"), "mine\n");
     await jj(["commit", "-m", "mine"], home, A.cfg);
     await jj(["bookmark", "set", "main", "-r", "@-"], home, A.cfg);
     const mine = await log("main", "commit_id");
+    // `main`'s row too: a start reads the branch from its rows.
+    writeBranchRow(A.db, A.id, { project: A.project.id, branch: "main", commit: mine, drops: [] });
     const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
     const workspace = join(paths(A.cfg).task(m.id), "a");
     const config = await workspaceConfigPath(workspace, A.cfg);
     expect(existsSync(config)).toBe(true);
     await writeFile(join(workspace, "work"), "work\n");
     await promptAndWait(A, m.id, "Reply with the single word ok.");
-    const head = (await homeLines(A.cfg, home, m.id))[0]!.commitId;
+    const head = await log(`meddle/task/${m.id}/a`, "commit_id");
     expect(await log(`${head}-`, "commit_id")).toBe(mine);
+
+    await A.runner.archive(m.id);
+    expect(await lineRefs(A, home, m.id)).toEqual([`refs/remotes/meddle/task/${m.id}/a ${head}`]);
     expect(await log(mine, "immutable")).toBe("true");
     const refused = await jj(["--ignore-working-copy", "describe", "-r", mine, "-m", "mine, reworded"], home, A.cfg).catch((err: unknown) => err);
     expect(refused).toBeInstanceOf(JjError);
-
-    await A.runner.archive(m.id);
-    expect(await homeLines(A.cfg, home, m.id)).toEqual([{ taskId: m.id, name: "a", commitId: head }]);
     await A.runner.deleteTask(m.id);
     expect(getTask(A.db, m.id)).toBeNull();
-    expect(await homeLines(A.cfg, home, m.id)).toEqual([]);
+    expect(await lineRefs(A, home, m.id)).toEqual([]);
+    expect(listLineRows(A.db, A.project.id, m.id).map((r) => r.commit)).toEqual([null]);
     expect(existsSync(config)).toBe(false);
     expect(await namespace(A, home, m.id)).toEqual({ local: [], remote: 0 });
     // Nothing was abandoned: the user's commit and the task's work are still there, and the user's is theirs again.
@@ -222,52 +263,52 @@ test("a task without a project archives and restores here with its transcript in
   }
 }, 20_000);
 
-test("archiving on a node that is not the project's home pushes the task's line to the home first, restoring fetches it from there, and archiving is refused while the home is offline", async () => {
+test("archive, restore and delete work with every other node offline: the lines are rows held here", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
-    // A is the home; the task lives on B, which made a change and a side bookmark no turn end has pushed yet.
-    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
-    const replicaB = paths(B.cfg).replica(A.project.id);
+    // The project was added on A; the task lives on B, which made a change and a side bookmark no turn end has written.
+    const P = A.project.id;
+    const m = await createTask(B, { title: "t", projectIds: [P] });
+    const replicaB = paths(B.cfg).replica(P);
     const workspaceB = join(paths(B.cfg).task(m.id), "a");
     await writeFile(join(workspaceB, "note.txt"), "made on B\n");
     await jj(["bookmark", "create", `meddle/task/${m.id}/a.spike`, "-r", "@"], workspaceB, B.cfg);
     const change = await changeAt(B, workspaceB, "@");
-    // The home holds the line its start wrote, at the task's start; no turn end has moved it yet.
-    expect(await homeLines(A.cfg, A.project.replica, m.id)).toEqual([{ taskId: m.id, name: "a", commitId: m.projects[0]!.base }]);
+    const commit = (await jj(["log", "--ignore-working-copy", "-r", change, "--no-graph", "-T", "commit_id"], replicaB, B.cfg)).trim();
+    A.net.unwatch(B.id, "bye");
+    B.net.unwatch(A.id, "bye");
+    await until("A online to B", () => B.net.isOnline(A.id), false);
 
     await B.runner.archive(m.id);
-    // The home holds the task's line, and nothing under its own bookmarks: the restore can only come from the line.
-    const commit = await jj(["log", "--ignore-working-copy", "-r", `task/${m.id}/a@meddle`, "--no-graph", "-T", "commit_id"], A.project.replica, A.cfg);
-    expect(await homeLines(A.cfg, A.project.replica, m.id)).toEqual([
-      { taskId: m.id, name: "a", commitId: commit },
-      { taskId: m.id, name: "a.spike", commitId: commit },
-    ]);
-    expect(await changeAt(A, A.project.replica, commit)).toBe(change);
-    expect(await git(["for-each-ref", `refs/heads/meddle/task/${m.id}`], A.project.replica, A.cfg)).toBe("");
-    expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
-    expect(existsSync(paths(B.cfg).task(m.id))).toBe(false);
     expect(getTask(B.db, m.id)).toMatchObject({ state: "archived", archived_on: B.id });
+    expect(existsSync(paths(B.cfg).task(m.id))).toBe(false);
+    // Its lines are its rows, held by B and archived; B's repo keeps them as refs.
+    expect(listLineRows(B.db, P, m.id).map((r) => [r.name, r.holder, r.commit, r.archived])).toEqual([
+      ["a", B.id, commit, true], ["a.spike", B.id, commit, true],
+    ]);
+    expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
+    expect(await lineRefs(B, replicaB, m.id)).toEqual([`refs/remotes/meddle/task/${m.id}/a ${commit}`, `refs/remotes/meddle/task/${m.id}/a.spike ${commit}`]);
 
-    // Restored on B: the task's bookmarks come back from the home, and the workspace starts on the archived change.
+    // Restored on B: the task's bookmarks come back from its rows, and the workspace starts on the archived change.
     await B.runner.restoreHere(m.id);
     expect(await changeAt(B, workspaceB, "@-")).toBe(change);
     expect(await Bun.file(join(workspaceB, "note.txt")).text()).toBe("made on B\n");
     expect((await namespace(B, replicaB, m.id)).local).toEqual([`meddle/task/${m.id}/a ${change}`, `meddle/task/${m.id}/a.spike ${change}`]);
     expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", archived_on: null });
+    expect(listLineRows(B.db, P, m.id).map((r) => r.archived)).toEqual([false, false]);
 
-    // With the home offline, the archive is refused and nothing changes.
-    const other = await createTask(B, { title: "u", projectIds: [A.project.id] });
-    A.net.unwatch(B.id, "bye");
-    B.net.unwatch(A.id, "bye");
-    await until("A online to B", () => B.net.isOnline(A.id), false);
-    await expect(B.runner.archive(other.id)).rejects.toThrow(`cannot archive: home ${shortId(A.id)} of a is offline`);
-    expect(existsSync(join(paths(B.cfg).task(other.id), "a"))).toBe(true);
-    expect(getTask(B.db, other.id)).toMatchObject({ state: "idle", archived_on: null });
-    expect(existsSync(paths(B.cfg).archiveFile(other.id))).toBe(false);
+    // Archived again and deleted: every line released, its refs gone, the work still there.
+    await B.runner.archive(m.id);
+    await B.runner.deleteTask(m.id);
+    expect(getTask(B.db, m.id)).toBeNull();
+    expect(listLineRows(B.db, P, m.id).map((r) => [r.name, r.commit])).toEqual([["a", null], ["a.spike", null]]);
+    expect(await lineRefs(B, replicaB, m.id)).toEqual([]);
+    expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
+    expect(B.logs.filter((l) => l.startsWith("meddle: delete:") || l.startsWith("meddle: archive:") || l.startsWith("meddle: apply:"))).toEqual([]);
   } finally {
     await close();
   }
-}, 30_000);
+}, 45_000);
 
 test("archiving is refused while a turn runs, while prompts are queued, and while the task moves", async () => {
   const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }] });
@@ -430,7 +471,7 @@ test("exportArchive sends an archived task as exportTask sent it before: importT
   }
 }, 30_000);
 
-test("restore with no node named lands a task archived off its project's home on the home through a move: staged during the handoff, forgotten after, the archive becomes the leftover, and it resumes there", async () => {
+test("restore with no node named lands a task archived off its project's home on the home through a move: the target takes its lines from their rows, the archive becomes the leftover, and it resumes there", async () => {
   const { A, B, close } = await twoPoolNodes();
   const owner = linkClient(A.host);
   try {
@@ -443,8 +484,9 @@ test("restore with no node named lands a task archived off its project's home on
     await A.runner.archive(m.id);
     expect(await namespace(A, replicaA, m.id)).toEqual({ local: [], remote: 0 });
     await peerReady(A, B);
-    // What an unstage that failed would leave: forgotten before the staging, so it never travels.
+    // A stray bookmark of the task's here, with no row: it never travels, and goes with the archived copy.
     await jj(["bookmark", "create", `meddle/task/${m.id}/a.stale`, "-r", "@"], replicaA, A.cfg);
+    const stale = [`meddle/task/${m.id}/a.stale ${await changeAt(A, replicaA, `meddle/task/${m.id}/a.stale`)}`];
 
     let staged: { local: string[]; remote: number } | null = null;
     B.hooks.beforeReceive = async () => { staged = await namespace(A, replicaA, m.id); };
@@ -457,9 +499,9 @@ test("restore with no node named lands a task archived off its project's home on
     }
     await moveSettled(A);
 
-    // A fetched the task's namespace from B before B fetched it from A.
+    // Nothing was staged here for B: it took the lines from their rows.
     expect(staged).not.toBeNull();
-    expect(staged!.local).toEqual([`meddle/task/${m.id}/a ${change}`]);
+    expect(staged!.local).toEqual(stale);
     expect(states).toEqual(["moving", "moved"]);
     expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
     expect(await namespace(A, replicaA, m.id)).toEqual({ local: [], remote: 0 });
@@ -482,10 +524,10 @@ test("restore with no node named lands a task archived off its project's home on
   }
 }, 45_000);
 
-test("restore on a named node from a node that is not the project's home stages the task's side bookmarks there during the handoff and forgets them after", async () => {
+test("restore on a named node takes the task's side lines there from their rows, and the source forgets nothing it needs", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
-    // A is the home; the task lives on B, with a side bookmark, and is archived there (pushed to A).
+    // The project was added on A; the task lives on B, with a side bookmark, and is archived there.
     const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
     const replicaB = paths(B.cfg).replica(A.project.id);
     const workspaceB = join(paths(B.cfg).task(m.id), "a");
@@ -494,25 +536,22 @@ test("restore on a named node from a node that is not the project's home stages 
     const change = await changeAt(B, workspaceB, "@");
     await B.runner.archive(m.id);
     const both = [`meddle/task/${m.id}/a ${change}`, `meddle/task/${m.id}/a.spike ${change}`];
-    // On the home it is the task's line: B stages from there.
-    expect((await homeLines(A.cfg, A.project.replica, m.id)).map((l) => l.name)).toEqual(["a", "a.spike"]);
     expect((await namespace(A, A.project.replica, m.id)).local).toEqual([]);
     expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
     await peerReady(B, A);
+    await peerReady(A, B);
 
-    let staged: { local: string[]; remote: number } | null = null;
-    A.hooks.beforeReceive = async () => { staged = await namespace(B, replicaB, m.id); };
     expect(await B.runner.restore(m.id, A.id)).toEqual({ nodeId: A.id });
     await moveSettled(B);
 
-    expect(staged!.local).toEqual(both);
     expect(await namespace(B, replicaB, m.id)).toEqual({ local: [], remote: 0 });
     expect(getTask(B.db, m.id)).toMatchObject({ state: "moved", moved_to: A.id });
     expect(existsSync(paths(B.cfg).archiveFile(m.id))).toBe(false);
     expect(existsSync(paths(B.cfg).movedFile(m.id))).toBe(true);
-    // The home has them from B now, and the task runs there on the archived change.
+    // A has them from the rows now, holds them, and the task runs there on the archived change.
     expect((await namespace(A, A.project.replica, m.id)).local).toEqual(both);
     expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
+    await until("A's rows", () => listLineRows(A.db, A.project.id, m.id).map((r) => [r.name, r.holder, r.archived]), [["a", A.id, false], ["a.spike", A.id, false]]);
     const workspaceA = join(paths(A.cfg).task(m.id), "a");
     expect(await changeAt(A, workspaceA, "@-")).toBe(change);
     expect(await Bun.file(join(workspaceA, "note.txt")).text()).toBe("made on B\n");
@@ -520,6 +559,50 @@ test("restore on a named node from a node that is not the project's home stages 
     await close();
   }
 }, 45_000);
+
+test("restoring on a third node a task archived on the first gives that node the next epoch as it activates; one it refuses at activation leaves the first two epochs up, still archived", async () => {
+  const { nodes, close } = await poolNodes(3);
+  const [A, B, C] = nodes as [GitPoolNode, GitPoolNode, GitPoolNode];
+  try {
+    const P = A.project.id;
+    const m = await createTask(A, { title: "t", projectIds: [P] });
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await A.runner.archive(m.id);
+    const row = listLineRows(A.db, P, m.id)[0]!;
+    const rows = (n: GitPoolNode) => listLineRows(n.db, P, m.id).map((r) => `${r.name} ${r.holder} ${r.epoch} ${r.archived}`).join();
+    expect(rows(A)).toBe(`a ${A.id} ${row.epoch} true`);
+    for (const [from, to] of [[A, C], [C, A]] as const) await peerReady(from, to);
+
+    // C refuses the activation: the move rolls back, the task archived on A again, its rows above any C could write.
+    let atActivation: string[] = [];
+    let refuse = true;
+    C.hooks.beforeActivate = () => {
+      atActivation.push(rows(C));
+      if (refuse) throw new Error("activation broke");
+    };
+    await A.runner.restore(m.id, C.id);
+    await moveSettled(A);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", archived_on: A.id });
+    expect(getTask(C.db, m.id)).toBeNull();
+    expect(atActivation).toEqual([`a ${A.id} ${row.epoch} true`]);
+    const back = `a ${A.id} ${row.epoch + 2} true`;
+    expect(rows(A)).toBe(back);
+    for (const n of [B, C]) await until("the line's row", () => rows(n), back);
+
+    // Now C takes it: one epoch up from A's, live again, on every node.
+    refuse = false;
+    atActivation = [];
+    expect(await A.runner.restore(m.id, C.id)).toEqual({ nodeId: C.id });
+    await moveSettled(A);
+    expect(getTask(C.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
+    expect(atActivation).toEqual([back]);
+    const taken = `a ${C.id} ${row.epoch + 3} false`;
+    expect(rows(C)).toBe(taken);
+    for (const n of [A, B]) await until("the line's row", () => rows(n), taken);
+  } finally {
+    await close();
+  }
+}, 60_000);
 
 test("a restore-move the target refuses leaves the task archived on the source with its archive, nothing staged; one to an offline node is refused with the move's message", async () => {
   const { A, B, close } = await twoPoolNodes();

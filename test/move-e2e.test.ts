@@ -18,9 +18,10 @@ async function home(lighthouseUrl: string) {
   const dir = await mkdtemp("/tmp/meddle-move-e2e-");
   await mkdir(`${dir}/t`, { recursive: true });
   await initColocated(`${dir}/repo`);
-  // A first commit, `@` empty on it: a task of the repo starts there.
+  // A first commit, `@` empty on it, bookmarked `main` (the project's default branch): a task of the repo starts there.
   await writeFile(`${dir}/repo/README`, "repo\n");
   await jj(["commit", "-m", "init"], `${dir}/repo`);
+  await jj(["bookmark", "set", "main", "-r", "@-"], `${dir}/repo`);
   const env = {
     HOME: dir,
     MEDDLE_DATA_DIR: `${dir}/d`,
@@ -96,7 +97,9 @@ test("a task moves from one node to another through the CLI and resumes there", 
     expect(added.code).toBe(0);
     const projectId = added.stdout.trim();
     const listed = await meddle(["project", "list"], atA);
-    expect(listed.stdout).toBe(`${projectId}  repo  home ${shortId(A.id)}  on ${shortId(A.id)}\n`);
+    // B keeps a service repo of every project too, from whenever its applier hears of this one.
+    const holders = [shortId(A.id), shortId(B.id)].sort().join(",");
+    expect([`${shortId(A.id)}`, holders].map((on) => `${projectId}  repo  home ${shortId(A.id)}  on ${on}\n`)).toContain(listed.stdout);
     const created = await meddle(["task", "new", "--title", "t", "--project", projectId], atA);
     expect(created.stderr).toBe("");
     expect(created.code).toBe(0);

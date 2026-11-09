@@ -68,6 +68,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const move = useValue(task.move);
   const movedTo = useValue(task.movedTo);
   const archivedOn = useValue(task.archivedOn);
+  const acceptance = useValue(task.acceptance);
   const nodeId = useValue(node.nodeId);
   const nodes = useValue(pool.nodes);
   const nameOf = (id: string) => nodes.find((n) => n.nodeId === id)?.hostname ?? shortId(id);
@@ -83,7 +84,8 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const live = state === "running" || state === "waiting";
   return (
     <div class="task">
-      <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving} />
+      <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving}
+        partly={acceptance === "partly" && !archived && state !== "moved"} />
       {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
       {state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
@@ -101,8 +103,10 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
 
 // ─── the head ───
 
-function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving }: {
+function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly }: {
   task: TaskRef; nodes: PoolRef["nodes"]["value"]; nodeId: string; title: string; state: string; pendingCount: number; moving: boolean;
+  /** A pushed branch contains the task's line for some of its projects, not all: nothing is archived yet. */
+  partly: boolean;
 }) {
   const [renaming, setRenaming] = useState(false);
   const [restoreAt, setRestoreAt] = useState<Anchor | null>(null);
@@ -126,6 +130,11 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving }: {
           </>}
         <StateDot state={state} waiting={pendingCount > 0} />
         <span class="muted state-text">{stateText}</span>
+        {partly && (
+          <span class="muted state-text" title="A pushed branch contains this task's work for some of its projects; it is archived once every project's is">
+            · partly accepted
+          </span>
+        )}
       </div>
       <div class="head-actions">
         {action.error !== null && <span class="error" title={action.error}>{action.error}</span>}

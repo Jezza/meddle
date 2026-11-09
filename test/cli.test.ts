@@ -1,14 +1,16 @@
 import { test, expect } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
+import { delimiter } from "node:path";
+import { paths } from "../src/config";
 import { startDashboard } from "../src/dashboard/server";
 import { resolveNodeId, shortId } from "../src/pool/ids";
 import { PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
-import { getTask } from "../src/store/records";
+import { getTask, listTasks } from "../src/store/records";
 import { markToken, tokenId } from "../src/token";
 import { childEnv, closedPort, createTask, meddle } from "./helpers";
-import { linkClient, peerReady, twoPoolNodes } from "./pool-helpers";
+import { linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** The env a CLI child runs with: no inherited MEDDLE_* and a port nothing listens on. */
 async function env() {
@@ -98,6 +100,17 @@ test("config without a running node says to start one", async () => {
     const out = await meddle(["config", ...args], { MEDDLE_PORT: String(await closedPort()) });
     expect(out).toEqual({ stdout: "", stderr: 'meddle: start "meddle serve" first\n', code: 1 });
   }
+});
+
+test("the usage text lists the project subcommands", async () => {
+  const out = await meddle([], { MEDDLE_PORT: String(await closedPort()) });
+  expect(out.code).toBe(2);
+  const lines = out.stderr.split("\n").map((l) => l.trim());
+  expect(lines).toContain("meddle project add <path-or-url> [--name <n>] [--no-fetch]");
+  expect(lines).toContain("meddle project list");
+  expect(out.stderr).not.toContain("sync");
+  expect(lines).toContain("meddle project set-default <id|name> <branch>");
+  expect(lines).toContain("meddle checkout <id|name> [<dir>]");
 });
 
 test("the usage text lists the config subcommands", async () => {
@@ -265,27 +278,29 @@ test("task new: --rev and --edit belong to the --project before them; --edit nee
 
 test("task new --project a --rev X --edit --project b sends a's revision to edit and b with none", async () => {
   const { writeFile: write, mkdir } = await import("node:fs/promises");
-  const { jj } = await import("../src/jj");
+  const { initColocated, jj } = await import("../src/jj");
   const { addProjectFromFolder } = await import("../src/projects/project");
-  const { paths } = await import("../src/config");
   const { A, B, close } = await twoPoolNodes();
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
   try {
     const read = async (n: typeof A, repo: string, rev: string) =>
       (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", "commit_id"], repo, n.cfg)).trim();
-    // a (A's): W on its fork point P, `@` back on P. b (B's): one commit, `@` empty on it.
+    // a (A's): W on its default branch P, its service repo's `@` back on P. b (B's): one commit, its default branch.
     const a = A.project.replica;
-    const P = await read(A, a, "@-");
+    const P = await read(A, a, "main");
+    await jj(["new", P], a, A.cfg);
     await write(`${a}/w`, "w\n");
     await jj(["commit", "-m", "W"], a, A.cfg);
     const W = await read(A, a, "@-");
     await jj(["new", P], a, A.cfg);
-    const bRepo = `${B.home}/b`;
-    await mkdir(bRepo);
-    const b = await addProjectFromFolder(B.cfg, B.db, bRepo, B.id, "b");
-    await write(`${bRepo}/b`, "b\n");
-    await jj(["commit", "-m", "b"], bRepo, B.cfg);
-    const fork = await read(B, bRepo, "@-");
+    const bFolder = `${B.home}/b`;
+    await mkdir(bFolder);
+    await initColocated(bFolder, B.cfg);
+    await write(`${bFolder}/b`, "b\n");
+    await jj(["commit", "-m", "b"], bFolder, B.cfg);
+    await jj(["bookmark", "set", "main", "-r", "@-"], bFolder, B.cfg);
+    const b = await addProjectFromFolder(B.cfg, B.db, bFolder, B.id, "b");
+    const fork = await read(B, b.replica, "main");
     await peerReady(A, B);
     await eventually(() => A.store.row(B.id)?.summary?.projects.some((p) => p.id === b.id) === true, () => "A to hear of b");
 
@@ -294,8 +309,8 @@ test("task new --project a --rev X --edit --project b sends a's revision to edit
     expect(out.stderr).toBe("");
     expect(out.code).toBe(0);
     const id = /^task (\S+) on/.exec(out.stdout)![1]!;
-    const manifest = JSON.parse(getTask(A.db, id)!.manifest) as { projects: Array<{ name: string; base: string }> };
-    expect(manifest.projects.map((p) => [p.name, p.base])).toEqual([["a", P], ["b", fork]]);
+    const manifest = JSON.parse(getTask(A.db, id)!.manifest) as { projects: Array<{ name: string; base: string[] }> };
+    expect(manifest.projects.map((p) => [p.name, p.base])).toEqual([["a", [P]], ["b", [fork]]]);
     const task = paths(A.cfg).task(id);
     // a's workspace edits W; b's is a new change on b's fork point.
     expect(await read(A, `${task}/a`, "@")).toBe(W);
@@ -305,6 +320,11 @@ test("task new --project a --rev X --edit --project b sends a's revision to edit
     await close();
   }
 }, 60_000);
+
+/** A PATH with `n`'s `<data>/bin`, where its `git-remote-meddle` is, first: what `project add` checks for. */
+function withHelper(n: { cfg: Parameters<typeof paths>[0] }): string {
+  return `${paths(n.cfg).bin}${delimiter}${process.env.PATH}`;
+}
 
 /** Waits until `cond` holds, or fails with `what()`. */
 async function eventually(cond: () => boolean, what: () => string, ms = 15_000): Promise<void> {
@@ -367,7 +387,7 @@ test("project list shows every project in the pool and who holds it; --project t
   const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
   try {
     const port = new URL(dashboard.url).port;
-    const env = { HOME: A.home, MEDDLE_PORT: port };
+    const env = { HOME: A.home, MEDDLE_PORT: port, PATH: withHelper(A) };
     await peerReady(A, B);
     // A holds a replica of B's project (both are named "a").
     await createTask(A, { title: "r", projectIds: [B.project.id] });
@@ -395,10 +415,11 @@ test("project list shows every project in the pool and who holds it; --project t
 
     await mkdir(`${A.home}/solo`);
     await initColocated(`${A.home}/solo`);
-    // A first commit: a task of `solo` starts on it.
+    // A first commit, its default branch: a task of `solo` starts on it.
     await writeFile(`${A.home}/solo/README`, "solo\n");
     await (await import("../src/jj")).jj(["commit", "-m", "solo"], `${A.home}/solo`);
-    const added = await meddle(["project", "add", `${A.home}/solo`, "--name", "solo"], env);
+    await (await import("../src/jj")).jj(["bookmark", "set", "main", "-r", "@-"], `${A.home}/solo`);
+    const added = await meddle(["project", "add", `${A.home}/solo`, "--name", "solo", "--no-fetch"], env);
     expect(added.code).toBe(0);
     const soloId = added.stdout.trim();
     const created = await meddle(["task", "new", "Say hello", "--project", "solo", "--here"], env);
@@ -412,57 +433,16 @@ test("project list shows every project in the pool and who holds it; --project t
   }
 }, 60_000);
 
-test("project add --sync and project sync set a project's sync branches, which project list shows", async () => {
-  const { mkdir } = await import("node:fs/promises");
-  const { initColocated } = await import("../src/jj");
-  const { getProject } = await import("../src/projects/project");
-  const { A, B, close } = await twoPoolNodes();
-  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
-  try {
-    const env = { HOME: A.home, MEDDLE_PORT: new URL(dashboard.url).port };
-    await peerReady(A, B);
-    await mkdir(`${A.home}/solo`);
-    await initColocated(`${A.home}/solo`);
-    // A first commit: a task of `solo` starts on it.
-    await writeFile(`${A.home}/solo/README`, "solo\n");
-    await (await import("../src/jj")).jj(["commit", "-m", "solo"], `${A.home}/solo`);
-    const added = await meddle(["project", "add", `${A.home}/solo`, "--sync", "dev", "--name", "solo", "--sync", "main"], env);
-    expect(added.stderr).toBe("");
-    expect(added.code).toBe(0);
-    const id = added.stdout.trim();
-    expect(getProject(A.db, id)!.sync).toEqual(["dev", "main"]);
-
-    const set = await meddle(["project", "sync", "solo", "main", "release/1.2"], env);
-    expect(set).toEqual({ stdout: "", stderr: "", code: 0 });
-    expect(getProject(A.db, id)!.sync).toEqual(["main", "release/1.2"]);
-    const sa = shortId(A.id);
-    await eventually(
-      () => A.store.row(A.id)?.summary?.projects.find((p) => p.id === id)?.sync.join(",") === "main,release/1.2",
-      () => `A's summary: ${JSON.stringify(A.store.row(A.id)?.summary?.projects)}`,
-    );
-    const listed = await meddle(["project", "list"], env);
-    expect(listed.stdout.split("\n")).toContain(`${id}  solo  home ${sa}  on ${sa}  sync main,release/1.2`);
-
-    expect(await meddle(["project", "sync", "solo"], env)).toEqual({ stdout: "", stderr: "", code: 0 });
-    expect(getProject(A.db, id)!.sync).toEqual([]);
-    const bad = await meddle(["project", "sync", "solo", "main", "-x"], env);
-    expect(bad).toEqual({ stdout: "", stderr: 'meddle: invalid sync branch name "-x"\n', code: 1 });
-    expect((await meddle(["project", "add", `${A.home}/solo`, "--sync", ""], env)).stderr).toBe('meddle: invalid sync branch name ""\n');
-    expect(getProject(A.db, id)!.sync).toEqual([]);
-    // B is not the home of A's project.
-    const dashboardB = await startDashboard({ ...B.cfg, port: 0 }, B.host, B.pool);
-    try {
-      const refused = await meddle(["project", "sync", id, "x"], { HOME: B.home, MEDDLE_PORT: new URL(dashboardB.url).port });
-      expect(refused.code).toBe(1);
-      expect(refused.stderr).toContain("not the home of");
-    } finally {
-      await dashboardB.stop();
-    }
-  } finally {
-    await dashboard.stop();
-    await close();
+test("project sync is no command, and project add takes no --sync", async () => {
+  const env = { MEDDLE_PORT: String(await closedPort()) };
+  for (const args of [["project", "sync", "solo", "main"], ["project", "sync", "solo"], ["project", "add", "/tmp/solo", "--sync", "dev"]]) {
+    const out = await meddle(args, env);
+    expect(out.code).toBe(2);
+    expect(out.stdout).toBe("");
+    expect(out.stderr).toStartWith("usage: meddle project add <path-or-url> [--name <n>] [--no-fetch]\n");
+    expect(out.stderr).not.toContain("sync");
   }
-}, 60_000);
+});
 
 test("task list prints every task of the pool, this node's first, archived ones last, each with its node and projects", async () => {
   const { acceptDashboardStreams } = await import("../src/dashboard/tunnel");
@@ -597,9 +577,9 @@ test("ids resolve by a unique prefix, and each id's shortest unique prefix is wh
 test("a project is named by its id, its name, or a unique prefix of its id", async () => {
   const { resolveProject } = await import("../src/pool/projects");
   const projects = [
-    { id: "aaaa11112222", name: "alpha", home: "h", sync: [], holders: [] },
-    { id: "aaab33334444", name: "beta", home: "h", sync: [], holders: [] },
-    { id: "cccc55556666", name: "aaaa", home: "h", sync: [], holders: [] },
+    { id: "aaaa11112222", name: "alpha", home: "h", holders: [] },
+    { id: "aaab33334444", name: "beta", home: "h", holders: [] },
+    { id: "cccc55556666", name: "aaaa", home: "h", holders: [] },
   ];
   expect(resolveProject(projects, "aaaa1")).toBe("aaaa11112222");
   expect(resolveProject(projects, "c")).toBe("cccc55556666");
@@ -608,3 +588,167 @@ test("a project is named by its id, its name, or a unique prefix of its id", asy
   expect(() => resolveProject(projects, "aaa")).toThrow("ambiguous project: aaa (aaaa11112222, aaab33334444)");
   expect(() => resolveProject(projects, "zz")).toThrow("unknown project: zz");
 });
+
+/**
+ * One pool node serving the CLI, with a checkout `co` of its project `a` cloned from it: `main` (P) there, then C (a
+ * change with content on P) under the checkout's `@`, an empty change. `cli` runs `meddle` in the checkout.
+ */
+async function checkoutNode() {
+  const { jj } = await import("../src/jj");
+  const { makeCheckout } = await import("../src/projects/checkouts");
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  const dashboard = await startDashboard({ ...n.cfg, port: 0 }, n.host, n.pool);
+  const port = new URL(dashboard.url).port;
+  const PATH = withHelper(n);
+  const co = await makeCheckout(n.cfg, n.id, n.project, `${n.home}/co`, { PATH });
+  const run = (args: string[]) => jj(args, co, n.cfg);
+  const read = async (rev: string, template = "commit_id") => (await run(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", template])).trim();
+  await writeFile(`${co}/c`, "c\n");
+  await run(["commit", "-m", "C"]);
+  const cli = (args: string[]) => meddle(args, { HOME: n.home, MEDDLE_DATA_DIR: n.cfg.dataDir, MEDDLE_PORT: port, PATH }, co);
+  return {
+    n, co, cli, run, read, P: await read("main"), C: await read("@-"), Cid: await read("@-", "change_id.short(12)"),
+    close: async () => { await dashboard.stop(); await close(); },
+  };
+}
+
+/** The id `task new` printed. */
+const taskIdOf = (stdout: string) => /task (\S+) on/.exec(stdout)![1]!;
+
+/** A manifest's bases, by project name. */
+const basesOf = (n: GitPoolNode, id: string) =>
+  (JSON.parse(getTask(n.db, id)!.manifest) as { projects: Array<{ name: string; base: string[] }> }).projects.map((p) => [p.name, p.base]);
+
+test("task new in a checkout starts on the fork point of its @, which is immutable in the checkout when the command returns", async () => {
+  const c = await checkoutNode();
+  try {
+    expect(await c.read(`${c.C} & immutable()`)).toBe("");
+    const out = await c.cli(["task", "new", "--title", "t", "--project", "a", "--here"]);
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    const id = taskIdOf(out.stdout);
+    expect(basesOf(c.n, id)).toEqual([["a", [c.C]]]);
+    // The task's line, fetched back: C is read-only in the checkout now.
+    expect(await c.read(`${c.C} & immutable()`)).toBe(c.C);
+    expect(await c.read(`meddle/task/${id}/a@meddle`)).toBe(c.C);
+    // On the node, the task's workspace is a new change on C.
+    const { jj } = await import("../src/jj");
+    expect(await jj(["log", "--ignore-working-copy", "-r", "@-", "--no-graph", "-T", "commit_id"], `${paths(c.n.cfg).task(id)}/a`, c.n.cfg)).toBe(c.C);
+  } finally {
+    await c.close();
+  }
+}, 60_000);
+
+test("task new --edit W in a checkout whose @ is an empty child of W: @ moves onto W's parents, and the start's base is W's parents", async () => {
+  const c = await checkoutNode();
+  try {
+    const out = await c.cli(["task", "new", "--title", "t", "--project", "a", "--rev", c.C, "--edit", "--here"]);
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    expect(out.stdout).toStartWith(`moved your empty @ off ${c.Cid}\n`);
+    const id = taskIdOf(out.stdout);
+    expect(basesOf(c.n, id)).toEqual([["a", [c.P]]]);
+    expect(await c.read("@-")).toBe(c.P);
+    expect(await c.read("@ & empty()", "change_id")).not.toBe("");
+    expect(await c.read(`${c.C} & immutable()`)).toBe(c.C);
+    expect(await c.read(`meddle/task/${id}/a@meddle`)).toBe(c.C);
+  } finally {
+    await c.close();
+  }
+}, 60_000);
+
+test("task new --edit W in a checkout: refused while W is the checkout's @ with changes, and while W has another child", async () => {
+  const c = await checkoutNode();
+  try {
+    // @ is W itself, with changes.
+    await c.run(["edit", c.C]);
+    await writeFile(`${c.co}/more`, "more\n");
+    const wc = await c.cli(["task", "new", "--title", "t", "--project", "a", "--rev", "@", "--edit", "--here"]);
+    expect(wc.code).toBe(1);
+    const W = await c.read("@", "change_id.short(12)");
+    expect(wc.stderr).toBe(`meddle: project a: ${W} is default's working copy; move off it first\n`);
+
+    // W with a child D (content), and @ an empty change on D.
+    await c.run(["new", "-m", "D"]);
+    await writeFile(`${c.co}/d`, "d\n");
+    await c.run(["new"]);
+    const top = await c.cli(["task", "new", "--title", "t", "--project", "a", "--rev", W, "--edit", "--here"]);
+    expect(top.code).toBe(1);
+    expect(top.stderr).toBe(`meddle: project a: ${W} has revisions on top of it\n`);
+    expect(listTasks(c.n.db)).toEqual([]);
+  } finally {
+    await c.close();
+  }
+}, 60_000);
+
+test("task new in a checkout with no --project is a task of the checkout's project, started from its @'s fork point", async () => {
+  const c = await checkoutNode();
+  try {
+    const out = await c.cli(["task", "new", "--title", "t", "--here"]);
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    const id = taskIdOf(out.stdout);
+    expect(basesOf(c.n, id)).toEqual([["a", [c.C]]]);
+    expect(await c.read(`meddle/task/${id}/a@meddle`)).toBe(c.C);
+  } finally {
+    await c.close();
+  }
+}, 60_000);
+
+test("task new in a checkout with --rev and --edit but no --project starts the checkout's project there; outside one it is a usage error", async () => {
+  const c = await checkoutNode();
+  try {
+    const child = await c.cli(["task", "new", "--title", "t", "--rev", "main", "--here"]);
+    expect(child.stderr).toBe("");
+    expect(child.code).toBe(0);
+    expect(basesOf(c.n, taskIdOf(child.stdout))).toEqual([["a", [c.P]]]);
+
+    const edit = await c.cli(["task", "new", "--title", "t", "--rev", c.C, "--edit", "--here"]);
+    expect(edit.stderr).toBe("");
+    expect(edit.code).toBe(0);
+    expect(edit.stdout).toStartWith(`moved your empty @ off ${c.Cid}\n`);
+    const id = taskIdOf(edit.stdout);
+    expect(basesOf(c.n, id)).toEqual([["a", [c.P]]]);
+    expect(await c.read(`meddle/task/${id}/a@meddle`)).toBe(c.C);
+
+    // --edit alone still needs --rev.
+    const noRev = await c.cli(["task", "new", "--title", "t", "--edit", "--here"]);
+    expect(noRev.code).toBe(2);
+    expect(noRev.stderr).toBe("meddle: --edit needs --rev\n");
+  } finally {
+    await c.close();
+  }
+}, 60_000);
+
+test("project status prints each branch: its commit, or a conflicted one's siblings and how to resolve it", async () => {
+  const { git } = await import("../src/jj");
+  const { listBranchRows, mergeBranchRows, writeBranchRow } = await import("../src/pool/rows");
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  const dashboard = await startDashboard({ ...n.cfg, port: 0 }, n.host, n.pool);
+  try {
+    const repo = n.project.replica;
+    const main = listBranchRows(n.db, n.project.id, "main")[0]!.commit!;
+    // Two commits on main, pushed as `feature` on two nodes that could not see each other.
+    const commit = async (message: string) => (await git(["commit-tree", `${main}^{tree}`, "-p", main, "-m", message], repo, n.cfg)).trim();
+    const [x, y] = [await commit("x"), await commit("y")].sort() as [string, string];
+    mergeBranchRows(n.db, [{ project: n.project.id, branch: "feature", node: "f".repeat(64), seq: 1, commit: y, drops: [] }]);
+    writeBranchRow(n.db, n.id, { project: n.project.id, branch: "feature", commit: x, drops: [] });
+    const out = await meddle(["project", "status", n.project.name], { HOME: n.home, MEDDLE_DATA_DIR: n.cfg.dataDir, MEDDLE_PORT: new URL(dashboard.url).port });
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    expect(out.stdout).toBe([
+      `main  ${main.slice(0, 12)} (default)`,
+      `feature  conflicted, at its siblings' merge base ${main.slice(0, 12)}`,
+      "feature is conflicted; push a merge of its siblings, or delete the ones you don't want",
+      `  meddle/conflict/feature/${x.slice(0, 12)}@meddle`,
+      `  meddle/conflict/feature/${y.slice(0, 12)}@meddle`,
+      "  to keep your own work: jj bookmark set feature -r <your commit>",
+      "",
+    ].join("\n"));
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);

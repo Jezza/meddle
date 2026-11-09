@@ -20,10 +20,9 @@ export const TaskStateSchema = Type.Union([
 
 export const HandoffModeSchema = Type.Union([Type.Literal("edit"), Type.Literal("child")]);
 
-export const StartSchema = Type.Union([
-  Type.Object({ projectId: Type.String(), kind: Type.Literal("line"), mode: HandoffModeSchema, commit: Type.String(), base: Type.String() }),
-  Type.Object({ projectId: Type.String(), kind: Type.Literal("sync"), branch: Type.String() }),
-]);
+export const StartSchema = Type.Object({
+  projectId: Type.String(), mode: HandoffModeSchema, commit: Type.String(), base: Type.Array(Type.String()),
+});
 
 export const TaskManifestSchema = Type.Object({
   id: Type.String(),
@@ -35,8 +34,9 @@ export const TaskManifestSchema = Type.Object({
     replica: Type.String(),
     workspace: Type.String(),
     parent: Type.String(),
-    /** Absent from an older node's manifest. */
-    base: Type.Optional(Type.String()),
+    base: Type.Array(Type.String()),
+    /** The project's context.toml as the task's start had it; null for none. */
+    context: Nullable(Type.String()),
   })),
   /** Null for a task without a project. */
   primaryProjectId: Nullable(Type.String()),
@@ -86,22 +86,17 @@ export const ProjectSchema = Type.Object({
   replica: Type.String(),
   /** The node id of the project's home. */
   home: Type.String(),
-  /** The project's sync branches, in order: the bookmarks a task can start from. */
-  sync: Type.Array(Type.String()),
-  /** Whether its default start is its first sync branch (added from an upstream URL on its home). */
-  upstream: Type.Optional(Type.Boolean()),
+  /** The branch a task starts from when it names no revision; null for none (absent from an older node). */
+  defaultBranch: Type.Optional(Nullable(Type.String())),
 });
 
-/**
- * A project as another node sees it. `upstream`: whether its default start is its first sync branch (added from an
- * upstream URL on its home). A node of an older meddle sends neither `sync` nor `upstream` (read as none, and false).
- */
+/** A project as another node sees it. */
 export const ProjectInfoSchema = Type.Object({
   id: Type.String(),
   name: Type.String(),
   home: Type.String(),
-  sync: Type.Optional(Type.Array(Type.String())),
-  upstream: Type.Optional(Type.Boolean()),
+  /** The branch a task starts from when it names no revision, and the view's `HEAD`; absent from an older node. */
+  defaultBranch: Type.Optional(Nullable(Type.String())),
 });
 
 export const EventSchema = Type.Object({ seq: Type.Number(), message: Type.Unknown() });
@@ -141,9 +136,9 @@ const nodeState = {
 const nodeMethods = {
   /**
    * Creates a task on the node `node` names: absent or null, the one placement picks (`place`); `"here"`, this node;
-   * else that node id, a member of the pool. It mints the task's id, asks each project's home for its start, and creates
-   * the task there from those starts; when a start or the creation certainly failed, the lines already written are
-   * released. `prompt`, when given, starts its first turn there. `title` absent or
+   * else that node id, a member of the pool. It mints the task's id, resolves each project's start here (`startAt`,
+   * which writes the task's line row), and creates the task there from those starts; when a start or the creation
+   * certainly failed, the line rows already written are released. `prompt`, when given, starts its first turn there. `title` absent or
    * blank: Haiku's title for the prompt, else its first line, or two adjectives and a noun (`taskTitle`). Answers the manifest and the node the
    * task is on.
    */
@@ -151,23 +146,25 @@ const nodeMethods = {
     Type.Object({
       title: Type.Optional(Type.String()),
       /**
-       * The task's projects, the first the primary, each starting where its home resolves (`PeerObject.startAt`): at
-       * `rev` (`child` mode unless `mode` says `edit`), or, without one, at its default start.
+       * The task's projects, the first the primary, each starting where this node resolves (`startAt`): at `rev`
+       * (`child` mode unless `mode` says `edit`), or, without one, at its default branch. `checkout` is the path of the
+       * user's checkout `task new` ran in, which pushed `rev` (a commit id) to this node and checked it there.
        */
       projects: Type.Array(Type.Object({
         id: Type.String(),
         rev: Type.Optional(Type.String()),
         mode: Type.Optional(HandoffModeSchema),
+        checkout: Type.Optional(Type.String()),
       })),
       prompt: Type.Optional(Nullable(Type.String())),
       node: Type.Optional(Nullable(Type.String())),
     }),
     Type.Object({ manifest: TaskManifestSchema, nodeId: Type.String() }),
   ),
-  addProjectFromFolder: method(Type.Object({ path: Type.String(), name: Type.Optional(Type.String()), sync: Type.Optional(Type.Array(Type.String())) }), ProjectSchema),
-  addProjectFromUpstream: method(Type.Object({ url: Type.String(), name: Type.Optional(Type.String()), sync: Type.Optional(Type.Array(Type.String())) }), ProjectSchema),
-  /** Replaces the sync branches of project `projectId`, homed on this node (`not the home of <project>` otherwise). */
-  setProjectSync: method(Type.Object({ projectId: Type.String(), sync: Type.Array(Type.String()) }), ProjectSchema),
+  addProjectFromFolder: method(Type.Object({ path: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
+  addProjectFromUpstream: method(Type.Object({ url: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
+  /** Sets the default branch of project `projectId` on this node (`no project <short id>` when it has none). */
+  setDefaultBranch: method(Type.Object({ projectId: Type.String(), branch: Type.String() }), ProjectSchema),
   dismiss: method(Type.Object({ id: Type.String() })),
 };
 
@@ -196,6 +193,18 @@ export const NodeStore = local("meddle.node-store", {
 /** A bookmark of a project's replica: local (`remote` null) or a remote's; a conflicted one has `changeId` "". */
 export const HeadSchema = Type.Object({ name: Type.String(), remote: Nullable(Type.String()), changeId: Type.String(), conflicted: Type.Boolean() });
 
+/**
+ * A shared branch of a project as its node computes it from every node's rows (`ProjectBranch`): `single` at `commit`;
+ * `conflicted`, its `siblings` the heads concurrent pushes left, served at `commit`, their merge base (null when they
+ * share no history); `fetching` while a commit its rows name is not on the node yet.
+ */
+export const BranchSchema = Type.Object({
+  name: Type.String(),
+  state: Type.Union([Type.Literal("single"), Type.Literal("conflicted"), Type.Literal("fetching")]),
+  commit: Nullable(Type.String()),
+  siblings: Type.Array(Type.String()),
+});
+
 export const ProjectObject = remote("meddle.project", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
@@ -210,6 +219,8 @@ export const ProjectObject = remote("meddle.project", {
          * changes state, and every 60 s.
          */
         heads: Type.Array(HeadSchema),
+        /** The project's branches, by name: re-computed when its branch rows change, and every 60 s. */
+        branches: Type.Array(BranchSchema),
       },
     },
   },
@@ -245,6 +256,11 @@ export const TaskObject = remote("meddle.task", {
         movedTo: Nullable(Type.String()),
         /** The node an `archived` task was archived on (its archive is there); null for any other. */
         archivedOn: Nullable(Type.String()),
+        /**
+         * Whether the task's work is accepted, as its node last checked: a pushed branch contains its line for every
+         * project of it (`accepted`: archived once idle), for some only (`partly`), or for none (`no`).
+         */
+        acceptance: Type.Union([Type.Literal("accepted"), Type.Literal("partly"), Type.Literal("no")]),
         /**
          * Every local bookmark under the task's namespace, per project (its id) in the manifest's order: the project's
          * own and the side bookmarks. Re-read like `ProjectObject.heads`: when projects change, when the task changes
@@ -286,8 +302,8 @@ export const TaskObject = remote("meddle.task", {
         /** Makes the task's move, while it waits for the running turn, interrupt the turn ("move now") instead. */
         moveNow: method(Type.Object({})),
         /**
-         * Archives the idle task on its node: its folder goes, its rows stay, and on a node that is not a project's
-         * home the task's bookmarks are pushed to the home first. Rejects with the reason when refused.
+         * Archives the idle task on its node: its folder goes, its rows stay, and its lines stay as rows held by that
+         * node, archived. Rejects with the reason when refused.
          */
         archive: method(Type.Object({})),
         /**
@@ -444,6 +460,36 @@ export const TokenMetaSchema = Type.Object({
   expiresAt: Type.String(),
 });
 
+/**
+ * Where a task's line points, as pool sync carries it (`LineRow` in src/pool/rows.ts): `commit` null is released.
+ * Plain numbers, so that a row with a seq that is not an integer is dropped by `mergeLineRows` rather than failing the
+ * whole state.
+ */
+export const LineRowSchema = Type.Object({
+  project: Type.String(),
+  task: Type.String(),
+  name: Type.String(),
+  holder: Type.String(),
+  epoch: Type.Number(),
+  seq: Type.Number(),
+  commit: Nullable(Type.String()),
+  base: Type.Array(Type.String()),
+  archived: Type.Boolean(),
+});
+
+/**
+ * Where a node puts a branch, as pool sync carries it (`BranchRow` in src/pool/rows.ts): `commit` null is deleted,
+ * `drops` the `(node, seq)` rows it replaced. Plain numbers, as `LineRowSchema`.
+ */
+export const BranchRowSchema = Type.Object({
+  project: Type.String(),
+  branch: Type.String(),
+  node: Type.String(),
+  seq: Type.Number(),
+  commit: Nullable(Type.String()),
+  drops: Type.Array(Type.Object({ node: Type.String(), seq: Type.Number() })),
+});
+
 export const PoolNodeSchema = Type.Object({
   nodeId: Type.String(),
   hostname: Type.String(),
@@ -490,11 +536,12 @@ export const PeerObject = remote("meddle.peer", {
         /** The project with this id, or null when this node does not hold it. */
         projectInfo: method(Type.Object({ id: Type.String() }), Nullable(ProjectInfoSchema)),
         /**
-         * Prepares to receive a task from the caller: fetches its bookmarks from the caller and provisions it as
+         * Prepares to receive a task from the caller: merges the task's line rows the caller sends (`lineRows`, its
+         * last write of them), sets the task's bookmarks from them (their commits fetched by id) and provisions it as
          * `receiving`. `ok: false` says why it was refused (versions, no task root, a task already here, …).
          */
         receiveTask: method(
-          Type.Object({ manifest: TaskManifestSchema, claudeCodeVersion: Type.String() }),
+          Type.Object({ manifest: TaskManifestSchema, claudeCodeVersion: Type.String(), lineRows: Type.Array(LineRowSchema) }),
           Type.Object({ ok: Type.Boolean(), reason: Type.Optional(Type.String()) }),
         ),
         /** Makes a task received from the caller live here, running `followUp` and its queued prompts one turn each. */
@@ -502,40 +549,24 @@ export const PeerObject = remote("meddle.peer", {
         /** Removes a task still being received from the caller. */
         abandonTask: method(Type.Object({ taskId: Type.String() })),
         /**
-         * Creates task `taskId` here for the caller (a member; anyone else is refused `forbidden`) from the starts its
-         * projects' homes resolved, then starts its first turn with `prompt` when one is given. Refused like a local
+         * Creates task `taskId` here for the caller (a member; anyone else is refused `forbidden`) from the starts the
+         * caller resolved, then starts its first turn with `prompt` when one is given. Refused like a local
          * create: no task root, no usable token, a task `taskId` already here, ….
          */
         createTaskAt: method(
           Type.Object({ title: Type.String(), taskId: Type.String(), starts: Type.Array(StartSchema), prompt: Nullable(Type.String()) }),
           Type.Object({ manifest: TaskManifestSchema }),
         ),
+        /**
+         * Every line row and branch row this node holds of project `projectId` (a member only; `forbidden` otherwise):
+         * what a node catching up on one project asks each peer, rather than waiting for pool sync.
+         */
+        rowsOf: method(
+          Type.Object({ projectId: Type.String() }),
+          Type.Object({ lineRows: Type.Array(LineRowSchema), branchRows: Type.Array(BranchRowSchema) }),
+        ),
         /** Whether this node has task `id` (a `moved` row, left by a task that went on, is not having it). */
         taskHeld: method(Type.Object({ id: Type.String() }), Type.Boolean()),
-        /**
-         * On the home of project `projectId`, releases every line of task `taskId` whose name is not in `keep` (a member
-         * only; `forbidden` otherwise) and returns the names released; refused `not the home of <project>` on any other
-         * node, and `invalid task id: <id>` for an id that is not one safe path segment.
-         */
-        releaseLines: method(
-          Type.Object({ projectId: Type.String(), taskId: Type.String(), keep: Type.Array(Type.String()) }),
-          Type.Object({ released: Type.Array(Type.String()) }),
-        ),
-        /**
-         * On the home of project `projectId` (a member only; `forbidden` otherwise), resolves where task `taskId`
-         * starts in it: `rev` (null: the default start) taken as `mode`. A line start writes the task's line there.
-         * Refused with the reason when the start cannot be made, `invalid task id: <id>` for an id that is not one safe
-         * path segment, and `a task's start is resolved on its project's home, <short id>` on any other node.
-         */
-        startAt: method(
-          Type.Object({
-            projectId: Type.String(),
-            taskId: Type.String(),
-            rev: Nullable(Type.String()),
-            mode: HandoffModeSchema,
-          }),
-          StartSchema,
-        ),
       },
     },
   },
@@ -602,6 +633,9 @@ export const PoolObject = remote("meddle.pool", {
         /** Every token row, removed ones included, so that a removal replicates. */
         tokens: Type.Array(TokenMetaSchema),
         settings: Type.Array(SettingRowSchema),
+        /** Every line row and every branch row this node holds, of every project. */
+        lineRows: Type.Array(LineRowSchema),
+        branchRows: Type.Array(BranchRowSchema),
       },
       methods: {
         /** The value of a token this node lists (not removed); refuses non-members and any other id. */

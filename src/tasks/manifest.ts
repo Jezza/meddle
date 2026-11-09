@@ -14,10 +14,15 @@ export type ManifestProject = {
   /** The revision the workspace was made on here: the commit its start named. */
   parent: string;
   /**
-   * The commit the task's work is measured from: its workspace may rewrite nothing at or below it
-   * (`scopeWorkspace`). Its start's base: a `line` start's `base`, a `sync` start's commit.
+   * The commits the task's work is measured from: its workspace may rewrite nothing at or below them
+   * (`scopeWorkspace`). Its start's `base`: the revision itself for a child start, its parents for an edit start.
    */
-  base: string;
+  base: string[];
+  /**
+   * The project's `.meddle/context.toml` as the task's start commit had it (null for none), captured as the task was
+   * created so that its agent cannot loosen it.
+   */
+  context: string | null;
 };
 
 export type TaskManifest = {
@@ -30,30 +35,20 @@ export type TaskManifest = {
   createdAt: string;
 };
 
-/**
- * A manifest as another node sends it, or as a row written before meddle recorded bases holds it: a project may lack
- * its `base`, resolved from its `parent` then.
- */
-export type ReceivedManifest = Omit<TaskManifest, "projects"> & {
-  projects: Array<Omit<ManifestProject, "base"> & { base?: string }>;
-};
-
 /** How a task takes a revision it starts at: `edit` works on it in place, `child` on a new change on top of it. */
 export type HandoffMode = "edit" | "child";
 
 /**
- * Where one project of a task starts, as the project's home resolved it (commit ids): a `line` start at a revision
- * (its line is written at `commit`; `base` is the commit the task's work is measured from), or a `sync` start from one
- * of the project's sync branches, which writes no line.
+ * Where one project of a task starts, as the node asked resolved it (commit ids): the task's line is written at
+ * `commit`, and `base` are the commits the task's work is measured from (`[commit]` in `child` mode, its parents in
+ * `edit` mode).
  */
-export type Start =
-  | { projectId: string; kind: "line"; mode: HandoffMode; commit: string; base: string }
-  | { projectId: string; kind: "sync"; branch: string };
+export type Start = { projectId: string; mode: HandoffMode; commit: string; base: string[] };
 
 /**
  * Every bookmark of task `taskId` is under `meddle/task/<taskId>/`: its project's bookmark `<project name>` and the
- * side bookmarks the agent names `<project name>.<label>`. All of them are pushed to the home, travel on a move and
- * are forgotten together.
+ * side bookmarks the agent names `<project name>.<label>`. Each is one of its line rows (`writeLineRows`), all travel
+ * on a move, and they are forgotten together.
  */
 export function taskNamespace(taskId: string): string {
   return `meddle/task/${taskId}/`;

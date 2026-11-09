@@ -12,22 +12,26 @@ import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { peerOf, remoteReason, servePool } from "../pool/object";
 import type { PoolRuntime } from "../pool/runtime";
 import { acceptPeerLinks } from "../pool/sync";
+import { branchChanges, listBranchRows, listLineRows } from "../pool/rows";
 import { bookmarkList } from "../jj";
-import { loadContext } from "../projects/context";
-import { releaseLines } from "../projects/lines";
-import { releaseStarts, resolveStarts, startAt } from "../projects/starts";
-import { repoKey, serialised } from "../serial";
-import { addProjectFromFolder, addProjectFromUpstream, checkSyncNames, getProject, listProjects, projectChanges, setProjectSync, type Project } from "../projects/project";
+import { projectBranches } from "../projects/applier";
+import { loadBranchContext } from "../projects/context";
+import { releaseLineRows } from "../projects/lines";
+import { resolveStarts } from "../projects/starts";
+import {
+  addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, setDefaultBranch,
+  type Project,
+} from "../projects/project";
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
-import { claimHomelessProjects, getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
+import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
-import { taskNamespace, type ReceivedManifest, type Start, type TaskManifest } from "../tasks/manifest";
+import { taskNamespace, type Start, type TaskManifest } from "../tasks/manifest";
 import { taskTitle } from "../tasks/names";
-import { SAFE_ID } from "../tasks/provision";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { VERSION } from "../version";
 import {
+  BranchSchema,
   HeadSchema,
   isProgress,
   NodeObject,
@@ -63,6 +67,8 @@ type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
 const NOTIFICATIONS_KEPT = 50;
 /** How often a `ProjectObject` re-reads its replica's bookmarks when nothing told it they changed (pushes from peers). */
 const HEADS_REFRESH_MS = 60_000;
+/** How often a project's branches are read again while one waits for its commits to arrive. */
+const FETCHING_REFRESH_MS = 5000;
 const WINDOW_SIZE = 200;
 
 export type PeerObjectDeps = {
@@ -83,8 +89,8 @@ export type PeerObjectDeps = {
 };
 
 /** A project as another node sees it. */
-function projectInfo(p: Project): { id: string; name: string; home: string; sync: string[]; upstream: boolean } {
-  return { id: p.id, name: p.name, home: p.home, sync: p.sync, upstream: p.upstream };
+function projectInfo(p: Project): { id: string; name: string; home: string; defaultBranch: string | null } {
+  return { id: p.id, name: p.name, home: p.home, defaultBranch: p.defaultBranch };
 }
 
 /** Serves `PeerObject` on `host` to `peer:<nodeId>` principals; anyone else is refused `forbidden`. */
@@ -117,31 +123,22 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         const found = getProject(db, id);
         return found === null ? null : projectInfo(found);
       },
-      receiveTask: async ({ manifest, claudeCodeVersion }, ctx) => {
-        const result = await deps.runner.receiveTask(manifest, from, claudeCodeVersion);
+      receiveTask: async ({ manifest, claudeCodeVersion, lineRows }, ctx) => {
+        const result = await deps.runner.receiveTask(manifest, from, claudeCodeVersion, lineRows);
         await refreshHostsTasks(ctx);
         return result;
       },
       activateTask: ({ taskId, followUp }) => deps.runner.activateTask(taskId, from, followUp),
       abandonTask: ({ taskId }) => deps.runner.abandonTask(taskId, from),
+      rowsOf: ({ projectId }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return { lineRows: listLineRows(db, projectId), branchRows: listBranchRows(db, projectId) };
+      },
       taskHeld: ({ id }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
         // A `moved` row is what a task that went on left here: it holds nothing.
         const row = getTask(db, id);
         return row !== null && row.state !== "moved";
-      },
-      releaseLines: async ({ projectId, taskId, keep }) => {
-        if (!deps.isMember(from)) throw forbidden("members only");
-        // It goes into a jj pattern: never a glob naming other tasks' lines.
-        if (!SAFE_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
-        const project = getProject(db, projectId);
-        if (project === null || project.home !== deps.selfId) throw new Error(`not the home of ${shortId(projectId)}`);
-        const released = await serialised(repoKey(project.replica), () => releaseLines(deps.cfg, project.replica, taskId, keep));
-        return { released };
-      },
-      startAt: ({ projectId, taskId, rev, mode }) => {
-        if (!deps.isMember(from)) throw forbidden("members only");
-        return startAt(deps, projectId, taskId, rev, mode);
       },
       // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
       createTaskAt: async ({ title, taskId, starts, prompt }) => {
@@ -183,12 +180,11 @@ function latest<T>(read: () => Promise<T>, cell: { readonly value: T; replace(ct
 
 /**
  * A host named `node` serving `NodeObject`, `ProjectObject`, `TaskObject`, `SessionObject`, `PoolObject` and
- * `PeerObject`. Projects from before projects had a home get this node as theirs. The runner is given the pool (a
- * no-op when it was built with it), so tasks created here replicate projects homed elsewhere.
+ * `PeerObject`. The runner is given the pool (a no-op when it was built with it), so tasks created here replicate
+ * projects homed elsewhere.
  */
 export function createNodeHost(deps: NodeHostDeps): Host {
   const { cfg, db, runner, metrics, pool } = deps;
-  claimHomelessProjects(db, pool.identity.id);
   runner.attachPool(pool);
   const approvals = runner.approvals;
   const events: Subscribable<TaskEvent> = {
@@ -203,6 +199,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const queuedChanges: Subscribable<{ taskId: string }> = {
     subscribe: (cb) => runner.onQueued((taskId) => cb({ taskId })),
   };
+  const acceptances: Subscribable<{ taskId: string }> = {
+    subscribe: (cb) => runner.onAcceptance((taskId) => cb({ taskId })),
+  };
   const moves: Subscribable<{ taskId: string; move: MoveState | null }> = {
     subscribe: (cb) => runner.onMove((taskId, move) => cb({ taskId, move })),
   };
@@ -212,6 +211,14 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const headTicks: Subscribable<null> = {
     subscribe: (cb) => {
       const timer = setInterval(() => cb(null), HEADS_REFRESH_MS);
+      timer.unref();
+      return () => clearInterval(timer);
+    },
+  };
+
+  const fetchingTicks: Subscribable<null> = {
+    subscribe: (cb) => {
+      const timer = setInterval(() => cb(null), FETCHING_REFRESH_MS);
       timer.unref();
       return () => clearInterval(timer);
     },
@@ -378,12 +385,18 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         const selfId = pool.identity.id;
         const target = node === "here" ? selfId : node ?? await placeTask(projects.map((p) => p.id));
         if (target !== selfId && !pool.store.isMember(target)) throw new Error(`no such node: ${target}`);
-        // Each home writes the line of a start at a revision now, before the task exists (Decision 7): a creation that
-        // certainly failed releases them; one the target may have made all the same (its answer was lost) keeps them
-        // while the target holds the task, for the janitor to release once it is gone from every node.
+        // This node writes each start's line row now, before the task exists: a creation that certainly failed releases
+        // them; one the target may have made all the same (its answer was lost) keeps them while the target holds the
+        // task.
         const taskId = newId();
         const deps = { cfg, db, selfId, pool };
-        const starts = await resolveStarts(deps, taskId, projects);
+        let starts: Start[];
+        try {
+          starts = await resolveStarts(deps, taskId, projects);
+        } catch (err) {
+          releaseLineRows(db, taskId, []);
+          throw err;
+        }
         const text = prompt ?? null;
         if (target === selfId) {
           let manifest: TaskManifest;
@@ -392,7 +405,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           } catch (err) {
             // A task made all the same (a failure after it) keeps its lines.
             if (getTask(db, taskId) !== null) throw err;
-            throw await releaseStarts(deps, taskId, starts, err);
+            releaseLineRows(db, taskId, []);
+            throw err;
           }
           if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
           // The pool sees the new task count now, not at the next periodic refresh.
@@ -407,27 +421,27 @@ export function createNodeHost(deps: NodeHostDeps): Host {
             const held = await heldOn(target, taskId);
             if (held !== false) {
               const why = held ? `${shortId(target)} has task ${taskId} all the same` : `${shortId(target)} may have task ${taskId}`;
-              throw new Error(`${err.message}; ${why}: its lines stay until the janitor releases them`);
+              throw new Error(`${err.message}; ${why}: its lines stay`);
             }
           }
-          throw await releaseStarts(deps, taskId, starts, err);
+          releaseLineRows(db, taskId, []);
+          throw err;
         }
       },
-      addProjectFromFolder: async ({ path, name, sync }, ctx) => {
-        const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name, sync);
+      addProjectFromFolder: async ({ path, name }, ctx) => {
+        const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name);
         projectIds.replace(ctx, projectIdsNow());
         return project;
       },
-      addProjectFromUpstream: async ({ url, name, sync }, ctx) => {
-        const project = await addProjectFromUpstream(cfg, db, url, pool.identity.id, name, sync);
+      addProjectFromUpstream: async ({ url, name }, ctx) => {
+        const project = await addProjectFromUpstream(cfg, db, url, pool.identity.id, name);
         projectIds.replace(ctx, projectIdsNow());
         return project;
       },
-      setProjectSync: async ({ projectId, sync }) => {
-        const held = getProject(db, projectId);
-        if (held === null || held.home !== pool.identity.id) throw new Error(`not the home of ${held?.name ?? shortId(projectId)}`);
-        await checkSyncNames(cfg, sync);
-        return setProjectSync(db, projectId, sync) ?? held;
+      setDefaultBranch: async ({ projectId, branch }) => {
+        const project = setDefaultBranch(db, projectId, branch);
+        if (project === null) throw new Error(`no project ${shortId(projectId)}`);
+        return project;
       },
       dismiss: ({ id }, ctx) => {
         notifications.replace(ctx, notifications.value.filter((n) => n.id !== id));
@@ -460,7 +474,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       createTask: (input, ctx) => store.createTask(input, ctx),
       addProjectFromFolder: (input, ctx) => store.addProjectFromFolder(input, ctx),
       addProjectFromUpstream: (input, ctx) => store.addProjectFromUpstream(input, ctx),
-      setProjectSync: (input, ctx) => store.setProjectSync(input, ctx),
+      setDefaultBranch: (input, ctx) => store.setDefaultBranch(input, ctx),
       dismiss: (input, ctx) => store.dismiss(input, ctx),
     };
   });
@@ -472,7 +486,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         if (found === null) throw new Error(`unknown project: ${id}`);
         let contextLoaded = true;
         try {
-          await loadContext(found.replica);
+          // No task: the project's files as its default branch has them.
+          await loadBranchContext(cfg, found.replica, found.defaultBranch);
         } catch {
           contextLoaded = false;
         }
@@ -499,6 +514,22 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     // Bookmarks a peer pushes into the replica's `.git`, or the user's git, tell nothing: a slow re-read (which imports
     // the git refs first) catches them.
     self.on("ticks", headTicks, (_event, ctx) => refreshHeads(ctx));
+    /** The project's branches as this node computes them; [] while (or whenever) they cannot be read. */
+    const branchesNow = async () => {
+      try {
+        return await projectBranches({ cfg, db }, id);
+      } catch {
+        return [];
+      }
+    };
+    const branches = self.state("branches", Type.Array(BranchSchema), { init: branchesNow });
+    const refreshBranches = latest(branchesNow, branches);
+    self.on("branchRows", branchChanges, (projectId, ctx) => { if (projectId === id) return refreshBranches(ctx); });
+    // A commit the rows name arriving changes no row: a branch still fetching is read again soon, the rest slowly.
+    self.on("fetchingTicks", fetchingTicks, (_event, ctx) => {
+      if (branches.value.some((b) => b.state === "fetching")) return refreshBranches(ctx);
+    });
+    self.on("branchTicks", headTicks, (_event, ctx) => refreshBranches(ctx));
     return {
       variant: "default",
       id: self.derive([project], (p) => p.id),
@@ -506,10 +537,10 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       source: self.derive([project], (p) => p.source),
       replica: self.derive([project], (p) => p.replica),
       home: self.derive([project], (p) => p.home),
-      sync: self.derive([project], (p) => p.sync),
-      upstream: self.derive([project], (p) => p.upstream ?? false),
+      defaultBranch: self.derive([project], (p) => p.defaultBranch ?? null),
       contextLoaded: self.derive([project], (p) => p.contextLoaded),
       heads,
+      branches,
     };
   });
 
@@ -522,6 +553,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const move = self.state("move", members.move, { init: () => runner.moveState(id) });
     const movedTo = self.state("movedTo", members.movedTo, { init: () => getTask(db, id)?.moved_to ?? null });
     const archivedOn = self.state("archivedOn", members.archivedOn, { init: () => archivedOnNow(id) });
+    const acceptance = self.state("acceptance", members.acceptance, { init: () => runner.acceptance(id) });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
     const queued = self.state("queued", members.queued, { init: () => runner.queued(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
@@ -558,6 +590,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     // What the agent bookmarks during a turn, or the user by hand, tells nothing: a slow re-read catches it.
     self.on("ticks", headTicks, (_event, ctx) => refreshBookmarks(ctx));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
+    self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
     self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) queued.replace(ctx, runner.queued(id)); });
     // What changed between the cells' init and the listeners starting.
@@ -566,6 +599,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       move.replace(ctx, runner.moveState(id));
       movedTo.replace(ctx, getTask(db, id)?.moved_to ?? null);
       archivedOn.replace(ctx, archivedOnNow(id));
+      acceptance.replace(ctx, runner.acceptance(id));
       pending.replace(ctx, approvals.pending(id));
       queued.replace(ctx, runner.queued(id));
       refreshRow(ctx);
@@ -592,6 +626,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       move,
       movedTo,
       archivedOn,
+      acceptance,
       bookmarks,
       activityAt,
       prompt: async ({ text }) => ({ queued: (await runner.prompt(id, text)) === "queued" }),
@@ -699,7 +734,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
    */
   async function createOn(
     target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null },
-  ): Promise<ReceivedManifest> {
+  ): Promise<TaskManifest> {
     const peer = await pool.peerRef(target, PeerObject);
     try {
       if (peer.variant !== "peer") throw new Error(`${shortId(target)} did not serve the peer variant of PeerObject`);

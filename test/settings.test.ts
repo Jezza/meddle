@@ -106,7 +106,7 @@ test("env maps jj identity and env.* and apply updates cfg.poolEnv", () => {
   expect(jjEnv(cfg).FOO).toBe("bar");
   const manifest = {
     id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: "p1", createdAt: "",
-    projects: [{ id: "p1", name: "a", replica: "/r/a", workspace: "a", parent: "root()", base: "0000000000000000000000000000000000000000" }],
+    projects: [{ id: "p1", name: "a", replica: "/r/a", workspace: "a", parent: "root()", base: ["0000000000000000000000000000000000000000"], context: null }],
   };
   const input: EngineInput = {
     cfg, manifest, contexts: [], projectSettings: [], token: "tok-a", prompt: (async function* () {})(),

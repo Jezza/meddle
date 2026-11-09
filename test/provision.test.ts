@@ -11,20 +11,40 @@ import { addProjectFromFolder, type Project } from "../src/projects/project";
 import { resolveStarts } from "../src/projects/starts";
 import { newId } from "../src/store/records";
 import { provisionFromManifest, provisionTask, cwdFor, unscopeWorkspace, workspaceImmutableHeads } from "../src/tasks/provision";
-import { initColocated, isJjRepo, jj, workspaceConfigPath } from "../src/jj";
+import { git, gitImport, initColocated, isJjRepo, jj, workspaceConfigPath } from "../src/jj";
 import type { NodeConfig } from "../src/config";
 
 /** The home node id of the projects these tests add. */
 const PROJECT_HOME = "a".repeat(64);
 
-/** A fresh colocated repo at `repo` with a first commit, `@` empty on it: a task of it starts there. */
-async function initCommitted(repo: string): Promise<void> {
+/**
+ * A fresh colocated repo at `repo` with a first commit (a README and `files`, by path), bookmarked `main` (the default
+ * branch): a task of it starts there.
+ */
+async function initCommitted(repo: string, files: Record<string, string> = {}): Promise<void> {
+  const { mkdir, writeFile } = await import("node:fs/promises");
   await initColocated(repo);
-  await (await import("node:fs/promises")).writeFile(`${repo}/README`, "init\n");
+  await writeFile(`${repo}/README`, "init\n");
+  for (const [path, text] of Object.entries(files)) {
+    await mkdir(dirname(`${repo}/${path}`), { recursive: true });
+    await writeFile(`${repo}/${path}`, text);
+  }
   await jj(["commit", "-m", "init"], repo);
+  await jj(["bookmark", "set", "main", "-r", "@-"], repo);
 }
 
 /** Provisions a new task of `projects` (homed on `PROJECT_HOME`), each starting where its home resolves (`startAt`). */
+/** Task `taskId`'s line `name` held elsewhere, as the applier keeps one in `repo`: `task/<id>/<name>@meddle`. */
+async function lineRef(cfg: NodeConfig, repo: string, taskId: string, name: string, commit: string): Promise<void> {
+  await git(["update-ref", `refs/remotes/meddle/task/${taskId}/${name}`, commit], repo, cfg);
+  await gitImport(repo, cfg);
+}
+
+/** Releases task `taskId`'s lines held elsewhere in `repo`, as the applier does: through jj, never a git deletion. */
+async function forgetLines(cfg: NodeConfig, repo: string, taskId: string): Promise<void> {
+  await jj(["--ignore-working-copy", "bookmark", "forget", "--include-remotes", `glob:task/${taskId}/*`], repo, cfg);
+}
+
 async function provision(cfg: NodeConfig, db: Database, title: string, projects: Project[]) {
   const taskId = newId();
   const starts = await resolveStarts({ cfg, db, selfId: PROJECT_HOME }, taskId, projects.map((p) => ({ id: p.id })));
@@ -36,19 +56,23 @@ test("provision creates workspaces, config dir links and CLAUDE.md, seeding the 
   await ensureDataDirs(cfg);
   await (await import("node:fs/promises")).mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(`${home}/data/meddle.sqlite`);
-  const a = `${home}/a`; await initCommitted(a);
+  const a = `${home}/a`; await initCommitted(a, { ".claude/settings.json": '{"env":{"FROM":"project"}}\n' });
   const pa = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   const m = await provision(cfg, db, "t", [pa]);
   const task = paths(cfg).task(m.id);
   expect((await lstat(`${task}/a/.jj`)).isDirectory()).toBe(true);
+  // The project's settings reach the task's workspace through its start revision.
+  expect(await readFile(`${task}/a/.claude/settings.json`, "utf8")).toBe('{"env":{"FROM":"project"}}\n');
   expect(await readlink(`${task}/.meddle/claude/skills`)).toBe(`${paths(cfg).profile}/skills`);
   expect(await readlink(`${task}/.meddle/claude/projects/${pa.id}/memory`)).toBe(paths(cfg).memory(pa.id));
   expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toContain("# Task: t");
   expect(await isJjRepo(paths(cfg).profile)).toBe(true);
-  expect(m.projects[0]).toMatchObject({ id: pa.id, name: "a", replica: a, workspace: "a" });
+  expect(pa.replica).not.toBe(a);
+  expect(m.projects[0]).toMatchObject({ id: pa.id, name: "a", replica: pa.replica, workspace: "a" });
   expect(await Bun.file(`${task}/a/.git`).exists()).toBe(true);
-  expect(await (await import("../src/jj")).jj(["bookmark", "list", `meddle/task/${m.id}/a`], a)).toContain(`meddle/task/${m.id}/a`);
-  expect(cwdFor(m, cfg)).toEqual({ cwd: `${task}/a`, projectConfigRoot: a, settingSources: ["user", "project", "local"] });
+  expect(await (await import("../src/jj")).jj(["bookmark", "list", `meddle/task/${m.id}/a`], pa.replica)).toContain(`meddle/task/${m.id}/a`);
+  // Project settings are read from the task's workspace, not the service repo (whose working copy is empty).
+  expect(cwdFor(m, cfg)).toEqual({ cwd: `${task}/a`, projectConfigRoot: `${task}/a`, settingSources: ["user", "project", "local"] });
   // the transcripts live under .meddle: only this user may read it
   expect((await lstat(`${task}/.meddle`)).mode & 0o777).toBe(0o700);
 });
@@ -99,7 +123,7 @@ test("provision with an unknown project throws and leaves no task folder", async
   await ensureDataDirs(cfg);
   await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(`${home}/data/meddle.sqlite`);
-  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ projectId: "0123456789ab", kind: "sync", branch: "main" }] })).rejects.toThrow(
+  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ projectId: "0123456789ab", mode: "child", commit: "1".repeat(40), base: ["1".repeat(40)] }] })).rejects.toThrow(
     "unknown project: 0123456789ab",
   );
   expect(await readdir(cfg.taskRoot)).toEqual([]);
@@ -121,17 +145,20 @@ test("a provision failing after a workspace exists undoes workspaces, bookmarks 
   const [startA] = await resolveStarts({ cfg, db, selfId: PROJECT_HOME }, taskId, [{ id: pa.id }]);
   const missing = "1".repeat(40);
   await expect(
-    provisionTask(cfg, db, { title: "t", taskId, starts: [startA!, { projectId: pb.id, kind: "line", mode: "child", commit: missing, base: missing }] }),
+    provisionTask(cfg, db, { title: "t", taskId, starts: [startA!, { projectId: pb.id, mode: "child", commit: missing, base: [missing] }] }),
   ).rejects.toThrow(missing);
   expect(await readdir(cfg.taskRoot)).toEqual([]);
-  for (const repo of [a, b]) {
+  for (const repo of [pa.replica, pb.replica]) {
     expect((await jj(["workspace", "list", "-T", 'name ++ "\\n"'], repo)).trim()).toBe("default");
     expect((await jj(["bookmark", "list", "-T", 'name ++ "\\n"'], repo)).trim()).not.toContain("meddle/task/");
   }
   const { listTasks } = await import("../src/store/records");
   expect(listTasks(db)).toEqual([]);
 });
-/** A node in a temp home with project `a` (a folder, its own home) whose repo has a commit `main`; that commit's id. */
+/**
+ * A node in a temp home with project `a` (a folder, its own home) whose default branch `main` is a commit with content;
+ * `a` is the project's service repo, and `main` that commit's id.
+ */
 async function projectWithMain() {
   const { mkdir, writeFile } = await import("node:fs/promises");
   const home = await mkdtemp("/tmp/meddle-prov-");
@@ -145,19 +172,25 @@ async function projectWithMain() {
   await jj(["bookmark", "set", "main", "-r", "@-"], a);
   const main = (await jj(["log", "--ignore-working-copy", "-r", "main", "--no-graph", "-T", "commit_id"], a)).trim();
   const pa = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
-  return { cfg, db, a, pa, main };
+  return { cfg, db, a: pa.replica, pa, main };
 }
 
 test("provision scopes each workspace to its task's line, from its start's base; unscopeWorkspace removes that config", async () => {
   const { cfg, db, a, pa, main } = await projectWithMain();
   const m = await provision(cfg, db, "t", [pa]);
-  expect(m.projects[0]!.base).toBe(main);
+  expect(m.projects[0]!.base).toEqual([main]);
   const workspace = `${paths(cfg).task(m.id)}/a`;
   const immutableHeads = 'revset-aliases."immutable_heads()"';
-  const scoped = workspaceImmutableHeads(m.id, main);
-  expect(scoped).toBe(`present(${main}) | untracked_remote_bookmarks(~glob:"task/${m.id}/*", remote=exact:"meddle")`);
+  const scoped = workspaceImmutableHeads(m.id, [main]);
+  expect(scoped).toBe(
+    `present(${main}) | (bookmarks() ~ bookmarks(glob:"meddle/task/${m.id}/*")) | untracked_remote_bookmarks(~glob:"task/${m.id}/*", remote=exact:"meddle")`,
+  );
+  // One `present` for each base commit.
+  expect(workspaceImmutableHeads("t", ["b1", "b2"])).toBe(
+    `present(b1) | present(b2) | (bookmarks() ~ bookmarks(glob:"meddle/task/t/*")) | untracked_remote_bookmarks(~glob:"task/t/*", remote=exact:"meddle")`,
+  );
   expect((await jj(["config", "get", immutableHeads], workspace, cfg)).trim()).toBe(scoped);
-  // The user's own workspace keeps jj's default.
+  // The service repo's own workspace keeps jj's default.
   expect(await jj(["config", "get", immutableHeads], a, cfg).catch(() => "")).not.toContain(m.id);
   const file = await workspaceConfigPath(workspace, cfg);
   expect(await Bun.file(file).text()).toContain(scoped);
@@ -191,14 +224,13 @@ test("unscopeWorkspace of a workspace whose folder is gone still removes its jj 
 test("the agent's jj, in the environment meddle gives its Claude Code, reads its workspace's config: it may describe its line's head", async () => {
   const { mkdtemp: tempDir } = await import("node:fs/promises");
   const { buildEnv } = await import("../src/engine/options");
-  const { writeLine } = await import("../src/projects/lines");
   const { cfg, db, a, pa } = await projectWithMain();
   // The preload's own config dir, not `~/.config`: where meddle's jj wrote the workspace's config.
   expect(process.env.XDG_CONFIG_HOME).toStartWith(tmpdir());
   const m = await provision(cfg, db, "t", [pa]);
   const workspace = `${paths(cfg).task(m.id)}/a`;
   const head = (await jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"], workspace, cfg)).trim();
-  await writeLine(cfg, a, m.id, "a", head);
+  await lineRef(cfg, a, m.id, "a", head);
   const env = buildEnv({
     cfg, manifest: m, contexts: [], projectSettings: [], token: "tok", prompt: (async function* () {})(),
     canUseTool: async () => ({ behavior: "deny" as const, message: "x" }), onPermissionDenied: () => {}, sessionStore: {} as never,
@@ -219,56 +251,76 @@ test("the agent's jj, in the environment meddle gives its Claude Code, reads its
 });
 
 test("a task's workspace may not rewrite a commit another task's line also holds; alone on it, its own line's head it may", async () => {
-  const { writeLine, releaseLines } = await import("../src/projects/lines");
   const { cfg, db, a, pa } = await projectWithMain();
   const m = await provision(cfg, db, "t", [pa]);
   const workspace = `${paths(cfg).task(m.id)}/a`;
   await (await import("node:fs/promises")).writeFile(`${workspace}/work`, "work\n");
   const head = (await jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"], workspace, cfg)).trim();
-  await writeLine(cfg, a, m.id, "a", head);
+  await lineRef(cfg, a, m.id, "a", head);
   // Another task's line on the same commit (a child start at this task's line head).
-  await writeLine(cfg, a, "othertask", "a", head);
+  await lineRef(cfg, a, "othertask", "a", head);
   const describe = () => jj(["describe", "-r", head, "-m", "by the agent"], workspace, cfg);
   await expect(describe()).rejects.toThrow(`Commit ${head.slice(0, 12)} is immutable`);
-  await releaseLines(cfg, a, "othertask", []);
+  await forgetLines(cfg, a, "othertask");
   await describe();
   expect((await jj(["log", "-r", "@", "--no-graph", "-T", "description"], workspace, cfg)).trim()).toBe("by the agent");
 });
 
-test("a received manifest keeps its projects' base; one without (an older node's) takes the root commit, whatever its parent names", async () => {
+test("a task's workspace may not rewrite a branch nor another local task's line; its own line's head it may, by its bookmark or its remote ref alone", async () => {
+  const { writeFile } = await import("node:fs/promises");
   const { cfg, db, a, pa } = await projectWithMain();
-  const m = await provision(cfg, db, "t", [pa]);
-  const root = "0".repeat(40);
-  const { base: _, ...older } = m.projects[0]!;
-  const fromOlder = await provisionFromManifest(cfg, db, { ...m, id: "0123456789ab", projects: [{ ...older, parent: "main" }] }, { [pa.id]: "@" }, "idle");
-  expect(fromOlder.projects[0]!.base).toBe(root);
-  expect(fromOlder.projects[0]!.parent).toBe("@");
-  // A main-era task created off its home, moved or restored onto it: its parent names a remote the home does not have.
-  const head = (await jj(["log", "--ignore-working-copy", "-r", "main", "--no-graph", "-T", "commit_id"], a, cfg)).trim();
-  const fromTrunk = await provisionFromManifest(
-    cfg, db, { ...m, id: "0123456789ac", projects: [{ ...older, parent: `trunk@${PROJECT_HOME.slice(0, 10)}` }] }, { [pa.id]: head }, "idle",
-  );
-  expect(fromTrunk.projects[0]!.base).toBe(root);
-  const trunkWorkspace = `${paths(cfg).task("0123456789ac")}/a`;
-  expect((await jj(["config", "get", 'revset-aliases."immutable_heads()"'], trunkWorkspace, cfg)).trim()).toBe(workspaceImmutableHeads("0123456789ac", root));
-  // Its earlier work, below the commit it arrived at, stays its own to rewrite (once task m's line no longer holds it).
-  const { releaseLines } = await import("../src/projects/lines");
-  await releaseLines(cfg, a, m.id, []);
-  await jj(["describe", "-r", head, "-m", "reworded by the agent"], trunkWorkspace, cfg);
-  const kept = await provisionFromManifest(cfg, db, { ...m, id: "ba9876543210", projects: [{ ...m.projects[0]!, base: "0".repeat(40) }] }, { [pa.id]: "main" }, "idle");
-  expect(kept.projects[0]!.base).toBe("0".repeat(40));
-  // A base is a commit id, never anything else jj would read as a revset.
-  await expect(provisionFromManifest(cfg, db, { ...m, id: "abababababab", projects: [{ ...m.projects[0]!, base: "all()" }] }, { [pa.id]: "main" }, "idle"))
-    .rejects.toThrow("invalid base: all()");
-  const workspace = `${paths(cfg).task("ba9876543210")}/a`;
-  expect((await jj(["config", "get", 'revset-aliases."immutable_heads()"'], workspace, cfg)).trim()).toBe(workspaceImmutableHeads("ba9876543210", "0".repeat(40)));
+  const mine = await provision(cfg, db, "mine", [pa]);
+  const other = await provision(cfg, db, "other", [pa]);
+  const workspace = `${paths(cfg).task(mine.id)}/a`;
+  const otherWorkspace = `${paths(cfg).task(other.id)}/a`;
+  const commitAt = async (repo: string, rev: string) => (await jj(["log", "-r", rev, "--no-graph", "-T", "commit_id"], repo, cfg)).trim();
+  // `main` moves on past the task's base, as a branch does: a branch, not only the base, is not the task's.
+  await jj(["--ignore-working-copy", "new", "--no-edit", "main", "-m", "next"], a, cfg);
+  await jj(["--ignore-working-copy", "bookmark", "set", "main", "-r", 'children(main) & description(exact:"next\n")'], a, cfg);
+  expect(await commitAt(a, "main")).not.toBe(mine.projects[0]!.base);
+  await expect(jj(["describe", "main", "-m", "by the agent"], workspace, cfg)).rejects.toThrow("immutable");
+  // The other task's line, a local bookmark here.
+  await writeFile(`${otherWorkspace}/work`, "work\n");
+  const otherHead = await commitAt(otherWorkspace, "@");
+  await jj(["--ignore-working-copy", "bookmark", "set", `meddle/task/${other.id}/a`, "-r", otherHead], a, cfg);
+  await expect(jj(["describe", "-r", otherHead, "-m", "by the agent"], workspace, cfg)).rejects.toThrow("immutable");
+
+  // Its own line's head, by its local bookmark.
+  await writeFile(`${workspace}/work`, "work\n");
+  const head = await commitAt(workspace, "@");
+  await jj(["--ignore-working-copy", "bookmark", "set", `meddle/task/${mine.id}/a`, "-r", head], a, cfg);
+  await jj(["describe", "-r", head, "-m", "by the agent"], workspace, cfg);
+  // And by its `task/<id>/a@meddle` alone, as before provisioning or on a receiver before activation.
+  const described = await commitAt(workspace, "@");
+  await jj(["--ignore-working-copy", "bookmark", "forget", `exact:meddle/task/${mine.id}/a`], a, cfg);
+  await lineRef(cfg, a, mine.id, "a", described);
+  await jj(["describe", "-r", described, "-m", "again by the agent"], workspace, cfg);
+  expect((await jj(["log", "-r", "@", "--no-graph", "-T", "description"], workspace, cfg)).trim()).toBe("again by the agent");
 });
 
-test("a task provisioned from a manifest onto its home never snapshots the user's working copy but to add its workspace, nor on a failure", async () => {
+test("a received manifest keeps its projects' base; a base that is not a list of commit ids, or a context that is not text, is refused", async () => {
+  const { cfg, db, pa } = await projectWithMain();
+  const m = await provision(cfg, db, "t", [pa]);
+  const root = "0".repeat(40);
+  const kept = await provisionFromManifest(cfg, db, { ...m, id: "ba9876543210", projects: [{ ...m.projects[0]!, base: [root] }] }, { [pa.id]: "main" }, "idle");
+  expect(kept.projects[0]!.base).toEqual([root]);
+  const workspace = `${paths(cfg).task("ba9876543210")}/a`;
+  expect((await jj(["config", "get", 'revset-aliases."immutable_heads()"'], workspace, cfg)).trim()).toBe(workspaceImmutableHeads("ba9876543210", [root]));
+  // A base is a list of commit ids, never anything else jj would read as a revset.
+  const received = (project: Record<string, unknown>) =>
+    provisionFromManifest(cfg, db, { ...m, id: "abababababab", projects: [{ ...m.projects[0]!, ...project } as never] }, { [pa.id]: "main" }, "idle");
+  await expect(received({ base: ["all()"] })).rejects.toThrow('invalid base: ["all()"]');
+  await expect(received({ base: root })).rejects.toThrow(`invalid base: "${root}"`);
+  await expect(received({ base: undefined })).rejects.toThrow("invalid base");
+  await expect(received({ context: 1 })).rejects.toThrow("invalid context of project a");
+  await expect(received({ context: undefined })).rejects.toThrow("invalid context of project a");
+});
+
+test("a task provisioned from a manifest onto its home never snapshots the service repo's working copy but to add its workspace, nor on a failure", async () => {
   const { chmod, mkdir, readFile: read, writeFile } = await import("node:fs/promises");
   const { cfg, db, a, pa, main } = await projectWithMain();
   const m = await provision(cfg, db, "t", [pa]);
-  // meddle's jj runs with `<data>/bin` first on PATH: a jj there notes each command run in the user's folder.
+  // meddle's jj runs with `<data>/bin` first on PATH: a jj there notes each command run in the service repo.
   const calls = `${cfg.dataDir}/jj-calls`;
   await mkdir(paths(cfg).bin, { recursive: true });
   await writeFile(`${paths(cfg).bin}/jj`, `#!/bin/sh\nif [ "$PWD" = "${a}" ]; then printf '%s' "$*" | tr '\\n' ' ' >> "${calls}"; echo >> "${calls}"; fi\nexec "${Bun.which("jj")}" "$@"\n`);
@@ -357,17 +409,20 @@ test("provision takes each start: a child start on its commit, an edit start edi
   await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(`${home}/data/meddle.sqlite`);
   const read = async (repo: string, rev: string) => (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", "commit_id"], repo)).trim();
-  // Each repo: P, then W with content on it, `@` back on P.
+  // Each service repo: P (the default branch), then W with content on it, `@` back on P.
   const repos: Record<string, { project: Project; P: string; W: string }> = {};
   for (const name of ["a", "b", "c"]) {
-    const repo = `${home}/${name}`;
-    await initCommitted(repo);
-    const P = await read(repo, "@-");
+    const folder = `${home}/${name}`;
+    await initCommitted(folder);
+    const project = await addProjectFromFolder(cfg, db, folder, PROJECT_HOME, name);
+    const repo = project.replica;
+    const P = await read(repo, "main");
+    await jj(["new", P], repo);
     await writeFile(`${repo}/w`, "w\n");
     await jj(["commit", "-m", "W"], repo);
     const W = await read(repo, "@-");
     await jj(["new", P], repo);
-    repos[name] = { project: await addProjectFromFolder(cfg, db, repo, PROJECT_HOME, name), P, W };
+    repos[name] = { project, P, W };
   }
   const { a, b, c } = repos as Record<"a" | "b" | "c", { project: Project; P: string; W: string }>;
   const taskId = newId();
@@ -375,15 +430,14 @@ test("provision takes each start: a child start on its commit, an edit start edi
     title: "t",
     taskId,
     starts: [
-      { projectId: a.project.id, kind: "line", mode: "child", commit: a.W, base: a.W },
-      { projectId: b.project.id, kind: "line", mode: "edit", commit: b.W, base: b.P },
-      { projectId: c.project.id, kind: "sync", branch: "main" },
+      { projectId: a.project.id, mode: "child", commit: a.W, base: [a.W] },
+      { projectId: b.project.id, mode: "edit", commit: b.W, base: [b.P] },
+      { projectId: c.project.id, mode: "child", commit: c.P, base: [c.P] },
     ],
-    synced: { [c.project.id]: c.P },
   });
   const task = paths(cfg).task(taskId);
   expect(m.id).toBe(taskId);
-  expect(m.projects.map((p) => [p.name, p.parent, p.base])).toEqual([["a", a.W, a.W], ["b", b.W, b.P], ["c", c.P, c.P]]);
+  expect(m.projects.map((p) => [p.name, p.parent, p.base])).toEqual([["a", a.W, [a.W]], ["b", b.W, [b.P]], ["c", c.P, [c.P]]]);
   expect(await read(`${task}/a`, "@-")).toBe(a.W);
   expect(await read(`${task}/b`, "@")).toBe(b.W);
   expect(await read(`${task}/c`, "@-")).toBe(c.P);
@@ -391,14 +445,12 @@ test("provision takes each start: a child start on its commit, an edit start edi
   expect(await read(b.project.replica, `meddle/task/${taskId}/b`)).toBe(b.W);
   expect(await read(a.project.replica, `meddle/task/${taskId}/a`)).toBe(await read(`${task}/a`, "@"));
   for (const [name, base] of [["a", a.W], ["b", b.P], ["c", c.P]] as const) {
-    expect((await jj(["config", "get", 'revset-aliases."immutable_heads()"'], `${task}/${name}`, cfg)).trim()).toBe(workspaceImmutableHeads(taskId, base));
+    expect((await jj(["config", "get", 'revset-aliases."immutable_heads()"'], `${task}/${name}`, cfg)).trim()).toBe(workspaceImmutableHeads(taskId, [base]));
   }
 
   // The same id again, an id that is not one path segment, and a start that names no commit id are refused.
-  const start = { projectId: a.project.id, kind: "line" as const, mode: "child" as const, commit: a.W, base: a.W };
+  const start = { projectId: a.project.id, mode: "child" as const, commit: a.W, base: [a.W] };
   await expect(provisionTask(cfg, db, { title: "t", taskId, starts: [start] })).rejects.toThrow(`task ${taskId} exists here`);
   await expect(provisionTask(cfg, db, { title: "t", taskId: "../x", starts: [start] })).rejects.toThrow("invalid task id: ../x");
-  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ ...start, base: "all()" }] })).rejects.toThrow("invalid commit: all()");
-  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ projectId: c.project.id, kind: "sync", branch: "main" }] }))
-    .rejects.toThrow("no commit for the sync start of c");
+  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ ...start, base: ["all()"] }] })).rejects.toThrow("invalid commit: all()");
 });

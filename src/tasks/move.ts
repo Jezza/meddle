@@ -10,9 +10,9 @@ import type { NodeConfig } from "../config";
 import { bookmarkForget } from "../jj";
 import { ensurePrivateDir, paths } from "../paths";
 import { shortId } from "../pool/ids";
+import { listLineRows } from "../pool/rows";
 import type { PeerStream } from "../pool/net";
 import type { PoolRuntime } from "../pool/runtime";
-import { getProject } from "../projects/project";
 import { PeerObject } from "../state/contracts";
 import { clearTaskLog, getTask } from "../store/records";
 import { repoKey, serialised } from "../serial";
@@ -70,18 +70,18 @@ function stopping(runtime: MoveRuntime, context: Context): boolean {
 
 /**
  * Moves a task to another node. `prepare` checks the move again (decision 16), marks the task `moving`, waits for its
- * turn to end (or interrupts it with `now`) and writes the task's line on its homes (`pushTaskLines`, best effort: a
- * home that is offline gets the target's push); `handoff` sets the task bookmarks (and writes the line of a project
- * homed here, which the target fetches), has the target fetch them and provision the task (`receiveTask`), sends the
- * task over a `blob` stream and compares receipts; `commit` activates the task on the
- * target and records it here as `moved`; `cleanup` archives and removes the local copy. A restore-move (`fromArchive`,
- * spec 21.4, decision 8) moves a task archived here: no turn to wait for, the namespace staged from the projects' homes
- * instead of set from a workspace, the archive sent instead of the live task, no follow-up, and the archive kept as the
- * leftover; one that fails leaves the task `archived` here again. A step before `commit` that
- * fails rolls the move back itself (pi-durable faults a throwing phase and runs `abort` only after an abort mark) and
- * ends `failed`. Once the receipt is recorded, only a definite answer from the target rolls back (`activateTask`
- * answering `ok: false` or `forbidden`); without an answer, `commit` keeps asking (2 s doubling to 30 s) while the task
- * stays `moving`, and a restart asks again from the checkpoint. `handoff` and `commit` go on only while the task's row
+ * turn to end (or interrupts it with `now`) and writes the task's lines as rows while this node still holds it
+ * (`writeTaskLines`); `handoff` writes them once more, sends them to the target, which provisions the task from them
+ * (`receiveTask`), sends the task over a `blob` stream and compares receipts; `commit` activates the task on the
+ * target (which takes its lines' rows over, one epoch up) and records it here as `moved`; `cleanup` archives and
+ * removes the local copy. A restore-move (`fromArchive`, spec 21.4, decision 8) moves a task archived here: no turn
+ * to wait for, its lines' archived rows as they are, the archive sent instead of the live task, no follow-up, and the
+ * archive kept as the leftover; one that fails leaves the task `archived` here again. A rollback from `commit` takes
+ * the lines back two epochs up (`failMove`). A step before `commit` that fails rolls the move back itself (pi-durable
+ * faults a throwing phase and runs `abort` only after an abort mark) and ends `failed`. Once the receipt is recorded,
+ * only a definite answer from the target rolls back (`activateTask` answering `ok: false` or `forbidden`); without an
+ * answer, `commit` keeps asking (2 s doubling to 30 s) while the task stays `moving`, and a restart asks again from the
+ * checkpoint. `handoff` and `commit` go on only while the task's row
  * says `moving` (a rerun after a rollback whose end was lost rolls back again). `abort` rolls back unless the target
  * says it has the task, and ends `aborted`; the runner sends one for a move parked before the receipt, once it has
  * made the task live here again, and then `abort` only drops the target's copy.
@@ -100,9 +100,8 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       // Remembered before the interrupt: a rerun after a crash still knows it cut the turn. An archived task has no turn.
       if (!fromArchive) {
         await runner.awaitTurnEnd(taskId, now, context, async () => { await runtime.memo(CUT_MEMO, true, context); });
-        // The task's line reaches its homes while this node still holds it: once the row says `moved`, it never writes.
-        await runner.setTaskBookmarks(JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest);
-        await runner.pushTaskLines(taskId);
+        // The task's lines are written while this node still holds it: once the row says `moved`, it never writes.
+        await runner.writeTaskLines(taskId);
       }
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "handoff" } }), context);
     }),
@@ -114,17 +113,19 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       runner.enterMove(taskId, to, "handoff");
       const fromArchive = task.input.fromArchive ?? false;
       const manifest = JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest;
-      if (fromArchive) {
-        // No workspace to set bookmarks from: the home's copy of the task's namespace is staged here for the target.
-        await runner.stageNamespace(manifest);
-      } else {
-        // Nothing is set or sent under a turn: one that is running here ends first.
+      // A restore-move's task has no workspace: its lines' rows are as its archive left them.
+      if (!fromArchive) {
+        // Nothing is written or sent under a turn: one that is running here ends first.
         await runner.awaitTurnEnd(taskId, false, context, async () => {});
-        await runner.setHandoffBookmarks(manifest);
+        await runner.writeTaskLines(taskId);
       }
+      // The rows as this node last wrote them travel with the request: the target never starts from a stale one.
+      const lineRows = listLineRows(db, undefined, taskId);
       // A rerun of this step finds its partial copy there: the target replaces it.
       // No time limit: the target may clone the project from its home first. A dropped link still fails it at once.
-      const answer = await withPeer(pool, to, context, (peer) => peer.receiveTask({ manifest, claudeCodeVersion: claudeCodeVersion() }), null);
+      const answer = await withPeer(
+        pool, to, context, (peer) => peer.receiveTask({ manifest, claudeCodeVersion: claudeCodeVersion(), lineRows }), null,
+      );
       if (!answer.ok) throw new Error(answer.reason ?? `${shortId(to)} refused the task`);
       const exporter: Exporter = fromArchive
         ? async (send) => exportArchive(cfg, await readArchive(paths(cfg).archiveFile(taskId)), send)
@@ -189,10 +190,10 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
     cleanup: async (task, runtime, context) => {
       const runner = await runnerFor(runtime, context);
       const { taskId, to } = task.input;
-      const { cfg, db, pool, log } = runner.moveDeps();
+      const { cfg, db, log } = runner.moveDeps();
       try {
-        if (task.input.fromArchive ?? false) await removeArchivedCopy(cfg, db, pool.identity.id, taskId);
-        else await removeLocalCopy(cfg, db, pool.identity.id, taskId);
+        if (task.input.fromArchive ?? false) await removeArchivedCopy(cfg, db, taskId);
+        else await removeLocalCopy(cfg, db, taskId);
       } catch (err) {
         if (stopping(runtime, context)) throw err;
         // The task lives on the target; what is left here is only disk space.
@@ -359,21 +360,21 @@ async function reset(s: PeerStream): Promise<void> {
  * (decision 19): `releaseFolder`, then its event and transcript rows. The row stays, `moved`. A rerun finds pieces
  * already gone.
  */
-async function removeLocalCopy(cfg: NodeConfig, db: Database, self: string, taskId: string): Promise<void> {
+async function removeLocalCopy(cfg: NodeConfig, db: Database, taskId: string): Promise<void> {
   const row = getTask(db, taskId);
   if (row === null) return;
   await writeArchive(cfg, db, taskId, paths(cfg).movedFile(taskId));
-  await releaseFolder(cfg, db, self, taskId);
+  await releaseFolder(cfg, db, taskId);
   clearTaskLog(db, taskId, row.session_id);
 }
 
 /**
  * What a restore-move leaves of a task archived here once the target has it: its archive becomes the move's leftover
- * in `<data>/moved/` (kept seven days from now, as a move's), the task bookmarks staged off its projects' homes are
- * forgotten (`releaseFolder`; it has no folder or workspace), and its event and transcript rows go. The row stays,
- * `moved`. A rerun finds pieces already gone.
+ * in `<data>/moved/` (kept seven days from now, as a move's), any task bookmark left here is forgotten
+ * (`releaseFolder`; it has no folder or workspace), and its event and transcript rows go. The row stays, `moved`. A
+ * rerun finds pieces already gone.
  */
-async function removeArchivedCopy(cfg: NodeConfig, db: Database, self: string, taskId: string): Promise<void> {
+async function removeArchivedCopy(cfg: NodeConfig, db: Database, taskId: string): Promise<void> {
   const row = getTask(db, taskId);
   if (row === null) return;
   const p = paths(cfg);
@@ -389,23 +390,22 @@ async function removeArchivedCopy(cfg: NodeConfig, db: Database, self: string, t
     const now = new Date();
     await utimes(moved, now, now);
   }
-  await releaseFolder(cfg, db, self, taskId);
+  await releaseFolder(cfg, db, taskId);
   clearTaskLog(db, taskId, row.session_id);
 }
 
 /**
- * Takes task `taskId`'s folder off this node (`selfId`): removes its workspaces' jj config and forgets them
- * (`dropWorkspace`) and, in each replica of a project whose home is not this node, every bookmark under the task's
- * namespace (on the home they stay, beside the task's line); removes the task folder with its Claude Code config dir.
- * Writes no archive and leaves the rows alone. A task without a row, and pieces already gone, are no-ops.
+ * Takes task `taskId`'s folder off this node: removes its workspaces' jj config and forgets them (`dropWorkspace`)
+ * and, in each project's repo here, every bookmark under the task's namespace (its lines are rows, whose refs the
+ * applier keeps); removes the task folder with its Claude Code config dir. Writes no archive and leaves the rows alone.
+ * A task without a row, and pieces already gone, are no-ops.
  */
-export async function releaseFolder(cfg: NodeConfig, db: Database, selfId: string, taskId: string): Promise<void> {
+export async function releaseFolder(cfg: NodeConfig, db: Database, taskId: string): Promise<void> {
   const row = getTask(db, taskId);
   if (row === null) return;
   const manifest = JSON.parse(row.manifest) as TaskManifest;
   for (const p of manifest.projects) {
     await dropWorkspace(cfg, p.replica, `meddle-${taskId}`, join(paths(cfg).task(taskId), p.workspace));
-    if (getProject(db, p.id)?.home === selfId) continue;
     await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(taskId), cfg)).catch(() => {});
   }
   await rm(paths(cfg).task(taskId), { recursive: true, force: true });

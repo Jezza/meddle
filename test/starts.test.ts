@@ -1,32 +1,38 @@
-// test/starts.test.ts — a project's start resolved on its home: a revision, the fork point of the folder's `@`, or a
-// sync branch; a line start writes the task's line there and never touches the user's working copy.
+// test/starts.test.ts — a project's start resolved on the node asked, where the revision is: a revision of its service
+// repo, one a checkout pushed there, or the project's default branch as its rows compute it; a start writes the task's
+// line row (held by that node, epoch 0) and applies it.
 import { expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
-import { git, jj } from "../src/jj";
-import { shortId } from "../src/pool/identity";
-import { addProjectFromFolder, addProjectFromUpstream, registerReplica } from "../src/projects/project";
-import { startAt } from "../src/projects/starts";
+import { mkdir, writeFile } from "node:fs/promises";
+import { git, initColocated, jj } from "../src/jj";
+import { listLineRows, mergeBranchRows, writeBranchRow } from "../src/pool/rows";
+import { addProjectFromFolder, setDefaultBranch } from "../src/projects/project";
+import { startAt, type StartRequest } from "../src/projects/starts";
 import { startPoolNode, type GitPoolNode } from "./pool-helpers";
 
 /** `template` of `rev` in `repo`, read without a snapshot. */
 const read = async (n: GitPoolNode, repo: string, rev: string, template = "commit_id") =>
   (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", template], repo, n.cfg)).trim();
 
-/** Every line ref the home holds. */
+/** Every line ref the service repo holds. */
 const lineRefs = async (n: GitPoolNode, repo: string) =>
-  (await git(["for-each-ref", "--format=%(refname)", "refs/remotes/meddle/"], repo, n.cfg)).split("\n").filter(Boolean);
+  (await git(["for-each-ref", "--format=%(refname)", "refs/remotes/meddle/task/"], repo, n.cfg)).split("\n").filter(Boolean);
 
-const deps = (n: GitPoolNode) => ({ cfg: n.cfg, db: n.db, selfId: n.id });
+const deps = (n: GitPoolNode) => ({ cfg: n.cfg, db: n.db, selfId: n.id, pool: n.pool });
 
-/** A folder project `a` on a node: P (content) → W (content), with `@` an empty change on P (as after moving off W). */
+/** A start of task `taskId` at `rev` (null: the default branch) in `mode`, asked from no checkout unless given. */
+const start = (n: GitPoolNode, projectId: string, taskId: string, rev: string | null, mode: StartRequest["mode"], checkout: string | null = null) =>
+  startAt(deps(n), { projectId, taskId, rev, mode, checkout });
+
+/**
+ * The node's folder project `a`: in its service repo `repo`, P (content, the default branch `main`) → W (content),
+ * with the service repo's `@` an empty change on P.
+ */
 async function folder() {
   const n = await startPoolNode();
-  const repo = `${n.home}/a`;
-  await Bun.$`mkdir -p ${repo}`;
-  const project = await addProjectFromFolder(n.cfg, n.db, repo, n.id, "a");
-  await writeFile(`${repo}/p`, "p\n");
-  await jj(["commit", "-m", "P"], repo, n.cfg);
-  const P = await read(n, repo, "@-");
+  const project = n.project;
+  const repo = project.replica;
+  const P = await read(n, repo, "main");
+  await jj(["new", P], repo, n.cfg);
   await writeFile(`${repo}/w`, "w\n");
   await jj(["commit", "-m", "W"], repo, n.cfg);
   const W = await read(n, repo, "@-");
@@ -40,11 +46,14 @@ const refusal = async (p: Promise<unknown>): Promise<string> => {
   return (err as Error).message;
 };
 
-test("no revision, `@` empty on P: a child start at P, the line written there", async () => {
+test("no revision: a child start at the default branch; its line row is this node's at epoch 0, applied as the line's ref", async () => {
   const f = await folder();
   try {
-    const start = await startAt(deps(f.n), f.project.id, "t1", null, "child");
-    expect(start).toEqual({ projectId: f.project.id, kind: "line", mode: "child", commit: f.P, base: f.P });
+    const s = await start(f.n, f.project.id, "t1", null, "child");
+    expect(s).toEqual({ projectId: f.project.id, mode: "child", commit: f.P, base: [f.P] });
+    expect(listLineRows(f.n.db, f.project.id)).toEqual([
+      { project: f.project.id, task: "t1", name: "a", holder: f.n.id, epoch: 0, seq: 1, commit: f.P, base: [f.P], archived: false },
+    ]);
     expect(await lineRefs(f.n, f.repo)).toEqual(["refs/remotes/meddle/task/t1/a"]);
     expect(await git(["rev-parse", "refs/remotes/meddle/task/t1/a"], f.repo, f.n.cfg)).toBe(`${f.P}\n`);
   } finally {
@@ -52,86 +61,73 @@ test("no revision, `@` empty on P: a child start at P, the line written there", 
   }
 });
 
-test("no revision, `@` with content: refused, nothing written", async () => {
+test("no revision follows set-default, as the branch's rows have it; refused when no row has the branch", async () => {
   const f = await folder();
   try {
-    await writeFile(`${f.repo}/x`, "x\n");
-    await jj(["describe", "-m", "X"], f.repo, f.n.cfg);
-    expect(await refusal(startAt(deps(f.n), f.project.id, "t1", null, "child"))).toBe("@ has changes; move off it first");
+    writeBranchRow(f.n.db, f.n.id, { project: f.project.id, branch: "dev", commit: f.W, drops: [] });
+    setDefaultBranch(f.n.db, f.project.id, "dev");
+    expect(await start(f.n, f.project.id, "t1", null, "child")).toMatchObject({ commit: f.W, base: [f.W] });
+    setDefaultBranch(f.n.db, f.project.id, "nope");
+    expect(await refusal(start(f.n, f.project.id, "t2", null, "child"))).toBe("no bookmark nope in a");
+    expect(listLineRows(f.n.db, f.project.id).map((r) => r.task)).toEqual(["t1"]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a conflicted default branch is refused with the exact text, writing nothing", async () => {
+  const f = await folder();
+  try {
+    // S, a sibling of P on the root, is where another node put `main`: two heads.
+    await jj(["new", "root()", "-m", "S"], f.repo, f.n.cfg);
+    await writeFile(`${f.repo}/s`, "s\n");
+    await jj(["new", f.P], f.repo, f.n.cfg);
+    const S = await read(f.n, f.repo, 'description(exact:"S\n")');
+    mergeBranchRows(f.n.db, [{ project: f.project.id, branch: "main", node: "f".repeat(64), seq: 1, commit: S, drops: [] }]);
+    expect(await refusal(start(f.n, f.project.id, "t1", null, "child"))).toBe("main is conflicted; push a merge of its siblings");
+    expect(listLineRows(f.n.db, f.project.id)).toEqual([]);
     expect(await lineRefs(f.n, f.repo)).toEqual([]);
   } finally {
     await f.close();
   }
 });
 
-test("no revision, an unsnapshotted edit on disk: starts at the fork point of `@` as last snapshotted, the edit stays the user's", async () => {
-  const f = await folder();
-  try {
-    await writeFile(`${f.repo}/mine`, "mine\n");
-    const start = await startAt(deps(f.n), f.project.id, "t1", null, "child");
-    expect(start).toMatchObject({ kind: "line", commit: f.P });
-    const status = await jj(["status", "--ignore-working-copy"], f.repo, f.n.cfg);
-    expect(status).not.toContain("mine");
-    // jj has not snapshotted it: a snapshotting read sees it as the user's change in `@`.
-    expect(await jj(["status"], f.repo, f.n.cfg)).toContain("A mine");
-  } finally {
-    await f.close();
-  }
-});
-
-test("a url project starts from its first sync branch, or the one `rev` names; none is refused", async () => {
+test("no revision and no default branch: refused, nothing written", async () => {
   const n = await startPoolNode();
   try {
-    const up = `${n.home}/up`;
-    const g = (...args: string[]) => git(["-c", "user.name=t", "-c", "user.email=t@t", ...args], up);
-    await Bun.$`mkdir -p ${up}`;
-    await g("init", "-b", "main");
-    await writeFile(`${up}/m`, "m\n");
-    await g("add", ".");
-    await g("commit", "-m", "m");
-    await g("branch", "dev");
-    const project = await addProjectFromUpstream(n.cfg, n.db, up, n.id, "up", ["dev"]);
-    expect(project.sync).toEqual(["main", "dev"]);
-    expect(await startAt(deps(n), project.id, "t1", null, "child")).toEqual({ projectId: project.id, kind: "sync", branch: "main" });
-    expect(await startAt(deps(n), project.id, "t1", "dev", "child")).toEqual({ projectId: project.id, kind: "sync", branch: "dev" });
-    expect(await lineRefs(n, project.replica)).toEqual([]);
-    // --edit takes a revision: a sync branch named with it is refused, not taken as a sync start.
-    expect(await refusal(startAt(deps(n), project.id, "t1", "dev", "edit"))).toBe("--edit takes a revision, not the sync branch dev");
-    expect(await lineRefs(n, project.replica)).toEqual([]);
+    // A folder with neither `main` nor `master`.
+    const dir = `${n.home}/bare`;
+    await mkdir(dir);
+    await initColocated(dir, n.cfg);
+    await writeFile(`${dir}/x`, "x\n");
+    await jj(["commit", "-m", "x"], dir, n.cfg);
+    const project = await addProjectFromFolder(n.cfg, n.db, dir, n.id, "bare");
+    expect(project.defaultBranch).toBeNull();
+    expect(await refusal(start(n, project.id, "t1", null, "child"))).toBe("bare has no default branch; name a revision");
+    expect(listLineRows(n.db, project.id)).toEqual([]);
   } finally {
     await n.close();
   }
 });
 
-test("a url project with no sync branch is refused", async () => {
+test("--edit W: a line at W whose base is W's parents; --edit needs a revision", async () => {
   const f = await folder();
   try {
-    // A replica row is a url project (source: meddle://...) that carries no sync branches.
-    registerReplica(f.n.db, { id: "u1", name: "u", home: f.n.id, replica: f.repo });
-    expect(await refusal(startAt(deps(f.n), "u1", "t1", null, "child"))).toBe("u has no sync branch");
-    expect(await lineRefs(f.n, f.repo)).toEqual([]);
-  } finally {
-    await f.close();
-  }
-});
-
-test("--edit W: a line at W with base P; --edit needs a revision", async () => {
-  const f = await folder();
-  try {
-    const start = await startAt(deps(f.n), f.project.id, "t1", f.W, "edit");
-    expect(start).toEqual({ projectId: f.project.id, kind: "line", mode: "edit", commit: f.W, base: f.P });
+    const s = await start(f.n, f.project.id, "t1", f.W, "edit");
+    expect(s).toEqual({ projectId: f.project.id, mode: "edit", commit: f.W, base: [f.P] });
+    expect(listLineRows(f.n.db, f.project.id)).toMatchObject([{ task: "t1", commit: f.W, base: [f.P], holder: f.n.id, epoch: 0 }]);
     expect(await git(["rev-parse", "refs/remotes/meddle/task/t1/a"], f.repo, f.n.cfg)).toBe(`${f.W}\n`);
-    expect(await refusal(startAt(deps(f.n), f.project.id, "t2", null, "edit"))).toBe("--edit needs a revision");
+    expect(await refusal(start(f.n, f.project.id, "t2", null, "edit"))).toBe("--edit needs a revision");
   } finally {
     await f.close();
   }
 });
 
-test("each edit refusal, in order", async () => {
+test("each edit refusal, in order, in the service repo and its workspaces", async () => {
   const f = await folder();
   try {
     const id = (rev: string) => read(f.n, f.repo, rev, "change_id.short(12)");
-    const edit = (rev: string) => refusal(startAt(deps(f.n), f.project.id, "t9", rev, "edit"));
+    const edit = (rev: string) => refusal(start(f.n, f.project.id, "t9", rev, "edit"));
     // The workspace's own working copy.
     await jj(["describe", "-m", "wc"], f.repo, f.n.cfg);
     await writeFile(`${f.repo}/wc`, "wc\n");
@@ -139,7 +135,7 @@ test("each edit refusal, in order", async () => {
     const wc = await id("@");
     expect(await edit("@")).toBe(`${wc} is default's working copy; move off it first`);
     // Held by another task's line: W (and P below it) are immutable.
-    await startAt(deps(f.n), f.project.id, "t1", f.W, "edit");
+    await start(f.n, f.project.id, "t1", f.W, "edit");
     expect(await edit(f.P)).toBe(`${await id(f.P)} is immutable`);
     expect(await edit(f.W)).toBe(`${await id(f.W)} is immutable`);
     // A mutable change with a revision on top, and one with no changes.
@@ -152,28 +148,8 @@ test("each edit refusal, in order", async () => {
     const E = await id("@");
     await jj(["new", "root()"], f.repo, f.n.cfg);
     expect(await edit(E)).toBe(`nothing to hand off: ${E} has no changes`);
+    expect(listLineRows(f.n.db, f.project.id).map((r) => r.task)).toEqual(["t1"]);
     expect(await lineRefs(f.n, f.repo)).toEqual(["refs/remotes/meddle/task/t1/a"]);
-  } finally {
-    await f.close();
-  }
-});
-
-test("no fork point below W, and W with two fork points", async () => {
-  const f = await folder();
-  try {
-    const id = (rev: string) => read(f.n, f.repo, rev, "change_id.short(12)");
-    const edit = (rev: string) => refusal(startAt(deps(f.n), f.project.id, "t9", rev, "edit"));
-    await jj(["new", "root()", "-m", "R"], f.repo, f.n.cfg);
-    await writeFile(`${f.repo}/r`, "r\n");
-    await jj(["new", "root()"], f.repo, f.n.cfg);
-    const R = await read(f.n, f.repo, 'description(exact:"R\n")');
-    expect(await edit(R)).toBe(`no fork point below ${await id(R)}`);
-    // A merge Z of P and R, with content, has two fork points.
-    await jj(["new", f.P, R, "-m", "Z"], f.repo, f.n.cfg);
-    await writeFile(`${f.repo}/z`, "z\n");
-    await jj(["new", "root()"], f.repo, f.n.cfg);
-    const Z = await read(f.n, f.repo, 'description(exact:"Z\n")');
-    expect(await edit(Z)).toBe(`${await id(Z)} has 2 fork points`);
   } finally {
     await f.close();
   }
@@ -186,10 +162,7 @@ test("two concurrent edit starts of W: the second is refused as immutable", asyn
     await writeFile(`${f.repo}/v`, "v\n");
     await jj(["new", "root()"], f.repo, f.n.cfg);
     const V = await read(f.n, f.repo, `description(exact:"V\n")`);
-    const results = await Promise.allSettled([
-      startAt(deps(f.n), f.project.id, "t1", V, "edit"),
-      startAt(deps(f.n), f.project.id, "t2", V, "edit"),
-    ]);
+    const results = await Promise.allSettled([start(f.n, f.project.id, "t1", V, "edit"), start(f.n, f.project.id, "t2", V, "edit")]);
     expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
     expect(((results[1] as PromiseRejectedResult).reason as Error).message).toMatch(/ is immutable$/);
     expect(await lineRefs(f.n, f.repo)).toEqual(["refs/remotes/meddle/task/t1/a"]);
@@ -201,23 +174,38 @@ test("two concurrent edit starts of W: the second is refused as immutable", asyn
 test("a child at the root, an unknown revision and a revset of two revisions are refused", async () => {
   const f = await folder();
   try {
-    const child = (rev: string) => refusal(startAt(deps(f.n), f.project.id, "t1", rev, "child"));
+    const child = (rev: string) => refusal(start(f.n, f.project.id, "t1", rev, "child"));
     expect(await child("root()")).toBe("cannot start a task on the root commit");
     expect(await child("nosuchrev")).toBe("no revision nosuchrev in a");
     expect(await child("@ | @-")).toBe("@ | @- names 2 revisions in a");
-    expect(await lineRefs(f.n, f.repo)).toEqual([]);
+    expect(listLineRows(f.n.db, f.project.id)).toEqual([]);
   } finally {
     await f.close();
   }
 });
 
-test("asked of a node that is not the project's home", async () => {
+test("a commit a checkout pushed, which jj does not know yet: an edit start takes its parents from git, and the push's ref goes", async () => {
   const f = await folder();
   try {
-    const other = "b".repeat(64);
-    const away = await addProjectFromFolder(f.n.cfg, f.n.db, f.repo, other, "away");
-    expect(await refusal(startAt(deps(f.n), away.id, "t1", null, "child"))).toBe(`a task's start is resolved on its project's home, ${shortId(other)}`);
-    expect(await lineRefs(f.n, f.repo)).toEqual([]);
+    // X, a child of P, only in the view's incoming refs: nothing jj imports names it.
+    const g = (...args: string[]) => git(["-c", "user.name=t", "-c", "user.email=t@t", ...args], f.repo, f.n.cfg);
+    const tree = (await g("rev-parse", `${f.P}^{tree}`)).trim();
+    const X = (await g("commit-tree", tree, "-p", f.P, "-m", "X")).trim();
+    const incoming = `refs/namespaces/view/refs/meddle/incoming/${X}`;
+    await g("update-ref", incoming, X);
+    expect(await jj(["log", "--ignore-working-copy", "-r", `present(${X})`, "--no-graph", "-T", "commit_id"], f.repo, f.n.cfg)).toBe("");
+
+    const s = await start(f.n, f.project.id, "t1", X, "edit", "/a/checkout");
+    expect(s).toEqual({ projectId: f.project.id, mode: "edit", commit: X, base: [f.P] });
+    expect(await read(f.n, f.repo, X)).toBe(X);
+    expect(await git(["for-each-ref", incoming], f.repo, f.n.cfg)).toBe("");
+    // One the node does not have is refused.
+    const missing = "e".repeat(40);
+    expect(await refusal(start(f.n, f.project.id, "t2", missing, "child", "/a/checkout"))).toBe(`no revision ${missing} in a`);
+    // A pushed commit whose start is refused leaves no ref behind either: X is t1's line now.
+    await g("update-ref", incoming, X);
+    expect(await refusal(start(f.n, f.project.id, "t3", X, "edit", "/a/checkout"))).toMatch(/ is immutable$/);
+    expect(await git(["for-each-ref", incoming], f.repo, f.n.cfg)).toBe("");
   } finally {
     await f.close();
   }
@@ -227,9 +215,9 @@ test("a task id that is not one safe segment is refused before it names a ref", 
   const f = await folder();
   try {
     for (const id of ["../x", "t1/a", "t*", ""]) {
-      expect(await refusal(startAt(deps(f.n), f.project.id, id, null, "child"))).toBe(`invalid task id: ${id}`);
+      expect(await refusal(start(f.n, f.project.id, id, null, "child"))).toBe(`invalid task id: ${id}`);
     }
-    expect(await lineRefs(f.n, f.repo)).toEqual([]);
+    expect(listLineRows(f.n.db, f.project.id)).toEqual([]);
   } finally {
     await f.close();
   }

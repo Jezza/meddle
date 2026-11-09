@@ -1,13 +1,15 @@
-// test/create-starts.test.ts — a new task is created from the starts each project's home resolves for it: the node asked
-// mints the id, asks each home for its start, creates the task on the node placed, and releases the lines it had
-// written when a later start or the creation certainly failed.
+// test/create-starts.test.ts — a new task is created from the starts the node asked resolves for it, where the
+// revision is: that node mints the id, resolves each start (writing its line row), creates the task on the node placed,
+// which takes the lines one epoch up, and releases the rows it wrote when a later start or the creation certainly
+// failed.
 import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { paths } from "../src/config";
-import { git, jj } from "../src/jj";
+import { git, initColocated, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
-import { addProjectFromFolder, addProjectFromUpstream, getProject, setProjectSync } from "../src/projects/project";
-import { NodeObject } from "../src/state/contracts";
+import { listLineRows } from "../src/pool/rows";
+import { addProjectFromFolder, setDefaultBranch } from "../src/projects/project";
+import { NodeObject, PeerObject } from "../src/state/contracts";
 import { listTasks } from "../src/store/records";
 import { workspaceImmutableHeads } from "../src/tasks/provision";
 import { linkClient, peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
@@ -24,29 +26,38 @@ async function eventually(cond: () => boolean, what: () => string, ms = 10_000):
 const read = async (n: GitPoolNode, repo: string, rev: string, template = "commit_id") =>
   (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", template], repo, n.cfg)).trim();
 
-/** The line refs the home repo `repo` holds for task `taskId` (every task's when absent), each `<ref> <commit>`. */
-const lineRefs = async (n: GitPoolNode, repo: string, taskId?: string) =>
-  (await git(["for-each-ref", "--format=%(refname) %(objectname)", `refs/remotes/meddle/task${taskId === undefined ? "" : `/${taskId}`}`], repo, n.cfg))
+/** The line refs the service repo `repo` holds, each `<ref> <commit>`. */
+const lineRefs = async (n: GitPoolNode, repo: string) =>
+  (await git(["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/meddle/task"], repo, n.cfg))
     .split("\n").filter(Boolean);
+
+/** The line rows node `n` has of task `taskId`, by name, each as `[name, holder, epoch, commit, base]`. */
+const rowsOf = (n: GitPoolNode, taskId: string) =>
+  listLineRows(n.db, undefined, taskId).sort((x, y) => x.name.localeCompare(y.name)).map((r) => [r.name, r.holder, r.epoch, r.commit, r.base]);
 
 /** The immutable heads the workspace `workspace` of a task is scoped to. */
 const scopeOf = async (n: GitPoolNode, workspace: string) =>
   (await jj(["config", "get", 'revset-aliases."immutable_heads()"'], workspace, n.cfg)).trim();
 
-/** A folder project `name` homed on `n`: one commit with content, and `@` empty on it. Returns it with that commit. */
+/**
+ * A folder project `name` homed on `n`, from a folder with one commit with content, its default branch `main`. Returns
+ * it with its service repo and that commit.
+ */
 async function folderProject(n: GitPoolNode, name: string) {
-  const repo = `${n.home}/${name}`;
-  await mkdir(repo, { recursive: true });
-  const project = await addProjectFromFolder(n.cfg, n.db, repo, n.id, name);
-  await writeFile(`${repo}/${name}`, `${name}\n`);
-  await jj(["commit", "-m", name], repo, n.cfg);
-  return { project, repo, fork: await read(n, repo, "@-") };
+  const folder = `${n.home}/${name}`;
+  await mkdir(folder, { recursive: true });
+  await initColocated(folder, n.cfg);
+  await writeFile(`${folder}/${name}`, `${name}\n`);
+  await jj(["commit", "-m", name], folder, n.cfg);
+  await jj(["bookmark", "set", "main", "-r", "@-"], folder, n.cfg);
+  const project = await addProjectFromFolder(n.cfg, n.db, folder, n.id, name);
+  return { project, repo: project.replica, fork: await read(n, project.replica, "main") };
 }
 
 /** A and B in one pool: A is the home of `a` (its own project), B of `b`; each knows the other's projects. */
 async function setup() {
   const { A, B, close } = await twoPoolNodes();
-  const a = { project: A.project, repo: A.project.replica, fork: await read(A, A.project.replica, "@-") };
+  const a = { project: A.project, repo: A.project.replica, fork: await read(A, A.project.replica, "main") };
   const b = await folderProject(B, "b");
   await peerReady(A, B);
   await peerReady(B, A);
@@ -81,7 +92,14 @@ const refusal = async (p: Promise<unknown>): Promise<string> => {
   return (err as Error).message;
 };
 
-test("a task of a and b placed on B starts each on a child of its home's fork point; both lines are written on their homes", async () => {
+test("PeerObject has no startAt and no releaseLines: a start is resolved on the node asked", () => {
+  const methods = Object.keys(PeerObject.def.variants.peer.methods);
+  expect(methods).not.toContain("startAt");
+  expect(methods).not.toContain("releaseLines");
+  expect(methods).toContain("createTaskAt");
+});
+
+test("a task of a and b asked of A and placed on B: A resolves both starts, and B takes the lines with epoch 1", async () => {
   const { A, B, a, b, close } = await setup();
   try {
     const { manifest, nodeId } = await withNode(A, (node) => node.createTask({ title: "t", projects: [{ id: a.project.id }, { id: b.project.id }], node: B.id }));
@@ -89,27 +107,30 @@ test("a task of a and b placed on B starts each on a child of its home's fork po
     const id = manifest.id;
     expect(listTasks(B.db).map((t) => t.id)).toEqual([id]);
     expect(listTasks(A.db)).toEqual([]);
-    expect(manifest.projects.map((p) => [p.name, p.base])).toEqual([["a", a.fork], ["b", b.fork]]);
+    expect(manifest.projects.map((p) => [p.name, p.base])).toEqual([["a", [a.fork]], ["b", [b.fork]]]);
 
-    // Each line on its own home, at the start.
+    // A wrote each line at epoch 0 (and applied a's); B took them both, one epoch up.
+    expect(rowsOf(B, id)).toEqual([["a", B.id, 1, a.fork, [a.fork]], ["b", B.id, 1, b.fork, [b.fork]]]);
     expect(await lineRefs(A, a.repo)).toEqual([`refs/remotes/meddle/task/${id}/a ${a.fork}`]);
-    expect(await lineRefs(B, b.repo)).toEqual([`refs/remotes/meddle/task/${id}/b ${b.fork}`]);
 
-    // On B, each workspace is a new change on its start, scoped to its base.
+    // On B, each workspace is a new change on its start, scoped to its base; the task's own bookmark holds each line,
+    // so its remote ref is gone there.
     const task = paths(B.cfg).task(id);
     expect(await read(B, `${task}/a`, "@-")).toBe(a.fork);
     expect(await read(B, `${task}/b`, "@-")).toBe(b.fork);
-    expect(await scopeOf(B, `${task}/a`)).toBe(workspaceImmutableHeads(id, a.fork));
-    expect(await scopeOf(B, `${task}/b`)).toBe(workspaceImmutableHeads(id, b.fork));
+    expect(await scopeOf(B, `${task}/a`)).toBe(workspaceImmutableHeads(id, [a.fork]));
+    expect(await scopeOf(B, `${task}/b`)).toBe(workspaceImmutableHeads(id, [b.fork]));
+    expect(await lineRefs(B, b.repo)).toEqual([]);
   } finally {
     await close();
   }
 }, 60_000);
 
-test("a revision of a edited on B: B's workspace edits it, scoped to its fork point, and A holds the line at it", async () => {
+test("a revision of a edited on B: B's workspace edits it, its base W's parents, and A holds the line at it", async () => {
   const { A, B, a, close } = await setup();
   try {
     // W (content) on the fork point, `@` back on the fork point.
+    await jj(["new", a.fork], a.repo, A.cfg);
     await writeFile(`${a.repo}/w`, "w\n");
     await jj(["commit", "-m", "W"], a.repo, A.cfg);
     const W = await read(A, a.repo, "@-");
@@ -118,34 +139,34 @@ test("a revision of a edited on B: B's workspace edits it, scoped to its fork po
     const { manifest } = await withNode(A, (node) => node.createTask({ title: "t", projects: [{ id: a.project.id, rev: W, mode: "edit" }], node: B.id }));
     const workspace = `${paths(B.cfg).task(manifest.id)}/a`;
     expect(await read(B, workspace, "@")).toBe(W);
-    expect(manifest.projects[0]!.base).toBe(a.fork);
-    expect(await scopeOf(B, workspace)).toBe(workspaceImmutableHeads(manifest.id, a.fork));
+    expect(manifest.projects[0]!.base).toEqual([a.fork]);
+    expect(await scopeOf(B, workspace)).toBe(workspaceImmutableHeads(manifest.id, [a.fork]));
+    expect(rowsOf(B, manifest.id)).toEqual([["a", B.id, 1, W, [a.fork]]]);
     expect(await lineRefs(A, a.repo)).toEqual([`refs/remotes/meddle/task/${manifest.id}/a ${W}`]);
   } finally {
     await close();
   }
 }, 60_000);
 
-test("B refuses b's start: a's line on A is released and no task exists anywhere", async () => {
+test("two projects where the second refuses: the first's line row is released and no task exists anywhere", async () => {
   const { A, B, a, b, close } = await setup();
   try {
-    // `@` of b's folder has content: its fork point is `@` itself.
-    await writeFile(`${b.repo}/x`, "x\n");
-    await jj(["describe", "-m", "X"], b.repo, B.cfg);
+    // b's default branch names a branch no row has.
+    setDefaultBranch(B.db, b.project.id, "nope");
     const message = await refusal(withNode(B, (node) => node.createTask({ title: "t", projects: [{ id: a.project.id }, { id: b.project.id }], node: "here" })));
-    expect(message).toContain("project b: @ has changes; move off it first");
-    expect(await lineRefs(A, a.repo)).toEqual([]);
-    expect(await lineRefs(B, b.repo)).toEqual([]);
+    expect(message).toContain("project b: no bookmark nope in b");
+    const rows = listLineRows(B.db, a.project.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ name: "a", holder: B.id, epoch: 0, commit: null });
+    expect(listLineRows(B.db, b.project.id)).toEqual([]);
     expect(listTasks(A.db)).toEqual([]);
     expect(listTasks(B.db)).toEqual([]);
-    // Released through jj: nothing of it is left as a bookmark either.
-    expect(await jj(["bookmark", "list", "--ignore-working-copy", "--all-remotes", "glob:task/*"], a.repo, A.cfg)).toBe("");
   } finally {
     await close();
   }
 }, 60_000);
 
-test("a creation the target certainly refuses releases the lines its starts wrote: the target says it has no such task", async () => {
+test("a creation the target certainly refuses releases the line rows its starts wrote", async () => {
   const { rm } = await import("node:fs/promises");
   const { A, B, a, b, close } = await setup();
   try {
@@ -157,11 +178,10 @@ test("a creation the target certainly refuses releases the lines its starts wrot
     expect(message).not.toContain("may have task");
     expect(listTasks(A.db)).toEqual([]);
     expect(listTasks(B.db)).toEqual([]);
-    expect(await lineRefs(A, a.repo)).toEqual([]);
-    expect(await lineRefs(B, b.repo)).toEqual([]);
-    expect(await jj(["bookmark", "list", "--ignore-working-copy", "--all-remotes", "glob:task/*"], a.repo, A.cfg)).toBe("");
-    // Nor is a's line left fetched into B's replica of a.
-    expect(await git(["for-each-ref", "refs/heads/meddle/task/"], getProject(B.db, a.project.id)!.replica, B.cfg)).toBe("");
+    const released = listLineRows(A.db).map((r) => [r.name, r.holder, r.commit]).sort((x, y) => String(x[0]).localeCompare(String(y[0])));
+    expect(released).toEqual([["a", A.id, null], ["b", A.id, null]]);
+    // Nor is a bookmark of the task left in B's service repo of b.
+    expect(await git(["for-each-ref", "refs/heads/meddle/task/"], b.repo, B.cfg)).toBe("");
   } finally {
     await close();
   }
@@ -177,82 +197,27 @@ test("a creation whose answer is lost while the target holds the task keeps the 
     const id = held!.id;
     expect(message).toContain("the answer was lost");
     expect(message).toContain(`${shortId(B.id)} has task ${id} all the same`);
-    expect(await lineRefs(A, a.repo)).toEqual([`refs/remotes/meddle/task/${id}/a ${a.fork}`]);
-    expect(await lineRefs(B, b.repo)).toEqual([`refs/remotes/meddle/task/${id}/b ${b.fork}`]);
+    expect(rowsOf(B, id)).toEqual([["a", B.id, 1, a.fork, [a.fork]], ["b", B.id, 1, b.fork, [b.fork]]]);
+    expect(listLineRows(A.db, undefined, id).every((r) => r.commit !== null)).toBe(true);
   } finally {
     await close();
   }
 }, 60_000);
 
-test("with a's home offline: a sync branch starts from the copy B fetched last, with no line; no revision is refused", async () => {
+test("with a's home offline, B still starts a task of a from a's default branch as its rows have it", async () => {
   const { A, B, a, close } = await setup();
   try {
-    // a's sync branch `main` at M1, fetched by B as it creates a first task from it.
-    setProjectSync(A.db, a.project.id, ["main"]);
-    await jj(["bookmark", "set", "main", "-r", a.fork], a.repo, A.cfg);
-    const first = await withNode(B, (node) => node.createTask({ title: "first", projects: [{ id: a.project.id, rev: "main" }], node: "here" }));
-    expect(await read(B, `${paths(B.cfg).task(first.manifest.id)}/a`, "@-")).toBe(a.fork);
-    // A moves `main` on to M2, which B never fetches.
-    await writeFile(`${a.repo}/m2`, "m2\n");
-    await jj(["commit", "-m", "M2"], a.repo, A.cfg);
-    await jj(["bookmark", "set", "main", "-r", "@-"], a.repo, A.cfg);
+    // A first task of a on B brings a's rows and commits to B.
+    const first = await withNode(B, (node) => node.createTask({ title: "first", projects: [{ id: a.project.id }], node: "here" }));
+    expect(first.manifest.projects[0]!.base).toEqual([a.fork]);
 
     await A.net.stop();
     await eventually(() => !B.net.isOnline(A.id), () => "B to see A offline");
-    const second = await withNode(B, (node) => node.createTask({ title: "second", projects: [{ id: a.project.id, rev: "main" }], node: "here" }));
+    const second = await withNode(B, (node) => node.createTask({ title: "second", projects: [{ id: a.project.id }], node: "here" }));
     const workspace = `${paths(B.cfg).task(second.manifest.id)}/a`;
     expect(await read(B, workspace, "@-")).toBe(a.fork);
-    expect(second.manifest.projects[0]!.base).toBe(a.fork);
-    expect(await scopeOf(B, workspace)).toBe(workspaceImmutableHeads(second.manifest.id, a.fork));
-    expect(B.logs).toContain("meddle: project a: home offline; starting from main as fetched last");
-    // A sync start writes no line: the task's first turn end does.
-    expect(await lineRefs(A, a.repo)).toEqual([]);
-
-    expect(await refusal(withNode(B, (node) => node.createTask({ title: "t", projects: [{ id: a.project.id }], node: "here" }))))
-      .toContain(`project a: home ${shortId(A.id)} is offline`);
-    expect(await refusal(withNode(B, (node) => node.createTask({ title: "t", projects: [{ id: a.project.id, rev: "main", mode: "edit" }], node: "here" }))))
-      .toContain("project a: --edit takes a revision, not the sync branch main");
-    expect(listTasks(B.db).map((t) => t.id).sort()).toEqual([first.manifest.id, second.manifest.id].sort());
-  } finally {
-    await close();
-  }
-}, 60_000);
-
-test("with a url project's home offline and no revision, it starts from its first sync branch as B fetched it last, with no line", async () => {
-  const { A, B, close } = await setup();
-  try {
-    // An upstream git repo whose default branch `main` is at M; `u` is added from it on A.
-    const up = `${A.home}/up`;
-    await mkdir(up, { recursive: true });
-    const g = (...args: string[]) => git(["-c", "user.name=t", "-c", "user.email=t@t", ...args], up);
-    await g("init", "-b", "main");
-    await writeFile(`${up}/m`, "m\n");
-    await g("add", ".");
-    await g("commit", "-m", "m");
-    const M = (await g("rev-parse", "HEAD")).trim();
-    const u = await addProjectFromUpstream(A.cfg, A.db, up, A.id, "u");
-    expect(u.sync).toEqual(["main"]);
-    await eventually(
-      () => B.store.row(A.id)?.summary?.projects.some((p) => p.id === u.id && p.upstream === true) === true,
-      () => "B to hear of u as a url project",
-    );
-    // B fetches `main` as it creates a first task with no revision: the home resolves it to the sync branch.
-    const first = await withNode(B, (node) => node.createTask({ title: "first", projects: [{ id: u.id }], node: "here" }));
-    expect(first.manifest.projects[0]!.base).toBe(M);
-    expect(getProject(B.db, u.id)?.upstream).toBe(true);
-
-    await A.net.stop();
-    await eventually(() => !B.net.isOnline(A.id), () => "B to see A offline");
-    const second = await withNode(B, (node) => node.createTask({ title: "second", projects: [{ id: u.id }], node: "here" }));
-    expect(second.manifest.projects[0]!.base).toBe(M);
-    expect(await read(B, `${paths(B.cfg).task(second.manifest.id)}/u`, "@-")).toBe(M);
-    expect(B.logs).toContain("meddle: project u: home offline; starting from main as fetched last");
-    expect(await lineRefs(A, u.replica)).toEqual([]);
-
-    // With no sync branch left, a url project has no default start.
-    setProjectSync(B.db, u.id, []);
-    expect(await refusal(withNode(B, (node) => node.createTask({ title: "t", projects: [{ id: u.id }], node: "here" }))))
-      .toContain("project u: u has no sync branch");
+    expect(second.manifest.projects[0]!.base).toEqual([a.fork]);
+    expect(rowsOf(B, second.manifest.id)).toEqual([["a", B.id, 1, a.fork, [a.fork]]]);
   } finally {
     await close();
   }
@@ -265,6 +230,7 @@ test("a task with no projects starts as it always did: no workspace, no start, n
     expect(nodeId).toBe(A.id);
     expect(manifest.projects).toEqual([]);
     expect(manifest.primaryProjectId).toBeNull();
+    expect(listLineRows(A.db)).toEqual([]);
     expect(await lineRefs(A, a.repo)).toEqual([]);
   } finally {
     await close();

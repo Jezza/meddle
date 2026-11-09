@@ -16,9 +16,10 @@ async function home() {
   const dir = await mkdtemp("/tmp/meddle-e2e-");
   await mkdir(`${dir}/t`, { recursive: true });
   await initColocated(`${dir}/repo`);
-  // A first commit, `@` empty on it: a task of the repo starts there.
+  // A first commit, `@` empty on it, bookmarked `main` (the project's default branch): a task of the repo starts there.
   await writeFile(`${dir}/repo/README`, "repo\n");
   await jj(["commit", "-m", "init"], `${dir}/repo`);
+  await jj(["bookmark", "set", "main", "-r", "@-"], `${dir}/repo`);
   const env = {
     HOME: dir,
     MEDDLE_DATA_DIR: `${dir}/d`,

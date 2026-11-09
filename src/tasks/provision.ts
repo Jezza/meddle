@@ -4,16 +4,17 @@ import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { checkTaskRoot, ensurePrivateDir, paths } from "../paths";
 import {
-  bookmarkForget, bookmarkList, bookmarkSet, commitOf, configSetWorkspace, editIn, isJjRepo, jj, workspaceAdd,
+  bookmarkForget, bookmarkList, bookmarkSet, commitOf, configSetWorkspace, editIn, isJjRepo, workspaceAdd,
   workspaceConfigPath, workspaceForget,
 } from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
 import { ensureMemoryReplica, linkMemory } from "../memory";
+import { contextTextAt } from "../projects/context";
 import { getProject, type Project } from "../projects/project";
 import { getTask, insertTask } from "../store/records";
 import { repoKey, serialised } from "../serial";
 import type { TaskState } from "./durable";
-import { taskNamespace, writeManifest, type ReceivedManifest, type Start, type TaskManifest } from "./manifest";
+import { taskNamespace, writeManifest, type Start, type TaskManifest } from "./manifest";
 
 export type SettingSource = "user" | "project" | "local";
 
@@ -40,9 +41,10 @@ export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string 
 }
 
 /**
- * Where a task's Claude Code runs: one project → its workspace, with the replica's project settings; several → the
- * task folder, user settings only (each project's settings are composed in); none → the task folder, user settings
- * only and no project config root.
+ * Where a task's Claude Code runs: one project → its workspace, which is also where its project settings are read
+ * (the project's files as of the task's start, never the service repo's empty working copy); several → the task folder,
+ * user settings only (each project's settings are composed in); none → the task folder, user settings only and no
+ * project config root.
  */
 export function cwdFor(
   m: TaskManifest,
@@ -51,47 +53,39 @@ export function cwdFor(
   const task = paths(cfg).task(m.id);
   const [only] = m.projects;
   if (m.projects.length === 1 && only) {
-    return { cwd: join(task, only.workspace), projectConfigRoot: only.replica, settingSources: ["user", "project", "local"] };
+    const workspace = join(task, only.workspace);
+    return { cwd: workspace, projectConfigRoot: workspace, settingSources: ["user", "project", "local"] };
   }
   if (m.projects.length === 0) return { cwd: task, projectConfigRoot: null, settingSources: ["user"] };
   return { cwd: task, settingSources: ["user"] };
 }
 
 /**
- * What a task's workspace takes as `immutable_heads()` (Decision 2): `base` and everything below it, and every task's
- * line on the home but task `taskId`'s own. Its agent may rewrite its own line and anything else, as on main. The other
- * lines are picked by bookmark name, not by subtracting this task's commits: a commit another task's line also holds
- * stays immutable to it.
+ * What a task's workspace takes as `immutable_heads()` (Decision 2): each commit of `base` and everything below it;
+ * every local bookmark but task `taskId`'s own (`meddle/task/<id>/*`): the branches and this node's other tasks'
+ * lines; and every line held elsewhere (`task/<t>/*@meddle`) but the task's own, which it has before provisioning and
+ * on a receiver before activation. Its agent may rewrite its own line and anything else. The remote term picks lines by
+ * bookmark name, so a commit another node's line also holds stays immutable to it. The local term is a difference of
+ * commit sets: a branch's commit (or another local line's) is protected only while the task's own bookmark is not on it
+ * too. A branch the agent drags along that way is put back at turn end (`applyProject`), and checkouts only ever see
+ * branches as their rows say, never the service repo's bookmarks.
  */
-export function workspaceImmutableHeads(taskId: string, base: string): string {
-  return `present(${base}) | untracked_remote_bookmarks(~glob:"task/${taskId}/*", remote=exact:"meddle")`;
+export function workspaceImmutableHeads(taskId: string, base: string[]): string {
+  return [
+    ...base.map((commit) => `present(${commit})`),
+    `(bookmarks() ~ bookmarks(glob:"meddle/task/${taskId}/*"))`,
+    `untracked_remote_bookmarks(~glob:"task/${taskId}/*", remote=exact:"meddle")`,
+  ].join(" | ");
 }
 
 /**
  * Scopes the workspace `workspace` of task `taskId` to its own line (`workspaceImmutableHeads`), in its own jj config,
  * and notes where jj keeps workspace configs on this node (`jjWorkspacesNote`), for `unscopeWorkspace`.
  */
-export async function scopeWorkspace(cfg: NodeConfig, workspace: string, taskId: string, base: string): Promise<void> {
+export async function scopeWorkspace(cfg: NodeConfig, workspace: string, taskId: string, base: string[]): Promise<void> {
   await configSetWorkspace(workspace, 'revset-aliases."immutable_heads()"', workspaceImmutableHeads(taskId, base), cfg);
   const file = await workspaceConfigPath(workspace, cfg);
   if (jjWorkspaceConfig(file)) await writeFile(paths(cfg).jjWorkspacesNote, dirname(dirname(file))).catch(() => {});
-}
-
-/** Whether the workspace at `workspace` has an `immutable_heads()` of its own (`scopeWorkspace`'s), in its jj config. */
-export async function isScoped(cfg: NodeConfig, workspace: string): Promise<boolean> {
-  const out = await jj(["config", "list", "--workspace", 'revset-aliases."immutable_heads()"'], workspace, cfg);
-  return out.trim() !== "";
-}
-
-/**
- * Scopes the workspace at `workspace` of task `taskId` when it has no scope of its own (`isScoped`): a task made before
- * meddle scoped its workspaces. From `base`, or for a main-era manifest without one, the root commit, as
- * `provisionFromManifest` takes it. Returns whether it scoped it; a workspace that is gone is nothing to scope.
- */
-export async function scopeIfUnscoped(cfg: NodeConfig, workspace: string, taskId: string, base: string | undefined): Promise<boolean> {
-  if (!(await isJjRepo(workspace)) || (await isScoped(cfg, workspace))) return false;
-  await scopeWorkspace(cfg, workspace, taskId, base ?? (await commitOf(workspace, "root()", cfg)));
-  return true;
 }
 
 /** Whether `file` is where jj keeps a workspace's own config: `…/jj/workspaces/<id>/config.toml`. */
@@ -184,18 +178,17 @@ function resolveProjects(db: Database, projectIds: string[]): Project[] {
 }
 
 /**
- * Provisions task `taskId` from `starts`, the starts its projects' homes resolved, in order (the first the primary;
- * none for a task without a project). Each project gets a jj workspace in its repo here: a `line` start's at its
- * commit, which must be here (the home repo, or the line fetched into the replica), editing it in `edit` mode or a new
- * change on it in `child` mode; a `sync` start's a new change on `synced[projectId]`, the commit its branch was fetched
- * at. Each workspace is scoped to the task's line from its base (`scopeWorkspace`), and the task's bookmark
+ * Provisions task `taskId` from `starts`, the starts resolved for its projects, in order (the first the primary; none
+ * for a task without a project). Each project gets a jj workspace in its service repo here at its start's commit,
+ * which jj there must know (the task's line brought it), editing it in `edit` mode or a new change on it in `child`
+ * mode. Each workspace is scoped to the task's line from its base (`scopeWorkspace`), and the task's bookmark
  * `meddle/task/<id>/<project>` points at its working copy, set without snapshotting the repo's own. On failure, removes
  * what it made.
  */
 export async function provisionTask(
   cfg: NodeConfig,
   db: Database,
-  input: { title: string; taskId: string; starts: Start[]; synced?: Record<string, string> },
+  input: { title: string; taskId: string; starts: Start[] },
 ): Promise<TaskManifest> {
   const root = await checkTaskRoot(cfg);
   if (!root.ok) throw new Error(root.reason);
@@ -205,15 +198,8 @@ export async function provisionTask(
   if (getTask(db, id) !== null) throw new Error(`task ${id} exists here`);
   const projects = resolveProjects(db, starts.map((s) => s.projectId));
   // Each goes into a revset, and a base into the workspace's jj config: nothing but a commit id.
-  const at: string[] = [];
-  const bases: string[] = [];
-  for (const [i, start] of starts.entries()) {
-    const commit = start.kind === "line" ? start.commit : input.synced?.[start.projectId];
-    if (commit === undefined) throw new Error(`no commit for the sync start of ${projects[i]!.name}`);
-    const base = start.kind === "line" ? start.base : commit;
-    for (const c of [commit, base]) if (!COMMIT_ID.test(c)) throw new Error(`invalid commit: ${c}`);
-    at.push(commit);
-    bases.push(base);
+  for (const start of starts) {
+    for (const c of [start.commit, ...start.base]) if (!COMMIT_ID.test(c)) throw new Error(`invalid commit: ${c}`);
   }
   await seedProfile(cfg);
   await ensurePlugins(cfg);
@@ -231,19 +217,21 @@ export async function provisionTask(
     const entries: TaskManifest["projects"] = [];
     for (const [i, project] of projects.entries()) {
       const start = starts[i]!;
-      const parent = at[i]!;
-      const base = bases[i]!;
+      const parent = start.commit;
+      const base = [...start.base];
       const workspace = join(task, project.name);
       added.push({ replica: project.replica, workspace });
       await workspaceAdd(project.replica, workspaceName, workspace, parent, cfg);
       // Scoped first: on the home, the task's own line holds the commit an edit start works on.
       await scopeWorkspace(cfg, workspace, id, base);
-      if (start.kind === "line" && start.mode === "edit") await editIn(workspace, parent, cfg);
+      if (start.mode === "edit") await editIn(workspace, parent, cfg);
       const bookmark = `${taskNamespace(id)}${project.name}`;
       const head = await commitOf(workspace, "@", cfg);
       bookmarks.push({ replica: project.replica, name: bookmark });
       await serialised(repoKey(project.replica), () => bookmarkSet(project.replica, bookmark, head, cfg, { ignoreWorkingCopy: true }));
-      entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent, base });
+      // The meddle context as the start commit has it, in the service repo: never what the agent may later edit.
+      const context = await contextTextAt(cfg, project.replica, parent);
+      entries.push({ id: project.id, name: project.name, replica: project.replica, workspace: project.name, parent, base, context });
     }
     await linkProfile(configDir, cfg);
     // The primary project's memory; a task without a project has none.
@@ -284,7 +272,7 @@ export async function provisionTask(
 export const SAFE_ID = /^[A-Za-z0-9_-]+$/;
 
 /** A commit id from another node (SHA-1 or SHA-256). */
-const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+export const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** A folder or project name from another node: one path segment, as `provisionTask` admits. */
 function safeName(name: string): boolean {
@@ -293,10 +281,10 @@ function safeName(name: string): boolean {
 
 /**
  * Throws unless a manifest from another node is safe to provision here: ids and folder names are single path
- * segments, workspaces are distinct, a project's base (when it has one) is a commit id, and the primary project is one
- * of the task's (null, for a task without one).
+ * segments, workspaces are distinct, a project's base is a list of commit ids, its context a string or null, and the
+ * primary project is one of the task's (null, for a task without one).
  */
-export function checkReceivedManifest(m: ReceivedManifest): void {
+export function checkReceivedManifest(m: TaskManifest): void {
   if (!SAFE_ID.test(m.id)) throw new Error(`invalid task id: ${m.id}`);
   if (!SAFE_ID.test(m.sessionId)) throw new Error(`invalid session id: ${m.sessionId}`);
   const workspaces = new Set<string>();
@@ -306,7 +294,12 @@ export function checkReceivedManifest(m: ReceivedManifest): void {
     if (workspaces.has(p.workspace)) throw new Error(`duplicate workspace in task: ${p.workspace}`);
     workspaces.add(p.workspace);
     // It goes into the workspace's jj config as a revset: nothing but a commit id.
-    if (p.base !== undefined && !COMMIT_ID.test(p.base)) throw new Error(`invalid base: ${p.base}`);
+    const base: unknown = p.base;
+    if (!Array.isArray(base) || !base.every((c) => typeof c === "string" && COMMIT_ID.test(c))) {
+      throw new Error(`invalid base: ${JSON.stringify(base)}`);
+    }
+    const context: unknown = p.context;
+    if (context !== null && typeof context !== "string") throw new Error(`invalid context of project ${p.name}`);
   }
   if (m.projects.length === 0 ? m.primaryProjectId !== null : !m.projects.some((p) => p.id === m.primaryProjectId)) {
     throw new Error("the primary project is not one of the task's");
@@ -315,17 +308,17 @@ export function checkReceivedManifest(m: ReceivedManifest): void {
 
 /**
  * Provisions a task another node sent: the steps of `provisionTask`, keeping the manifest's id, title, session,
- * primary project, creation time and projects (ids, names, workspaces, bases), with each project's `replica` this
- * node's and its `parent` the revision `parents[projectId]` (fetched from the sender), where the workspace starts and the
- * task's bookmark points. A project without a `base` (a main-era manifest) takes the root commit as its
- * base. Each workspace is scoped to the task's line (`scopeWorkspace`). Writes `task.json` and the row (`started` 1,
+ * primary project, creation time and projects (ids, names, workspaces, bases, and the meddle contexts captured at the
+ * task's start), with each project's `replica` this node's and its `parent` the revision `parents[projectId]` (fetched
+ * from the sender), where the workspace starts and the task's bookmark points. Each workspace is scoped to the task's
+ * line (`scopeWorkspace`). Writes `task.json` and the row (`started` 1,
  * `state`, no turns); with `keepRow` (a task restored from its archive on this node, whose row is still here), no row:
  * the caller updates it. On failure, removes what it made.
  */
 export async function provisionFromManifest(
   cfg: NodeConfig,
   db: Database,
-  manifest: ReceivedManifest,
+  manifest: TaskManifest,
   parents: Record<string, string>,
   state: TaskState,
   options: { keepRow?: boolean } = {},
@@ -359,11 +352,7 @@ export async function provisionFromManifest(
     for (const [i, entry] of manifest.projects.entries()) {
       const replica = projects[i]!.replica;
       const parent = parents[entry.id]!;
-      // A main-era manifest has no base, and its `parent` is no safe stand-in: on the home it may name a remote the
-      // home does not have (`<bookmark>@<home short id>`), and for a task that has moved since, it is the commit it
-      // moved at, which would freeze the task's earlier work for its agent. The root commit instead: only other tasks'
-      // lines stay protected from it.
-      const base = entry.base ?? (await commitOf(replica, "root()", cfg));
+      const base = entry.base;
       const workspace = join(task, entry.workspace);
       added.push({ replica, workspace });
       await workspaceAdd(replica, workspaceName, workspace, parent, cfg);

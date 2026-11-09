@@ -6,7 +6,10 @@
 // MEDDLE_FIXTURE_LATER_RESULTS_MS=<ms> (wait that long before each `result` after the first: a slow later turn),
 // MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`),
 // MEDDLE_FIXTURE_BY_TOKEN=<token>=<path>,<token>=<path> (the recording of the entry whose token is the
-// CLAUDE_CODE_OAUTH_TOKEN this run got; MEDDLE_FIXTURE when none is).
+// CLAUDE_CODE_OAUTH_TOKEN this run got; MEDDLE_FIXTURE when none is),
+// MEDDLE_FIXTURE_TOOL_USE=<tool> (before the first `result`, as Claude Code does once that tool has run, calls each
+// `PostToolUse` hook the host registered at `initialize` whose matcher matches <tool>), and with
+// MEDDLE_FIXTURE_TOOL_USE_EXIT=1 then exits once the host answered them, with no `result` (a turn that fails).
 // Any argv is accepted; only `--session-id` / `--resume` are read (see `transcribe`). Dependency-free so it
 // starts fast. The recording's user messages' uuids become those of the user messages this run is sent, in order,
 // wherever an `out` line names them (`command_lifecycle`, `user_message_uuids`).
@@ -14,7 +17,11 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t: number } | { dir: "exit"; t: number; code: number | null };
-type Frame = { type: string; subtype?: string; uuid?: string; message?: { content?: unknown }; request_id?: string; request?: { subtype?: string }; response?: { request_id?: string } };
+type HookMatcher = { matcher?: string; hookCallbackIds?: string[] };
+type Frame = {
+  type: string; subtype?: string; uuid?: string; message?: { content?: unknown }; request_id?: string;
+  request?: { subtype?: string; hooks?: Record<string, HookMatcher[]> }; response?: { request_id?: string };
+};
 type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
 type Step = { need: Need; uuid?: string } | { emit: string; frame: Frame };
 
@@ -33,6 +40,10 @@ const stall = process.env.MEDDLE_FIXTURE_STALL === "1";
 const memory = process.env.MEDDLE_FIXTURE_MEMORY === "1";
 const laterResultsMs = Number(process.env.MEDDLE_FIXTURE_LATER_RESULTS_MS ?? 0);
 const resultsMs = Number(process.env.MEDDLE_FIXTURE_RESULTS_MS ?? 0);
+const toolUse = process.env.MEDDLE_FIXTURE_TOOL_USE;
+const exitAfterToolUse = process.env.MEDDLE_FIXTURE_TOOL_USE_EXIT === "1";
+/** The hooks the host registered with its `initialize` request, by event. */
+let hooks: Record<string, HookMatcher[]> = {};
 let resultsEmitted = 0;
 const EOF_CAP_MS = 5_000;
 
@@ -101,6 +112,7 @@ process.stdin.on("data", (chunk: Buffer) => {
     if (!line.trim()) continue;
     let f: Frame;
     try { f = JSON.parse(line); } catch { continue; }
+    if (f.type === "control_request" && f.request?.subtype === "initialize") hooks = f.request.hooks ?? {};
     if (f.type === "control_request") answer(f);
     if (f.type === "control_request" && f.request?.subtype === "interrupt" && stalling && heldResult !== undefined) {
       write(JSON.stringify({ ...JSON.parse(heldResult), subtype: "error_during_execution", is_error: true, errors: [] }));
@@ -199,8 +211,42 @@ async function waitFor(need: Need, recordedUuid?: string) {
   }
 }
 
+/** Calls each `PostToolUse` hook whose matcher matches `tool`, as Claude Code does once the tool has run; how many. */
+function toolUsed(tool: string): number {
+  let n = 0;
+  for (const m of hooks.PostToolUse ?? []) {
+    if (m.matcher !== undefined && m.matcher !== "" && !new RegExp(`^(?:${m.matcher})$`).test(tool)) continue;
+    for (const id of m.hookCallbackIds ?? []) {
+      const input = {
+        hook_event_name: "PostToolUse", session_id: sessionArg() ?? "", transcript_path: "", cwd: process.cwd(),
+        tool_name: tool, tool_input: {}, tool_response: {}, tool_use_id: "toolu_replay",
+      };
+      write(JSON.stringify({ type: "control_request", request_id: `replay-hook-${n++}`, request: { subtype: "hook_callback", callback_id: id, input, tool_use_id: "toolu_replay" } }));
+    }
+  }
+  return n;
+}
+
+/** Resolves once the host has answered `n` hook calls (`replay-hook-<i>`); exits if stdin ends first. */
+async function hooksAnswered(n: number) {
+  const answered = () => arrived.filter(a => a.frame.type === "control_response" && (a.frame.response?.request_id ?? "").startsWith("replay-hook-")).length;
+  while (answered() < n) {
+    if (eof) await finish();
+    await new Promise<void>(r => { wake = r; });
+  }
+}
+
+let toolCalled = false;
 for (const step of steps.slice(0, lastEmit + 1)) {
   if ("need" in step) { await waitFor(step.need, step.uuid); continue; }
+  if (step.frame.type === "result" && toolUse !== undefined && !toolCalled) {
+    toolCalled = true;
+    const called = toolUsed(toolUse);
+    if (exitAfterToolUse) {
+      await hooksAnswered(called);
+      await finish();
+    }
+  }
   if (step.frame.type === "result" && resultsMs > 0) await sleep(resultsMs);
   if (step.frame.type === "result" && resultsEmitted++ > 0 && laterResultsMs > 0) await sleep(laterResultsMs);
   const line = withLiveUuids(step.emit);

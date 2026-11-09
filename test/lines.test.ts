@@ -1,210 +1,24 @@
-// test/lines.test.ts — a task's line on the project's home: `refs/remotes/meddle/task/<id>/<name>`, which jj shows as
-// the read-only `task/<id>/<name>@meddle`, written, pushed, fetched and released.
+// test/lines.test.ts — a task's lines as rows: its holder writes one per bookmark under `meddle/task/<id>/` as its
+// agent works and at every turn end, and every node's applier keeps the refs from them (`task/<id>/<name>@meddle` where
+// another node holds the line; `meddle/task/<id>/<name>@meddle` in a checkout's fetch).
 import { expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { createRegistry } from "@earendil-works/pi-durable";
-import { loadConfig, paths, type NodeConfig } from "../src/config";
-import { cloneColocated, git, initColocated, jj, JjError } from "../src/jj";
-import { shortId } from "../src/pool/identity";
-import { fetchLines, homeLines, pushLines, releaseGoneLines, releaseLines, whereIs, writeLine } from "../src/projects/lines";
+import { rm, writeFile } from "node:fs/promises";
+import { delimiter, join } from "node:path";
+import { paths, type NodeConfig } from "../src/config";
+import { bookmarkRefs, git, jj, JjError } from "../src/jj";
+import { listLineRows, writeBranchRow, writeLineRow } from "../src/pool/rows";
+import { applyProject } from "../src/projects/applier";
+import { makeCheckout } from "../src/projects/checkouts";
+import { reclaimLineRows, writeLineRows } from "../src/projects/lines";
+import { openDb } from "../src/store/db";
+import { shortId } from "../src/pool/ids";
 import { PeerObject } from "../src/state/contracts";
-import { getTask } from "../src/store/records";
-import { TaskRunner } from "../src/tasks/durable";
-import { openHarness } from "../src/tasks/harness";
-import { readManifest } from "../src/tasks/manifest";
-import { createTask, replay, setupNode } from "./helpers";
-import { peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
-
-type Fixture = {
-  cfg: NodeConfig;
-  /** The user's own colocated checkout: P → W, with `@` on W. */
-  home: string;
-  P: string;
-  W: string;
-  close(): Promise<void>;
-};
+import { readManifest, sideBookmark } from "../src/tasks/manifest";
+import { createTask, setupNode } from "./helpers";
+import { peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 const log = (cfg: NodeConfig, repo: string, rev: string, template: string) =>
   jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", template], repo, cfg).then((s) => s.trim());
-
-async function fixture(): Promise<Fixture> {
-  const dir = await mkdtemp("/tmp/meddle-lines-");
-  const cfg = loadConfig({ HOME: dir, MEDDLE_DATA_DIR: `${dir}/d` });
-  const home = `${dir}/home`;
-  await initColocated(home, cfg);
-  await writeFile(`${home}/p`, "p\n");
-  await jj(["commit", "-m", "P"], home, cfg);
-  await writeFile(`${home}/w`, "w\n");
-  await jj(["describe", "-m", "W"], home, cfg);
-  const W = (await jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"], home, cfg)).trim();
-  const P = await log(cfg, home, "@-", "commit_id");
-  return { cfg, home, P, W, close: () => rm(dir, { recursive: true, force: true }) };
-}
-
-/** The commit git's ref `ref` names in `repo`, or null when there is none. */
-async function refOf(cfg: NodeConfig, repo: string, ref: string): Promise<string | null> {
-  const out = await git(["for-each-ref", "--format=%(objectname)", ref], repo, cfg);
-  return out.trim() === "" ? null : out.trim();
-}
-
-test("writeLine shows task/<id>/<name>@meddle and makes W and P immutable", async () => {
-  const f = await fixture();
-  try {
-    await writeLine(f.cfg, f.home, "t1", "app", f.W);
-    expect(await jj(["bookmark", "list", "--ignore-working-copy", "--all-remotes", "-T", 'name ++ "@" ++ remote ++ "\\n"', "glob:task/*"], f.home, f.cfg)).toBe("task/t1/app@meddle\n");
-    expect(await log(f.cfg, f.home, f.W, "immutable")).toBe("true");
-    expect(await log(f.cfg, f.home, f.P, "immutable")).toBe("true");
-    expect(await log(f.cfg, f.home, "immutable()", 'commit_id ++ "\\n"')).toContain(f.W);
-  } finally {
-    await f.close();
-  }
-});
-
-test("homeLines lists the lines by name, of one task or of every task", async () => {
-  const f = await fixture();
-  try {
-    await writeLine(f.cfg, f.home, "t1", "app", f.W);
-    await writeLine(f.cfg, f.home, "t1", "app.b", f.P);
-    await writeLine(f.cfg, f.home, "t2", "app", f.P);
-    expect(await homeLines(f.cfg, f.home, "t1")).toEqual([
-      { taskId: "t1", name: "app", commitId: f.W },
-      { taskId: "t1", name: "app.b", commitId: f.P },
-    ]);
-    expect((await homeLines(f.cfg, f.home)).map((l) => `${l.taskId}/${l.name}`)).toEqual(["t1/app", "t1/app.b", "t2/app"]);
-    expect(await homeLines(f.cfg, f.home, "t3")).toEqual([]);
-  } finally {
-    await f.close();
-  }
-});
-
-test("releaseLines keeps the user's commits and @", async () => {
-  const f = await fixture();
-  try {
-    await writeLine(f.cfg, f.home, "t1", "app", f.W);
-    await jj(["new", f.W], f.home, f.cfg);
-    expect(await releaseLines(f.cfg, f.home, "t1", [])).toEqual(["app"]);
-    expect(await refOf(f.cfg, f.home, "refs/remotes/meddle/task/t1/app")).toBeNull();
-    expect(await homeLines(f.cfg, f.home, "t1")).toEqual([]);
-    expect(await log(f.cfg, f.home, `${f.W} | ${f.P}`, 'commit_id ++ " " ++ immutable ++ "\\n"')).toBe(`${f.W} false\n${f.P} false`);
-    expect(await log(f.cfg, f.home, `visible_heads() & (${f.W} | ${f.P})::`, "commit_id")).not.toBe("");
-    expect(await log(f.cfg, f.home, "@-", "commit_id")).toBe(f.W);
-  } finally {
-    await f.close();
-  }
-});
-
-test("releaseLines with keep releases the other names and leaves the other tasks alone", async () => {
-  const f = await fixture();
-  try {
-    await writeLine(f.cfg, f.home, "t1", "p", f.W);
-    await writeLine(f.cfg, f.home, "t1", "p.x", f.P);
-    await writeLine(f.cfg, f.home, "t2", "p", f.P);
-    expect(await releaseLines(f.cfg, f.home, "t1", ["p"])).toEqual(["p.x"]);
-    expect(await homeLines(f.cfg, f.home)).toEqual([
-      { taskId: "t1", name: "p", commitId: f.W },
-      { taskId: "t2", name: "p", commitId: f.P },
-    ]);
-    // The line held P, which t2's line still holds; W stays held by t1's line.
-    expect(await log(f.cfg, f.home, f.W, "immutable")).toBe("true");
-  } finally {
-    await f.close();
-  }
-});
-
-test("pushLines puts a task's bookmarks on the home as its line and fetchLines brings them back, pruning", async () => {
-  const { A, B, close } = await twoPoolNodes();
-  try {
-    const home = A.project.replica;
-    await writeFile(`${home}/w`, "w\n");
-    await jj(["commit", "-m", "W"], home, A.cfg);
-    const W = (await jj(["log", "-r", "@-", "--no-graph", "-T", "commit_id"], home, A.cfg)).trim();
-    await writeLine(A.cfg, home, "t1", "a", W);
-    await peerReady(B, A);
-    await peerReady(A, B);
-
-    const project = { ...A.project, home: A.id };
-    const repo = `${B.home}/r`;
-    await cloneColocated(`meddle://${A.id}/project/${A.project.id}`, repo, B.cfg, shortId(A.id));
-    // Nothing under the namespace is nothing to push.
-    await pushLines(B.cfg, repo, project, "t2");
-    expect((await homeLines(A.cfg, home)).map((l) => l.taskId)).toEqual(["t1"]);
-
-    // The line comes down as mutable local bookmarks; the holder rewrites it and pushes it back, forced.
-    expect(await fetchLines(B.cfg, repo, project, A.id, "t1", "home")).toEqual([{ name: "a", commitId: W }]);
-    expect(await log(B.cfg, repo, "meddle/task/t1/a", "immutable")).toBe("false");
-    await jj(["describe", "-r", "meddle/task/t1/a", "-m", "W, reworded"], repo, B.cfg);
-    const W2 = await log(B.cfg, repo, "meddle/task/t1/a", "commit_id");
-    expect(W2).not.toBe(W);
-    await pushLines(B.cfg, repo, project, "t1");
-    expect(await homeLines(A.cfg, home, "t1")).toEqual([{ taskId: "t1", name: "a", commitId: W2 }]);
-
-    // A stale local side bookmark goes when the home does not have it.
-    await jj(["bookmark", "create", "meddle/task/t1/a.old", "-r", "@-"], repo, B.cfg);
-    expect(await fetchLines(B.cfg, repo, project, A.id, "t1", "home")).toEqual([{ name: "a", commitId: W2 }]);
-  } finally {
-    await close();
-  }
-}, 60_000);
-
-test("PeerObject.releaseLines releases a line on the home and is refused on another node", async () => {
-  const { A, B, close } = await twoPoolNodes();
-  try {
-    const repo = A.project.replica;
-    await writeFile(`${repo}/w`, "w\n");
-    await jj(["commit", "-m", "W"], repo, A.cfg);
-    const W = (await jj(["log", "-r", "@-", "--no-graph", "-T", "commit_id"], repo, A.cfg)).trim();
-    await writeLine(A.cfg, repo, "t1", "a", W);
-    await writeLine(A.cfg, repo, "t1", "a.b", W);
-    await peerReady(B, A);
-    await peerReady(A, B);
-
-    const onA = await B.pool.peerRef(A.id, PeerObject);
-    try {
-      if (onA.variant !== "peer") throw new Error("expected the peer variant");
-      // A task id goes into a jj pattern: one safe segment only, never a glob that would name another task's lines.
-      await expect(onA.releaseLines({ projectId: A.project.id, taskId: "*", keep: [] })).rejects.toThrow("invalid task id: *");
-      expect((await homeLines(A.cfg, repo, "t1")).length).toBe(2);
-      expect(await onA.releaseLines({ projectId: A.project.id, taskId: "t1", keep: ["a"] })).toEqual({ released: ["a.b"] });
-    } finally {
-      onA.release();
-    }
-    expect(await homeLines(A.cfg, repo, "t1")).toEqual([{ taskId: "t1", name: "a", commitId: W }]);
-
-    const onB = await A.pool.peerRef(B.id, PeerObject);
-    try {
-      if (onB.variant !== "peer") throw new Error("expected the peer variant");
-      await expect(onB.releaseLines({ projectId: A.project.id, taskId: "t1", keep: [] })).rejects.toThrow(`not the home of ${shortId(A.project.id)}`);
-    } finally {
-      onB.release();
-    }
-    expect(await homeLines(A.cfg, repo, "t1")).toEqual([{ taskId: "t1", name: "a", commitId: W }]);
-  } finally {
-    await close();
-  }
-}, 15_000);
-
-test("PeerObject.taskHeld and whereIs say where a task is", async () => {
-  const { A, B, close } = await twoPoolNodes();
-  try {
-    await peerReady(B, A);
-    await peerReady(A, B);
-    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
-    const onB = await A.pool.peerRef(B.id, PeerObject);
-    try {
-      if (onB.variant !== "peer") throw new Error("expected the peer variant");
-      expect(await onB.taskHeld({ id: m.id })).toBe(true);
-      expect(await onB.taskHeld({ id: "nope" })).toBe(false);
-    } finally {
-      onB.release();
-    }
-    const deps = { cfg: A.cfg, db: A.db, pool: A.pool };
-    expect(await whereIs(deps, m.id)).toBe("held");
-    expect(await whereIs(deps, "nope")).toBe("gone");
-  } finally {
-    await close();
-  }
-}, 30_000);
 
 /** Sends `text` to the task on `node` and waits for the turn to end. */
 async function promptAndWait(node: GitPoolNode, taskId: string, text: string): Promise<void> {
@@ -220,13 +34,17 @@ async function promptAndWait(node: GitPoolNode, taskId: string, text: string): P
   await idle;
 }
 
-/** Gives the home repo of `node`'s project a commit of the user's, `main`; returns its commit id. */
+/** Gives `node`'s project's service repo a commit of the user's on `main`, and moves `main` to it; returns its id. */
 async function userCommit(node: GitPoolNode): Promise<string> {
   const home = node.project.replica;
+  await jj(["new", "main"], home, node.cfg);
   await writeFile(`${home}/mine`, "mine\n");
   await jj(["commit", "-m", "mine"], home, node.cfg);
   await jj(["bookmark", "set", "main", "-r", "@-"], home, node.cfg);
-  return log(node.cfg, home, "main", "commit_id");
+  const mine = await log(node.cfg, home, "main", "commit_id");
+  // `main`'s row too: a start reads the branch from its rows, and an apply puts the bookmark back at its row's position.
+  writeBranchRow(node.db, node.id, { project: node.project.id, branch: "main", commit: mine, drops: [] });
+  return mine;
 }
 
 /** The git refs under `prefix` in `repo`, one `<ref> <commit>` each. */
@@ -234,9 +52,9 @@ async function refsIn(cfg: NodeConfig, repo: string, prefix: string): Promise<st
   return (await git(["for-each-ref", "--format=%(refname) %(objectname)", prefix], repo, cfg)).split("\n").filter(Boolean);
 }
 
-/** Polls `get` until it returns `want`; fails with the last value after 15 s. */
-async function untilValue<T>(what: string, get: () => Promise<T>, want: T): Promise<void> {
-  const end = Date.now() + 15_000;
+/** Polls `get` until it returns `want`; fails with the last value after `ms` (15 s). */
+async function untilValue<T>(what: string, get: () => Promise<T> | T, want: T, ms = 15_000): Promise<void> {
+  const end = Date.now() + ms;
   for (;;) {
     const got = await get();
     if (JSON.stringify(got) === JSON.stringify(want)) return;
@@ -245,62 +63,266 @@ async function untilValue<T>(what: string, get: () => Promise<T>, want: T): Prom
   }
 }
 
-/** Takes `a` and `b` off each other's network, and waits until each sees the other offline. */
-async function partition(a: GitPoolNode, b: GitPoolNode): Promise<void> {
-  a.net.unwatch(b.id, "bye");
-  b.net.unwatch(a.id, "bye");
-  await untilValue("the nodes offline to each other", async () => !a.net.isOnline(b.id) && !b.net.isOnline(a.id), true);
-}
+/** A PATH with `node`'s `<data>/bin` first: git finds the remote helper there. */
+const helperEnv = (node: GitPoolNode) => ({ PATH: `${paths(node.cfg).bin}${delimiter}${process.env.PATH}` });
 
-/** Puts `a` and `b` back on each other's network. */
-function rejoin(a: GitPoolNode, b: GitPoolNode): void {
-  a.net.watch(b.id);
-  b.net.watch(a.id);
-  a.net.offerAddress(a.pool.store.row(b.id)!.lastAddr!);
-  b.net.offerAddress(b.pool.store.row(a.id)!.lastAddr!);
-}
+/** The task's line rows of `node`'s project on `on`, as `[name, holder, commit]`. */
+const rowsOf = (on: GitPoolNode, projectId: string, taskId: string) =>
+  listLineRows(on.db, projectId, taskId).map((r) => [r.name, r.holder, r.commit] as const);
 
-test("a home task's turn end writes task/<id>/<project>@meddle at its bookmark, and the user's repo then refuses to describe it", async () => {
-  const { A, close } = await twoPoolNodes();
+test("writeLineRows snapshots the task's workspace, writes a row per bookmark under its namespace as this node's, and releases a side bookmark the agent deleted, never the project's line", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
   try {
-    const home = A.project.replica;
+    const logs: string[] = [];
+    const deps = { cfg: A.cfg, db: A.db, pool: A.pool, log: (line: string) => logs.push(line) };
+    const repo = A.project.replica;
     const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
-    await writeFile(join(paths(A.cfg).task(m.id), "a", "work"), "work\n");
-    await promptAndWait(A, m.id, "Reply with the single word ok.");
-    const head = await log(A.cfg, home, `meddle/task/${m.id}/a`, "commit_id");
-    expect(await homeLines(A.cfg, home, m.id)).toEqual([{ taskId: m.id, name: "a", commitId: head }]);
-    expect(await log(A.cfg, home, `task/${m.id}/a@meddle`, "commit_id")).toBe(head);
-    const refused = await jj(["--ignore-working-copy", "describe", "-r", head, "-m", "mine"], home, A.cfg).catch((err: unknown) => err);
-    expect(refused).toBeInstanceOf(JjError);
-    expect((refused as JjError).stderr).toContain(`Commit ${head.slice(0, 12)} is immutable`);
-    expect(A.logs.filter((l) => l.startsWith("meddle: push:") || l.startsWith("meddle: give back:"))).toEqual([]);
+    const [start] = listLineRows(A.db, A.project.id, m.id);
+    expect(start).toMatchObject({ name: "a", holder: A.id, commit: m.projects[0]!.base[0]! });
+    // A side bookmark, and one outside the namespace, on the start; then an edit no jj command has seen yet.
+    await jj(["--ignore-working-copy", "bookmark", "create", sideBookmark(m.id, "a", "spike"), "spike", "-r", start!.commit!], repo, A.cfg);
+    const workspace = join(paths(A.cfg).task(m.id), "a");
+    await writeFile(join(workspace, "work"), "work\n");
+
+    await writeLineRows(deps, m);
+    const head = await log(A.cfg, repo, `meddle/task/${m.id}/a`, "commit_id");
+    expect(await jj(["diff", "--ignore-working-copy", "-r", head, "--name-only"], repo, A.cfg)).toContain("work");
+    expect(listLineRows(A.db, A.project.id, m.id)).toMatchObject([
+      { name: "a", holder: A.id, epoch: start!.epoch, commit: head, base: start!.base, archived: false },
+      { name: "a.spike", holder: A.id, epoch: start!.epoch, commit: start!.commit, base: [], archived: false },
+    ]);
+    // Nothing moved: nothing written.
+    const seqs = listLineRows(A.db, A.project.id, m.id).map((r) => r.seq);
+    await writeLineRows(deps, m);
+    expect(listLineRows(A.db, A.project.id, m.id).map((r) => r.seq)).toEqual(seqs);
+
+    // A side line another node released below the task's epoch is taken at it when the agent bookmarks it again.
+    const other = "f".repeat(64);
+    const spikeRow = listLineRows(A.db, A.project.id, m.id)[1]!;
+    writeLineRow(A.db, { ...spikeRow, holder: other, epoch: start!.epoch - 1, commit: null });
+    await writeLineRows(deps, m);
+    expect(listLineRows(A.db, A.project.id, m.id)[1]).toMatchObject({ name: "a.spike", holder: A.id, epoch: start!.epoch, commit: start!.commit });
+
+    // A line another node holds is not this node's to write: no snapshot, no bookmark moved, no row written.
+    const held = writeLineRow(A.db, { ...start!, holder: other, epoch: start!.epoch + 1, commit: start!.commit });
+    const before = listLineRows(A.db, A.project.id, m.id);
+    await writeFile(join(workspace, "late"), "late\n");
+    await jj(["--ignore-working-copy", "bookmark", "delete", `exact:${sideBookmark(m.id, "a", "spike")}`], repo, A.cfg);
+    expect(logs).toEqual([]);
+    await writeLineRows(deps, m);
+    expect(listLineRows(A.db, A.project.id, m.id)).toEqual(before);
+    expect(await log(A.cfg, repo, `meddle/task/${m.id}/a`, "commit_id")).toBe(head);
+    expect(logs).toEqual([
+      `meddle: line: ${m.id}'s line ${shortId(A.project.id)}/a is held by ${shortId(other)} at epoch ${held.epoch}; not written here`,
+    ]);
+    logs.length = 0;
+    // Taken back here (as a rollback does), it is written again at its epoch.
+    writeLineRow(A.db, { ...held, holder: A.id, epoch: held.epoch + 1 });
+    await jj(["--ignore-working-copy", "bookmark", "create", sideBookmark(m.id, "a", "spike"), "-r", start!.commit!], repo, A.cfg);
+    await writeLineRows(deps, m);
+    const newHead = await log(A.cfg, repo, `meddle/task/${m.id}/a`, "commit_id");
+    expect(newHead).not.toBe(head);
+    expect(listLineRows(A.db, A.project.id, m.id)[0]).toMatchObject({ name: "a", holder: A.id, epoch: start!.epoch + 2, commit: newHead });
+
+    // The agent deletes both its bookmarks: the side line is released (holder and epoch kept), the project's stays.
+    await jj(["--ignore-working-copy", "bookmark", "delete", `exact:meddle/task/${m.id}/a`, `exact:${sideBookmark(m.id, "a", "spike")}`], repo, A.cfg);
+    await writeLineRows(deps, m);
+    expect(listLineRows(A.db, A.project.id, m.id)).toMatchObject([
+      { name: "a", holder: A.id, commit: newHead },
+      { name: "a.spike", holder: A.id, epoch: start!.epoch, commit: null },
+    ]);
+    expect(await log(A.cfg, repo, `meddle/task/${m.id}/a`, "commit_id")).toBe(newHead);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("reclaimLineRows takes a rolled-back task's live rows back above any epoch the target could have written", () => {
+  const db = openDb(":memory:");
+  try {
+    const [self, target] = ["a".repeat(64), "b".repeat(64)];
+    const [c1, c2] = ["1".repeat(40), "2".repeat(40)];
+    const row = { project: "p", task: "t", base: [], archived: false };
+    // A line still this node's (the target never activated), one the target took (its answer was lost), one released.
+    writeLineRow(db, { ...row, name: "a", holder: self, epoch: 4, commit: c1 });
+    writeLineRow(db, { ...row, name: "a.side", holder: target, epoch: 5, commit: c2 });
+    writeLineRow(db, { ...row, name: "a.gone", holder: self, epoch: 4, commit: null });
+    expect(reclaimLineRows(db, self, "t", true)).toEqual(["a", "a.side"]);
+    expect(listLineRows(db, "p", "t").map((r) => [r.name, r.holder === self, r.epoch, r.commit, r.archived])).toEqual([
+      ["a", true, 6, c1, true], ["a.gone", true, 4, null, false], ["a.side", true, 6, c2, true],
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
+test("writeLineRows archives a conflicted bookmark's row too, keeping the commit it had", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const deps = { cfg: A.cfg, db: A.db, pool: A.pool };
+    const repo = A.project.replica;
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    const spike = sideBookmark(m.id, "a", "spike");
+    const base = m.projects[0]!.base[0]!;
+    await jj(["--ignore-working-copy", "bookmark", "create", spike, "-r", base], repo, A.cfg);
+    await writeLineRows(deps, m);
+    expect(listLineRows(A.db, A.project.id, m.id)[1]).toMatchObject({ name: "a.spike", commit: base, archived: false });
+
+    // Two operations from the same one set it apart: jj holds it conflicted.
+    const op = (await jj(["op", "log", "--ignore-working-copy", "--no-graph", "-n", "1", "-T", "id"], repo, A.cfg)).trim();
+    const other = await log(A.cfg, repo, `meddle/task/${m.id}/a`, "commit_id");
+    await jj(["--ignore-working-copy", "bookmark", "set", spike, "-r", "root()", "--allow-backwards"], repo, A.cfg);
+    await jj(["--ignore-working-copy", "--at-op", op, "bookmark", "set", spike, "-r", other], repo, A.cfg);
+    expect((await bookmarkRefs(repo, `exact:${spike}`, A.cfg)).find((b) => b.remote === null)?.conflicted).toBe(true);
+
+    await writeLineRows(deps, m, { archived: true });
+    expect(listLineRows(A.db, A.project.id, m.id).map((r) => [r.name, r.commit, r.archived])).toEqual([
+      ["a", other, true], ["a.spike", base, true],
+    ]);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("PeerObject.taskHeld says whether a node holds a task", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    await peerReady(B, A);
+    await peerReady(A, B);
+    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
+    const onB = await A.pool.peerRef(B.id, PeerObject);
+    try {
+      if (onB.variant !== "peer") throw new Error("expected the peer variant");
+      expect(await onB.taskHeld({ id: m.id })).toBe(true);
+      expect(await onB.taskHeld({ id: "nope" })).toBe(false);
+    } finally {
+      onB.release();
+    }
   } finally {
     await close();
   }
 }, 30_000);
 
-test("a remote task's turn end pushes the same ref to the home, and the home's refs/heads/meddle/task/* stay untouched", async () => {
+test("a turn end on one node makes the task's line appear in a checkout's fetch on another, as meddle/task/<t>/<p>@meddle", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
-    const home = A.project.replica;
-    // A bookmark under the namespace in the home repo itself: no line write touches it.
-    await jj(["bookmark", "create", "meddle/task/old/a", "-r", await userCommit(A)], home, A.cfg);
-    const bookmarksBefore = await refsIn(A.cfg, home, "refs/heads/meddle/task");
-    expect(bookmarksBefore).toHaveLength(1);
+    await peerReady(A, B);
     await peerReady(B, A);
+    const co = await makeCheckout(A.cfg, A.id, A.project, `${A.home}/co`, helperEnv(A));
     const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
     await writeFile(join(paths(B.cfg).task(m.id), "a", "work"), "work\n");
     await promptAndWait(B, m.id, "Reply with the single word ok.");
     const head = await log(B.cfg, paths(B.cfg).replica(A.project.id), `meddle/task/${m.id}/a`, "commit_id");
-    expect(await homeLines(A.cfg, home, m.id)).toEqual([{ taskId: m.id, name: "a", commitId: head }]);
-    expect(await refsIn(A.cfg, home, `refs/remotes/meddle/task/${m.id}`)).toEqual([`refs/remotes/meddle/task/${m.id}/a ${head}`]);
-    expect(await log(A.cfg, home, head, "immutable")).toBe("true");
-    expect(await refsIn(A.cfg, home, "refs/heads/meddle/task")).toEqual(bookmarksBefore);
-    expect(B.logs.filter((l) => l.startsWith("meddle: push:") || l.startsWith("meddle: give back:"))).toEqual([]);
+    expect(head).not.toBe(m.projects[0]!.base[0]!);
+
+    await jj(["git", "fetch", "--remote", "meddle"], co, A.cfg);
+    const fetched = (await bookmarkRefs(co, `exact:meddle/task/${m.id}/a`, A.cfg)).find((r) => r.remote === "meddle");
+    expect(fetched).toMatchObject({ commitId: head, tracked: false });
+    expect(await log(A.cfg, co, head, "immutable")).toBe("true");
+    expect([...A.logs, ...B.logs].filter((l) => l.startsWith("meddle: git:") || l.startsWith("meddle: line"))).toEqual([]);
   } finally {
     await close();
   }
-}, 30_000);
+}, 60_000);
+
+test("an Edit the agent makes mid-turn moves its line within 6 s, before the turn ends", async () => {
+  // The stand-in calls the PostToolUse hooks for an Edit before its `result`, which it then holds back 12 s.
+  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_TOOL_USE: "Edit", MEDDLE_FIXTURE_RESULTS_MS: "12000" } }] });
+  const A = nodes[0]!;
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    const start = listLineRows(A.db, A.project.id, m.id)[0]!.commit;
+    await writeFile(join(paths(A.cfg).task(m.id), "a", "work"), "work\n");
+    // The last message before the hook: the stand-in calls it right after, as it reaches its `result`.
+    let lastEvent = 0;
+    let result = false;
+    const offEvents = A.runner.onEvent((id, _seq, msg) => {
+      if (id !== m.id) return;
+      lastEvent = Date.now();
+      if (msg.type === "result") result = true;
+    });
+    const idle = new Promise<void>((res) => {
+      const off = A.runner.onState((id, s) => { if (id === m.id && s === "idle") { off(); res(); } });
+    });
+    await A.runner.prompt(m.id, "Reply with the single word ok.");
+    const deadline = Date.now() + 20_000;
+    let moved: string | null = start;
+    while (moved === start) {
+      if (Date.now() > deadline) throw new Error("the line never moved mid-turn");
+      await Bun.sleep(25);
+      moved = listLineRows(A.db, A.project.id, m.id)[0]!.commit;
+    }
+    const after = Date.now() - lastEvent;
+    offEvents();
+    // Moved by the hook's write, not the turn end's: the turn has had no `result` yet.
+    expect(result).toBe(false);
+    expect(A.runner.state(m.id)).toBe("running");
+    expect(after).toBeLessThan(6000);
+    expect(await jj(["diff", "--ignore-working-copy", "-r", moved!, "--name-only"], A.project.replica, A.cfg)).toContain("work");
+    await idle;
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("a side bookmark the agent deleted is released on the other node at the next turn end, and the project's line is kept", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    await peerReady(B, A);
+    await peerReady(A, B);
+    const P = A.project.id;
+    const m = await createTask(B, { title: "t", projectIds: [P] });
+    const workspace = join(paths(B.cfg).task(m.id), "a");
+    await writeFile(join(workspace, "spike"), "spike\n");
+    await jj(["commit", "-m", "spike"], workspace, B.cfg);
+    await jj(["bookmark", "create", sideBookmark(m.id, "a", "spike"), "-r", "@-"], workspace, B.cfg);
+    const spike = await log(B.cfg, workspace, "@-", "commit_id");
+    await promptAndWait(B, m.id, "Reply with the single word ok.");
+    const head = await log(B.cfg, workspace, "@", "commit_id");
+    // On A, from B's rows: both lines, held by B, as remote refs once applied.
+    await untilValue("B's rows on A", () => rowsOf(A, P, m.id), [["a", B.id, head], ["a.spike", B.id, spike]]);
+    await applyProject({ cfg: A.cfg, db: A.db, pool: A.pool }, P, 10_000);
+    expect(await refsIn(A.cfg, A.project.replica, `refs/remotes/meddle/task/${m.id}`)).toEqual([
+      `refs/remotes/meddle/task/${m.id}/a ${head}`,
+      `refs/remotes/meddle/task/${m.id}/a.spike ${spike}`,
+    ]);
+
+    await jj(["bookmark", "delete", `exact:${sideBookmark(m.id, "a", "spike")}`], workspace, B.cfg);
+    await promptAndWait(B, m.id, "Again.");
+    await untilValue("B's rows on A", () => rowsOf(A, P, m.id), [["a", B.id, head], ["a.spike", B.id, null]]);
+    await applyProject({ cfg: A.cfg, db: A.db, pool: A.pool }, P, 10_000);
+    expect(await refsIn(A.cfg, A.project.replica, `refs/remotes/meddle/task/${m.id}`)).toEqual([`refs/remotes/meddle/task/${m.id}/a ${head}`]);
+    // Released through jj: the spike's commit is still there.
+    expect(await log(A.cfg, A.project.replica, spike, "commit_id")).toBe(spike);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("a turn end and an applier pass leave a checkout's operation log and git refs byte-identical (Review Focus 5)", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const co = await makeCheckout(A.cfg, A.id, A.project, `${A.home}/co`, helperEnv(A));
+    // An edit no jj command has seen yet: any snapshot of the checkout would record it.
+    await writeFile(join(co, "edited.txt"), "mine\n");
+    const state = async () => ({
+      ops: await jj(["op", "log", "--ignore-working-copy", "--no-graph", "-T", 'id ++ "\\n"'], co, A.cfg),
+      refs: await git(["show-ref"], co, A.cfg),
+    });
+    const before = await state();
+
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    await writeFile(join(paths(A.cfg).task(m.id), "a", "work"), "work\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await applyProject({ cfg: A.cfg, db: A.db, pool: A.pool }, A.project.id, 10_000);
+    expect(await state()).toEqual(before);
+  } finally {
+    await close();
+  }
+}, 60_000);
 
 test("the agent's workspace can describe its line's head but not its base", async () => {
   const { A, close } = await twoPoolNodes();
@@ -308,11 +330,11 @@ test("the agent's workspace can describe its line's head but not its base", asyn
     const home = A.project.replica;
     const mine = await userCommit(A);
     const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
-    expect((await readManifest(A.cfg, m.id)).projects[0]!.base).toBe(mine);
+    expect((await readManifest(A.cfg, m.id)).projects[0]!.base).toEqual([mine]);
     const workspace = join(paths(A.cfg).task(m.id), "a");
     await writeFile(join(workspace, "work"), "work\n");
     await promptAndWait(A, m.id, "Reply with the single word ok.");
-    const head = await log(A.cfg, home, `task/${m.id}/a@meddle`, "commit_id");
+    const head = await log(A.cfg, home, `meddle/task/${m.id}/a`, "commit_id");
     expect(await log(A.cfg, workspace, "@", "commit_id")).toBe(head);
     expect(await log(A.cfg, workspace, "@-", "commit_id")).toBe(mine);
 
@@ -327,182 +349,21 @@ test("the agent's workspace can describe its line's head but not its base", asyn
   }
 }, 30_000);
 
-test("a side bookmark the agent deleted is released on the home at the next turn end, and the project's line is kept", async () => {
-  const { A, B, close } = await twoPoolNodes();
-  try {
-    const home = A.project.replica;
-    await peerReady(B, A);
-    // Held on the home itself, and on another node.
-    for (const holder of [A, B]) {
-      const m = await createTask(holder, { title: "t", projectIds: [A.project.id] });
-      const workspace = join(paths(holder.cfg).task(m.id), "a");
-      await writeFile(join(workspace, "spike"), "spike\n");
-      await jj(["commit", "-m", "spike"], workspace, holder.cfg);
-      await jj(["bookmark", "create", `meddle/task/${m.id}/a.spike`, "-r", "@-"], workspace, holder.cfg);
-      await promptAndWait(holder, m.id, "Reply with the single word ok.");
-      expect((await homeLines(A.cfg, home, m.id)).map((l) => l.name)).toEqual(["a", "a.spike"]);
-
-      await jj(["bookmark", "delete", `exact:meddle/task/${m.id}/a.spike`], workspace, holder.cfg);
-      await promptAndWait(holder, m.id, "Again.");
-      const head = await log(holder.cfg, workspace, "@", "commit_id");
-      expect(await homeLines(A.cfg, home, m.id)).toEqual([{ taskId: m.id, name: "a", commitId: head }]);
-      expect(holder.logs.filter((l) => l.startsWith("meddle: push:") || l.startsWith("meddle: give back:"))).toEqual([]);
-    }
-  } finally {
-    await close();
-  }
-}, 60_000);
-
-test("a push that failed while the home was offline is made again when the home comes back, with no turn", async () => {
-  const { A, B, close } = await twoPoolNodes();
-  try {
-    const home = A.project.replica;
-    await peerReady(B, A);
-    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
-    const workspace = join(paths(B.cfg).task(m.id), "a");
-    await promptAndWait(B, m.id, "Reply with the single word ok.");
-    const first = (await homeLines(A.cfg, home, m.id))[0]?.commitId;
-    expect(first).toBeDefined();
-
-    await partition(A, B);
-    await writeFile(join(workspace, "work"), "work\n");
-    await promptAndWait(B, m.id, "Again.");
-    const line = await log(B.cfg, paths(B.cfg).replica(A.project.id), `meddle/task/${m.id}/a`, "commit_id");
-    expect(line).not.toBe(first);
-    expect(B.logs).toContain(`meddle: push: meddle/task/${m.id}/* to ${shortId(A.id)} failed: home ${shortId(A.id)} is offline`);
-    expect((await homeLines(A.cfg, home, m.id))[0]?.commitId).toBe(first);
-
-    rejoin(A, B);
-    await untilValue("the line on the home", async () => (await homeLines(A.cfg, home, m.id))[0]?.commitId, line);
-    expect(getTask(B.db, m.id)!.turns).toBe(2);
-  } finally {
-    await close();
-  }
-}, 60_000);
-
-test("a runner started while a task's home is offline writes the task's line once the home is back, with no turn", async () => {
-  const { A, B, close } = await twoPoolNodes();
-  let reopened: { close(): Promise<void> } | undefined;
-  try {
-    const home = A.project.replica;
-    await peerReady(B, A);
-    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
-    await promptAndWait(B, m.id, "Reply with the single word ok.");
-    const first = (await homeLines(A.cfg, home, m.id))[0]?.commitId;
-    await partition(A, B);
-    // The task's bookmark moved, and the node stopped before any push of it: the runner that starts knows nothing of it.
-    await writeFile(join(paths(B.cfg).task(m.id), "a", "work"), "work\n");
-    await B.runner.setTaskBookmarks(await readManifest(B.cfg, m.id));
-    const line = await log(B.cfg, paths(B.cfg).replica(A.project.id), `meddle/task/${m.id}/a`, "commit_id");
-    expect(line).not.toBe(first);
-    await B.harness.close();
-    const harness = await openHarness(B.cfg, createRegistry());
-    reopened = harness;
-    new TaskRunner(B.cfg, B.db, harness.harness, {
-      claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl` },
-      pool: B.pool, log: (l) => B.logs.push(l),
-    });
-
-    rejoin(A, B);
-    await untilValue("the line on the home", async () => (await homeLines(A.cfg, home, m.id))[0]?.commitId, line);
-    expect(getTask(B.db, m.id)!.turns).toBe(1);
-  } finally {
-    await reopened?.close();
-    await close();
-  }
-}, 60_000);
-
-test("the janitor releases the line of a task gone from every node, and keeps one an offline node may hold", async () => {
-  const { A, B, close } = await twoPoolNodes();
-  try {
-    const home = A.project.replica;
-    const deps = { cfg: A.cfg, db: A.db, pool: A.pool };
-    const W = await userCommit(A);
-    // A task gone from every node, and one held here.
-    await writeLine(A.cfg, home, "gone", "a", W);
-    await writeLine(A.cfg, home, "gone", "a.b", W);
-    const held = await createTask(A, { title: "held", projectIds: [A.project.id] });
-    await writeLine(A.cfg, home, held.id, "a", W);
-    await peerReady(A, B);
-
-    expect(await releaseGoneLines(deps)).toBe(1);
-    expect(await homeLines(A.cfg, home, "gone")).toEqual([]);
-    expect((await homeLines(A.cfg, home)).map((l) => l.taskId)).toEqual([held.id]);
-
-    // With B offline, a task no online node holds may be on B: its line stays.
-    await writeLine(A.cfg, home, "maybe", "a", W);
-    await partition(A, B);
-    expect(await releaseGoneLines(deps)).toBe(0);
-    expect((await homeLines(A.cfg, home)).map((l) => l.taskId).sort()).toEqual([held.id, "maybe"].sort());
-  } finally {
-    await close();
-  }
-}, 60_000);
-
-test("the janitor releases the line of a task that moved away and was then deleted where it went: a moved row holds nothing", async () => {
-  const { insertTask, updateTask } = await import("../src/store/records");
-  const { A, B, close } = await twoPoolNodes();
-  try {
-    const home = A.project.replica;
-    const deps = { cfg: A.cfg, db: A.db, pool: A.pool };
-    const W = await userCommit(A);
-    const moved = (db: typeof A.db, id: string, to: string) => {
-      insertTask(db, { id, title: id, state: "moved", session_id: `s-${id}`, manifest: "{}", started: 1, turns: 1 });
-      updateTask(db, id, { moved_to: to });
-    };
-    // One moved from A to B, one from B to A, each deleted there while A was offline: only the moved rows are left.
-    moved(A.db, "fromhome", B.id);
-    moved(B.db, "fromb", A.id);
-    await writeLine(A.cfg, home, "fromhome", "a", W);
-    await writeLine(A.cfg, home, "fromb", "a", W);
-    await peerReady(A, B);
-    expect(await whereIs(deps, "fromhome")).toBe("gone");
-    expect(await whereIs(deps, "fromb")).toBe("gone");
-    expect(await releaseGoneLines(deps)).toBe(2);
-    expect(await homeLines(A.cfg, home)).toEqual([]);
-  } finally {
-    await close();
-  }
-}, 60_000);
-
-test("setting a task's bookmarks on the home never snapshots the user's checkout", async () => {
+test("setting a task's bookmarks never snapshots the service repo's own working copy", async () => {
   const node = await setupNode();
   try {
     const { cfg, project, runner } = node;
-    const home = project.replica;
+    const repo = project.replica;
     const m = await createTask(node, { title: "t", projectIds: [project.id] });
-    // An edit in the user's checkout that no jj command has seen yet.
-    await writeFile(`${home}/edited.txt`, "mine\n");
+    // An edit in the service repo's working copy that no jj command has seen yet.
+    await writeFile(`${repo}/edited.txt`, "mine\n");
     await writeFile(join(paths(cfg).task(m.id), "a", "work"), "work\n");
     await runner.setTaskBookmarks(await readManifest(cfg, m.id));
-    // The task's own working copy was snapshotted into its bookmark; the user's was not.
-    expect(await jj(["diff", "--ignore-working-copy", "-r", `meddle/task/${m.id}/a`, "--name-only"], home, cfg)).toContain("work");
-    expect(await jj(["diff", "--ignore-working-copy", "-r", "default@", "--name-only"], home, cfg)).not.toContain("edited.txt");
+    // The task's own working copy was snapshotted into its bookmark; the service repo's was not.
+    expect(await jj(["diff", "--ignore-working-copy", "-r", `meddle/task/${m.id}/a`, "--name-only"], repo, cfg)).toContain("work");
+    expect(await jj(["diff", "--ignore-working-copy", "-r", "default@", "--name-only"], repo, cfg)).not.toContain("edited.txt");
   } finally {
     await node.harness.close();
     await rm(node.home, { recursive: true, force: true });
-  }
-}, 30_000);
-
-test("the janitor leaves a line startAt wrote alone for an hour, though no node holds its task yet; then releases it", async () => {
-  const { startPoolNode } = await import("./pool-helpers");
-  const { startAt } = await import("../src/projects/starts");
-  const { STARTING_MS } = await import("../src/projects/lines");
-  const A = await startPoolNode();
-  try {
-    const home = A.project.replica;
-    const deps = { cfg: A.cfg, db: A.db, pool: A.pool };
-    const log: string[] = [];
-    // A task being created: its start wrote the line, and no node has the task yet.
-    await startAt({ cfg: A.cfg, db: A.db, selfId: A.id }, A.project.id, "creating", null, "child");
-    expect((await homeLines(A.cfg, home)).map((l) => l.taskId)).toEqual(["creating"]);
-    expect(await releaseGoneLines(deps, (line) => log.push(line))).toBe(0);
-    expect((await homeLines(A.cfg, home)).map((l) => l.taskId)).toEqual(["creating"]);
-    // An hour on, its creation is long over: no node holds it, so its line goes.
-    expect(await releaseGoneLines(deps, (line) => log.push(line), Date.now() + STARTING_MS)).toBe(1);
-    expect(await homeLines(A.cfg, home)).toEqual([]);
-    expect(log).toEqual([]);
-  } finally {
-    await A.close();
   }
 }, 30_000);

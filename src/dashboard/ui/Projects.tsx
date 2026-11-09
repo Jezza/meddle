@@ -1,12 +1,12 @@
-// A project across the pool (its home, the nodes holding a copy and their bookmarks, its tasks), and adding a project
-// on this node from a folder or an upstream URL.
+// A project across the pool (its home, its branches, a conflicted one with its siblings, the nodes holding a copy and
+// their bookmarks, its tasks), and adding a project on this node from a folder or an upstream URL.
 import type { Host, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
 import { NodeObject, ProjectObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
 import { PaneHead, type PoolRef, StateDot } from "./common";
-import { headText, mergeProjects, type HeldProject } from "./pool-model";
+import { branchLines, headText, mergeProjects, type HeldProject } from "./pool-model";
 import { hashOf } from "./routes";
 import { waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
@@ -47,6 +47,23 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
             <dl>
               <dt>Home</dt><dd title={project.home}>{nameOf(project.home)}</dd>
             </dl>
+            <h3>Branches</h3>
+            {project.branches.length === 0 ? <p class="muted">No branches.</p> : (
+              <ul class="plain">
+                {branchLines(project.branches, project.defaultBranch).map((b) => (
+                  <li key={b.name} class={b.conflicted ? "flag" : ""}>
+                    <code>{b.name}</code> {b.isDefault && <span class="muted">(default) </span>}<code>{b.text}</code>
+                    {b.conflicted && (
+                      <div class="muted">
+                        Its siblings, in a checkout: {b.siblings.map((s, i) => <span key={s}>{i > 0 && ", "}<code>{s}</code></span>)}.
+                        Push a merge of them, or drop one with <code>git push meddle :refs/heads/meddle/conflict/{b.name}/&lt;id&gt;</code>;
+                        to keep your own work: <code>jj bookmark set {b.name} -r &lt;your commit&gt;</code>.
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
             <h3>Copies</h3>
             <table>
               <thead><tr><th>Node</th><th>Bookmarks</th></tr></thead>
@@ -102,13 +119,15 @@ function HeldSourceLoaded({ project, nodeId, report }: { project: Ref<typeof Pro
   const id = useValue(project.id);
   const name = useValue(project.name);
   const home = useValue(project.home);
+  const defaultBranch = useValue(project.defaultBranch);
   const heads = useValue(project.heads);
+  const branches = useValue(project.branches);
   const contextLoaded = useValue(project.contextLoaded);
   useEffect(() => {
     const key = `${nodeId}/${id}`;
-    report(key, { nodeId, id, name, home, heads, contextLoaded });
+    report(key, { nodeId, id, name, home, defaultBranch: defaultBranch ?? null, heads, branches, contextLoaded });
     return () => report(key, null);
-  }, [nodeId, id, name, home, heads, contextLoaded, report]);
+  }, [nodeId, id, name, home, defaultBranch, heads, branches, contextLoaded, report]);
   return null;
 }
 
@@ -142,6 +161,13 @@ export function AddProject({ node }: { node: Ref<typeof NodeObject> }) {
           <label><span>{kind === "folder" ? "Folder on this node" : "Upstream URL"}</span>
             <input value={where} placeholder={kind === "folder" ? "/path/to/repo" : "https://… or git@…"} onInput={(e) => setWhere(e.currentTarget.value)} required />
           </label>
+          {kind === "folder" && (
+            <p class="muted">
+              This builds the project's service repo from the folder and leaves the folder alone: it does not become a
+              checkout. To work in the folder with meddle (push to it, fetch tasks' work), add it on the command line
+              instead, with <code>meddle project add &lt;folder&gt;</code>, run on this node.
+            </p>
+          )}
           <label><span>Name <span class="muted">(optional)</span></span>
             <input value={name} onInput={(e) => setName(e.currentTarget.value)} />
           </label>

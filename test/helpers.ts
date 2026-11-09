@@ -1,5 +1,6 @@
 // test/helpers.ts — shared fixtures for tests that drive a whole node against the replayer.
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { delimiter } from "node:path";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { ensureDataDirs, loadConfig, paths } from "../src/config";
 import type { Database } from "bun:sqlite";
@@ -19,12 +20,13 @@ export const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 
 /**
  * A node in a temp home: data dirs, task root, database, its pool identity (the key a later `startPool` loads; `id`), one
- * colocated project added from a folder with this node as its home (one commit, `init`, with `@` empty on it: a task
- * of it starts on `init`),
+ * project `a` added from the colocated folder `<home>/a` with this node as its home (one commit, `init`, bookmarked
+ * `main`, the project's default branch: a task of it starts on `init`; the project's repo is its service repo),
  * a token (`options.token`, default `"tok"`; `null` adds none), and a Harness with a TaskRunner that runs Claude Code
  * turns from the `fixture` recording (a name in `test/fixtures`, or an absolute path). `extraEnv` is added to the
- * environment the config is read from; its `MEDDLE_FIXTURE_MEMORY`, `MEDDLE_FIXTURE_STALL` and `MEDDLE_FIXTURE_BY_TOKEN`
- * also reach the stand-in Claude Code. `log` receives the runner's log lines (default `console.error`); `hooks` are the runner's test hooks.
+ * environment the config is read from; its `MEDDLE_FIXTURE_*` names (`_MEMORY`, `_STALL`, `_BY_TOKEN`, `_RESULTS_MS`,
+ * `_TOOL_USE`, …) also reach the stand-in Claude Code. `log` receives the runner's log lines (default
+ * `console.error`); `hooks` are the runner's test hooks.
  */
 export async function setupNode(
   fixture = "hello.jsonl",
@@ -40,6 +42,7 @@ export async function setupNode(
   await initColocated(folder);
   await writeFile(`${folder}/README`, "a\n");
   await jj(["commit", "-m", "init"], folder, cfg);
+  await jj(["bookmark", "set", "main", "-r", "@-"], folder, cfg);
   const { id } = await loadOrCreateIdentity(cfg);
   const project = await addProjectFromFolder(cfg, db, folder, id, "a");
   const token = options.token === undefined ? "tok" : options.token;
@@ -50,9 +53,8 @@ export async function setupNode(
     claudeRuntime: "bun",
     extraEnv: {
       MEDDLE_FIXTURE: fixture.startsWith("/") ? fixture : `${import.meta.dir}/fixtures/${fixture}`,
-      ...(extraEnv.MEDDLE_FIXTURE_MEMORY === undefined ? {} : { MEDDLE_FIXTURE_MEMORY: extraEnv.MEDDLE_FIXTURE_MEMORY }),
-      ...(extraEnv.MEDDLE_FIXTURE_STALL === undefined ? {} : { MEDDLE_FIXTURE_STALL: extraEnv.MEDDLE_FIXTURE_STALL }),
-      ...(extraEnv.MEDDLE_FIXTURE_BY_TOKEN === undefined ? {} : { MEDDLE_FIXTURE_BY_TOKEN: extraEnv.MEDDLE_FIXTURE_BY_TOKEN }),
+      // The stand-in's own settings (`MEDDLE_FIXTURE_MEMORY`, `_STALL`, `_BY_TOKEN`, `_RESULTS_MS`, `_TOOL_USE`, …).
+      ...Object.fromEntries(Object.entries(extraEnv).filter(([name]) => name.startsWith("MEDDLE_FIXTURE_"))),
     },
     ...(options.log === undefined ? {} : { log: options.log }),
     ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
@@ -95,7 +97,9 @@ export const repoRoot = `${import.meta.dir}/..`;
 
 /**
  * `env` on top of this process's environment, without anything that would point a meddle child at the real
- * `~/.claude` or at another node (`CLAUDE_CONFIG_DIR`, any `MEDDLE_*`).
+ * `~/.claude` or at another node (`CLAUDE_CONFIG_DIR`, any `MEDDLE_*`). Unless `env` sets `PATH` itself, its
+ * `MEDDLE_DATA_DIR`'s `bin` (where `serve` writes `git-remote-meddle`) goes first on `PATH`, as the README has a user
+ * set it: `project add` and `checkout` refuse without the helper there.
  */
 export function childEnv(env: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
@@ -103,13 +107,16 @@ export function childEnv(env: Record<string, string>): Record<string, string> {
     if (value === undefined || key === "CLAUDE_CONFIG_DIR" || key.startsWith("MEDDLE_")) continue;
     out[key] = value;
   }
+  if (env.PATH === undefined && env.MEDDLE_DATA_DIR !== undefined) {
+    out.PATH = [`${env.MEDDLE_DATA_DIR}/bin`, ...(out.PATH === undefined ? [] : [out.PATH])].join(delimiter);
+  }
   return { ...out, ...env };
 }
 
-/** Runs `bun run src/cli.ts <args>` in the repo root with `env` (see `childEnv`) and collects its output. */
-export async function meddle(args: string[], env: Record<string, string>) {
-  const proc = Bun.spawn(["bun", "run", "src/cli.ts", ...args], {
-    cwd: repoRoot,
+/** Runs `bun run src/cli.ts <args>` in `cwd` (the repo root by default) with `env` (see `childEnv`) and collects its output. */
+export async function meddle(args: string[], env: Record<string, string>, cwd = repoRoot) {
+  const proc = Bun.spawn(["bun", "run", `${repoRoot}/src/cli.ts`, ...args], {
+    cwd,
     env: childEnv(env),
     stdin: "ignore",
     stdout: "pipe",

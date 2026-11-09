@@ -24,9 +24,10 @@ async function home(lighthouseUrl: string) {
   const dir = await mkdtemp("/tmp/meddle-e2e-plan4-");
   await mkdir(`${dir}/t`, { recursive: true });
   await initColocated(`${dir}/repo`);
-  // A first commit, `@` empty on it: a task of the repo starts there.
+  // A first commit, `@` empty on it, bookmarked `main` (the project's default branch): a task of the repo starts there.
   await writeFile(`${dir}/repo/README`, "repo\n");
   await jj(["commit", "-m", "init"], `${dir}/repo`);
+  await jj(["bookmark", "set", "main", "-r", "@-"], `${dir}/repo`);
   const env = {
     HOME: dir,
     MEDDLE_DATA_DIR: `${dir}/d`,
@@ -149,12 +150,14 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     expect(await meddle(["token", "add", "--file", `${a.dir}/tok-b`, "--label", "b"], atA)).toEqual({ stdout: `token ${idB} (b)\n`, stderr: "", code: 0 });
     await until(["token", "list"], atB, new RegExp(`^${idA} {2}a {2}ok {2}.*\\n${idB} {2}b {2}ok {2}.*\\nactive: ${idA}\\n$`));
 
-    // a project homed on each node; each node's project list shows both
+    // a project homed on each node; each node's project list shows both, each held on both nodes (every node keeps
+    // every project)
     const pa = (await meddle(["project", "add", `${a.dir}/repo`, "--name", "pa"], atA)).stdout.trim();
     const pb = (await meddle(["project", "add", `${b.dir}/repo`, "--name", "pb"], atB)).stdout.trim();
     expect(pa).toMatch(/^[0-9a-f]{12}$/);
     expect(pb).toMatch(/^[0-9a-f]{12}$/);
-    const both = [`${pa}  pa  home ${shortId(A.id)}  on ${shortId(A.id)}`, `${pb}  pb  home ${shortId(B.id)}  on ${shortId(B.id)}`].join("\n");
+    const holders = [shortId(A.id), shortId(B.id)].sort().join(",");
+    const both = [`${pa}  pa  home ${shortId(A.id)}  on ${holders}`, `${pb}  pb  home ${shortId(B.id)}  on ${holders}`].join("\n");
     await until(["project", "list"], atA, new RegExp(`^${both}\\n$`));
     await until(["project", "list"], atB, new RegExp(`^${both}\\n$`));
 
@@ -172,7 +175,8 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     await idle(B.port, spawnedB);
     const author = await jj(
       ["log", "--ignore-working-copy", "--no-graph", "-r", `meddle/task/${spawnedB}/pb`, "-T", 'author.name() ++ " <" ++ author.email() ++ ">"'],
-      `${b.dir}/repo`,
+      // B's service repo of pb, where its tasks are workspaces (the folder is only a checkout).
+      `${b.dir}/d/replicas/${pb}`,
     );
     expect(author).toBe("Pool Person <pool@meddle.invalid>");
 
@@ -185,8 +189,8 @@ test("settings, tokens, placement, the bookmark namespace and archive work acros
     expect(second.code).toBe(0);
     expect(second.stderr.trim().split("\n").at(-1)).toBe("result/success");
     await idle(B.port, spawned);
-    // read through git, so the test runs no jj operation in a repo A's serve is using
-    const refsOnA = async () => (await Bun.$`git -C ${a.dir}/repo for-each-ref ${"--format=%(refname)"} refs/remotes/meddle/task/${spawned}/`.quiet().text());
+    // read through git, so the test runs no jj operation in a repo A's serve is using: A's service repo of pa
+    const refsOnA = async () => (await Bun.$`git -C ${a.dir}/d/replicas/${pa} for-each-ref ${"--format=%(refname)"} refs/remotes/meddle/task/${spawned}/`.quiet().text());
     await untilValue(`${spike} on A`, refsOnA, (out) => out.split("\n").includes(`refs/remotes/meddle/task/${spawned}/pa.spike`));
 
     // archive it on B; restore it from B with no node: placement picks pa's home A, the printed node is where it is

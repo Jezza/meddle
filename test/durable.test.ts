@@ -11,18 +11,27 @@ import { appendEvent, listEvents } from "../src/store/events";
 import { getTask, queuedOf, updateTask } from "../src/store/records";
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
-import { bookmarkList, jj } from "../src/jj";
-import { shortId } from "../src/pool/identity";
+import { jj } from "../src/jj";
+import { listLineRows, writeBranchRow } from "../src/pool/rows";
+import { readManifest, writeManifest } from "../src/tasks/manifest";
 import { createTask, setupNode } from "./helpers";
 import { peerReady, twoPoolNodes } from "./pool-helpers";
 
 /** The home node id of the projects these tests add. */
 const PROJECT_HOME = "a".repeat(64);
 const replay = `${import.meta.dir}/fake-claude/replay.ts`;
-/** Gives the fresh repo at `repo` a first commit, with `@` empty on it: a task of it starts there. */
-async function committed(repo: string): Promise<void> {
+/**
+ * Gives the fresh repo at `repo` a first commit (a README and `files`, by path), bookmarked `main` (the project's default
+ * branch): a task of it starts there.
+ */
+async function committed(repo: string, files: Record<string, string> = {}): Promise<void> {
   await writeFile(`${repo}/README`, "a\n");
+  for (const [path, text] of Object.entries(files)) {
+    await mkdir(join(repo, path, ".."), { recursive: true });
+    await writeFile(join(repo, path), text);
+  }
   await jj(["commit", "-m", "init"], repo);
+  await jj(["bookmark", "set", "main", "-r", "@-"], repo);
 }
 test("a prompt runs a durable turn and leaves the task idle", async () => {
   const home = await mkdtemp("/tmp/meddle-dur-");
@@ -122,12 +131,13 @@ test("a pending approval makes the task waiting until it is answered", async () 
   expect(states).toEqual(["running/running", "waiting/waiting", "running/running", "idle/idle"]);
   await h.close();
 });
-async function setup() {
+/** A node with project `a`, whose first commit also holds `files` (by path), and a task of it. */
+async function setup(files: Record<string, string> = {}) {
   const home = await mkdtemp("/tmp/meddle-dur-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
   await ensureDataDirs(cfg); await mkdir(cfg.taskRoot, { recursive: true });
   const db = openDb(paths(cfg).db);
-  const a = `${home}/a`; await initColocated(a); await committed(a);
+  const a = `${home}/a`; await initColocated(a); await committed(a, files);
   const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   await (await import("../src/token")).addToken(cfg, db, "tok", { setBy: null });
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
@@ -210,10 +220,9 @@ test("a task started before with no transcript on disk starts its session fresh,
   await h.close();
 });
 test("a turn that fails before it runs logs turn_failed with the reason, and pi-durable's report reaches the log", async () => {
-  const { writeFile } = await import("node:fs/promises");
-  const { db, h, runner, m } = await setup();
-  await mkdir(`${m.projects[0]!.replica}/.meddle`, { recursive: true });
-  await writeFile(`${m.projects[0]!.replica}/.meddle/context.toml`, "[claude]\nallwo = []\n");
+  // The project's context, committed: read from the task's start commit, whatever its workspace holds now.
+  const { db, h, runner, m, cfg } = await setup({ ".meddle/context.toml": "[claude]\nallwo = []\n" });
+  await writeFile(join(paths(cfg).task(m.id), "a", ".meddle", "context.toml"), "[claude]\nallow = []\n");
   const logged = spyOn(console, "error").mockImplementation(() => {});
   try {
     const told: unknown[] = [];
@@ -226,6 +235,50 @@ test("a turn that fails before it runs logs turn_failed with the reason, and pi-
     expect(told).toEqual(failed);
     for (let i = 0; i < 100 && !logged.mock.calls.some(c => String(c[0]).includes("task_faulted")); i++) await Bun.sleep(10);
     expect(logged.mock.calls.some(c => String(c[0]).startsWith("meddle: durable task_faulted (meddle.turn "))).toBe(true);
+  } finally {
+    logged.mockRestore();
+  }
+  await h.close();
+});
+test("a task's meddle context is its start commit's: editing it in the workspace changes nothing for its next turn", async () => {
+  const { db, h, runner, m, cfg, settled } = await setup({ ".meddle/context.toml": 'instructions = "Committed."\n' });
+  // An agent's edit, after the start: a context that would fail the turn were it read.
+  await writeFile(join(paths(cfg).task(m.id), "a", ".meddle", "context.toml"), "[claude]\nallwo = []\n");
+  const done = settled(runner);
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await done;
+  const messages = listEvents(db, m.id).map(e => e.message as any);
+  expect(messages.filter(msg => msg.subtype === "turn_failed")).toEqual([]);
+  expect(messages.filter(msg => msg.type === "result").map(msg => msg.subtype)).toEqual(["success"]);
+  await h.close();
+});
+test("a task's meddle context comes from its row: editing task.json's copy changes nothing", async () => {
+  const { db, h, runner, m, cfg, settled } = await setup({ ".meddle/context.toml": 'instructions = "Committed."\n' });
+  expect(m.projects[0]!.context).toBe('instructions = "Committed."\n');
+  // task.json is in the task's folder, where its agent can write: a context there that would fail the turn.
+  const file = await readManifest(cfg, m.id);
+  await writeManifest(cfg, { ...file, projects: [{ ...file.projects[0]!, context: "[claude]\nallwo = []\n" }] });
+  const done = settled(runner);
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await done;
+  const messages = listEvents(db, m.id).map(e => e.message as any);
+  expect(messages.filter(msg => msg.subtype === "turn_failed")).toEqual([]);
+  expect(messages.filter(msg => msg.type === "result").map(msg => msg.subtype)).toEqual(["success"]);
+  await h.close();
+});
+test("a project id in task.json that the task's row lacks fails the turn", async () => {
+  const { db, h, runner, m, cfg } = await setup();
+  // The agent renames the project in task.json, which is in the task's folder.
+  const file = await readManifest(cfg, m.id);
+  const renamed = "f".repeat(m.projects[0]!.id.length);
+  await writeManifest(cfg, { ...file, projects: [{ ...file.projects[0]!, id: renamed }] });
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const idle = new Promise<void>(res => runner.onState((tid, s) => { if (tid === m.id && s === "idle") res(); }));
+    await runner.prompt(m.id, "hi");
+    await idle;
+    const failed = listEvents(db, m.id).map(e => e.message as any).filter(msg => msg.subtype === "turn_failed");
+    expect(failed).toMatchObject([{ type: "meddle", error: `Error: task.json names project ${renamed}, which is not one of the task's` }]);
   } finally {
     logged.mockRestore();
   }
@@ -369,13 +422,18 @@ async function eventually(cond: () => boolean, what: () => string, ms = 10_000):
   }
 }
 
-test("without a pool, a task of a folder project starts on the fork point of the folder's `@`", async () => {
+test("without a pool, a task of a folder project starts on its default branch", async () => {
   const node = await setupNode();
   const { cfg, project, harness } = node;
   try {
+    // `main` moves on in the service repo, and its row with it: a start reads the branch from its rows.
+    await jj(["new", "main"], project.replica, cfg);
     await writeFile(`${project.replica}/README`, "hello\n");
     await jj(["commit", "-m", "hello"], project.replica, cfg);
-    const fork = await changeOf(cfg, project.replica, "@-");
+    await jj(["bookmark", "set", "main", "-r", "@-"], project.replica, cfg);
+    const fork = await changeOf(cfg, project.replica, "main");
+    const main = (await jj(["log", "--ignore-working-copy", "-r", "main", "--no-graph", "-T", "commit_id"], project.replica, cfg)).trim();
+    writeBranchRow(node.db, project.home, { project: project.id, branch: "main", commit: main, drops: [] });
     const m = await createTask(node, { title: "t", projectIds: [project.id] });
     expect(await changeOf(cfg, join(paths(cfg).task(m.id), "a"), "@-")).toBe(fork);
   } finally {
@@ -383,49 +441,44 @@ test("without a pool, a task of a folder project starts on the fork point of the
   }
 });
 
-test("a turn-end push to an unreachable home is logged once and the turn completes; the next turn end pushes", async () => {
+test("a turn end with every other node offline writes the task's line rows, and the other node has them once it is back; nothing is logged", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     await peerReady(B, A);
-    const short = shortId(A.id);
-    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
+    const P = A.project.id;
+    const m = await createTask(B, { title: "t", projectIds: [P] });
     const workspace = join(paths(B.cfg).task(m.id), "a");
-    // The task's line on the home.
-    const onA = async () => (await bookmarkList(A.project.replica, A.cfg)).find((b) => b.name === `task/${m.id}/a` && b.remote === "meddle")?.changeId;
-    const pushLines = () => B.logs.filter((l) => l.startsWith("meddle: push: "));
+    const replicaB = paths(B.cfg).replica(P);
+    const lineOn = (db: typeof A.db) => listLineRows(db, P, m.id).map((r) => [r.name, r.holder, r.commit]);
 
-    // The home goes away.
+    // The other node goes away.
     A.net.unwatch(B.id, "bye");
     B.net.unwatch(A.id, "bye");
     await eventually(() => !B.net.isOnline(A.id) && !A.net.isOnline(B.id), () => `B sees A: ${B.net.isOnline(A.id)}, A sees B: ${A.net.isOnline(B.id)}`);
+    await writeFile(`${workspace}/work`, "work\n");
     const first = turnEnd(B.runner, m.id);
     await B.runner.prompt(m.id, "Reply with the single word ok.");
     expect((await first.result).subtype).toBe("success");
     await first.idle;
     expect(B.runner.state(m.id)).toBe("idle");
-    expect(pushLines()).toEqual([`meddle: push: meddle/task/${m.id}/* to ${short} failed: home ${short} is offline`]);
-    // The line stays where the task's start wrote it.
-    expect(await onA()).toBe(await changeOf(B.cfg, workspace, "@-"));
+    // The row follows the task's bookmark here at once; A, offline, still has the start's.
+    const head = (await jj(["log", "--ignore-working-copy", "-r", `meddle/task/${m.id}/a`, "--no-graph", "-T", "commit_id"], replicaB, B.cfg)).trim();
+    expect(head).not.toBe(m.projects[0]!.base[0]!);
+    expect(lineOn(B.db)).toEqual([["a", B.id, head]]);
+    expect(lineOn(A.db)).not.toEqual([["a", B.id, head]]);
 
-    // The home comes back; the task has moved on to a new change.
+    // It comes back: pool sync brings it the row, with no turn.
     A.net.watch(B.id);
     B.net.watch(A.id);
     B.net.offerAddress(B.pool.store.row(A.id)!.lastAddr!);
     A.net.offerAddress(A.pool.store.row(B.id)!.lastAddr!);
-    await eventually(() => B.net.isOnline(A.id), () => `B sees A: ${B.net.isOnline(A.id)}`);
-    await writeFile(`${workspace}/work`, "work\n");
-    await jj(["commit", "-m", "work"], workspace, B.cfg);
-    const change = await changeOf(B.cfg, workspace, "@");
-    const second = turnEnd(B.runner, m.id);
-    await B.runner.prompt(m.id, "Again.");
-    expect((await second.result).subtype).toBe("success");
-    await second.idle;
-    expect(await onA()).toBe(change);
-    expect(pushLines()).toHaveLength(1);
+    await eventually(() => JSON.stringify(lineOn(A.db)) === JSON.stringify([["a", B.id, head]]), () => `A's rows: ${JSON.stringify(lineOn(A.db))}`, 15_000);
+    expect(getTask(B.db, m.id)!.turns).toBe(1);
+    expect(B.logs.filter((l) => l.startsWith("meddle: push") || l.startsWith("meddle: line"))).toEqual([]);
   } finally {
     await close();
   }
-}, 15_000);
+}, 30_000);
 
 test("a turn started fresh after a seq sends its prompt, though the log before it ends in a cut-off turn", async () => {
   const { mkdir: mkdirp, writeFile: write } = await import("node:fs/promises");
@@ -446,50 +499,3 @@ test("a turn started fresh after a seq sends its prompt, though the log before i
   await h.close();
 });
 
-test("a runner that starts scopes each live task's workspace that has no jj config of its own: a main-era task from the root commit, one with a base from it", async () => {
-  const { createRegistry } = await import("@earendil-works/pi-durable");
-  const { unscopeWorkspace, workspaceImmutableHeads } = await import("../src/tasks/provision");
-  const { readManifest, writeManifest } = await import("../src/tasks/manifest");
-  const { writeLine } = await import("../src/projects/lines");
-  const node = await setupNode();
-  let reopened: { close(): Promise<void> } | undefined;
-  try {
-    const { cfg, db, project } = node;
-    const legacy = await createTask(node, { title: "legacy", projectIds: [project.id] });
-    const based = await createTask(node, { title: "based", projectIds: [project.id] });
-    const workspaceOf = (id: string) => join(paths(cfg).task(id), "a");
-    const scope = async (id: string) =>
-      (await jj(["config", "get", 'revset-aliases."immutable_heads()"'], workspaceOf(id), cfg).catch(() => "")).trim();
-    // As a main-era task is after the upgrade: no workspace config, and the legacy one's manifest without a base.
-    for (const id of [legacy.id, based.id]) await unscopeWorkspace(cfg, workspaceOf(id));
-    const { base: _, ...older } = legacy.projects[0]!;
-    const mainEra = { ...legacy, projects: [{ ...older, parent: `trunk@${shortId(node.id)}` }] };
-    updateTask(db, legacy.id, { manifest: JSON.stringify(mainEra) });
-    await writeManifest(cfg, mainEra as never);
-    expect(await scope(legacy.id)).not.toContain(legacy.id);
-    expect(await scope(based.id)).not.toContain(based.id);
-    // The agent's own work, which its first turn end writes to its line.
-    await writeFile(join(workspaceOf(legacy.id), "work"), "work\n");
-    const head = (await jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"], workspaceOf(legacy.id), cfg)).trim();
-    await writeLine(cfg, project.replica, legacy.id, "a", head);
-
-    await node.harness.close();
-    const harness = await openHarness(cfg, createRegistry());
-    reopened = harness;
-    new TaskRunner(cfg, db, harness.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl` } });
-    const end = Date.now() + 15_000;
-    const want = { [legacy.id]: workspaceImmutableHeads(legacy.id, "0".repeat(40)), [based.id]: workspaceImmutableHeads(based.id, based.projects[0]!.base) };
-    while ((await scope(legacy.id)) !== want[legacy.id] || (await scope(based.id)) !== want[based.id]) {
-      if (Date.now() > end) throw new Error("the workspaces were not scoped");
-      await Bun.sleep(50);
-    }
-    expect((await readManifest(cfg, legacy.id)).projects[0]!.base).toBeUndefined();
-    // Its agent may still rewrite its own work at its line's head.
-    await jj(["describe", "-r", head, "-m", "by the agent"], workspaceOf(legacy.id), cfg);
-  } finally {
-    await reopened?.close();
-    await node.harness.close().catch(() => {});
-    const { rm } = await import("node:fs/promises");
-    await rm(node.home, { recursive: true, force: true });
-  }
-}, 30_000);

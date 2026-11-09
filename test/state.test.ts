@@ -292,6 +292,43 @@ test("a project's heads list its replica's bookmarks and follow a turn's end of 
   }
 }, 15_000);
 
+test("a project's contextLoaded reads the context on its default branch, not the service repo's empty working copy", async () => {
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const { initColocated, jj } = await import("../src/jj");
+  const { addProjectFromFolder } = await import("../src/projects/project");
+  const { cfg, db, id, home, client, close } = await connect();
+  try {
+    // `bad`'s default branch holds a context.toml that does not parse; `fine`'s holds it only above its default branch.
+    const add = async (name: string, onMain: boolean) => {
+      const folder = `${home}/${name}`;
+      await mkdir(`${folder}/.meddle`, { recursive: true });
+      await initColocated(folder, cfg);
+      await writeFile(`${folder}/README`, "r\n");
+      await jj(["commit", "-m", "readme"], folder, cfg);
+      if (!onMain) await jj(["bookmark", "set", "main", "-r", "@-"], folder, cfg);
+      await writeFile(`${folder}/.meddle/context.toml`, "[claude]\nallwo = []\n");
+      await jj(["commit", "-m", "context"], folder, cfg);
+      if (onMain) await jj(["bookmark", "set", "main", "-r", "@-"], folder, cfg);
+      return addProjectFromFolder(cfg, db, folder, id, name);
+    };
+    const bad = await add("bad", true);
+    const fine = await add("fine", false);
+    expect(await Bun.file(`${bad.replica}/.meddle/context.toml`).exists()).toBe(false);
+    const loaded = async (projectId: string) => {
+      const view = await client.get(ProjectObject, { id: projectId });
+      try {
+        return view.contextLoaded.value;
+      } finally {
+        view.release();
+      }
+    };
+    expect(await loaded(bad.id)).toBe(false);
+    expect(await loaded(fine.id)).toBe(true);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
 test("a task's bookmarks are listed without waiting for a push holding its replica's lock", async () => {
   const { client, project, close } = await connect();
   try {

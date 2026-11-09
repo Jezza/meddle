@@ -16,7 +16,7 @@ import type { PoolRuntime } from "../src/pool/runtime";
 import { readArchive, runJanitor, writeArchive } from "../src/tasks/archive";
 import { TaskRunner } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
-import { homeLines } from "../src/projects/lines";
+import { listLineRows, mergeLineRows, writeBranchRow } from "../src/pool/rows";
 import { readManifest, sideBookmark, transcriptPath, type TaskManifest } from "../src/tasks/manifest";
 import { MOVE_NOW_FOLLOW_UP } from "../src/tasks/move";
 import { workspaceImmutableHeads } from "../src/tasks/provision";
@@ -59,6 +59,11 @@ async function peerOn(from: GitPoolNode, to: GitPoolNode) {
   return ref;
 }
 
+/** What `from`'s move asks the target to receive: the manifest, this Claude Code version, the task's rows on `from`. */
+function request(from: GitPoolNode, manifest: TaskManifest) {
+  return { manifest, claudeCodeVersion: claudeCodeVersion(), lineRows: listLineRows(from.db, undefined, manifest.id) };
+}
+
 /** Sends task `taskId` from `from` to `to` over a blob stream; the sender's receipt and the one `to` answered. */
 async function sendTask(from: GitPoolNode, to: GitPoolNode, taskId: string): Promise<{ sent: Receipt | null; got: Receipt | null }> {
   const s = await from.net.openStream(to.id, { stream: "blob", kind: "task", taskId });
@@ -76,6 +81,11 @@ async function commitAt(node: GitPoolNode, dir: string, rev: string): Promise<st
   return (await jj(["log", "-r", rev, "--no-graph", "-T", "commit_id"], dir, node.cfg)).trim();
 }
 
+/** Task `taskId`'s line rows of project `projectId` on `node`, as `name holder commit` (commit `-` when released). */
+function rowsOn(node: GitPoolNode, projectId: string, taskId: string): string {
+  return listLineRows(node.db, projectId, taskId).map((r) => `${r.name} ${r.holder} ${r.commit ?? "-"}`).join("\n");
+}
+
 /** The change the local task bookmark of project `a` points at on `node`, or undefined. */
 async function taskBookmark(node: GitPoolNode, replica: string, taskId: string): Promise<string | undefined> {
   return (await bookmarkList(replica, node.cfg)).find((b) => b.name === `meddle/task/${taskId}/a` && b.remote === null)?.changeId;
@@ -89,17 +99,18 @@ test("a task is received, imported, activated and resumed", async () => {
     expect(atA).toBeDefined();
     const ref = await peerOn(A, B);
     try {
-      expect(await ref.receiveTask({ manifest: await readManifest(A.cfg, m.id), claudeCodeVersion: claudeCodeVersion() })).toEqual({ ok: true });
+      expect(await ref.receiveTask(request(A, await readManifest(A.cfg, m.id)))).toEqual({ ok: true });
 
       const row = getTask(B.db, m.id)!;
       expect(row.state).toBe("receiving");
       expect(row.receiving_from).toBe(A.id);
       const replicaB = paths(B.cfg).replica(A.project.id);
       const manifestB = await readManifest(B.cfg, m.id);
-      // It starts at the commit A's line holds, measured from the task's base.
+      // It starts at the commit A's line holds (on A, which holds the task, its own bookmark), measured from the task's
+      // base.
       expect(manifestB).toEqual({
         ...m,
-        projects: [{ ...m.projects[0]!, replica: replicaB, parent: (await homeLines(A.cfg, A.project.replica, m.id))[0]!.commitId }],
+        projects: [{ ...m.projects[0]!, replica: replicaB, parent: await commitAt(A, A.project.replica, `meddle/task/${m.id}/a`) }],
       });
       // The workspace starts on A's change; B's own task bookmark points at it.
       const workspace = join(paths(B.cfg).task(m.id), "a");
@@ -174,7 +185,7 @@ test("activation replays the follow-up and the queued prompts as one turn each, 
     A.db.query("UPDATE tasks SET queued = ? WHERE id = ?").run(JSON.stringify(["first queued", "second queued"]), m.id);
     const ref = await peerOn(A, B);
     try {
-      expect(await ref.receiveTask({ manifest: m, claudeCodeVersion: claudeCodeVersion() })).toMatchObject({ ok: true });
+      expect(await ref.receiveTask(request(A, m))).toMatchObject({ ok: true });
       const { got } = await sendTask(A, B, m.id);
       expect(got).not.toBeNull();
       expect(JSON.parse(getTask(B.db, m.id)!.queued!)).toEqual(["first queued", "second queued"]);
@@ -232,17 +243,18 @@ test("a receiving task is abandoned or replaced and leaves nothing behind", asyn
       events: B.db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ?").get(m.id),
       transcript: B.db.query("SELECT COUNT(*) AS n FROM transcript WHERE session_id = ?").get(m.sessionId),
       workspaces: (await jj(["workspace", "list", "-T", 'name ++ "\\n"'], replicaB, B.cfg)).split("\n").filter((n) => n.includes(m.id)),
-      bookmarks: (await bookmarkList(replicaB, B.cfg)).filter((b) => b.name.includes(m.id)),
+      // Its own bookmarks; the line's refs (held by A) the applier keeps on every node, as rows say.
+      bookmarks: (await bookmarkList(replicaB, B.cfg)).filter((b) => b.name.includes(m.id) && b.remote === null),
     });
     const nothing = { row: null, folder: false, events: { n: 0 }, transcript: { n: 0 }, workspaces: [], bookmarks: [] };
     try {
-      expect(await ref.receiveTask({ manifest: m, claudeCodeVersion: claudeCodeVersion() })).toEqual({ ok: true });
+      expect(await ref.receiveTask(request(A, m))).toEqual({ ok: true });
       const { got } = await sendTask(A, B, m.id);
       expect(got).not.toBeNull();
       // A partial copy (a stray file) is replaced by a second receive from the same node: the rerun of a handoff.
       const stray = join(paths(B.cfg).taskConfig(m.id), "projects", "stray");
       await writeFile(stray, "x");
-      expect(await ref.receiveTask({ manifest: m, claudeCodeVersion: claudeCodeVersion() })).toEqual({ ok: true });
+      expect(await ref.receiveTask(request(A, m))).toEqual({ ok: true });
       expect(existsSync(stray)).toBe(false);
       expect(getTask(B.db, m.id)!.state).toBe("receiving");
       expect(B.db.query("SELECT COUNT(*) AS n FROM events WHERE task_id = ?").get(m.id)).toEqual({ n: 0 });
@@ -251,7 +263,7 @@ test("a receiving task is abandoned or replaced and leaves nothing behind", asyn
       expect(await leftovers()).toEqual(nothing);
 
       // An orphan of a move that never finished is abandoned at start.
-      expect(await ref.receiveTask({ manifest: m, claudeCodeVersion: claudeCodeVersion() })).toEqual({ ok: true });
+      expect(await ref.receiveTask(request(A, m))).toEqual({ ok: true });
       await sendTask(A, B, m.id);
       await B.runner.abandonOrphans();
       expect(await leftovers()).toEqual(nothing);
@@ -271,11 +283,11 @@ test("only the sending node may import, activate or abandon a receiving task", a
     const fromA = await peerOn(A, B);
     const fromC = await peerOn(C, B);
     try {
-      expect(await fromA.receiveTask({ manifest: m, claudeCodeVersion: claudeCodeVersion() })).toEqual({ ok: true });
+      expect(await fromA.receiveTask(request(A, m))).toEqual({ ok: true });
       const refusal = `not receiving ${m.id} from ${shortId(C.id)}`;
       await expect(fromC.activateTask({ taskId: m.id, followUp: null })).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining(refusal) });
       await expect(fromC.abandonTask({ taskId: m.id })).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining(refusal) });
-      expect(await fromC.receiveTask({ manifest: m, claudeCodeVersion: claudeCodeVersion() })).toEqual({ ok: false, reason: `task ${m.id} already exists here` });
+      expect(await fromC.receiveTask(request(C, m))).toEqual({ ok: false, reason: `task ${m.id} already exists here` });
       // C's copy of the task (a fresh export of A's rows) is reset with no receipt.
       await copyTask(A, C, m.id);
       const { got } = await sendTask(C, B, m.id);
@@ -319,15 +331,15 @@ test("a receive is refused for another Claude Code version, an unknown one, an u
     const ours = claudeCodeVersion();
     const manifest: TaskManifest = {
       id: "0123456789ab", title: "t", sessionId: crypto.randomUUID(), primaryProjectId: A.project.id, createdAt: new Date().toISOString(),
-      projects: [{ id: A.project.id, name: "a", replica: A.project.replica, workspace: "a", parent: "root()", base: "0000000000000000000000000000000000000000" }],
+      projects: [{ id: A.project.id, name: "a", replica: A.project.replica, workspace: "a", parent: "root()", base: ["0000000000000000000000000000000000000000"], context: null }],
     };
     const ref = await peerOn(A, B);
     try {
-      expect(await ref.receiveTask({ manifest, claudeCodeVersion: "0.0.1" })).toEqual({ ok: false, reason: `claude code ${ours} here, 0.0.1 there` });
-      expect(await ref.receiveTask({ manifest, claudeCodeVersion: "unknown" })).toEqual({ ok: false, reason: `claude code ${ours} here, unknown there` });
-      expect(await ref.receiveTask({ manifest: { ...manifest, id: "../x" }, claudeCodeVersion: ours })).toEqual({ ok: false, reason: "invalid task id: ../x" });
+      expect(await ref.receiveTask({ manifest, claudeCodeVersion: "0.0.1", lineRows: [] })).toEqual({ ok: false, reason: `claude code ${ours} here, 0.0.1 there` });
+      expect(await ref.receiveTask({ manifest, claudeCodeVersion: "unknown", lineRows: [] })).toEqual({ ok: false, reason: `claude code ${ours} here, unknown there` });
+      expect(await ref.receiveTask({ manifest: { ...manifest, id: "../x" }, claudeCodeVersion: ours, lineRows: [] })).toEqual({ ok: false, reason: "invalid task id: ../x" });
       await rm(B.cfg.taskRoot, { recursive: true, force: true });
-      expect(await ref.receiveTask({ manifest, claudeCodeVersion: ours })).toEqual({
+      expect(await ref.receiveTask({ manifest, claudeCodeVersion: ours, lineRows: [] })).toEqual({
         ok: false,
         reason: `this node does not host tasks: task root ${B.cfg.taskRoot} does not exist`,
       });
@@ -438,9 +450,10 @@ test("an idle task moves to another node: the source keeps only its row and an a
     expect(archive.manifest).toEqual(m);
     expect({ events: archive.events.length, transcript: archive.transcript.length }).toEqual(before);
     expect(archive.files.map((f) => f.path)).toContain(`${m.primaryProjectId}/${m.sessionId}.jsonl`);
-    // A is the project's home: its task bookmark stays, beside the task's line.
-    expect(await taskBookmark(A, A.project.replica, m.id)).toBeDefined();
-    expect((await homeLines(A.cfg, A.project.replica, m.id)).map((l) => l.name)).toEqual(["a"]);
+    // Its bookmark goes with its folder: B holds the line now, its row taken over there.
+    expect(await taskBookmark(A, A.project.replica, m.id)).toBeUndefined();
+    const workspaceB = join(paths(B.cfg).task(m.id), "a");
+    await until("the line's row on A", () => rowsOn(A, A.project.id, m.id).split(" ")[1], B.id);
 
     const moved = `task has moved to ${shortId(B.id)}`;
     await expect(A.runner.prompt(m.id, "hi")).rejects.toThrow(moved);
@@ -452,15 +465,40 @@ test("an idle task moves to another node: the source keeps only its row and an a
     await promptAndWait(B, m.id, "Carry on.");
     const started = listEvents(B.db, m.id).filter((e) => (e.message as { subtype?: string }).subtype === "turn_started");
     expect(started.map((e) => (e.message as { resume: boolean }).resume)).toEqual([false, true]);
-    // B's turn end pushed its change to the home: A's line follows the task.
-    const workspaceB = join(paths(B.cfg).task(m.id), "a");
-    expect((await homeLines(A.cfg, A.project.replica, m.id)).map((l) => l.commitId)).toEqual([await commitAt(B, workspaceB, "@")]);
+    // B's turn end wrote its change to the line's row, which reaches A.
+    await until("the line's row on A", () => rowsOn(A, A.project.id, m.id), `a ${B.id} ${await commitAt(B, workspaceB, "@")}`);
     expect(B.logs.filter((l) => l.includes("push"))).toEqual([]);
   } finally {
     await owner.close();
     await close();
   }
 }, 15_000);
+
+test("a task's meddle context travels with its manifest: an edit its agent committed into its line changes nothing after a move", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    expect(m.projects[0]!.context).toBeNull();
+    // The agent writes a context.toml that would fail a turn; its next turn end puts it in the task's line.
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    await mkdir(join(workspaceA, ".meddle"), { recursive: true });
+    await writeFile(join(workspaceA, ".meddle", "context.toml"), "[claude]\nallwo = []\n");
+    await promptAndWait(A, m.id, "Again.");
+    await peerReady(A, B);
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    await until("the task on A", () => getTask(A.db, m.id)?.state, "moved");
+    // B's workspace starts at the line, edit and all; its row carries the context captured at the start.
+    expect(await readFile(join(paths(B.cfg).task(m.id), "a", ".meddle", "context.toml"), "utf8")).toBe("[claude]\nallwo = []\n");
+    expect((JSON.parse(getTask(B.db, m.id)!.manifest) as TaskManifest).projects[0]!.context).toBeNull();
+    await promptAndWait(B, m.id, "Carry on.");
+    const messages = listEvents(B.db, m.id).map((e) => e.message as { type?: string; subtype?: string });
+    expect(messages.filter((msg) => msg.subtype === "turn_failed")).toEqual([]);
+    expect(messages.filter((msg) => msg.type === "result").map((msg) => msg.subtype)).toEqual(["success", "success", "success"]);
+  } finally {
+    await close();
+  }
+}, 30_000);
 
 test("a task moves to another node and back: the old row is replaced, and the non-home node forgets its bookmark", async () => {
   const { A, B, close } = await twoPoolNodes();
@@ -476,7 +514,8 @@ test("a task moves to another node and back: the old row is replaced, and the no
 
     expect(getTask(B.db, m.id)).toMatchObject({ state: "moved", moved_to: A.id });
     const replicaB = paths(B.cfg).replica(A.project.id);
-    expect((await bookmarkList(replicaB, B.cfg)).filter((b) => b.name.includes(m.id))).toEqual([]);
+    // Its own bookmarks; the line's base stays an untracked ref on every node while the line is live.
+    expect((await bookmarkList(replicaB, B.cfg)).filter((b) => b.name.includes(m.id) && !b.name.startsWith(`base/${m.id}/`))).toEqual([]);
     expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", moved_to: null, receiving_from: null, turns: 2 });
     expect(existsSync(paths(A.cfg).movedFile(m.id))).toBe(true);
     await promptAndWait(A, m.id, "Home again.");
@@ -487,31 +526,34 @@ test("a task moves to another node and back: the old row is replaced, and the no
   }
 }, 15_000);
 
-test("a task moved off the home and back: each receiver fetches the line, its workspace names the same base, and only the holder writes the line (Review Focus 4)", async () => {
+test("a task moved off the home and back: each receiver takes the line from its row, its workspace names the same base, and only the holder writes the line", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     const home = A.project.replica;
+    await jj(["new", "main"], home, A.cfg);
     await writeFile(join(home, "mine"), "mine\n");
     await jj(["commit", "-m", "mine"], home, A.cfg);
     await jj(["bookmark", "set", "main", "-r", "@-"], home, A.cfg);
+    // `main`'s row too: a turn end puts the bookmark back at its row's position.
+    writeBranchRow(A.db, A.id, { project: A.project.id, branch: "main", commit: await commitAt(A, home, "main"), drops: [] });
     const m = await turnedTask(A);
     const base = (await readManifest(A.cfg, m.id)).projects[0]!.base;
-    expect(base).toBe(await commitAt(A, home, "main"));
+    expect(base).toEqual([await commitAt(A, home, "main")]);
     const scoped = workspaceImmutableHeads(m.id, base);
     const workspaceA = join(paths(A.cfg).task(m.id), "a");
     const configA = await workspaceConfigPath(workspaceA, A.cfg);
     expect(await Bun.file(configA).text()).toContain(scoped);
-    const lineOnA = async () => (await homeLines(A.cfg, home, m.id)).map((l) => l.commitId);
+    const lineOnA = () => listLineRows(A.db, A.project.id, m.id).map((r) => r.commit);
     await peerReady(A, B);
     await peerReady(B, A);
 
-    // Off the home: B starts on the home's line, scoped to the same base; A's workspace config goes with its folder.
+    // Off the home: B starts on the line, scoped to the same base; A's workspace config goes with its folder.
     await A.runner.moveTo(m.id, B.id, false);
     await moveSettled(A.harness.harness);
     const replicaB = paths(B.cfg).replica(A.project.id);
-    expect(await lineOnA()).toEqual([await commitAt(B, replicaB, `meddle/task/${m.id}/a`)]);
+    expect(lineOnA()).toEqual([await commitAt(B, replicaB, `meddle/task/${m.id}/a`)]);
     const workspaceB = join(paths(B.cfg).task(m.id), "a");
-    expect((await readManifest(B.cfg, m.id)).projects[0]!.base).toBe(base);
+    expect((await readManifest(B.cfg, m.id)).projects[0]!.base).toEqual(base);
     expect(await Bun.file(await workspaceConfigPath(workspaceB, B.cfg)).text()).toContain(scoped);
     expect(existsSync(configA)).toBe(false);
 
@@ -519,26 +561,29 @@ test("a task moved off the home and back: each receiver fetches the line, its wo
     await writeFile(join(workspaceB, "work"), "on B\n");
     await promptAndWait(B, m.id, "On B.");
     const onB = await commitAt(B, workspaceB, "@");
-    expect(await lineOnA()).toEqual([onB]);
-    await A.runner.pushTaskLines(m.id);
-    expect(await lineOnA()).toEqual([onB]);
-    expect([...A.logs, ...B.logs].filter((l) => l.startsWith("meddle: push:"))).toEqual([]);
+    await until("the line's row on A", () => lineOnA().join(), onB);
+    await A.runner.writeTaskLines(m.id);
+    expect(rowsOn(A, A.project.id, m.id)).toBe(`a ${B.id} ${onB}`);
+    expect([...A.logs, ...B.logs].filter((l) => l.startsWith("meddle: push:") || l.startsWith("meddle: line"))).toEqual([]);
 
     // Back on the home: it starts on B's commit, scoped to the same base, and its turn end moves the line.
     await B.runner.moveTo(m.id, A.id, false);
     await moveSettled(B.harness.harness);
     expect(await commitAt(A, workspaceA, "@-")).toBe(onB);
-    expect((await readManifest(A.cfg, m.id)).projects[0]!.base).toBe(base);
+    expect((await readManifest(A.cfg, m.id)).projects[0]!.base).toEqual(base);
     expect(await Bun.file(await workspaceConfigPath(workspaceA, A.cfg)).text()).toContain(scoped);
     await writeFile(join(workspaceA, "work"), "on B\nhome again\n");
     await promptAndWait(A, m.id, "Home again.");
-    expect(await lineOnA()).toEqual([await commitAt(A, workspaceA, "@")]);
+    // Held on the home again, the line is the task's own bookmark there, and its row follows it.
+    const head = await commitAt(A, workspaceA, "@");
+    expect(await commitAt(A, home, `meddle/task/${m.id}/a`)).toBe(head);
+    expect(listLineRows(A.db, A.project.id, m.id)).toMatchObject([{ name: "a", holder: A.id, commit: head }]);
   } finally {
     await close();
   }
 }, 30_000);
 
-test("every bookmark under the task's namespace travels with a move and is listed there; a non-home source forgets them", async () => {
+test("every bookmark under the task's namespace travels with a move as its line rows and is listed there; the source forgets them", async () => {
   const { A, B, close } = await twoPoolNodes();
   const ownerA = linkClient(A.host);
   const ownerB = linkClient(B.host);
@@ -572,7 +617,7 @@ test("every bookmark under the task's namespace travels with a move and is liste
       onB.release();
     }
 
-    // On B, not the home: another side bookmark; the turn's end pushes the whole namespace to the home.
+    // On B: another side bookmark; the turn's end writes a row for each bookmark under the namespace, which reach A.
     const workspaceB = join(paths(B.cfg).task(m.id), "a");
     await writeFile(join(workspaceB, "extra.txt"), "extra\n");
     await jj(["commit", "-m", "extra"], workspaceB, B.cfg);
@@ -580,7 +625,7 @@ test("every bookmark under the task's namespace travels with a move and is liste
     await jj(["bookmark", "create", extra, "-r", "@-"], workspaceB, B.cfg);
     const extraChange = await changeAt(B, workspaceB, "@-");
     await promptAndWait(B, m.id, "On B.");
-    expect((await homeLines(A.cfg, A.project.replica, m.id)).map((l) => l.name)).toEqual(["a", "a.extra", "a.spike"]);
+    await until("the line rows on A", () => listLineRows(A.db, A.project.id, m.id).map((r) => `${r.name} ${r.holder}`).join(), [`a ${B.id}`, `a.extra ${B.id}`, `a.spike ${B.id}`].join());
     expect(B.logs.filter((l) => l.includes("push"))).toEqual([]);
 
     await B.runner.moveTo(m.id, A.id, false);
@@ -600,6 +645,190 @@ test("every bookmark under the task's namespace travels with a move and is liste
     await close();
   }
 }, 20_000);
+
+/** Task `taskId`'s line rows of project `projectId` on `node`, as `name holder epoch commit` (`-` when released). */
+function epochsOn(node: GitPoolNode, projectId: string, taskId: string): string {
+  return listLineRows(node.db, projectId, taskId).map((r) => `${r.name} ${r.holder} ${r.epoch} ${r.commit ?? "-"}`).join("\n");
+}
+
+test("a receiver starts from the rows the sender sends with the request, and takes the lines one epoch up only as it activates the task", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    const P = A.project.id;
+    const row = listLineRows(A.db, P, m.id)[0]!;
+    // The sender's last write, which its sync has not carried yet: a commit on its line, only in the request's row.
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    await writeFile(join(workspaceA, "last"), "last\n");
+    await jj(["commit", "-m", "last"], workspaceA, A.cfg);
+    const last = await commitAt(A, workspaceA, "@-");
+    const sent = { ...row, commit: last, seq: row.seq + 1 };
+    const ref = await peerOn(A, B);
+    try {
+      expect(await ref.receiveTask({ ...request(A, m), lineRows: [sent] })).toEqual({ ok: true });
+      expect(await commitAt(B, join(paths(B.cfg).task(m.id), "a"), "@-")).toBe(last);
+      // Received, not activated: the rows are still the sender's, as it sent them.
+      const senders = `a ${A.id} ${row.epoch} ${last}`;
+      expect(epochsOn(B, P, m.id)).toBe(senders);
+      const { got } = await sendTask(A, B, m.id);
+      expect(got).not.toBeNull();
+      expect(epochsOn(B, P, m.id)).toBe(senders);
+      expect(await ref.activateTask({ taskId: m.id, followUp: null })).toEqual({ ok: true });
+      expect(epochsOn(B, P, m.id)).toBe(`a ${B.id} ${row.epoch + 1} ${last}`);
+    } finally {
+      ref.release();
+    }
+  } finally {
+    await close();
+  }
+}, 30_000);
+
+test("an activation the receiver refuses rolls the move back with the sender two epochs up and no row written there, and the sender's next turn end moves the line everywhere", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    const P = A.project.id;
+    const row = listLineRows(A.db, P, m.id)[0]!;
+    await peerReady(A, B);
+    await peerReady(B, A);
+    let atActivation = null as string | null;
+    B.hooks.beforeActivate = () => {
+      atActivation = epochsOn(B, P, m.id);
+      throw new Error("activation broke");
+    };
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", moved_to: null });
+    expect(getTask(B.db, m.id)).toBeNull();
+    // B had the sender's rows as they were, and wrote none of its own.
+    expect(atActivation).toBe(`a ${A.id} ${row.epoch} ${row.commit}`);
+    const back = `a ${A.id} ${row.epoch + 2} ${row.commit}`;
+    expect(epochsOn(A, P, m.id)).toBe(back);
+    await until("the line's row on B", () => epochsOn(B, P, m.id), back);
+
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    await writeFile(join(workspaceA, "again"), "again\n");
+    await promptAndWait(A, m.id, "Again.");
+    const next = `a ${A.id} ${row.epoch + 2} ${await commitAt(A, workspaceA, "@")}`;
+    expect(epochsOn(A, P, m.id)).toBe(next);
+    await until("the line's row on B", () => epochsOn(B, P, m.id), next);
+  } finally {
+    await close();
+  }
+}, 30_000);
+
+test("an activation that cannot hold the task's lines is no activation: the receiver answers ok: false, the move rolls back, and the sender takes the lines two epochs up", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    const P = A.project.id;
+    const row = listLineRows(A.db, P, m.id)[0]!;
+    await peerReady(A, B);
+    await peerReady(B, A);
+    // B can write no row as their holder: holding the lines as it activates the task fails.
+    for (const op of ["INSERT", "UPDATE"]) {
+      B.db.run(`CREATE TRIGGER no_hold_${op} BEFORE ${op} ON line_rows WHEN NEW.holder = '${B.id}' BEGIN SELECT RAISE(ABORT, 'rows broke'); END`);
+    }
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", moved_to: null });
+    expect(getTask(B.db, m.id)).toBeNull();
+    expect(B.logs.filter((l) => l.startsWith(`meddle: move: could not activate ${m.id} from ${shortId(A.id)}: `))).toHaveLength(1);
+    expect(A.logs.filter((l) => l.startsWith(`meddle: move: ${m.id} failed at commit: `))).toHaveLength(1);
+    const back = `a ${A.id} ${row.epoch + 2} ${row.commit}`;
+    expect(epochsOn(A, P, m.id)).toBe(back);
+    await until("the line's row on B", () => epochsOn(B, P, m.id), back);
+  } finally {
+    await close();
+  }
+}, 30_000);
+
+test("a late write of the lines by the node the task moved from, by its runner or as a row at its old epoch, changes no node's line", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    const P = A.project.id;
+    const row = listLineRows(A.db, P, m.id)[0]!;
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    const bookmarkA = () => commitAt(A, A.project.replica, `meddle/task/${m.id}/a`);
+    let late = null as { held: string; bookmark: string; after: { A: string; B: string; bookmark: string } } | null;
+    // B has activated the task; A, waiting for the answer, still says `moving` and still has its workspace.
+    B.hooks.afterActivate = async () => {
+      const held = epochsOn(B, P, m.id);
+      await until("B's row on A", () => epochsOn(A, P, m.id), held);
+      const bookmark = await bookmarkA();
+      await writeFile(join(workspaceA, "late"), "late\n");
+      await A.runner.writeTaskLines(m.id);
+      late = { held, bookmark, after: { A: epochsOn(A, P, m.id), B: epochsOn(B, P, m.id), bookmark: await bookmarkA() } };
+    };
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    expect(late).not.toBeNull();
+    const { held, bookmark, after } = late!;
+    expect(held).toBe(`a ${B.id} ${row.epoch + 1} ${row.commit}`);
+    expect(after).toEqual({ A: held, B: held, bookmark });
+    expect(A.logs.filter((l) => l.startsWith("meddle: line:"))).toEqual([
+      `meddle: line: ${m.id}'s line ${shortId(P)}/a is held by ${shortId(B.id)} at epoch ${row.epoch + 1}; not written here`,
+    ]);
+
+    // The row such a write would have carried at A's old epoch, with any seq, loses wherever it arrives.
+    const stale = { ...row, seq: row.seq + 1000, commit: bookmark };
+    for (const n of [A, B]) {
+      mergeLineRows(n.db, [stale]);
+      expect(epochsOn(n, P, m.id)).toBe(held);
+    }
+    expect(await commitAt(B, paths(B.cfg).replica(P), `meddle/task/${m.id}/a`)).toBe(row.commit!);
+  } finally {
+    await close();
+  }
+}, 45_000);
+
+test("a turn that fails after its agent's tool call leaves no write of its lines behind: a move right after is the last writer here, and the receiver's rows stay its own", async () => {
+  // A's stand-in calls the PostToolUse hooks for an Edit, then exits with no `result`: the turn fails, with no `finish`.
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ extraEnv: { MEDDLE_FIXTURE_TOOL_USE: "Edit", MEDDLE_FIXTURE_TOOL_USE_EXIT: "1" } }, {}] });
+  try {
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const P = A.project.id;
+    const m = await createTask(A, { title: "t", projectIds: [P] });
+    const start = listLineRows(A.db, P, m.id)[0]!;
+    await writeFile(join(paths(A.cfg).task(m.id), "a", "work"), "work\n");
+    let failedAt = 0;
+    const failed = new Promise<void>((res) => {
+      const off = A.runner.onEvent((id, _seq, msg) => {
+        if (id === m.id && msg.type === "meddle" && (msg as { subtype?: string }).subtype === "turn_failed") { failedAt = Date.now(); off(); res(); }
+      });
+    });
+    const idle = idleOn(A, m.id);
+    await A.runner.prompt(m.id, "Reply with the single word ok.");
+    await failed;
+    await idle;
+    // The write the hook scheduled would land 5 s after it: B's answer to the activation waits past that, so such a
+    // write would come while A still says `moving` and B's rows are back here.
+    const pastWindow = failedAt + 7000;
+    B.hooks.afterActivate = async () => { await Bun.sleep(Math.max(0, pastWindow - Date.now())); };
+    await A.runner.moveTo(m.id, B.id, false);
+    const deadline = Date.now() + 30_000;
+    while (getTask(A.db, m.id)?.state !== "moved") {
+      if (Date.now() > deadline) throw new Error(`the task on A is still ${getTask(A.db, m.id)?.state}`);
+      await Bun.sleep(25);
+    }
+    await Bun.sleep(Math.max(0, pastWindow + 500 - Date.now()));
+    const rows = (n: GitPoolNode) => listLineRows(n.db, P, m.id).map((r) => `${r.name} ${r.holder} ${r.epoch}`).join();
+    const held = `a ${B.id} ${start.epoch + 1}`;
+    expect(rows(B)).toBe(held);
+    await until("the line's row on A", () => rows(A), held);
+    // The move's own write carried the agent's work.
+    const commit = listLineRows(B.db, P, m.id)[0]!.commit!;
+    expect(await jj(["diff", "--ignore-working-copy", "-r", commit, "--name-only"], paths(B.cfg).replica(P), B.cfg)).toContain("work");
+    expect(A.logs.filter((l) => l.startsWith("meddle: line:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 60_000);
 
 test("a move without `now` waits for the running turn; prompts sent meanwhile run on the target one turn each, in order", async () => {
   const { A, B, close } = await twoPoolNodes({ nodes: [{ fixture: "approval.jsonl" }, {}] });
