@@ -12,7 +12,9 @@ everything a machine contributes to the pool:
 - the dashboard, on `http://127.0.0.1:7777/`, and the socket every `meddle` command talks to (the same port);
 - the pool endpoint, an iroh (QUIC) connection to each other node, over which settings, tokens, task moves and the
   other nodes' dashboards travel;
-- the git server other nodes fetch repos and memory from, on a unix socket in the data directory.
+- a service repo of every project of the pool, where that machine's tasks are jj workspaces;
+- the git server other nodes fetch commits and memory from, and your checkouts on that machine fetch from and push to,
+  on a unix socket in the data directory.
 
 There is nothing else to run. No database server (the state is SQLite files in the data directory), no broker, no
 worker processes, no separate web server. One machine is a pool of one, and everything below works on one machine;
@@ -103,8 +105,8 @@ names another), and in it, some at that start and some on first use:
 | `secrets/tokens/<id>` | The login tokens' values, one file each (from the first `token add`). |
 | `profile/` | A jj repo seeded from this machine's `~/.claude` (`CLAUDE.md`, `settings.json`, `skills`, `agents`, `commands`, `hooks`): the user layer every task's Claude Code sees. See [Profile](#profile-the-user-layer). |
 | `plugins` | A symlink to `~/.claude/plugins` when that exists, else an empty directory. |
-| `replicas/<project id>`, `memory/<project id>` | The projects this node holds that were added elsewhere, and every project's memory repo. |
-| `bin/git-remote-meddle`, `git-hooks/update`, `git.sock` | The git plumbing other nodes fetch and push through. |
+| `replicas/<project id>`, `memory/<project id>` | The service repo of every project of the pool, where this node's tasks are jj workspaces (you never work in it), and every project's memory repo. |
+| `bin/git-remote-meddle`, `checkout-hooks/pre-receive`, `git.sock` | The git plumbing other nodes fetch through, and your checkouts here fetch and push through. |
 | `archives/`, `moved/` | Archived tasks, and what a task that moved away left (kept seven days); made by the first archive and the first move. |
 
 Until a pool secret is set (see [The second machine](#the-second-machine)) the node is alone: its dashboard and tasks
@@ -132,32 +134,60 @@ meddle config set jj.email you@example.com
 ```
 
 This needs the node running. It is a pool setting: every node, and every task's Claude Code, commits with it. Without
-it jj refuses to push, so the commits a task makes never reach the project's home (each turn end logs
+it jj refuses to push the commits it makes, so the node's memory syncs to a project's home fail (each turn end logs
 `meddle: git: …`). `config list` shows what is set ([Pool settings](../README.md#pool-settings)).
 
 ### 6. Run the first task
+
+meddle finds `git-remote-meddle` the way git does, by name, so put the data directory's `bin` on your `PATH` first
+(in your shell profile; `serve` writes the helper there):
+
+```sh
+export PATH="$HOME/.local/share/meddle/bin:$PATH"
+export MEDDLE_GIT_SOCKET="$HOME/.local/share/meddle/git.sock"
+```
 
 Add a project from a folder you already have (it becomes a colocated jj repo if it is not one) or from an upstream
 URL, and give it a task:
 
 ```sh
 meddle project add ~/src/myproject --name myproject
-meddle task new "Find out why test_sync is flaky and fix it" --project myproject
+cd ~/src/myproject
+meddle task new "Find out why test_sync is flaky and fix it"
 ```
+
+`project add` builds the project's service repo (in the data directory) from the folder's `main` (else `master`),
+and makes the folder a **checkout**: it gets a git remote `meddle` pointing at this node. Without the helper on your
+`PATH` it is refused (`git-remote-meddle is not on your PATH; add <data>/bin to it`). On any other machine of the
+pool, `meddle checkout myproject` clones a checkout of your own. (The dashboard can add a project too, but it cannot
+make your folder a checkout: use `meddle project add` for that.)
 
 `task new` prints `task <id> on <short id>` once the first turn has started. Open `http://127.0.0.1:7777/`: the pool
 view shows this node and its task; the task's view shows the conversation as it goes, with Approve and Deny for the
 tool calls Claude Code asks about, Interrupt, a composer for the next message, and the task's model, effort and
-permission mode. A task needs no project: `meddle task new "Compare these two libraries for me"` starts in a scratch
-folder of its own with your user layer only.
+permission mode. A task needs no project: `meddle task new "Compare these two libraries for me"`, run outside a
+checkout, starts in a scratch folder of its own with your user layer only.
 
-The task starts on the newest commit under your folder's `@` that has changes (its fork point), so commit or `jj new`
-first: while `@` itself has changes, `task new` is refused (`@ has changes; move off it first`), as meddle never moves
-your working copy. `--rev <rev>` starts it on another revision, and `--rev <rev> --edit` has it work on that revision
-itself ([Where a task starts](../README.md#where-a-task-starts)). The work lands in the project's own repo as the
-task's line, the read-only bookmark `task/<task id>/myproject@meddle`, written at the end of every turn. Taking it is
-yours to do in jj (`jj new task/<task id>/myproject@meddle`, or a rebase of your work onto it); meddle never merges
-anything. The task's folder, with a jj workspace per project, is under the task root.
+Run in a checkout with no `--project`, `task new` is a task of the checkout's project, and it starts on the newest
+commit at or below your `@` that has changes (its fork point): the command pushes that commit to meddle and fetches
+the task's line back, so it is read-only in your checkout when the command returns. If `@` itself has changes, `@` is
+that commit, so run `jj new` afterwards to go on working. `--rev <rev>` starts it on another revision, and `--rev <rev>
+--edit` has it work on that revision itself ([Where a task starts](../README.md#where-a-task-starts)). From anywhere
+else, `--project myproject` starts it on the project's default branch.
+
+The task's work is its line, which a checkout's fetch shows as the read-only bookmark
+`meddle/task/<task id>/myproject@meddle`; it moves as the agent works. To take the work, fetch, review, then
+fast-forward your branch onto the line and push it:
+
+```sh
+jj git fetch --remote meddle
+jj bookmark set main -r meddle/task/<task id>/myproject@meddle
+jj git push --remote meddle -b main
+```
+
+Once a pushed branch contains the task's work, the task is archived on its own
+([Taking a task's work](../README.md#taking-a-tasks-work)). meddle never merges anything. The task's folder, with a jj
+workspace per project, is under the task root.
 
 ### 7. Run it as a service
 
@@ -210,9 +240,10 @@ What follows on its own:
 
 - the pool settings and the token list, within seconds; the new node pulls each token's value from a member that has
   it;
-- a project, the first time a task of it is placed on the new node: the repo is cloned from the project's home, and
-  its memory with it. `meddle project list` on either node lists every project of the pool with its home and the
-  nodes holding a copy;
+- every project: the new node makes a service repo of each, and fetches the commits the pool's rows name from any
+  member, and each project's memory from its home. `meddle project list` on either node lists every project of the
+  pool with its home and the nodes holding a copy, and `meddle checkout <project>` there gives you a checkout to work
+  in;
 - placement: `task new` without `--node` now picks between the two, preferring the project's home, then
   the node holding the project, then the one with fewer turns running. `--here` or `--node <short id>` chooses.
 
@@ -251,17 +282,12 @@ dashboard shows it read-only. `meddle task restore <id>` brings it back, on the 
 ([Archiving a task](../README.md#archiving-a-task)). Archiving is how you stop paying for an idle Claude Code session
 without losing the thread.
 
-**Your own jj in a replica.** A project that was added on another node lives here under
-`<data dir>/replicas/<project id>`, with a remote per node named after that node's short id. To run jj there
-yourself, your shell needs what meddle gives its own jj:
-
-```sh
-export PATH="$HOME/.local/share/meddle/bin:$PATH"
-export MEDDLE_GIT_SOCKET="$HOME/.local/share/meddle/git.sock"
-```
-
-The project's own folder on its home node needs nothing: it is an ordinary jj repo, and the task bookmarks arrive
-there as pushes.
+**Working with branches.** You work in checkouts, never in a service repo. `jj git fetch --remote meddle` shows every
+branch, every live task's line and any conflict; `jj git push --remote meddle` records branches, on any machine,
+online or not. Pushes made from two machines that could not see each other are both kept, and the branch shows as
+conflicted, with its sides as `meddle/conflict/<b>/<id>@meddle`. `meddle project status <project>` (or the project's
+page in the dashboard) shows each branch and how to resolve one: push a merge of the sides, or drop one with
+`git push meddle :refs/heads/meddle/conflict/<b>/<id>` ([Branches](../README.md#branches)).
 
 ### Profile: the user layer
 
@@ -298,8 +324,13 @@ systemctl --user restart meddle
 ```
 
 A move is refused when the two nodes report different Claude Code versions, and nodes at different meddle commits
-may not be able to talk at all (a newer node cannot use an older node's calls), so update them in one go. The data
-directory and the task root carry over.
+may not be able to talk at all (a newer node cannot use an older node's calls), so update them in one go: all nodes
+together, before you use the pool again. The data directory and the task root carry over, except across the update
+to service repos: nothing carries the projects and tasks of an older meddle over to it. Stop every node, update them
+all, remove the old projects' and tasks' state on each (the replicas, memory repos, archives, task folders and
+their tables; the tokens, the pool secret, the node's identity and the pool's settings stay), start them again and
+add your projects again. [Upgrading to service repos](../README.md#upgrading-to-service-repos) lists exactly what to
+remove and what to keep.
 
 ## When something is wrong
 
@@ -310,7 +341,9 @@ directory and the task root carry over.
 | `… refused the connection: closed by peer: bad proof` or `… did not prove the pool secret` in the log | The two nodes have different secrets (or pool names). | Set the same secret with the same name on both. |
 | `no usable token` | No token is `ok` (or its value is not on this node yet). | `meddle token list`; add one, or `token enable` a disabled one. |
 | `this node has no task root` / `no online node hosts tasks` | The task root is missing or not writable on every candidate. | Create it (step 2) and restart the node. |
-| `meddle: push: meddle/task/… to <short id> failed: …` or `meddle: git: …` in the log | A turn end could not push the task's bookmarks or memory to the project's home: no jj identity, or the home offline. | `meddle config set jj.user …` and `jj.email`; check `meddle pool`. The next turn end pushes again. |
+| `meddle: git: memory of <short id> …` in the log | A turn end could not sync the project's memory with its home: no jj identity, or the home offline. | `meddle config set jj.user …` and `jj.email`; check `meddle pool`. The next turn end tries again. |
+| `git-remote-meddle is not on your PATH; add <data>/bin to it` | `project add` or `checkout` needs git's remote helper for meddle, which git finds by name. | Put `<data dir>/bin` on your shell's `PATH` (step 6). |
+| `<b> is conflicted; push a merge of its siblings…` | Two machines pushed `<b>` without seeing each other; both commits are kept. | `meddle project status <project>` shows the sides and the fix. |
 | A node shows offline though it runs | In the network lab (`lab/REPORT-2026-11-02.md`) a node that went away was noticed only after about 30 s. A node that restarted dials every member it remembers at once, and the first one it reaches tells the rest where it is now. | Wait half a minute; check the lighthouse URL in Settings; `meddle pool` on both sides. |
 | `Move to … failed at handoff: Executable not found in $PATH: "jj"`, or `meddle status` says `jj is not on this node's PATH` | The service on that node runs with a `PATH` that lacks `jj` (a user service does not get your shell's). | On that node, run `meddle service install` again from your shell (the unit then carries its `PATH`), or link `jj` into a directory on the service's `PATH` (`ln -s ~/.cargo/bin/jj ~/.local/bin/jj`). |
 | A move waits and you want it off | It waits for the running turn to end. | `meddle task move <id> --cancel` (or Cancel move in the task's view); `--now` instead interrupts the turn and goes ahead. |
@@ -331,5 +364,6 @@ sudo rm -rf /opt/meddle/tasks/*   # the task folders
 ```
 
 A node started after that is a new node with a new id and a new pool of its own; the other nodes still list the old
-one as a member until you remove it from their Settings view. Projects added from your own folders are untouched:
-the task bookmarks meddle pushed there stay in the repo (`jj bookmark list 'glob:meddle/task/*'`).
+one as a member until you remove it from their Settings view. Your checkouts are untouched: what they fetched stays
+in them (`jj bookmark list --all-remotes 'glob:meddle/*'`), and their `meddle` remote points at the old node until you
+change it.

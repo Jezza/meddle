@@ -25,7 +25,10 @@ const GROUPS: Group[] = [
         details:
           "Runs in the foreground until stopped, and prints the node's id and the dashboard's address when it starts " +
           "(http://127.0.0.1:7777/ unless MEDDLE_PORT says otherwise). Most other commands talk to it, and say " +
-          '`start "meddle serve" first` when it is not running. To run it in the background, see `meddle help service install`.',
+          '`start "meddle serve" first` when it is not running. To run it in the background, see `meddle help service install`. ' +
+          "Nothing of the projects and tasks of a meddle older than service repos carries over: stop and upgrade every " +
+          "node, remove that state as the README's upgrade note lists (the tokens, the pool secret, the node's identity " +
+          "and the pool's settings stay), start them and add the projects again.",
       },
       {
         name: "status",
@@ -179,30 +182,72 @@ const GROUPS: Group[] = [
     commands: [
       {
         name: "project add",
-        usage: ["project add <path-or-url> [--name <n>] [--sync <bookmark>]..."],
-        summary: "Add a project from a folder on this node or an upstream URL; this node becomes its home.",
+        usage: ["project add <path-or-url> [--name <n>] [--no-fetch]"],
+        summary: "Add a project from a folder on this node or an upstream URL; the folder becomes a checkout.",
         details:
-          "A folder is used in place (made a jj repo, colocated with git, if it is not one); a URL is cloned. The home " +
-          "resolves where each new task of the project starts, and holds every task's work read-only as its line, " +
-          "`task/<task id>/<project>@meddle`. Other nodes fetch it from the home when they need it. --name names it " +
-          "(else after the folder, or the repo in the URL). --sync adds a sync branch (a bookmark tasks can start from; " +
-          "repeatable; see `project sync`). Prints the project id. Needs the node running.",
+          "The node builds the project's service repo (in its data directory, where the project's tasks are jj " +
+          "workspaces) from the folder's or the URL's default branch: the folder's `main`, else `master`, or the URL's " +
+          "HEAD branch. Tasks start from that branch unless told otherwise (see `project set-default`). Nothing fetches " +
+          "from the URL after that: fetch its later changes in a checkout and push them to meddle. The folder is " +
+          "made a jj repo colocated with git if it is not a jj repo (a jj repo that keeps its git repo elsewhere is " +
+          "refused), and becomes a checkout: it gets a git remote `meddle` pointing at this node, and is fetched from " +
+          "it (not with --no-fetch). The node never touches a checkout: only the meddle commands you run in it do. " +
+          "That remote needs git-remote-meddle, in the data directory's bin, on your PATH (git finds it by name); " +
+          "without it the add is refused with `git-remote-meddle is not on your PATH; add <data>/bin to it`, before " +
+          "anything is added. Every node of the pool keeps a service repo of the project. A checkout's fetch shows each " +
+          "branch where the pool's pushes put it (see `project status`) and every task's work as its line, " +
+          "`meddle/task/<task id>/<project>@meddle`, read-only; a push records branches. --name names it (else after " +
+          "the folder, or the repo in the URL). Prints the project id. Needs the node running. The dashboard's add " +
+          "form builds the service repo too, but does not make the folder a checkout.",
       },
       {
-        name: "project sync",
-        usage: ["project sync <id|name> [<bookmark>...]"],
-        summary: "Set the sync branches of a project homed on this node, replacing its list.",
+        name: "project set-default",
+        usage: ["project set-default <id|name> <branch>"],
+        summary: "Set the branch a task of the project starts from when it names no revision.",
         details:
-          "A project's sync branches are the bookmarks a task can start from, in order; the first is the default. `project " +
-          "add <url>` starts the list with the upstream's default branch and `project add <folder>` with none; each " +
-          "`--sync <bookmark>` of `project add` adds one. With no bookmark, the list is emptied. Nothing polls them: a " +
-          "task fetches its branch from the project's home as it is created (the home fetches a URL project's sync " +
-          "branches from the upstream first). Refused on a node that is not the project's home. Needs the node running.",
+          "A project's default branch is set when it is added: the folder's `main`, else `master`, or the URL's HEAD " +
+          "branch. A task started from outside a checkout with no --rev starts there, and a checkout's fetch makes it " +
+          "the HEAD branch. This changes it on this node. Needs the node running.",
+      },
+      {
+        name: "project status",
+        usage: ["project status <id|name>"],
+        summary: "Print each branch of a project as this node computes it, and how to resolve a conflicted one.",
+        details:
+          "A branch is never stored: every node computes it from each node's record of the pushes it took, so every " +
+          "node prints the same once it has heard the same pushes. One line per branch, the default branch first: " +
+          "`<b>  <commit>`, or `still fetching its commits` while this node lacks a commit a push named. Two pushes " +
+          "that could not see each other (machines offline, or not yet caught up) leave a branch conflicted, with " +
+          "both commits kept as its siblings: a checkout fetches each as `meddle/conflict/<b>/<id>@meddle` (<id> is " +
+          "its commit's first 12 characters), and the branch itself at their merge base. A task can't start from a " +
+          "conflicted branch, and nothing on it accepts a task's work. A conflicted branch is followed by the fix: push " +
+          "a commit descending from every sibling (a merge of them), or drop the side you don't want with " +
+          "`git push meddle :refs/heads/meddle/conflict/<b>/<id>` (jj pushes only the deletion of a tracked " +
+          "bookmark, and conflict refs arrive untracked); when your own `<b>` had work on a sibling that is not pushed, " +
+          "`jj bookmark set <b> -r <your commit>` first, then push a merge of it with each sibling. Tracking a conflict " +
+          "ref with `jj bookmark track` makes that sibling mutable in your checkout until you push its deletion. " +
+          "Dropping a sibling, like rewinding or deleting a branch, can make jj abandon commits only the old position " +
+          "held; jj says so, and `jj op log` gets them back. Needs the node running.",
+      },
+      {
+        name: "checkout",
+        usage: ["checkout <id|name> [<dir>]"],
+        summary: "Clone a project from this node into a new checkout of your own.",
+        details:
+          "Clones into <dir> (else ./<project name>, refused when it exists and is not empty) a jj repo colocated with " +
+          "git, whose remote `meddle` points at this node: fetch the project from it (`jj git fetch --remote meddle`), " +
+          "and push branches to it (`jj git push --remote meddle`) from any machine of the pool. A checkout is any repo " +
+          "with that remote: none is registered, and meddle changes one only during a meddle command you run in it. " +
+          "A push that is not a fast-forward of a branch needs jj's --allow-backwards (git's --force), and moves the " +
+          "branch everywhere; nothing under `meddle/` can be pushed, except the deletion of a conflict ref (see " +
+          "`project status`). Needs git-remote-meddle, in the data directory's bin, on your PATH (else " +
+          "`git-remote-meddle is not on your PATH; add <data>/bin to it`), and the node running. Prints the " +
+          "checkout's path.",
       },
       {
         name: "project list",
         usage: ["project list"],
-        summary: "List the pool's projects: id, name, home, the nodes holding a copy and sync branches.",
+        summary: "List the pool's projects: id, name, home and the nodes holding a copy.",
         details: "Works while a holder is offline (it reads the roster). Needs the node running.",
       },
     ],
@@ -216,16 +261,29 @@ const GROUPS: Group[] = [
         summary: "Create a task and, given a prompt, start its first turn; without one it waits idle for one.",
         details:
           "--project takes one project (an id, or a name one project of the pool has) and can be given again, the first " +
-          "being the primary; with none the task has no project and works in a scratch folder. Each project gets a jj " +
-          "workspace where the project's home says it starts: --rev <rev> (for the --project before it) starts it on a " +
-          "new change on that revision, and with --edit too it works on the revision itself (one with changes, nothing " +
-          "on top of it and no workspace on it). A --rev naming one of the project's sync branches starts it from that " +
-          "branch as the home has it. Without --rev, a folder project starts on the fork point of the folder's `@` (the " +
-          "newest ancestor with changes; refused while `@` itself has changes, as meddle never moves your working copy) " +
-          "and a URL project from its first sync branch. A start at a revision is held read-only on the home from then " +
-          "on, as the task's line `task/<task id>/<project>@meddle`. Creating needs each project's home online, except " +
-          "for a sync start (a --rev naming a sync branch, or a URL project without --rev): that starts from the copy " +
-          "the task's node fetched last. Without --node or --here meddle picks an online node that hosts " +
+          "being the primary; with none the task has no project and works in a scratch folder, except in a checkout of " +
+          "this node, where it is the checkout's project (and --rev and --edit may then come without a --project). Each " +
+          "project gets a jj " +
+          "workspace on a new change on its start's revision, or, with --edit too, working on the revision itself (one " +
+          "with changes, nothing on top of it and no workspace on it), its work measured from the revision's parents. " +
+          "The start is resolved where the revision is, on this node; no other node needs to be online. Run in a " +
+          "checkout of the project (its remote `meddle` naming this node), --rev <rev> (for the --project before it) is " +
+          "a revision of the checkout, and without --rev the start is the fork point of your @ (the newest revision at " +
+          "or below it with changes); the command checks it there, pushes it to this node and fetches the task's line " +
+          "back, so the revision is read-only in your checkout when it returns. When your @ itself has changes, it is " +
+          "that fork point: it is pushed and becomes read-only, so run `jj new` to go on working. --edit still needs a " +
+          "--rev there. With --edit, when your @ is an empty change whose parent is the revision, it is " +
+          "moved onto the revision's parents first (`moved your empty @ off <id>`). Elsewhere, --rev is a revision of " +
+          "this node's service repo, and without --rev the project starts from its default branch (see `project " +
+          "set-default`), refused `<branch> is conflicted; push a merge of its siblings` while concurrent pushes left " +
+          "it with several heads (see `project status`). The start is held " +
+          "read-only from then on, as the task's line (`meddle/task/<task id>/<project>@meddle` in a checkout). Once " +
+          "any pushed branch contains the task's line in every project the task changed, the task is archived when " +
+          "idle: a scratch bookmark on the line, pushed (say with `jj git push --all`), archives it too. When the line " +
+          "moves off work it neither descends from nor rewrote (the agent started over with `jj new main`, say), that " +
+          "work is kept as the side line `meddle/task/<task id>/<project>.before-<n>`, archived and kept when the task " +
+          "is accepted without it; a rebase keeps none. " +
+          "Without --node or --here meddle picks an online node that hosts " +
           "tasks and has room, preferring the primary project's home. Without --title, Claude Haiku names the task from " +
           "its prompt (the first 60 characters of the prompt's first line when it cannot), or with no prompt it gets " +
           "two adjectives and a noun. With a prompt it returns once the " +
@@ -271,9 +329,10 @@ const GROUPS: Group[] = [
         usage: ["task archive <id>"],
         summary: "Take an idle task's folder off its node, keeping its conversation and committed work.",
         details:
-          "Writes the task to an archive in the data directory and removes its folder; only committed work (its " +
-          "bookmarks, pushed to each project's home) and the conversation survive. Refused unless the task is idle. " +
-          "Bring it back with `task restore`.",
+          "Writes the task to an archive in the data directory and removes its folder; only committed work (its lines, " +
+          "kept and held by this node, no longer shown to checkouts) and the conversation survive. No other node is " +
+          "asked anything. Refused unless the task is idle. A task whose work a pushed branch contains is archived " +
+          "without this. Bring it back with `task restore`.",
       },
       {
         name: "task restore",
@@ -288,7 +347,8 @@ const GROUPS: Group[] = [
         usage: ["task delete <id>"],
         summary: "Delete an archived or moved task's archive, log and conversation.",
         details:
-          "Refused for any other task. The bookmarks each project's home keeps for the task stay.",
+          "Refused for any other task. An archived task's lines are released, so their commits stay only where a " +
+          "branch or another line holds them; a moved task's lines stay with the node that has it.",
       },
     ],
   },
@@ -299,7 +359,11 @@ const GROUPS: Group[] = [
         name: "git-remote",
         usage: ["git-remote <name> <url>"],
         summary: "git's remote helper for meddle:// remotes; git runs it, not you.",
-        details: "Nodes move repos with git over the pool's connections; `serve` installs the wrapper git calls.",
+        details:
+          "Nodes move repos with git over the pool's connections, and a checkout fetches from and pushes to its node " +
+          "through it; `serve` writes the wrapper git calls, `<data>/bin/git-remote-meddle`, which must be on your PATH " +
+          "for a `jj git fetch` or `jj git push` you type. Agents can't reach meddle:// remotes: a task's Claude Code " +
+          "gets neither `<data>/bin` on its PATH nor `MEDDLE_GIT_SOCKET`; its lines and the branches reach it as rows.",
       },
       {
         name: "--version",

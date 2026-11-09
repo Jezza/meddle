@@ -39,17 +39,44 @@ test("a command's help says what it does in full, asked either way; a group's li
   expect((await meddle(["help", "token", "set"], await env())).stdout).toContain("usage: meddle token add");
 });
 
-test("project add and project sync are documented with their sync branches", async () => {
+test("a project has no sync branches: help, the usage text and the README name none, and project sync is no command", async () => {
   const add = await meddle(["help", "project", "add"], await env());
-  expect(add.stdout).toStartWith("usage: meddle project add <path-or-url> [--name <n>] [--sync <bookmark>]...\n");
-  expect(add.stdout).toContain("--sync adds a sync branch");
-  const sync = await meddle(["project", "sync", "--help"], await env());
-  expect(sync.code).toBe(0);
-  expect(sync.stdout).toStartWith("usage: meddle project sync <id|name> [<bookmark>...]\n");
-  expect(sync.stdout).toContain("the list is emptied");
+  expect(add.stdout).toStartWith("usage: meddle project add <path-or-url> [--name <n>] [--no-fetch]\n");
+  expect(add.stdout).not.toContain("--sync");
+  const sync = await meddle(["help", "project", "sync"], await env());
+  expect(sync.code).toBe(2);
+  expect(sync.stderr).toStartWith("meddle: no such command: project sync\n");
   const usage = await meddle(["project"], await env());
   expect(usage.code).toBe(2);
-  expect(usage.stderr).toContain("meddle project sync <id|name> [<bookmark>...]");
+  expect(usage.stderr).not.toContain("project sync");
+  expect(usage.stderr).not.toContain("--sync");
+  const all = await meddle(["help"], await env());
+  expect(all.stdout.replace(/\s+/g, " ").toLowerCase()).not.toContain("sync branch");
+  expect(all.stdout).not.toContain("project sync");
+  const readme = (await Bun.file(`${import.meta.dir}/../README.md`).text()).replace(/\s+/g, " ").toLowerCase();
+  expect(readme).not.toContain("sync branch");
+  expect(readme).not.toContain("project sync");
+  expect(readme).not.toContain("--sync");
+});
+
+test("project add, project set-default and checkout document the service repo, the default branch and checkouts", async () => {
+  const add = await meddle(["help", "project", "add"], await env());
+  expect(add.stdout).toContain("service repo");
+  expect(add.stdout).toContain("git-remote-meddle");
+  const setDefault = await meddle(["project", "set-default", "--help"], await env());
+  expect(setDefault.code).toBe(0);
+  expect(setDefault.stdout).toStartWith("usage: meddle project set-default <id|name> <branch>\n");
+  expect(setDefault.stdout).toContain("default branch");
+  const checkout = await meddle(["help", "checkout"], await env());
+  expect(checkout.code).toBe(0);
+  expect(checkout.stdout).toStartWith("usage: meddle checkout <id|name> [<dir>]\n");
+  const all = await meddle(["help"], await env());
+  expect(all.stdout).toContain("  meddle project set-default <id|name> <branch>");
+  expect(all.stdout).toContain("  meddle checkout <id|name> [<dir>]");
+  const usage = await meddle(["project"], await env());
+  expect(usage.stderr).toContain("meddle project set-default <id|name> <branch>");
+  const readme = await Bun.file(`${import.meta.dir}/../README.md`).text();
+  for (const form of ["project set-default <id|name> <branch>", "checkout <id|name> [<dir>]"]) expect(readme).toContain(form);
 });
 
 test("help for no such command says so on stderr and exits 2; a usage error points at help", async () => {
@@ -110,15 +137,61 @@ test("task new documents each project's start, and neither the help nor the READ
   const asked = await meddle(["help", "task", "new"], await env());
   expect(asked.code).toBe(0);
   expect(asked.stdout).toStartWith(`usage: meddle ${usage}\n`);
+  expect(asked.stdout).toContain("default branch");
   expect(asked.stdout).toContain("fork point");
   expect(asked.stdout).toContain("--edit");
   const all = await meddle(["help"], await env());
   expect(all.stdout).toContain(`  meddle ${usage}`);
   expect(all.stdout.toLowerCase()).not.toContain("trunk");
-  for (const command of ["task new", "project add", "project sync"]) {
+  for (const command of ["task new", "project add"]) {
     expect((await meddle(["help", ...command.split(" ")], await env())).stdout.toLowerCase()).not.toContain("trunk");
   }
   const readme = await Bun.file(`${import.meta.dir}/../README.md`).text();
   expect(readme).toContain(usage);
   expect(readme.toLowerCase()).not.toContain("trunk");
+});
+
+test("task new's help and the README say a start is resolved where the revision is: from a checkout, or the default branch", async () => {
+  const help = await meddle(["help", "task", "new"], await env());
+  expect(help.code).toBe(0);
+  // Wrapped to the terminal: read as one line.
+  const text = help.stdout.replace(/\s+/g, " ");
+  for (const phrase of ["resolved where the revision is", "fork point of your @", "moved your empty @ off <id>", "is conflicted; push a merge of its siblings",
+    "where it is the checkout's project (and --rev and --edit may then come without a --project)"]) {
+    expect(text).toContain(phrase);
+  }
+  expect(text).not.toContain("sync branch");
+  expect(text).not.toContain("home online");
+  const readme = await Bun.file(`${import.meta.dir}/../README.md`).text();
+  const starts = readme.slice(readme.indexOf("### Where a task starts"), readme.indexOf("### Taking a task's work")).replace(/\s+/g, " ");
+  for (const text of ["git push meddle <commit>:refs/meddle/incoming/<commit>", "moved your empty @ off <W>", "<branch> is conflicted; push a merge of its siblings"]) {
+    expect(starts).toContain(text);
+  }
+  expect(starts).not.toContain("sync branch");
+});
+
+test("help documents checkout, project set-default and project status, and how a sibling is dropped; nothing of a migration", async () => {
+  const all = await meddle(["help"], await env());
+  for (const form of ["checkout <id|name> [<dir>]", "project set-default <id|name> <branch>", "project status <id|name>"]) {
+    expect(all.stdout).toContain(`  meddle ${form}\n`);
+  }
+  const status = await meddle(["project", "status", "--help"], await env());
+  expect(status.code).toBe(0);
+  expect(status.stdout).toStartWith("usage: meddle project status <id|name>\n");
+  // Wrapped to the terminal: read as one line.
+  const text = status.stdout.replace(/\s+/g, " ");
+  for (const phrase of [
+    "meddle/conflict/<b>/<id>@meddle", "jj bookmark set <b> -r <your commit>", "git push meddle :refs/heads/meddle/conflict/<b>/<id>",
+    "`jj bookmark track` makes that sibling mutable in your checkout until you push its deletion",
+  ]) {
+    expect(text).toContain(phrase);
+  }
+  expect(all.stdout).not.toContain("migrate");
+  const usage = await meddle(["project"], await env());
+  expect(usage.stderr).toContain("meddle project status <id|name>");
+  const readme = (await Bun.file(`${import.meta.dir}/../README.md`).text()).replace(/\s+/g, " ");
+  for (const phrase of ["project status <id|name>", "git push meddle :refs/heads/meddle/conflict/<b>/<id>", "jj bookmark track"]) {
+    expect(readme).toContain(phrase);
+  }
+  expect(readme).not.toContain("meddle migrate");
 });
