@@ -8,7 +8,6 @@ export function paths(cfg: NodeConfig) {
   const secrets = join(data, "secrets");
   const task = (taskId: string) => join(cfg.taskRoot, taskId);
   const bin = join(data, "bin");
-  const hooks = join(data, "git-hooks");
   return {
     profile: join(data, "profile"),
     plugins: join(data, "plugins"),
@@ -25,12 +24,12 @@ export function paths(cfg: NodeConfig) {
     taskMeta: (taskId: string) => join(task(taskId), ".meddle"),
     taskConfig: (taskId: string) => join(task(taskId), ".meddle", "claude"),
     taskManifest: (taskId: string) => join(task(taskId), ".meddle", "task.json"),
-    /** Prepended to `PATH` for every jj and Claude Code meddle runs: it holds the git remote helper. */
+    /** Prepended to `PATH` for every jj meddle runs (never an agent's): it holds the git remote helper. */
     bin,
     binHelper: join(bin, "git-remote-meddle"),
-    /** `core.hooksPath` of the `receive-pack` serving a peer's push. */
-    hooks,
-    hookUpdate: join(hooks, "update"),
+    /** `core.hooksPath` of every `receive-pack` this node serves (a checkout's push here, a peer's to a memory repo). */
+    checkoutHooks: join(data, "checkout-hooks"),
+    hookPreReceive: join(data, "checkout-hooks", "pre-receive"),
     gitSocket: cfg.gitSocket ?? join(data, "git.sock"),
     /** The archives of tasks archived here, kept until the task is restored or deleted: mode 700, each archive 600. */
     archives: join(data, "archives"),

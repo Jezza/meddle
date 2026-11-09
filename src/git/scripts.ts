@@ -1,5 +1,5 @@
-// The files git runs on meddle's behalf: the `git-remote-meddle` remote helper wrapper and the `update` hook of the
-// `receive-pack` serving a peer's push.
+// The files git runs on meddle's behalf: the `git-remote-meddle` remote helper wrapper and the `pre-receive` hook of
+// every `receive-pack` this node serves.
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -21,37 +21,30 @@ async function writeScript(file: string, content: string): Promise<string> {
 }
 
 /**
+ * How a script runs this meddle with `entry`'s command: this bun and the checkout's `src/git/<entry>` (which loads only
+ * what that command needs), or, inside the compiled binary (where `import.meta.dir` names a virtual directory), the
+ * binary itself.
+ */
+function meddleCommand(entry: string): string {
+  const file = resolve(import.meta.dir, entry);
+  return existsSync(file) ? `${shq(process.execPath)} ${shq(file)}` : shq(process.execPath);
+}
+
+/**
  * Writes `<data>/bin/git-remote-meddle`: a `#!/bin/sh` script that execs this meddle (this bun and the checkout's
  * `src/git/remote-main.ts`, which loads only the helper, or the compiled binary itself) with `git-remote "$@"`.
  * Rewritten only when its content changed.
  */
 export async function writeHelperWrapper(cfg: NodeConfig): Promise<string> {
-  const entry = resolve(import.meta.dir, "remote-main.ts");
-  // Inside a compiled binary `import.meta.dir` names a virtual directory: the binary is the cli.
-  const command = existsSync(entry) ? `${shq(process.execPath)} ${shq(entry)}` : shq(process.execPath);
-  return writeScript(paths(cfg).binHelper, `#!/bin/sh\n# Written by meddle: git's remote helper for meddle:// remotes.\nexec ${command} git-remote "$@"\n`);
+  return writeScript(paths(cfg).binHelper, `#!/bin/sh\n# Written by meddle: git's remote helper for meddle:// remotes.\nexec ${meddleCommand("remote-main.ts")} git-remote "$@"\n`);
 }
 
-const UPDATE_HOOK = `#!/bin/sh
-# Written by meddle: what a peer may push here. $1 is the ref, $2 the old object id, $3 the new one.
-ref="$1"
-case "$3" in
-  *[!0]*) ;;
-  *) echo "meddle: deleting $ref is not accepted here" >&2; exit 1 ;;
-esac
-case "$MEDDLE_REPO_KIND:$ref" in
-  project:refs/remotes/meddle/task/*) exit 0 ;;
-  memory:refs/heads/memory) exit 0 ;;
-esac
-echo "meddle: ref $ref is not accepted here" >&2
-exit 1
-`;
-
 /**
- * Writes `<data>/git-hooks/update`: it refuses deletions (`meddle: deleting <ref> is not accepted here`) and admits
- * only a task's line, `refs/remotes/meddle/task/*`, into a project repo and `refs/heads/memory` into a memory repo
- * (`MEDDLE_REPO_KIND`), refusing every other ref with `meddle: ref <ref> is not accepted here`.
+ * Writes `<data>/checkout-hooks/pre-receive`: a `#!/bin/sh` script that execs this meddle (this bun and the checkout's
+ * `src/git/pre-receive.ts`, or the compiled binary itself) with `git-pre-receive`, which reads git's lines on its stdin
+ * and refuses the whole push or admits it. Its own directory: git runs every hook of a `core.hooksPath`. Rewritten only
+ * when its content changed.
  */
-export async function writeUpdateHook(cfg: NodeConfig): Promise<string> {
-  return writeScript(paths(cfg).hookUpdate, UPDATE_HOOK);
+export async function writePreReceiveHook(cfg: NodeConfig): Promise<string> {
+  return writeScript(paths(cfg).hookPreReceive, `#!/bin/sh\n# Written by meddle: the gate of a push to this node.\nexec ${meddleCommand("pre-receive.ts")} git-pre-receive\n`);
 }

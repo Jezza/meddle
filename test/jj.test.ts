@@ -3,7 +3,6 @@ import { test, expect } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkList, bookmarkSet, fetch, jj, push, remoteAdd, track } from "../src/jj";
 import { shortId } from "../src/pool/identity";
-import { pushLines } from "../src/projects/lines";
 import { twoPoolNodes } from "./pool-helpers";
 test("init, workspace add, change id, bookmark, forget", async () => {
   const repo = await mkdtemp("/tmp/meddle-jj-");
@@ -74,7 +73,7 @@ test("listing bookmarks imports git's refs and never snapshots the working copy"
   expect(await recorded()).not.toContain("edited.txt");
 });
 
-test("a peer's fetch and push against a home with an edit in its checkout never snapshot that checkout", async () => {
+test("a peer's fetch from a repo with an edit in its working copy never snapshots it, and writes nothing there", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     const home = A.project.replica;
@@ -90,21 +89,16 @@ test("a peer's fetch and push against a home with an edit in its checkout never 
     await initColocated(repo, B.cfg);
     await remoteAdd(repo, shortA, `meddle://${A.id}/project/${A.project.id}`, B.cfg);
     await fetch(repo, shortA, ["main"], B.cfg);
-    await jj(["new", `main@${shortA}`], repo, B.cfg);
-    await Bun.write(`${repo}/work`, "from b\n");
-    await jj(["commit", "-m", "work"], repo, B.cfg);
-    await bookmarkSet(repo, "meddle/task/t1/p", "@-", B.cfg);
-    await pushLines(B.cfg, repo, { ...A.project, home: A.id }, "t1");
-    // a second fetch changes nothing on the home
+    // a second fetch changes nothing either
     await fetch(repo, shortA, ["main"], B.cfg);
 
     const fresh = (await opIds()).filter((id) => !known.has(id));
     const described = await Promise.all(fresh.map(async (id) => (await jj(["op", "show", "--ignore-working-copy", id, "--no-graph", "-T", "description", "--no-op-diff"], home, A.cfg)).trim()));
     expect(described.filter((d) => d.startsWith("snapshot"))).toEqual([]);
-    // the pushed line's import, nothing else: a fetch writes nothing on the home
-    expect(fresh.length).toBeLessThanOrEqual(1);
+    // a fetch writes nothing there
+    expect(fresh).toEqual([]);
     expect((await jj(["diff", "--ignore-working-copy", "-r", "@", "--name-only"], home, A.cfg)).split("\n")).not.toContain("edited.txt");
-    expect((await bookmarkList(home, A.cfg)).map((b) => `${b.name}@${b.remote ?? ""}`).sort()).toEqual(["main@", "task/t1/p@meddle"]);
+    expect((await bookmarkList(home, A.cfg)).map((b) => `${b.name}@${b.remote ?? ""}`).sort()).toEqual(["main@"]);
     expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
   } finally {
     await close();

@@ -4,7 +4,7 @@ import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
-import { ensureReplica, type ReplicaDeps } from "../src/projects/replicas";
+import { ensureServiceRepo, type ReplicaDeps } from "../src/projects/replicas";
 import { createTask, setupNode } from "./helpers";
 import { peerReady, startPoolNode, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -23,7 +23,7 @@ async function replicated() {
   try {
     await peerReady(B, A);
     const id = A.project.id;
-    await ensureReplica(depsOf(B), id);
+    await ensureServiceRepo(depsOf(B), id);
     const logs: string[] = [];
     const log = (line: string) => { logs.push(line); };
     return { ...nodes, id, memA: paths(A.cfg).memory(id), memB: paths(B.cfg).memory(id), logs, log };
