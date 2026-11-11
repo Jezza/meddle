@@ -338,6 +338,7 @@ one, and sets a key picked from the table below (an `env.` key with the name typ
 | `lighthouse.url` | The discovery lighthouse, applied live; it cannot be set empty. A node that sets `MEDDLE_LIGHTHOUSE_URL` (even empty, which turns discovery off there) uses its own instead. |
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
 | `roster.forget` | How long, in seconds, a member may go unheard of before a node counts it gone ([Addresses and forgetting](#addresses-and-forgetting)): `0` never, else at least `60`; `900` (three lighthouse announce TTLs) when unset. A node that sets `MEDDLE_FORGET_MS` uses its own instead. |
+| `defaults.model`, `defaults.effort` | The model, and the effort (`low`, `medium`, `high`, `xhigh` or `max`), of a turn whose task chose none in the dashboard; unset leaves them to Claude Code. A model cannot be set empty. |
 
 Each key replicates on its own, last writer wins on the time it was set, the roster's rule (on equal times, the
 setting from the node with the greater id wins, then the greater value); an unset replicates too. A value is at most

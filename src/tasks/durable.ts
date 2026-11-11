@@ -244,6 +244,8 @@ export class TaskRunner {
   #cancelling = new Set<string>();
   #moveListeners = new Set<(taskId: string, move: MoveState | null) => void>();
   #manifestListeners = new Set<(taskId: string, manifest: TaskManifest) => void>();
+  /** Told whenever a task's stored settings (model, effort, permission mode) change here. */
+  #settingsListeners = new Set<(taskId: string) => void>();
   /** Woken whenever a turn of the task ends (completed, failed or aborted): a move waits for it. */
   #turnWaiters = new Map<string, Set<() => void>>();
   /** Tasks being archived: until the row says `archived`, no turn or move of them starts. */
@@ -563,14 +565,14 @@ export class TaskRunner {
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
     this.#refuseElsewhere(taskId);
     await this.liveQuery(taskId)?.setPermissionMode(mode);
-    updateTaskSettings(this.#db, taskId, { permissionMode: mode });
+    this.#updateSettings(taskId, { permissionMode: mode });
   }
 
   /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the default. */
   async setModel(taskId: string, model?: string): Promise<void> {
     this.#refuseElsewhere(taskId);
     await this.liveQuery(taskId)?.setModel(model);
-    updateTaskSettings(this.#db, taskId, { model });
+    this.#updateSettings(taskId, { model });
   }
 
   /**
@@ -623,7 +625,18 @@ export class TaskRunner {
   /** Effort for the task's later turns; a live turn keeps its own. */
   async setEffort(taskId: string, effort: string): Promise<void> {
     this.#refuseElsewhere(taskId);
-    updateTaskSettings(this.#db, taskId, { effort });
+    this.#updateSettings(taskId, { effort });
+  }
+
+  onSettings(cb: (taskId: string) => void): () => void {
+    this.#settingsListeners.add(cb);
+    return () => { this.#settingsListeners.delete(cb); };
+  }
+
+  /** Stores a change to the task's settings and tells the `onSettings` listeners. */
+  #updateSettings(taskId: string, patch: Parameters<typeof updateTaskSettings>[2]): void {
+    updateTaskSettings(this.#db, taskId, patch);
+    notify(this.#settingsListeners, (cb) => cb(taskId));
   }
 
   /** The model, effort and permission mode the task's next turn starts with, where the user chose one. */
@@ -976,6 +989,7 @@ export class TaskRunner {
         queued: got.queued.length === 0 ? null : JSON.stringify(got.queued),
         turns: got.turns,
       });
+      notify(this.#settingsListeners, (cb) => cb(taskId));
       return got.receipt;
     });
   }
@@ -2020,7 +2034,10 @@ export class TaskRunner {
     };
     // With a pool, the task's lines follow its agent's work (`#filesChanged`).
     if (this.#pool !== undefined) input.onFilesChanged = () => this.#filesChanged(taskId);
-    const { model, effort, permissionMode } = getTaskSettings(this.#db, taskId);
+    const chosen = getTaskSettings(this.#db, taskId);
+    const { permissionMode } = chosen;
+    const model = chosen.model ?? this.#pool?.settings.defaultModel() ?? undefined;
+    const effort = chosen.effort ?? this.#pool?.settings.defaultEffort() ?? undefined;
     if (model !== undefined) input.model = model;
     if (effort !== undefined) input.effort = effort;
     if (permissionMode !== undefined) input.permissionMode = permissionMode;

@@ -160,6 +160,8 @@ const nodeMethods = {
       })),
       prompt: Type.Optional(Nullable(Type.String())),
       node: Type.Optional(Nullable(Type.String())),
+      /** The model the task's turns use, where the user chose one; else the default. */
+      model: Type.Optional(Type.String()),
     }),
     Type.Object({ manifest: TaskManifestSchema, nodeId: Type.String() }),
   ),
@@ -189,6 +191,9 @@ export const NodeStore = local("meddle.node-store", {
     ...nodeMethods,
     efforts: Type.Record(Type.String(), Type.String()),
     setEffort: method(Type.Object({ taskId: Type.String(), effort: Type.String() })),
+    /** Each task's chosen model; backs `TaskObject.model` ahead of the first turn that reports one. */
+    chosenModels: Type.Record(Type.String(), Type.String()),
+    setModel: method(Type.Object({ taskId: Type.String(), model: Type.Optional(Type.String()) })),
   },
 });
 
@@ -564,6 +569,7 @@ export const PeerObject = remote("meddle.peer", {
             starts: Type.Array(StartSchema),
             prompt: Nullable(Type.String()),
             nameFromPrompt: Type.Optional(Type.Boolean()),
+            model: Type.Optional(Type.String()),
           }),
           Type.Object({ manifest: TaskManifestSchema }),
         ),

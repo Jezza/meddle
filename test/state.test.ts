@@ -96,6 +96,27 @@ test("a client follows a task through a prompted turn over a link", async () => 
   }
 });
 
+test("a model chosen for an idle task shows at once, for every client, and its unset falls back to the log's", async () => {
+  const { client, project, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }], model: "fable" });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    const other = await client.get(TaskObject, { id: manifest.id });
+    expect(task.model.value).toBe("fable");
+    await task.setModel({ model: "opus" });
+    await until(task.model, (m) => m === "opus");
+    await until(other.model, (m) => m === "opus");
+    await task.setModel({});
+    await until(task.model, (m) => m === null);
+    task.release();
+    other.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
 test("renaming a task updates its manifest for every client, its row and its folder's manifest", async () => {
   const { client, project, cfg, db, close } = await connect();
   try {

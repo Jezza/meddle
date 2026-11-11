@@ -85,7 +85,7 @@ export type PeerObjectDeps = {
   /** Whether a node is a member of this node's pool: only a member may create a task here. */
   isMember(nodeId: string): boolean;
   /** Receives tasks other nodes move here (each call names the calling node), and creates tasks members place here. */
-  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt">;
+  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel">;
 };
 
 /** A project as another node sees it. */
@@ -141,9 +141,10 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         return row !== null && row.state !== "moved";
       },
       // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
-      createTaskAt: async ({ title, taskId, starts, prompt, nameFromPrompt }) => {
+      createTaskAt: async ({ title, taskId, starts, prompt, nameFromPrompt, model }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
         const manifest = await deps.runner.create({ title, taskId, starts });
+        if (model !== undefined) await deps.runner.setModel(manifest.id, model);
         if (prompt !== null && nameFromPrompt === true) void deps.runner.nameFromPrompt(manifest.id, title, prompt);
         if (prompt !== null) await deps.runner.prompt(manifest.id, prompt);
         return { manifest };
@@ -196,6 +197,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   };
   const manifests: Subscribable<{ taskId: string }> = {
     subscribe: (cb) => runner.onManifest((taskId) => cb({ taskId })),
+  };
+  const settingsChanges: Subscribable<{ taskId: string }> = {
+    subscribe: (cb) => runner.onSettings((taskId) => cb({ taskId })),
   };
   const queuedChanges: Subscribable<{ taskId: string }> = {
     subscribe: (cb) => runner.onQueued((taskId) => cb({ taskId })),
@@ -262,6 +266,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const models = self.state("models", NodeStore.def.members.models, []);
     const notifications = self.state("notifications", NodeStore.def.members.notifications, []);
     const efforts = self.state("efforts", NodeStore.def.members.efforts, { init: effortsNow });
+    const chosenModels = self.state("chosenModels", NodeStore.def.members.chosenModels, { init: chosenModelsNow });
     /** Tasks whose current turn's messages reported a token fault (until their next `turn_started`). */
     const faulted = new Set<string>();
     /** Tasks whose last event was a `token_fault` for no usable token: the `turn_failed` after it is the same failure. */
@@ -312,6 +317,14 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           // keep the previous list
         }
       }
+    });
+    // A model or effort chosen at creation (here or by a peer) or brought by a move shows without a turn.
+    self.on("settings", settingsChanges, ({ taskId }, ctx) => {
+      const { model, effort } = getTaskSettings(db, taskId);
+      const { [taskId]: _model, ...models } = chosenModels.value;
+      const { [taskId]: _effort, ...rest } = efforts.value;
+      if (chosenModels.value[taskId] !== model) chosenModels.replace(ctx, model === undefined ? models : { ...models, [taskId]: model });
+      if (efforts.value[taskId] !== effort) efforts.replace(ctx, effort === undefined ? rest : { ...rest, [taskId]: effort });
     });
     self.on("approvals", approvalChanges, (_event, ctx) => {
       const pending = approvals.pending();
@@ -379,7 +392,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       models,
       notifications,
       efforts,
-      createTask: async ({ title: given, projects, prompt, node }, ctx) => {
+      chosenModels,
+      createTask: async ({ title: given, projects, prompt, node, model }, ctx) => {
         // Named here, before it goes anywhere, so that a peer of any version gets a title. Untitled, it starts with a
         // made-up name, not waiting on Haiku: the node it is on names it from its prompt afterwards.
         const title = initialTitle(given);
@@ -404,6 +418,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           let manifest: TaskManifest;
           try {
             manifest = await runner.create({ title, taskId, starts });
+            if (model !== undefined) await runner.setModel(taskId, model);
           } catch (err) {
             // A task made all the same (a failure after it) keeps its lines.
             if (getTask(db, taskId) !== null) throw err;
@@ -418,7 +433,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           return { manifest, nodeId: selfId };
         }
         try {
-          return { manifest: await createOn(target, { title, taskId, starts, prompt: text, nameFromPrompt }), nodeId: target };
+          return { manifest: await createOn(target, { title, taskId, starts, prompt: text, nameFromPrompt, ...(model === undefined ? {} : { model }) }), nodeId: target };
         } catch (err) {
           if (err instanceof CreationSent) {
             const held = await heldOn(target, taskId);
@@ -448,6 +463,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       },
       dismiss: ({ id }, ctx) => {
         notifications.replace(ctx, notifications.value.filter((n) => n.id !== id));
+      },
+      // Answered once the change shows, so a select does not snap back between the answer and the `settings` event.
+      setModel: async ({ taskId, model }, ctx) => {
+        await runner.setModel(taskId, model);
+        const { [taskId]: _, ...rest } = chosenModels.value;
+        chosenModels.replace(ctx, model === undefined ? rest : { ...rest, [taskId]: model });
       },
       setEffort: async ({ taskId, effort }, ctx) => {
         await runner.setEffort(taskId, effort);
@@ -623,7 +644,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       queued,
       lastSeq: self.derive([log], (l) => l.lastSeq),
       permissionMode: self.derive([log], (l) => l.permissionMode),
-      model: self.derive([log], (l) => l.model),
+      model: self.derive([log, store.chosenModels], (l, c) => c[id] ?? l.model),
       effort: self.derive([store.efforts], (e) => e[id] ?? null),
       contextUsage: self.derive([log], (l) => l.contextUsage),
       move,
@@ -646,7 +667,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         answer(requestId, (req) => ({ behavior: "allow", updatedInput: { ...req.input, answers } }));
       },
       setPermissionMode: ({ mode }) => runner.setPermissionMode(id, mode),
-      setModel: ({ model }) => runner.setModel(id, model),
+      setModel: ({ model }, ctx) => store.setModel({ taskId: id, ...(model === undefined ? {} : { model }) }, ctx),
       setEffort: ({ effort }, ctx) => store.setEffort({ taskId: id, effort }, ctx),
       moveTo: ({ nodeId, now }) => runner.moveTo(id, nodeId, now),
       cancelMove: () => runner.cancelMove(id),
@@ -736,7 +757,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
    * `CreationSent` once the request went out: the target may have made the task all the same.
    */
   async function createOn(
-    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null; nameFromPrompt: boolean },
+    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null; nameFromPrompt: boolean; model?: string },
   ): Promise<TaskManifest> {
     const peer = await pool.peerRef(target, PeerObject);
     try {
@@ -777,6 +798,16 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   function projectIdsNow(): string[] {
     return listProjects(db).map((p) => p.id);
+  }
+
+  /** Each task's chosen model, from the tasks' stored settings. */
+  function chosenModelsNow(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const t of listTasks(db)) {
+      const { model } = getTaskSettings(db, t.id);
+      if (model !== undefined) out[t.id] = model;
+    }
+    return out;
   }
 
   /** Each task's chosen effort, from the tasks' stored settings. */

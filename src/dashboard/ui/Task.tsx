@@ -7,7 +7,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/ho
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
-import { type Anchor, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { type Anchor, modelChoices, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { usageShort } from "./sidebar-model";
@@ -646,7 +646,10 @@ function Settings({ task, node, disabled }: { task: TaskRef; node: NodeRef; disa
   const model = useValue(task.model);
   const effort = useValue(task.effort);
   const action = useAction();
-  const modelOptions = model !== null && !models.includes(model) ? [model, ...models] : models;
+  /** The model just picked, shown until its change lands (or fails), so the select does not snap back meanwhile. */
+  const [picked, setPicked] = useState<string | null>(null);
+  const shown = picked ?? model ?? "";
+  const modelOptions = modelChoices(models, shown === "" ? null : shown);
   return (
     <>
       {action.error !== null && <span class="error" title={action.error}>!</span>}
@@ -664,9 +667,10 @@ function Settings({ task, node, disabled }: { task: TaskRef; node: NodeRef; disa
         {effort === null && <option value="">effort</option>}
         {EFFORT_LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
       </select>
-      <select class="pill" title="Model" disabled={disabled} value={model ?? ""} onChange={(e) => {
+      <select class="pill" title="Model" disabled={disabled} value={shown} onChange={(e) => {
         const value = e.currentTarget.value;
-        void action.run(() => task.setModel(value === "" ? {} : { model: value }));
+        setPicked(value);
+        void action.run(() => task.setModel(value === "" ? {} : { model: value })).finally(() => setPicked(null));
       }}>
         <option value="">default model</option>
         {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}

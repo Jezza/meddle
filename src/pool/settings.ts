@@ -4,7 +4,7 @@ import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 
 /** The keys a pool setting may have; `env.<NAME>` sets `<NAME>` for jj and for every task's Claude Code. */
-export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|roster\.forget|env\.[A-Z_][A-Z0-9_]*)$/;
+export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|roster\.forget|defaults\.model|defaults\.effort|env\.[A-Z_][A-Z0-9_]*)$/;
 
 /** How long a member goes unheard of before it is gone (`roster.forget`'s default): three lighthouse announce TTLs. */
 export const DEFAULT_FORGET_SECS = 900;
@@ -55,7 +55,9 @@ export const MAX_POOL_ENV = 65536;
 const CONTROL = /[\x00-\x08\x0a-\x1f\x7f-\x9f]/;
 const BAD_VALUE = `setting value must be at most ${MAX_SETTING_VALUE} characters with no control characters`;
 /** The keys whose value may not be empty: an empty jj identity overrides the node's own and jj refuses to push. */
-const NON_EMPTY = new Set(["jj.user", "jj.email", "lighthouse.url"]);
+const NON_EMPTY = new Set(["jj.user", "jj.email", "lighthouse.url", "defaults.model"]);
+/** The efforts `defaults.effort` may name. */
+export const EFFORT_LEVELS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
 /** The most distinct ignored keys logged; later ones are only counted. */
 const MAX_LOGGED = 100;
 /** How much of an ignored key a log line shows. */
@@ -82,6 +84,7 @@ function valueProblem(key: string, value: string): string | null {
   if (value.length > MAX_SETTING_VALUE || CONTROL.test(value)) return BAD_VALUE;
   if (NON_EMPTY.has(key) && value === "") return `${key} must not be empty`;
   if (key === "limits.running" && nonNegativeInteger(value) === null) return "limits.running must be a non-negative integer";
+  if (key === "defaults.effort" && !EFFORT_LEVELS.includes(value)) return `defaults.effort must be one of ${EFFORT_LEVELS.join(", ")}`;
   if (key === "roster.forget") {
     const secs = nonNegativeInteger(value);
     if (secs === null || (secs !== 0 && secs < MIN_FORGET_SECS)) return `roster.forget must be 0 or at least ${MIN_FORGET_SECS} (seconds)`;
@@ -281,6 +284,18 @@ export class PoolSettings {
     const raw = this.get("roster.forget");
     const secs = raw === null ? DEFAULT_FORGET_SECS : nonNegativeInteger(raw) ?? DEFAULT_FORGET_SECS;
     return secs === 0 ? null : Math.max(secs, MIN_FORGET_SECS) * 1000;
+  }
+
+  /** `defaults.model`, the model of a task that chose none; null when unset or empty (Claude Code then picks its own). */
+  defaultModel(): string | null {
+    const model = this.get("defaults.model");
+    return model === null || model === "" ? null : model;
+  }
+
+  /** `defaults.effort`, the effort of a task that chose none; null when unset or not a known level. */
+  defaultEffort(): string | null {
+    const effort = this.get("defaults.effort");
+    return effort !== null && EFFORT_LEVELS.includes(effort) ? effort : null;
   }
 
   /** `lighthouse.url`, or null when it is unset or empty (a replicated empty value must not reach discovery). */

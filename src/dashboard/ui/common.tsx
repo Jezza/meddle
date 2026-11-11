@@ -209,3 +209,12 @@ export function tokenText(token: { present: boolean; expiresAt: string | null })
 export function mb(kb: number): string {
   return kb >= 1024 * 1024 ? `${(kb / 1024 / 1024).toFixed(1)} GiB` : `${(kb / 1024).toFixed(0)} MiB`;
 }
+
+/** Models always offered, beside the node's list (which may lack newer ones). */
+const EXTRA_MODELS = ["fable", "opus", "sonnet", "haiku"];
+
+/** The models to pick from: the node's list plus `EXTRA_MODELS`, with the task's `current` one kept in. */
+export function modelChoices(listed: readonly string[], current: string | null): string[] {
+  const all = [...new Set([...listed, ...EXTRA_MODELS])];
+  return current !== null && !all.includes(current) ? [current, ...all] : all;
+}
