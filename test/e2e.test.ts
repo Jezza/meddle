@@ -73,11 +73,6 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     expect(types).toContain("system/init");
     expect(types.at(-1)).toBe("result/success");
 
-    // nothing is parked, so there is nothing to retry (chord marks a method's own error `unavailable`)
-    const retried = await meddle(["task", "retry", taskId], client);
-    expect(retried.code).toBe(1);
-    expect(retried.stderr).toBe(`meddle: no parked turn for task ${taskId}\n`);
-
     const page = await fetch(node.url);
     expect(page.status).toBe(200);
     await page.body?.cancel();

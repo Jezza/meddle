@@ -88,8 +88,6 @@ test("a client follows a task through a prompted turn over a link", async () => 
 
     await task.setEffort({ effort: "low" });
     await until(task.effort, (e) => e === "low");
-    // nothing is parked: retry says so
-    await expect(task.retry({})).rejects.toThrow(`no parked turn for task ${manifest.id}`);
     task.release();
     session.release();
     node.release();

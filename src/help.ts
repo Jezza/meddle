@@ -310,8 +310,8 @@ const GROUPS: Group[] = [
       {
         name: "task retry",
         usage: ["task retry <id>"],
-        summary: "Run again a turn that repeated crashes parked.",
-        details: "A turn that crashed the node several times is parked rather than started again; this releases it.",
+        summary: "Run again a turn that was parked, interrupted or failed.",
+        details: "A turn that crashed the node several times is parked rather than started again; this releases it. On an idle task it starts a new turn that carries on from where the last one stopped, e.g. after you interrupted it.",
       },
       {
         name: "task move",

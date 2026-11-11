@@ -283,7 +283,7 @@ export const TaskObject = remote("meddle.task", {
         /** Renames the task; refused for a blank title and while it is not live here (moving, moved, archived). */
         rename: method(Type.Object({ title: Type.String() })),
         interrupt: method(Type.Object({})),
-        /** Runs the task's turn again after repeated crashes parked it; rejects when no turn is parked. */
+        /** Runs the task's turn again after repeated crashes parked it, or, for an idle task that has had a turn, starts one that carries on from it (after an interrupt or a failure); rejects otherwise. */
         retry: method(Type.Object({})),
         approve: method(Type.Object({ requestId: Type.String(), updatedInput: Type.Optional(Type.Record(Type.String(), Type.Unknown())) })),
         deny: method(Type.Object({ requestId: Type.String(), message: Type.String(), interrupt: Type.Optional(Type.Boolean()) })),

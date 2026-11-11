@@ -420,7 +420,7 @@ bun run src/cli.ts task new "Finish this" --project myproject --rev <rev> --edit
 cd ~/src/myproject && bun run ~/src/meddle/src/cli.ts task new "Go on" --project myproject   # from your checkout's @
 bun run src/cli.ts task prompt <task-id> "Find out why test_sync is flaky and fix it"
 bun run src/cli.ts task list   # every task of the pool, with its state and node
-bun run src/cli.ts task retry <task-id>   # runs a turn again that repeated crashes parked
+bun run src/cli.ts task retry <task-id>   # runs a parked turn again, or carries on an idle task after an interrupt or failure
 bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to another node
 bun run src/cli.ts task archive <task-id>   # takes an idle task's folder off its node, keeps its log
 bun run src/cli.ts task restore <task-id> [--node <id|prefix> | --here]   # brings an archived task back, here or on another node

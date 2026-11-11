@@ -139,8 +139,10 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
       <div class="head-actions">
         {action.error !== null && <span class="error" title={action.error}>{action.error}</span>}
         {live && <button disabled={moving || action.busy} onClick={() => action.run(() => task.interrupt({}))}>■ Interrupt</button>}
-        {/* A turn that crashed the node too often is parked; retry says so when none is. */}
-        {live && pendingCount === 0 && <button disabled={moving || action.busy} title="Runs a parked turn again" onClick={() => action.run(() => task.retry({}))}>↻ Retry</button>}
+        {/* Retry runs a parked turn (one that crashed the node too often) again, or carries on an idle task's last turn (interrupted or failed). */}
+        {(live ? pendingCount === 0 : state === "idle") && !moving && (
+          <button disabled={action.busy} title={live ? "Runs a parked turn again" : "Carries on the last turn, e.g. one you interrupted"} onClick={() => action.run(() => task.retry({}))}>↻ Retry</button>
+        )}
         {/* Only an idle task archives; the node says why it refuses one (queued prompts, a home offline, …). */}
         {state === "idle" && !moving && (
           <button disabled={action.busy} title="Removes the task's folder from this node and keeps its log; Restore brings it back"

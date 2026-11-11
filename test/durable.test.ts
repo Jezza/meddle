@@ -159,7 +159,7 @@ test("a task started without any Claude Code output is reconciled and starts its
   updateTask(db, m.id, { started: 1, state: "running" });
   appendEvent(db, m.id, { type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: false });
   appendEvent(db, m.id, { type: "user", message: { role: "user", content: "lost" }, parent_tool_use_id: null });
-  await expect(runner.retry(m.id)).rejects.toThrow(`no parked turn for task ${m.id}`);
+  await expect(runner.retry(m.id)).rejects.toThrow(`nothing to retry for task ${m.id}`);
   const done = settled(runner);
   await runner.prompt(m.id, "Reply with the single word ok.");
   await done;

@@ -139,6 +139,10 @@ export const CARRY_ON_PROMPT =
 export const TOKEN_RETRY_PROMPT =
   "The previous attempt at this message failed because the login it used hit a usage limit; meddle switched to another login. If you had not started on it, start now; otherwise continue where you left off and do not redo finished work.";
 
+/** What a retry of an idle task's last turn (one the user interrupted, or that failed) sends into its session. */
+export const RETRY_PROMPT =
+  "The previous turn did not finish: it was interrupted or failed. Continue where you left off; do not redo work that is already done.";
+
 /** How long a token that hit a limit the SDK gave no reset time for is left alone. */
 const EXHAUSTED_DEFAULT_MS = 3600_000;
 
@@ -628,12 +632,22 @@ export class TaskRunner {
     return getTaskSettings(this.#db, taskId);
   }
 
-  /** Runs the task's turn again after pi-durable's restart limit parked it. */
+  /**
+   * Runs the task's turn again: one pi-durable's restart limit parked, else (an idle task that has had a turn) a new
+   * turn that carries on in the session with `RETRY_PROMPT`, for a turn that was interrupted or failed.
+   */
   async retry(taskId: string): Promise<void> {
     this.#refuseElsewhere(taskId);
     const turn = await this.#durableTurn(taskId);
-    if (turn === undefined || !isParked(turn)) throw new Error(`no parked turn for task ${taskId}`);
-    await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+    if (turn !== undefined && isParked(turn)) {
+      await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+      return;
+    }
+    if (this.#row(taskId).state === "idle" && latestEventOfType(this.#db, taskId, "meddle", "turn_started") !== null) {
+      await this.prompt(taskId, RETRY_PROMPT);
+      return;
+    }
+    throw new Error(`nothing to retry for task ${taskId}`);
   }
 
   onEvent(cb: (taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void): () => void {
