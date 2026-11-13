@@ -324,10 +324,10 @@ test("C1 control characters are refused like C0 ones", () => {
   expect(settings.set("env.FOO", "caf\u00e9 \u00a0").value).toBe("caf\u00e9 \u00a0");
 });
 
-test("default model and effort: unset reads null, a bad effort or empty model is refused", () => {
+test("default model and effort: unset reads opus at medium, a bad effort or empty model is refused", () => {
   const { settings } = fresh();
-  expect(settings.defaultModel()).toBeNull();
-  expect(settings.defaultEffort()).toBeNull();
+  expect(settings.defaultModel()).toBe("opus");
+  expect(settings.defaultEffort()).toBe("medium");
   settings.set("defaults.model", "opus");
   settings.set("defaults.effort", "high");
   expect(settings.defaultModel()).toBe("opus");

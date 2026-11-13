@@ -3,8 +3,9 @@ import type { Ref } from "@earendil-works/chord";
 import type { ComponentChildren } from "preact";
 import { createContext } from "preact";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { PoolObject, TaskObject } from "../../state/contracts";
+import { NodeObject, PoolObject, TaskObject } from "../../state/contracts";
 import { type HostStatus, useAction } from "./hooks";
+import { EFFORT_LEVELS } from "../../pool/settings";
 import { moveChoices } from "./sidebar-model";
 
 /** `PoolObject` as a dashboard holds it: its `default` variant. */
@@ -210,11 +211,63 @@ export function mb(kb: number): string {
   return kb >= 1024 * 1024 ? `${(kb / 1024 / 1024).toFixed(1)} GiB` : `${(kb / 1024).toFixed(0)} MiB`;
 }
 
-/** Models always offered, beside the node's list (which may lack newer ones). */
-const EXTRA_MODELS = ["fable", "opus", "sonnet", "haiku"];
+export type Model = Ref<typeof NodeObject>["models"]["value"][number];
 
-/** The models to pick from: the node's list plus `EXTRA_MODELS`, with the task's `current` one kept in. */
-export function modelChoices(listed: readonly string[], current: string | null): string[] {
-  const all = [...new Set([...listed, ...EXTRA_MODELS])];
-  return current !== null && !all.includes(current) ? [current, ...all] : all;
+/** What a model of unknown efforts is offered. */
+const unknown = (value: string, displayName: string): Model => ({ value, resolvedModel: null, displayName, description: "", efforts: [...EFFORT_LEVELS] });
+
+/** Offered while the node has listed none: no turn has run there yet. */
+const FALLBACK_MODELS: readonly Model[] = [unknown("fable", "Fable"), unknown("opus", "Opus"), unknown("sonnet", "Sonnet"), unknown("haiku", "Haiku")];
+
+/** Whether `m` is model `id`: its alias or the id the alias resolves to. */
+function isModel(m: Model, id: string): boolean {
+  return m.value === id || m.resolvedModel === id;
+}
+
+/** The models to pick from: the node's list (else `FALLBACK_MODELS`), with `current` kept in when it lists no such. */
+function modelChoices(listed: readonly Model[], current: string): readonly Model[] {
+  const all = listed.length > 0 ? listed : FALLBACK_MODELS;
+  return all.some((m) => isModel(m, current)) ? all : [unknown(current, current), ...all];
+}
+
+/**
+ * A model and effort as one pill (`✦ Opus · medium`); it opens the models, each with its description, and the efforts
+ * the picked one takes. Picking the model already picked changes nothing; an effort the new model lacks is kept.
+ */
+export function ModelPicker({ models, model, effort, disabled = false, onModel, onEffort }: {
+  models: readonly Model[]; model: string; effort: string; disabled?: boolean; onModel(model: string): void; onEffort(effort: string): void;
+}) {
+  const [at, setAt] = useState<Anchor | null>(null);
+  const choices = modelChoices(models, model);
+  const current = choices.find((m) => isModel(m, model))!;
+  return (
+    <>
+      <button class="pill" title="Model and effort" disabled={disabled} onClick={(e) => setAt({ el: e.currentTarget, above: true })}>
+        ✦ {current.displayName}{current.efforts.length > 0 && ` · ${effort}`} ▾
+      </button>
+      {at !== null && (
+        <Popover anchor={at} onClose={() => setAt(null)} wide>
+          <div class="menu-head">Model</div>
+          {choices.map((m) => (
+            <button key={m.value} class={`menu-item${m === current ? " on" : ""}`} title={m.resolvedModel ?? m.value}
+              onClick={() => { if (m !== current) onModel(m.value); }}>
+              <span class="menu-check">{m === current && "✓"}</span>
+              <span class="menu-two"><span>{m.displayName}</span>{m.description !== "" && <span class="menu-desc">{m.description}</span>}</span>
+            </button>
+          ))}
+          {current.efforts.length > 0 && (
+            <>
+              <div class="menu-sep" />
+              <div class="menu-head">Effort</div>
+              <div class="menu-seg">
+                {EFFORT_LEVELS.map((l) => (
+                  <button key={l} class={l === effort ? "on" : ""} disabled={!current.efforts.includes(l)} onClick={() => { if (l !== effort) onEffort(l); }}>{l}</button>
+                ))}
+              </div>
+            </>
+          )}
+        </Popover>
+      )}
+    </>
+  );
 }

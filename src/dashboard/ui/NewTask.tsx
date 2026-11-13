@@ -4,7 +4,7 @@ import type { Ref } from "@earendil-works/chord";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { NodeObject } from "../../state/contracts";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
-import { type Anchor, MenuItem, modelChoices, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
+import { type Anchor, MenuItem, ModelPicker, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
 import { projectChoices } from "./pool-model";
 import type { Open } from "./routes";
 
@@ -28,9 +28,13 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
   const canHost = nodes.filter((n) => n.status === "member" && n.online && n.hostsTasks);
   const [chosen, setChosen] = useState<string[]>(() => (projectId === null ? [] : [projectId]));
   const [prompt, setPrompt] = useState("");
-  const models = modelChoices(useValue(node.models), null);
-  /** The model picked; "" for the default. */
-  const [model, setModel] = useState("");
+  const models = useValue(node.models);
+  const defaults = useValue(pool.defaults);
+  /** The model and effort picked; null while they are the pool's defaults. */
+  const [chosenModel, setChosenModel] = useState<string | null>(null);
+  const [chosenEffort, setChosenEffort] = useState<string | null>(null);
+  const model = chosenModel ?? defaults.model;
+  const effort = chosenEffort ?? defaults.effort;
   /** The node picked; null for Automatic. */
   const [picked, setPicked] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ kind: "project" | "node"; anchor: Anchor } | null>(null);
@@ -46,7 +50,7 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
     if (prompt.trim() === "" || action.busy) return;
     let created: { taskId: string; nodeId: string } | undefined;
     const ok = await action.run(async () => {
-      const { manifest, nodeId } = await node.createTask({ projects: chosen.map((id) => ({ id })), node: where?.nodeId ?? null, prompt, ...(model === "" ? {} : { model }) });
+      const { manifest, nodeId } = await node.createTask({ projects: chosen.map((id) => ({ id })), node: where?.nodeId ?? null, prompt, model, effort });
       created = { taskId: manifest.id, nodeId };
     });
     if (ok && created !== undefined) open(created.nodeId, created.taskId);
@@ -72,10 +76,7 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
           <button class="pill" title="Where the task runs" onClick={(e) => setMenu({ kind: "node", anchor: { el: e.currentTarget, above: true } })}>
             ⌂ {where === null ? "Automatic" : where.hostname} ▾
           </button>
-          <select class="pill" title="Model" value={model} onChange={(e) => setModel(e.currentTarget.value)}>
-            <option value="">default model</option>
-            {models.map((m) => <option key={m} value={m}>{m}</option>)}
-          </select>
+          <ModelPicker models={models} model={model} effort={effort} onModel={setChosenModel} onEffort={setChosenEffort} />
           <span class="bar-gap" />
           {action.error !== null && <span class="error">{action.error}</span>}
           <button class="primary" disabled={action.busy || prompt.trim() === ""} onClick={() => void start()} title="Ctrl+Enter">

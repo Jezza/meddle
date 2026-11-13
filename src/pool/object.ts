@@ -215,6 +215,7 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       activeTokenId: active,
       mixedVersions: self.derive([roster, live], (rows, l) => mixed(rows, selfId, l)),
       settings: listed,
+      defaults: self.derive([listed], () => ({ model: settings.defaultModel(), effort: settings.defaultEffort() })),
       poolChanged: () => deps.poolChanged(),
       remove: ({ nodeId }) => deps.remove(nodeId),
       allow: ({ nodeId }) => deps.allow(nodeId),

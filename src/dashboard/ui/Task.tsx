@@ -1,13 +1,13 @@
 // One task: its head (title, state, actions), the thread from the session's event log with what waits on you inline,
 // the composer, and the bar beneath (project, node, bookmark, the latest turn's tokens, mode, effort, model).
-import type { EffortLevel, PermissionMode } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
 import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
-import { type Anchor, modelChoices, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { type Anchor, ModelPicker, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { usageShort } from "./sidebar-model";
@@ -21,7 +21,6 @@ type LogEvent = SessionRef["window"]["value"][number];
 type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
 
 const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"];
-const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 const EARLIER_PAGE = 200;
 const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
 
@@ -633,23 +632,23 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
       )}
       {usage !== null && <span class="bar-item" title="The latest turn's tokens, summed over its API calls">{usage}</span>}
       <span class="bar-gap" />
-      {!archived && <Settings task={task} node={node} disabled={moving} />}
+      {!archived && <Settings task={task} node={node} pool={pool} disabled={moving} />}
       {moveAt !== null && <MoveMenu task={task} nodes={nodes} from={nodeId} anchor={moveAt} onClose={() => setMoveAt(null)} />}
     </footer>
   );
 }
 
-/** The task's permission mode, effort and model, as small selects. */
-function Settings({ task, node, disabled }: { task: TaskRef; node: NodeRef; disabled: boolean }) {
+/** The task's permission mode, then its model and effort (the pool's defaults where it chose none). */
+function Settings({ task, node, pool, disabled }: { task: TaskRef; node: NodeRef; pool: PoolRef; disabled: boolean }) {
   const models = useValue(node.models);
+  const defaults = useValue(pool.defaults);
   const permissionMode = useValue(task.permissionMode);
   const model = useValue(task.model);
   const effort = useValue(task.effort);
   const action = useAction();
-  /** The model just picked, shown until its change lands (or fails), so the select does not snap back meanwhile. */
-  const [picked, setPicked] = useState<string | null>(null);
-  const shown = picked ?? model ?? "";
-  const modelOptions = modelChoices(models, shown === "" ? null : shown);
+  /** The model and the effort just picked, each shown until its change lands (or fails), so the pill does not snap back. */
+  const [pickedModel, setPickedModel] = useState<string | null>(null);
+  const [pickedEffort, setPickedEffort] = useState<string | null>(null);
   return (
     <>
       {action.error !== null && <span class="error" title={action.error}>!</span>}
@@ -660,21 +659,16 @@ function Settings({ task, node, disabled }: { task: TaskRef; node: NodeRef; disa
         {permissionMode === null && <option value="">mode</option>}
         {PERMISSION_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
       </select>
-      <select class="pill" title="Effort" disabled={disabled} value={effort ?? ""} onChange={(e) => {
-        const value = e.currentTarget.value;
-        void action.run(() => task.setEffort({ effort: value }));
-      }}>
-        {effort === null && <option value="">effort</option>}
-        {EFFORT_LEVELS.map((l) => <option key={l} value={l}>{l}</option>)}
-      </select>
-      <select class="pill" title="Model" disabled={disabled} value={shown} onChange={(e) => {
-        const value = e.currentTarget.value;
-        setPicked(value);
-        void action.run(() => task.setModel(value === "" ? {} : { model: value })).finally(() => setPicked(null));
-      }}>
-        <option value="">default model</option>
-        {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
-      </select>
+      <ModelPicker models={models} model={pickedModel ?? model ?? defaults.model} effort={pickedEffort ?? effort ?? defaults.effort}
+        disabled={disabled}
+        onModel={(next) => {
+          setPickedModel(next);
+          void action.run(() => task.setModel({ model: next })).finally(() => setPickedModel(null));
+        }}
+        onEffort={(next) => {
+          setPickedEffort(next);
+          void action.run(() => task.setEffort({ effort: next })).finally(() => setPickedEffort(null));
+        }} />
     </>
   );
 }

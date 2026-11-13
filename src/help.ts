@@ -161,7 +161,7 @@ const GROUPS: Group[] = [
           "Keys: jj.user and jj.email (the identity every node's jj and tasks commit with), env.<NAME> (an environment " +
           "variable for every task), lighthouse.url, limits.running (turns a node runs at once; 0 is no limit) and " +
           "roster.forget (seconds a member may go unheard of before it counts as gone; 0 is never), defaults.model and " +
-          "defaults.effort (low, medium, high, xhigh or max) for tasks that chose none. Values replicate to " +
+          "defaults.effort (low, medium, high, xhigh or max) for tasks that chose none (unset: opus, medium). Values replicate to " +
           "every member, so they are not for secrets. Needs the node running.",
       },
       {

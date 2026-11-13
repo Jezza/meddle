@@ -71,12 +71,15 @@ test("a client follows a task through a prompted turn over a link", async () => 
     await until(task.contextUsage, (u) => u !== null);
     expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 376 } });
     expect(task.permissionMode.value).toBe("auto");
-    expect(task.model.value).toBe("claude-haiku-5-5");
+    // none chosen: the pool's default, not the turn's
+    expect(task.model.value).toBeNull();
     expect(task.lastSeq.value).toBe(session.window.value.at(-1)!.seq);
     expect(task.pending.value).toEqual([]);
     // the recorded initialize response carries the model list
     await until(node.models, (models) => models.length > 0);
-    expect(node.models.value).toEqual(["default", "sonnet", "fable", "opus", "haiku"]);
+    // Claude Code's own default is left out: the pool's is the one shown
+    expect(node.models.value.map((m) => m.value)).toEqual(["sonnet", "fable", "opus", "haiku"]);
+    expect(node.models.value[2]).toMatchObject({ resolvedModel: "claude-opus-5-5", displayName: "Opus", efforts: ["low", "medium", "high", "xhigh", "max"] });
 
     const earlier = await session.loadEarlier({ beforeSeq: session.window.value.at(-1)!.seq, limit: 2 });
     expect(earlier.map((e) => e.seq)).toEqual(session.window.value.slice(-3, -1).map((e) => e.seq));
@@ -96,14 +99,15 @@ test("a client follows a task through a prompted turn over a link", async () => 
   }
 });
 
-test("a model chosen for an idle task shows at once, for every client, and its unset falls back to the log's", async () => {
+test("a model chosen for an idle task shows at once, for every client, and its unset is the pool's default", async () => {
   const { client, project, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
-    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }], model: "fable" });
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }], model: "fable", effort: "high" });
     const task = await client.get(TaskObject, { id: manifest.id });
     const other = await client.get(TaskObject, { id: manifest.id });
     expect(task.model.value).toBe("fable");
+    expect(task.effort.value).toBe("high");
     await task.setModel({ model: "opus" });
     await until(task.model, (m) => m === "opus");
     await until(other.model, (m) => m === "opus");
@@ -276,7 +280,6 @@ test("a task's activation reads its log summary from the newest events, and its 
     appendEvent(db, id, { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } } });
     const task = await client.get(TaskObject, { id });
     expect(task.lastSeq.value).toBe(255);
-    expect(task.model.value).toBe("new");
     expect(task.permissionMode.value).toBe("plan");
     expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 1 } });
     const session = await client.get(SessionObject, { taskId: id });

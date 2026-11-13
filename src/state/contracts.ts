@@ -65,6 +65,17 @@ export const NodeMetricsSchema = Type.Object({
   diskFreeKb: Type.Number(),
 });
 
+/** A model Claude Code offers (its `ModelInfo`): the alias or id a turn takes, what the dashboard shows, its efforts. */
+export const ModelSchema = Type.Object({
+  value: Type.String(),
+  /** The id `value` resolves to, when it is an alias. */
+  resolvedModel: Nullable(Type.String()),
+  displayName: Type.String(),
+  description: Type.String(),
+  /** The efforts it takes; none when it takes no effort. */
+  efforts: Type.Array(Type.String()),
+});
+
 export const NotificationSchema = Type.Object({
   id: Type.String(),
   at: Type.String(),
@@ -128,7 +139,8 @@ const nodeState = {
   /** The tasks archived on this node: their rows and archive are here, their folder is not. */
   archivedIds: Type.Array(Type.String()),
   projectIds: Type.Array(Type.String()),
-  models: Type.Array(Type.String()),
+  /** The models the node's Claude Code offers, as its latest turn listed them (none before its first), its own default left out. */
+  models: Type.Array(ModelSchema),
   /** Newest last; the newest 50 are kept. */
   notifications: Type.Array(NotificationSchema),
 };
@@ -160,8 +172,9 @@ const nodeMethods = {
       })),
       prompt: Type.Optional(Nullable(Type.String())),
       node: Type.Optional(Nullable(Type.String())),
-      /** The model the task's turns use, where the user chose one; else the default. */
+      /** The model and effort the task's turns use, where the user chose them; else the pool's defaults. */
       model: Type.Optional(Type.String()),
+      effort: Type.Optional(Type.String()),
     }),
     Type.Object({ manifest: TaskManifestSchema, nodeId: Type.String() }),
   ),
@@ -191,7 +204,7 @@ export const NodeStore = local("meddle.node-store", {
     ...nodeMethods,
     efforts: Type.Record(Type.String(), Type.String()),
     setEffort: method(Type.Object({ taskId: Type.String(), effort: Type.String() })),
-    /** Each task's chosen model; backs `TaskObject.model` ahead of the first turn that reports one. */
+    /** Each task's chosen model; backs `TaskObject.model`. */
     chosenModels: Type.Record(Type.String(), Type.String()),
     setModel: method(Type.Object({ taskId: Type.String(), model: Type.Optional(Type.String()) })),
   },
@@ -253,6 +266,7 @@ export const TaskObject = remote("meddle.task", {
         queued: Type.Array(Type.String()),
         lastSeq: Type.Number(),
         permissionMode: Nullable(Type.String()),
+        /** The model and effort chosen for the task; null where its turns take the pool's defaults. */
         model: Nullable(Type.String()),
         effort: Nullable(Type.String()),
         /** `usage` and `modelUsage` of the latest `result`. */
@@ -388,7 +402,6 @@ export const ProjectViewSchema = Type.Object({ ...ProjectSchema.properties, cont
 export const TaskLogSchema = Type.Object({
   lastSeq: Type.Number(),
   permissionMode: Nullable(Type.String()),
-  model: Nullable(Type.String()),
   contextUsage: Type.Unknown(),
 });
 export type TaskLog = Type.Static<typeof TaskLogSchema>;
@@ -570,6 +583,7 @@ export const PeerObject = remote("meddle.peer", {
             prompt: Nullable(Type.String()),
             nameFromPrompt: Type.Optional(Type.Boolean()),
             model: Type.Optional(Type.String()),
+            effort: Type.Optional(Type.String()),
           }),
           Type.Object({ manifest: TaskManifestSchema }),
         ),
@@ -613,6 +627,8 @@ export const PoolObject = remote("meddle.pool", {
         settings: Type.Array(
           Type.Object({ key: Type.String(), value: Type.String(), setBy: Type.String(), updatedAt: Type.String() }),
         ),
+        /** The model and effort of a task that chose none: `defaults.model` and `defaults.effort`, else the fallback. */
+        defaults: Type.Object({ model: Type.String(), effort: Type.String() }),
       },
       methods: {
         /** The pool row or the roster changed on this node (the CLI wrote it): re-read it and act on it. */

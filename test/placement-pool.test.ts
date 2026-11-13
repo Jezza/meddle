@@ -144,6 +144,7 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
       prompt: async () => { created.push("prompt"); return "turn" as const; },
       nameFromPrompt: async () => {},
       setModel: async () => {},
+      setEffort: async () => {},
     },
   });
   const [down, up] = memoryLinkPair();

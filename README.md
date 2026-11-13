@@ -338,7 +338,7 @@ one, and sets a key picked from the table below (an `env.` key with the name typ
 | `lighthouse.url` | The discovery lighthouse, applied live; it cannot be set empty. A node that sets `MEDDLE_LIGHTHOUSE_URL` (even empty, which turns discovery off there) uses its own instead. |
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
 | `roster.forget` | How long, in seconds, a member may go unheard of before a node counts it gone ([Addresses and forgetting](#addresses-and-forgetting)): `0` never, else at least `60`; `900` (three lighthouse announce TTLs) when unset. A node that sets `MEDDLE_FORGET_MS` uses its own instead. |
-| `defaults.model`, `defaults.effort` | The model, and the effort (`low`, `medium`, `high`, `xhigh` or `max`), of a turn whose task chose none in the dashboard; unset leaves them to Claude Code. A model cannot be set empty. |
+| `defaults.model`, `defaults.effort` | The model, and the effort (`low`, `medium`, `high`, `xhigh` or `max`), of a turn whose task chose none, and what the dashboard picks for a new task; unset, `opus` and `medium`. A model cannot be set empty. |
 
 Each key replicates on its own, last writer wins on the time it was set, the roster's rule (on equal times, the
 setting from the node with the greater id wins, then the greater value); an unset replicates too. A value is at most
@@ -1127,12 +1127,14 @@ A task opens beside the sidebar: its title (✎ renames it), state and actions (
 Delete for an archived one), its thread with the assistant's text as Markdown and each run of tool calls folded into
 one line, what waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
 was sent and has not taken yet (`queued`), the composer (Queue while a turn runs, Send otherwise),
-and a bar with its projects, its node, its bookmark, the latest turn's tokens, and its permission mode, effort and
-model. The node in the bar opens the move menu: every other member, those that cannot take the task greyed with why,
+and a bar with its projects, its node, its bookmark, the latest turn's tokens, its permission mode, and its model and
+effort as one pill (the pool's defaults where it chose none) that opens the node's models and the efforts the picked
+one takes. The node in the bar opens the move menu: every other member, those that cannot take the task greyed with why,
 and whether the move waits for the running turn or interrupts it (see [Moving a task](#moving-a-task)); a task that
 moved is followed to its new node. New task opens an empty composer: its projects (the one it was opened under, more
 added with ＋ project), the node (Automatic, the default, or a chosen online node that hosts tasks; see
-[Where a new task runs](#where-a-new-task-runs)) and its first prompt; Start creates it and opens it. A project's page
+[Where a new task runs](#where-a-new-task-runs)), its model and effort (the pool's defaults until changed) and its
+first prompt; Start creates it and opens it. A project's page
 (its name in the sidebar) shows its home; its branches, the default one marked, each at its commit, a conflicted one
 flagged with its siblings (`meddle/conflict/<b>/<id>@meddle`) and how to resolve it, as `meddle project status`
 prints them (see [Branches](#branches)); the nodes holding a copy with their service repos' bookmarks; and its

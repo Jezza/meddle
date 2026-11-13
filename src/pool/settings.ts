@@ -58,6 +58,9 @@ const BAD_VALUE = `setting value must be at most ${MAX_SETTING_VALUE} characters
 const NON_EMPTY = new Set(["jj.user", "jj.email", "lighthouse.url", "defaults.model"]);
 /** The efforts `defaults.effort` may name. */
 export const EFFORT_LEVELS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+/** The model and effort of a task that chose none while the pool sets none. */
+export const FALLBACK_MODEL = "opus";
+export const FALLBACK_EFFORT = "medium";
 /** The most distinct ignored keys logged; later ones are only counted. */
 const MAX_LOGGED = 100;
 /** How much of an ignored key a log line shows. */
@@ -286,16 +289,16 @@ export class PoolSettings {
     return secs === 0 ? null : Math.max(secs, MIN_FORGET_SECS) * 1000;
   }
 
-  /** `defaults.model`, the model of a task that chose none; null when unset or empty (Claude Code then picks its own). */
-  defaultModel(): string | null {
+  /** `defaults.model`, the model of a task that chose none; `FALLBACK_MODEL` when unset or empty. */
+  defaultModel(): string {
     const model = this.get("defaults.model");
-    return model === null || model === "" ? null : model;
+    return model === null || model === "" ? FALLBACK_MODEL : model;
   }
 
-  /** `defaults.effort`, the effort of a task that chose none; null when unset or not a known level. */
-  defaultEffort(): string | null {
+  /** `defaults.effort`, the effort of a task that chose none; `FALLBACK_EFFORT` when unset or not a known level. */
+  defaultEffort(): string {
     const effort = this.get("defaults.effort");
-    return effort !== null && EFFORT_LEVELS.includes(effort) ? effort : null;
+    return effort !== null && EFFORT_LEVELS.includes(effort) ? effort : FALLBACK_EFFORT;
   }
 
   /** `lighthouse.url`, or null when it is unset or empty (a replicated empty value must not reach discovery). */

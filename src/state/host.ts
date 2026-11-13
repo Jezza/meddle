@@ -11,6 +11,7 @@ import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type Tok
 import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { peerOf, remoteReason, servePool } from "../pool/object";
 import type { PoolRuntime } from "../pool/runtime";
+import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
 import { branchChanges, listBranchRows, listLineRows } from "../pool/rows";
 import { bookmarkList } from "../jj";
@@ -85,7 +86,7 @@ export type PeerObjectDeps = {
   /** Whether a node is a member of this node's pool: only a member may create a task here. */
   isMember(nodeId: string): boolean;
   /** Receives tasks other nodes move here (each call names the calling node), and creates tasks members place here. */
-  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel">;
+  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel" | "setEffort">;
 };
 
 /** A project as another node sees it. */
@@ -141,10 +142,11 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         return row !== null && row.state !== "moved";
       },
       // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
-      createTaskAt: async ({ title, taskId, starts, prompt, nameFromPrompt, model }) => {
+      createTaskAt: async ({ title, taskId, starts, prompt, nameFromPrompt, model, effort }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
         const manifest = await deps.runner.create({ title, taskId, starts });
         if (model !== undefined) await deps.runner.setModel(manifest.id, model);
+        if (effort !== undefined) await deps.runner.setEffort(manifest.id, effort);
         if (prompt !== null && nameFromPrompt === true) void deps.runner.nameFromPrompt(manifest.id, title, prompt);
         if (prompt !== null) await deps.runner.prompt(manifest.id, prompt);
         return { manifest };
@@ -312,7 +314,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         if (query === null) return;
         try {
           const list = await query.supportedModels();
-          models.replace(ctx, list.map((info) => info.value));
+          models.replace(ctx, list.filter((info) => info.value !== "default").map((info) => ({
+            value: info.value,
+            resolvedModel: info.resolvedModel ?? null,
+            displayName: info.displayName,
+            description: info.description,
+            efforts: info.supportsEffort === false ? [] : info.supportedEffortLevels ?? [...EFFORT_LEVELS],
+          })));
         } catch {
           // keep the previous list
         }
@@ -393,7 +401,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       notifications,
       efforts,
       chosenModels,
-      createTask: async ({ title: given, projects, prompt, node, model }, ctx) => {
+      createTask: async ({ title: given, projects, prompt, node, model, effort }, ctx) => {
         // Named here, before it goes anywhere, so that a peer of any version gets a title. Untitled, it starts with a
         // made-up name, not waiting on Haiku: the node it is on names it from its prompt afterwards.
         const title = initialTitle(given);
@@ -419,6 +427,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           try {
             manifest = await runner.create({ title, taskId, starts });
             if (model !== undefined) await runner.setModel(taskId, model);
+            if (effort !== undefined) await runner.setEffort(taskId, effort);
           } catch (err) {
             // A task made all the same (a failure after it) keeps its lines.
             if (getTask(db, taskId) !== null) throw err;
@@ -433,7 +442,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           return { manifest, nodeId: selfId };
         }
         try {
-          return { manifest: await createOn(target, { title, taskId, starts, prompt: text, nameFromPrompt, ...(model === undefined ? {} : { model }) }), nodeId: target };
+          return { manifest: await createOn(target, { title, taskId, starts, prompt: text, nameFromPrompt, ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) }), nodeId: target };
         } catch (err) {
           if (err instanceof CreationSent) {
             const held = await heldOn(target, taskId);
@@ -644,7 +653,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       queued,
       lastSeq: self.derive([log], (l) => l.lastSeq),
       permissionMode: self.derive([log], (l) => l.permissionMode),
-      model: self.derive([log, store.chosenModels], (l, c) => c[id] ?? l.model),
+      model: self.derive([store.chosenModels], (c) => c[id] ?? null),
       effort: self.derive([store.efforts], (e) => e[id] ?? null),
       contextUsage: self.derive([log], (l) => l.contextUsage),
       move,
@@ -757,7 +766,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
    * `CreationSent` once the request went out: the target may have made the task all the same.
    */
   async function createOn(
-    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null; nameFromPrompt: boolean; model?: string },
+    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null; nameFromPrompt: boolean; model?: string; effort?: string },
   ): Promise<TaskManifest> {
     const peer = await pool.peerRef(target, PeerObject);
     try {
@@ -850,9 +859,9 @@ function questionText(req: PendingApproval): string {
 
 // ─── folding the event log into a task's log summary and a session's view ───
 
-const EMPTY_TASK_LOG: TaskLog = { lastSeq: 0, permissionMode: null, model: null, contextUsage: null };
+const EMPTY_TASK_LOG: TaskLog = { lastSeq: 0, permissionMode: null, contextUsage: null };
 
-/** `permissionMode` and `model` from the latest `system` `init` or `status`; `contextUsage` from the latest `result`. */
+/** `permissionMode` from the latest `system` `init` or `status`; `contextUsage` from the latest `result`. */
 function foldTaskLog(log: TaskLog, events: EventRecord[]): TaskLog {
   const next = { ...log };
   for (const { seq, message } of events) {
@@ -860,7 +869,6 @@ function foldTaskLog(log: TaskLog, events: EventRecord[]): TaskLog {
     const m = message as Message;
     if (m.type === "system" && (m.subtype === "init" || m.subtype === "status")) {
       if (typeof m.permissionMode === "string") next.permissionMode = m.permissionMode;
-      if (typeof m.model === "string") next.model = m.model;
     } else if (m.type === "result") {
       next.contextUsage = { usage: m.usage ?? null, modelUsage: m.modelUsage ?? null };
     }

@@ -252,6 +252,20 @@ test("the dashboard's settings show who set each one", async () => {
   });
 }, 15_000);
 
+test("the pool's defaults fall back to opus at medium, and follow the settings", async () => {
+  await withNodes(2, async ([a, b]) => {
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    await onlineOn(b!, a!);
+    expect(b!.pool.defaults.value).toEqual({ model: "opus", effort: "medium" });
+    await a!.pool.setSetting({ key: "defaults.model", value: "fable" });
+    await a!.pool.setSetting({ key: "defaults.effort", value: "high" });
+    await until(b!.pool.defaults, (d) => d.model === "fable" && d.effort === "high");
+    await a!.pool.unsetSetting({ key: "defaults.effort" });
+    await until(b!.pool.defaults, (d) => d.model === "fable" && d.effort === "medium");
+  });
+}, 15_000);
+
 test("a removed node is cut off, sees itself removed, and comes back once it is allowed again", async () => {
   await withNodes(3, async ([a, b, c]) => {
     const [A, B, C] = [a!.node, b!.node, c!.node];
