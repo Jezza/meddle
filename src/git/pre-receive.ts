@@ -32,18 +32,13 @@ export function parsePushLines(text: string): PushedRef[] {
   return pushed;
 }
 
-/** Runs git in the repo the hook runs in, with its environment (the pushed objects, still in quarantine, visible). */
-function gitIn(env: Record<string, string | undefined>) {
-  return async (args: string[]) => {
+/** The commit graph of the repo git runs the hook in, the pushed objects (still in quarantine) included. */
+function hookGraph(env: Record<string, string | undefined>): Graph {
+  const run = async (args: string[]) => {
     const proc = Bun.spawn(["git", ...args], { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     return { stdout, stderr, code };
   };
-}
-
-/** The commit graph of the repo git runs the hook in, the pushed objects (still in quarantine) included. */
-function hookGraph(env: Record<string, string | undefined>): Graph {
-  const run = gitIn(env);
   return {
     async isAncestor(a, b) {
       const { stderr, code } = await run(["merge-base", "--is-ancestor", a, b]);
@@ -99,29 +94,13 @@ function branchOf(ref: string): string | null {
 }
 
 /**
- * The first branch of the push whose live rows (neither deleted nor dropped) name a commit this repo lacks: the node
- * can't tell what such a push means until the applier has fetched it.
- */
-async function unfetched(pushed: PushedRef[], rows: readonly BranchRow[], env: Record<string, string | undefined>): Promise<string | null> {
-  const run = gitIn(env);
-  for (const branch of new Set(pushed.map((p) => branchOf(p.ref)).filter((b) => b !== null))) {
-    const ofBranch = rows.filter((r) => r.branch === branch);
-    const dropped = new Set(ofBranch.flatMap((r) => r.drops.map((d) => `${d.node}\0${d.seq}`)));
-    for (const r of ofBranch) {
-      if (r.commit === null || dropped.has(`${r.node}\0${r.seq}`)) continue;
-      if ((await run(["cat-file", "-e", `${r.commit}^{commit}`])).code !== 0) return branch;
-    }
-  }
-  return null;
-}
-
-/**
  * Why a push of `pushed` is refused, or null when it is accepted. `MEDDLE_REFUSE`, when the node set it, refuses any
  * push with its reason (the node takes no input while an update awaits confirmation). `MEDDLE_REPO_KIND` names the
  * repo: a memory repo takes only `refs/heads/memory`, and never its deletion. A project's push goes through `refusePush`, with the branches' heads from
  * `MEDDLE_HEADS`, then is planned (`planPush`) from the rows the file `MEDDLE_ROWS` names (both the node's, when it
  * spawned `receive-pack`): refused with `<b>: this node is still fetching it; push again shortly` while the view shows a
- * pushed branch behind its rows or a live row of one names a commit this repo lacks, and refused when planning fails.
+ * pushed branch behind its rows, and refused when planning fails. (A peer's row naming a commit this node lacks is not
+ * among the rows: it waits until the commit is here, so it never holds a push up.)
  */
 export async function preReceiveRefusal(pushed: PushedRef[], env: Record<string, string | undefined>): Promise<string | null> {
   // The node takes no input now (an update awaits confirmation): the push is refused whole, with why.
@@ -144,8 +123,6 @@ export async function preReceiveRefusal(pushed: PushedRef[], env: Record<string,
   // against rows the pusher never saw (and drop them as if forced).
   const behind = pushed.map((p) => branchOf(p.ref)).find((b) => b !== null && plan.stale.includes(b));
   if (behind !== undefined && behind !== null) return `${behind}: this node is still fetching it; push again shortly`;
-  const missing = await unfetched(pushed, plan.rows, env);
-  if (missing !== null) return `${missing}: this node is still fetching it; push again shortly`;
   try {
     await planPush(plan.selfId, plan.project, pushed, plan.rows, graph);
   } catch (err) {

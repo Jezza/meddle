@@ -13,7 +13,7 @@ import { peerOf, remoteReason, servePool } from "../pool/object";
 import type { PoolRuntime } from "../pool/runtime";
 import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
-import { branchChanges, listBranchRows, listLineRows } from "../pool/rows";
+import { listBranchRows, listLineRows, rowChanges } from "../pool/rows";
 import { bookmarkList } from "../jj";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
@@ -74,8 +74,6 @@ type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
 const NOTIFICATIONS_KEPT = 50;
 /** How often a `ProjectObject` re-reads its replica's bookmarks when nothing told it they changed (pushes from peers). */
 const HEADS_REFRESH_MS = 60_000;
-/** How often a project's branches are read again while one waits for its commits to arrive. */
-const FETCHING_REFRESH_MS = 5000;
 const WINDOW_SIZE = 200;
 
 export type PeerObjectDeps = {
@@ -224,14 +222,6 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const headTicks: Subscribable<null> = {
     subscribe: (cb) => {
       const timer = setInterval(() => cb(null), HEADS_REFRESH_MS);
-      timer.unref();
-      return () => clearInterval(timer);
-    },
-  };
-
-  const fetchingTicks: Subscribable<null> = {
-    subscribe: (cb) => {
-      const timer = setInterval(() => cb(null), FETCHING_REFRESH_MS);
       timer.unref();
       return () => clearInterval(timer);
     },
@@ -563,11 +553,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     };
     const branches = self.state("branches", Type.Array(BranchSchema), { init: branchesNow });
     const refreshBranches = latest(branchesNow, branches);
-    self.on("branchRows", branchChanges, (projectId, ctx) => { if (projectId === id) return refreshBranches(ctx); });
-    // A commit the rows name arriving changes no row: a branch still fetching is read again soon, the rest slowly.
-    self.on("fetchingTicks", fetchingTicks, (_event, ctx) => {
-      if (branches.value.some((b) => b.state === "fetching")) return refreshBranches(ctx);
-    });
+    // Any row change, a push of another node's that waits for its commit included (still fetching until admitted).
+    self.on("rows", rowChanges, (projectId, ctx) => { if (projectId === id) return refreshBranches(ctx); });
     self.on("branchTicks", headTicks, (_event, ctx) => refreshBranches(ctx));
     return {
       variant: "default",

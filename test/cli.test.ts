@@ -724,7 +724,7 @@ test("task new in a checkout with --rev and --edit but no --project starts the c
 
 test("project status prints each branch: its commit, or a conflicted one's siblings and how to resolve it", async () => {
   const { git } = await import("../src/jj");
-  const { listBranchRows, mergeBranchRows, writeBranchRow } = await import("../src/pool/rows");
+  const { listBranchRows, mergeBranchRows, settleBranchRows, writeBranchRow } = await import("../src/pool/rows");
   const { nodes, close } = await poolNodes(1);
   const n = nodes[0]!;
   const dashboard = await startDashboard({ ...n.cfg, port: 0 }, n.host, n.pool);
@@ -735,6 +735,7 @@ test("project status prints each branch: its commit, or a conflicted one's sibli
     const commit = async (message: string) => (await git(["commit-tree", `${main}^{tree}`, "-p", main, "-m", message], repo, n.cfg)).trim();
     const [x, y] = [await commit("x"), await commit("y")].sort() as [string, string];
     mergeBranchRows(n.db, [{ project: n.project.id, branch: "feature", node: "f".repeat(64), seq: 1, commit: y, drops: [] }]);
+    settleBranchRows(n.db, n.project.id, new Set([main, y]));
     writeBranchRow(n.db, n.id, { project: n.project.id, branch: "feature", commit: x, drops: [] });
     const out = await meddle(["project", "status", n.project.name], { HOME: n.home, MEDDLE_DATA_DIR: n.cfg.dataDir, MEDDLE_PORT: new URL(dashboard.url).port });
     expect(out.stderr).toBe("");

@@ -1,8 +1,12 @@
+import { Database } from "bun:sqlite";
 import { test, expect } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDb } from "../src/store/db";
 import {
-  listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, writeBranchRow, writeLineRow,
-  type BranchRow, type LineRow,
+  listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, settleBranchRows, waitingBranchRows,
+  writeBranchRow, writeLineRow, type BranchRow, type LineRow,
 } from "../src/pool/rows";
 
 const A = "a".repeat(40);
@@ -18,6 +22,9 @@ function branch(seq: number, extra: Partial<BranchRow> = {}): BranchRow {
   return { project: "p", branch: "main", node: N1, seq, commit: A, drops: [], ...extra };
 }
 
+/** Settles project `p`'s waiting branch rows as if every commit they name were here. */
+const settleAll = (db: ReturnType<typeof openDb>) => settleBranchRows(db, "p", new Set([A, B, B.slice(0, 40)]));
+
 test("a line row with the greater (epoch, seq) wins in either order of arrival", () => {
   for (const order of [[line(0, 5), line(1, 1)], [line(1, 1), line(0, 5)]]) {
     const db = openDb(":memory:");
@@ -30,6 +37,7 @@ test("a branch row with the greater seq wins in either order of arrival", () => 
   for (const order of [[branch(3, { commit: B }), branch(4)], [branch(4), branch(3, { commit: B })]]) {
     const db = openDb(":memory:");
     for (const row of order) mergeBranchRows(db, [row]);
+    settleAll(db);
     expect(listBranchRows(db, "p")).toEqual([branch(4)]);
   }
 });
@@ -43,6 +51,8 @@ test("rows of an equal key and seq settle on the same row on two databases", () 
   for (const row of [...lines].reverse()) mergeLineRows(two, [row]);
   for (const row of branches) mergeBranchRows(one, [row]);
   for (const row of [...branches].reverse()) mergeBranchRows(two, [row]);
+  settleAll(one);
+  settleAll(two);
   expect(listLineRows(one)).toHaveLength(1);
   expect(listLineRows(one)).toEqual(listLineRows(two));
   expect(listBranchRows(one, "p")).toHaveLength(1);
@@ -93,7 +103,7 @@ test("each malformed row is dropped and counted", () => {
     branch(1, { drops: [{ node: N2, seq: 0.5 }] }),
   ];
   expect(mergeBranchRows(db, [...badBranches, branch(1, { branch: "meddle" })])).toEqual({ changed: ["p"], rejected: badBranches.length });
-  expect(listBranchRows(db, "p")).toEqual([branch(1, { branch: "meddle" })]);
+  expect(waitingBranchRows(db, "p")).toEqual([branch(1, { branch: "meddle" })]);
 });
 
 test("a branch name is refused exactly when `git check-ref-format --branch` refuses it", () => {
@@ -118,6 +128,83 @@ test("writeBranchRow after merging a peer's copy of this node's own row at seq 7
   expect(listBranchRows(db, "p", "main")).toEqual([written]);
   // Another node's row of the same branch is a row of its own.
   expect(writeBranchRow(db, N2, { project: "p", branch: "main", commit: A, drops: [] }).seq).toBe(1);
+});
+
+test("a peer's branch row waits, unlisted and unrelayed, until its commit is here", () => {
+  const db = openDb(":memory:");
+  const heard: string[] = [];
+  const off = rowChanges.subscribe((project) => heard.push(project));
+  try {
+    mergeBranchRows(db, [branch(1, { node: N2 })]);
+    expect(listBranchRows(db, "p")).toEqual([]);
+    expect(waitingBranchRows(db, "p")).toEqual([branch(1, { node: N2 })]);
+    // Heard of, so that the applier fetches its commit.
+    expect(heard).toEqual(["p"]);
+    expect(settleBranchRows(db, "p", new Set())).toBe(false);
+    expect(listBranchRows(db, "p")).toEqual([]);
+    expect(settleBranchRows(db, "p", new Set([A]))).toBe(true);
+    expect(listBranchRows(db, "p")).toEqual([branch(1, { node: N2 })]);
+    expect(waitingBranchRows(db, "p")).toEqual([]);
+    expect(heard).toEqual(["p", "p"]);
+  } finally {
+    off();
+  }
+});
+
+test("a newer row waiting for its commit leaves its writer's older row where it is", () => {
+  const db = openDb(":memory:");
+  mergeBranchRows(db, [branch(1, { node: N2 })]);
+  settleAll(db);
+  mergeBranchRows(db, [branch(2, { node: N2, commit: B })]);
+  settleBranchRows(db, "p", new Set([A]));
+  expect(listBranchRows(db, "p")).toEqual([branch(1, { node: N2 })]);
+  expect(waitingBranchRows(db, "p")).toEqual([branch(2, { node: N2, commit: B })]);
+  // An older row than the one listed is no news.
+  mergeBranchRows(db, [branch(1, { node: N2, commit: B })]);
+  expect(waitingBranchRows(db, "p")).toEqual([branch(2, { node: N2, commit: B })]);
+  settleBranchRows(db, "p", new Set([A, B]));
+  expect(listBranchRows(db, "p")).toEqual([branch(2, { node: N2, commit: B })]);
+});
+
+test("a deleting row is admitted without a commit; a row it drops still waits for its own", () => {
+  const db = openDb(":memory:");
+  const deleting = branch(3, { node: N2, commit: null, drops: [{ node: N1, seq: 1 }] });
+  mergeBranchRows(db, [deleting, branch(1, { node: N1, commit: B })]);
+  settleBranchRows(db, "p", new Set());
+  expect(listBranchRows(db, "p")).toEqual([deleting]);
+  expect(waitingBranchRows(db, "p")).toEqual([branch(1, { node: N1, commit: B })]);
+});
+
+test("this node's own row come back from a peer waits, and its next row goes above it keeping what it dropped", () => {
+  const db = openDb(":memory:");
+  mergeBranchRows(db, [branch(5, { node: N1, commit: B, drops: [{ node: N2, seq: 2 }] })]);
+  const written = writeBranchRow(db, N1, { project: "p", branch: "main", commit: A, drops: [{ node: N2, seq: 3 }] });
+  expect(written).toEqual(branch(6, { node: N1, commit: A, drops: [{ node: N2, seq: 3 }, { node: N2, seq: 2 }] }));
+  expect(listBranchRows(db, "p")).toEqual([written]);
+  expect(waitingBranchRows(db, "p")).toEqual([]);
+});
+
+test("a database from before rows waited has every branch row wait, once", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "meddle-rows-"));
+  try {
+    const path = join(dir, "db.sqlite");
+    const old = new Database(path);
+    old.exec(`CREATE TABLE branch_rows (project TEXT NOT NULL, branch TEXT NOT NULL, node TEXT NOT NULL, seq INTEGER NOT NULL,
+      commit_id TEXT NULL, drops TEXT NOT NULL, PRIMARY KEY (project, branch, node))`);
+    old.query("INSERT INTO branch_rows VALUES ('p', 'main', ?, 1, ?, '[]')").run(N1, A);
+    old.close();
+    const db = openDb(path);
+    expect(listBranchRows(db, "p")).toEqual([]);
+    expect(waitingBranchRows(db, "p")).toEqual([branch(1)]);
+    settleBranchRows(db, "p", new Set([A]));
+    db.close();
+    // Opened again, the admitted row stays.
+    const again = openDb(path);
+    expect(listBranchRows(again, "p")).toEqual([branch(1)]);
+    again.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("writeLineRow writes above the highest seq seen for the line, a losing row's included", () => {

@@ -1,6 +1,6 @@
 // The applier: each node turns a project's rows into refs, in its own service repo of the project and in the git view
 // (`refs/namespaces/view/`) that checkouts fetch from. A commit a row names is fetched by id from whichever member has
-// it, the row's writer first.
+// it, the row's writer first; a peer's branch row waiting for its commit is admitted once it is here (`settleBranchRows`).
 // - A line held elsewhere is `refs/remotes/meddle/task/<t>/<name>`, untracked; so is one held here before its task
 //   made its own bookmark `meddle/task/<t>/<name>` (jj can't see a commit no ref names). Its base commits are
 //   `refs/remotes/meddle/base/<t>/<name>/<i>`. Released ones are forgotten with `jj bookmark forget --include-remotes`:
@@ -13,7 +13,10 @@ import type { NodeConfig } from "../config";
 import { bookmarkRefs, git, GitError, gitImport, isJjRepo, jj, jjEnv, networkMs } from "../jj";
 import { shortId } from "../pool/ids";
 import { dedupe } from "../pool/report";
-import { listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, type BranchRow, type LineRow } from "../pool/rows";
+import {
+  listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, settleBranchRows, waitingBranchRows,
+  type BranchRow, type LineRow,
+} from "../pool/rows";
 import { repoKey, serialised } from "../serial";
 import { PeerObject } from "../state/contracts";
 import { computeBranch, type Graph, type ProjectBranch } from "./branches";
@@ -93,30 +96,25 @@ function isRefComponent(name: string): boolean {
     && !name.includes("..") && !name.includes("@{") && !/[\x00-\x20\x7f~^:?*[\\/]/.test(name);
 }
 
-/** A branch's rows neither deleted nor dropped by any row: the ones whose commits its position is computed from. */
-function liveRows(rows: readonly BranchRow[]): BranchRow[] {
-  const dropped = new Set(rows.flatMap((r) => r.drops.map((d) => JSON.stringify([d.node, d.seq]))));
-  return rows.filter((r) => r.commit !== null && !dropped.has(JSON.stringify([r.node, r.seq])));
-}
-
-/** A project's rows, as one pass applies them. */
-type Rows = { lines: LineRow[]; branches: Map<string, BranchRow[]> };
+/** A project's rows, as one pass applies them, and the branch rows waiting for their commits. */
+type Rows = { lines: LineRow[]; branches: Map<string, BranchRow[]>; waiting: BranchRow[] };
 
 function rowsOf(deps: Pick<ReplicaDeps, "db">, projectId: string): Rows {
   const lines = listLineRows(deps.db, projectId).filter((l) => isRefComponent(l.name));
   const branches = new Map<string, BranchRow[]>();
   for (const r of listBranchRows(deps.db, projectId)) branches.set(r.branch, [...(branches.get(r.branch) ?? []), r]);
-  return { lines, branches };
+  return { lines, branches, waiting: waitingBranchRows(deps.db, projectId) };
 }
 
 /**
- * The commits the rows name, each with the nodes whose rows name it: the live rows of each branch, and each line
- * not released, then (last, as they mostly come with the lines) its base commits.
+ * The commits the rows name that may not be here, each with the nodes whose rows name it: each waiting branch row's
+ * (an admitted one's is here), and each line not released, then (last, as they mostly come with the lines) its base
+ * commits.
  */
 function wanted(rows: Rows): Map<string, Set<string>> {
   const want = new Map<string, Set<string>>();
   const add = (commit: string, writer: string) => want.set(commit, (want.get(commit) ?? new Set()).add(writer));
-  for (const branch of rows.branches.values()) for (const r of liveRows(branch)) add(r.commit!, r.node);
+  for (const r of rows.waiting) if (r.commit !== null) add(r.commit, r.node);
   for (const l of rows.lines) if (l.commit !== null) add(l.commit, l.holder);
   for (const l of rows.lines) if (l.commit !== null) for (const b of l.base) add(b, l.holder);
   return want;
@@ -241,11 +239,23 @@ async function updateRefs(deps: ReplicaDeps, repo: string, ops: string[]): Promi
   }
 }
 
-/** Sets the service repo's refs and the view from the rows, with the commits the repo has; returns the ones it lacks. */
+/** Admits the project's waiting branch rows whose commits are here (`settleBranchRows`). */
+async function settle(deps: ReplicaDeps, project: Project): Promise<void> {
+  const waiting = waitingBranchRows(deps.db, project.id);
+  if (waiting.length === 0) return;
+  const have = await present(deps.cfg, project.replica, waiting.flatMap((r) => (r.commit === null ? [] : [r.commit])));
+  settleBranchRows(deps.db, project.id, have);
+}
+
+/**
+ * Settles the branch rows, then sets the service repo's refs and the view from the rows, with the commits the repo
+ * has; returns the ones it lacks.
+ */
 async function applyRows(deps: ReplicaDeps, project: Project): Promise<string[]> {
   const { cfg } = deps;
   const repo = project.replica;
   const self = deps.pool.identity.id;
+  await settle(deps, project);
   const rows = rowsOf(deps, project.id);
   const want = wanted(rows);
   const have = await present(cfg, repo, want.keys());
@@ -264,19 +274,15 @@ async function applyRows(deps: ReplicaDeps, project: Project): Promise<string[]>
   const forgetBranch: string[] = [];
   /** Branches jj holds conflicted, with the position they go back to. */
   const reset: Array<[string, string]> = [];
-  /** What the view should show, by ref under `refs/heads/`, and what it keeps as it is while commits are missing. */
+  /** What the view should show, by ref under `refs/heads/`, and what it keeps as it is while a line's commit is missing. */
   const view = new Map<string, string>();
   const keep: Array<(ref: string) => boolean> = [];
 
   const graph = gitGraph(cfg, repo);
+  // Every admitted branch row's commit is here.
   for (const [branch, branchRows] of rows.branches) {
     const local = `${HEADS}${branch}`;
     const conflicts = `${HEADS}meddle/conflict/${branch}/`;
-    if (liveRows(branchRows).some((r) => !have.has(r.commit!))) {
-      // Its position can't be computed until every live row's commit is here: as it was until then.
-      keep.push((ref) => ref === local || ref.startsWith(conflicts));
-      continue;
-    }
     const state = await computeBranch(branchRows, graph);
     const at = state.kind === "single" ? state.commit : state.kind === "conflicted" ? state.served : null;
     if (at !== null) {
@@ -365,17 +371,16 @@ export async function projectBranches(deps: Pick<ReplicaDeps, "cfg" | "db">, pro
   const project = getProject(deps.db, projectId);
   if (project === null) return [];
   const rows = rowsOf(deps, projectId);
-  const have = await present(deps.cfg, project.replica, wanted({ ...rows, lines: [] }).keys());
+  const waiting = new Map<string, Set<string>>();
+  for (const r of rows.waiting) if (r.commit !== null) waiting.set(r.branch, (waiting.get(r.branch) ?? new Set()).add(r.commit));
   const graph = gitGraph(deps.cfg, project.replica);
   const out: ProjectBranch[] = [];
-  for (const [name, branchRows] of [...rows.branches].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-    if (liveRows(branchRows).some((r) => !have.has(r.commit!))) {
-      out.push({ name, state: "fetching", commit: null, siblings: [] });
-      continue;
-    }
-    const state = await computeBranch(branchRows, graph);
-    if (state.kind === "single") out.push({ name, state: "single", commit: state.commit, siblings: [] });
-    else if (state.kind === "conflicted") out.push({ name, state: "conflicted", commit: state.served, siblings: state.siblings });
+  for (const name of [...new Set([...rows.branches.keys(), ...waiting.keys()])].sort()) {
+    const pushes = [...(waiting.get(name) ?? [])].sort();
+    const state = await computeBranch(rows.branches.get(name) ?? [], graph);
+    if (state.kind === "single") out.push({ name, state: "single", commit: state.commit, siblings: [], waiting: pushes });
+    else if (state.kind === "conflicted") out.push({ name, state: "conflicted", commit: state.served, siblings: state.siblings, waiting: pushes });
+    else if (pushes.length > 0) out.push({ name, state: "fetching", commit: null, siblings: [], waiting: pushes });
   }
   return out;
 }
@@ -405,9 +410,10 @@ async function dropFetched(deps: ReplicaDeps, repo: string, commits: string[]): 
 
 /**
  * Applies project `projectId`'s rows to this node's service repo of it (made first when there is none) and to its
- * view. Each missing commit a row names is fetched by id, from the row's writer first, then from each online member;
- * with `budgetMs`, fetching stops once that much time has gone. `pending` are the commits the rows name that the repo
- * still lacks: their refs wait, as they were, for a later pass.
+ * view. Each missing commit a row names (a waiting branch row's included) is fetched by id, from the row's writer
+ * first, then from each online member; with `budgetMs`, fetching stops once that much time has gone. A waiting branch
+ * row whose commit is here is then admitted. `pending` are the commits the rows name that the repo still lacks: their
+ * refs (and the rows waiting for them) wait, as they were, for a later pass.
  */
 export async function applyProject(deps: ReplicaDeps, projectId: string, budgetMs?: number): Promise<{ pending: string[] }> {
   const deadline = budgetMs === undefined ? Infinity : Date.now() + budgetMs;

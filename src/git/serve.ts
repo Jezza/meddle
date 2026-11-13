@@ -176,7 +176,7 @@ async function branchStates(
     try {
       state = await computeBranch(branchRows, graph);
     } catch {
-      // A commit missing here.
+      // git could not read the graph (every admitted row's commit is here): refused, as for a view behind its rows.
       stale.push(branch);
       continue;
     }

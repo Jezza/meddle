@@ -21,21 +21,27 @@ export type BranchState =
 
 /**
  * A branch as `meddle project status` and the dashboard show it: `single` at `commit`; `conflicted`, with its
- * `siblings` and served at `commit`, their merge base (null when they share no history); `fetching` while a commit its
- * rows name is not here yet, so its position can't be computed. A branch every row deleted or dropped isn't one.
+ * `siblings` and served at `commit`, their merge base (null when they share no history); `fetching` while it is only
+ * pushed elsewhere. `waiting` are the commits of other nodes' pushes of it that are not here yet, and so not counted.
+ * A branch every row deleted or dropped, and none waits to bring back, isn't one.
  */
-export type ProjectBranch = { name: string; state: "single" | "conflicted" | "fetching"; commit: string | null; siblings: string[] };
+export type ProjectBranch = {
+  name: string; state: "single" | "conflicted" | "fetching"; commit: string | null; siblings: string[]; waiting: string[];
+};
 
 /**
- * Where `branch` is, in a few words: its commit's first 12 characters; for a conflicted one, where it is served; or
- * that its commits are still being fetched.
+ * Where `branch` is, in a few words: its commit's first 12 characters; for a conflicted one, where it is served; then
+ * the pushes of it still being fetched.
  */
 export function branchText(branch: ProjectBranch): string {
-  if (branch.state === "fetching") return "still fetching its commits";
-  if (branch.state === "single") return (branch.commit ?? "").slice(0, 12);
-  return branch.commit === null
-    ? "conflicted, not served: its siblings share no history"
-    : `conflicted, at its siblings' merge base ${branch.commit.slice(0, 12)}`;
+  const fetching = `still fetching ${branch.waiting.map((c) => c.slice(0, 12)).join(", ")}, pushed elsewhere`;
+  if (branch.state === "fetching") return fetching;
+  const at = branch.state === "single"
+    ? (branch.commit ?? "").slice(0, 12)
+    : branch.commit === null
+      ? "conflicted, not served: its siblings share no history"
+      : `conflicted, at its siblings' merge base ${branch.commit.slice(0, 12)}`;
+  return branch.waiting.length === 0 ? at : `${at}; ${fetching}`;
 }
 
 /** One ref of a push: `old` null is a creation, `new` null a deletion. */

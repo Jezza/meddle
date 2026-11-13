@@ -4,7 +4,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { git, initColocated, jj } from "../src/jj";
-import { listLineRows, mergeBranchRows, writeBranchRow } from "../src/pool/rows";
+import { listLineRows, mergeBranchRows, settleBranchRows, writeBranchRow } from "../src/pool/rows";
 import { addProjectFromFolder, setDefaultBranch } from "../src/projects/project";
 import { startAt, type StartRequest } from "../src/projects/starts";
 import { startPoolNode, type GitPoolNode } from "./pool-helpers";
@@ -84,6 +84,7 @@ test("a conflicted default branch is refused with the exact text, writing nothin
     await jj(["new", f.P], f.repo, f.n.cfg);
     const S = await read(f.n, f.repo, 'description(exact:"S\n")');
     mergeBranchRows(f.n.db, [{ project: f.project.id, branch: "main", node: "f".repeat(64), seq: 1, commit: S, drops: [] }]);
+    settleBranchRows(f.n.db, f.project.id, new Set([f.P, S]));
     expect(await refusal(start(f.n, f.project.id, "t1", null, "child"))).toBe("main is conflicted; push a merge of its siblings");
     expect(listLineRows(f.n.db, f.project.id)).toEqual([]);
     expect(await lineRefs(f.n, f.repo)).toEqual([]);

@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 
+const WAITING = "branch_rows_waiting";
+
 const MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -105,6 +107,18 @@ const MIGRATIONS = [
     drops TEXT NOT NULL,
     PRIMARY KEY (project, branch, node)
   )`,
+  // A peer's branch rows still waiting for their commits (src/pool/rows.ts), as branch_rows has them: each newer than
+  // its key's row there, if any. Neither used nor relayed until the applier admits it to branch_rows. Created by
+  // `openDb`, which moves every branch row of an older database here first (see there).
+  `CREATE TABLE IF NOT EXISTS ${WAITING} (
+    project TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    node TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    commit_id TEXT NULL,
+    drops TEXT NOT NULL,
+    PRIMARY KEY (project, branch, node)
+  )`,
 ];
 
 /** Columns added to a table after its first release: each is added to a database that lacks it. */
@@ -141,7 +155,16 @@ export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
   if (path !== ":memory:") db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA busy_timeout = 5000");
+  const hadWaiting = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(WAITING) !== null;
   for (const sql of MIGRATIONS) db.exec(sql);
+  if (!hadWaiting) {
+    // A database from before rows waited for their commits may use rows whose commits never arrived (and so refuse
+    // every push to their branch): all of them wait now, and the applier's first pass admits each whose commit is here.
+    db.transaction(() => {
+      db.exec(`INSERT INTO ${WAITING} SELECT project, branch, node, seq, commit_id, drops FROM branch_rows`);
+      db.exec("DELETE FROM branch_rows");
+    }).immediate();
+  }
   for (const { table, column, type } of ADDED_COLUMNS) {
     const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
     if (!columns.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);

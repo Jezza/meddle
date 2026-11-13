@@ -8,7 +8,7 @@ import type { NodeConfig } from "../config";
 import { changesIn, git, GitError, jj, JjError } from "../jj";
 import { shortId } from "../pool/ids";
 import { remoteReason } from "../pool/object";
-import { listBranchRows, writeLineRow, type BranchRow } from "../pool/rows";
+import { listBranchRows, waitingBranchRows, writeLineRow } from "../pool/rows";
 import type { PoolRuntime } from "../pool/runtime";
 import { serialised } from "../serial";
 import type { HandoffMode, Start } from "../tasks/manifest";
@@ -142,28 +142,26 @@ async function resolveRev(cfg: NodeConfig, project: Project, rev: string): Promi
   return resolved[0]!.commitId;
 }
 
-/** How long a start waits to catch up on a default branch whose rows or commits are not here yet. */
+/** How long a start waits to catch up on a default branch with no row here, or a push of it waiting for its commit. */
 const CATCH_UP_MS = 5000;
 
 /**
  * The commit of `project`'s default branch, computed from its rows (`computeBranch`), refused as `startAt` says. With
- * no row of it here, or a row whose commit is not here yet, it catches up first (`catchUp`: the peers' rows, then the
- * commits); refused `<b> is not here yet; try again shortly` when a commit still is not.
+ * no row of it here, or another node's push of it waiting for its commit, it catches up first (`catchUp`: the peers'
+ * rows, then the commits); refused `<b> is not here yet; try again shortly` when it still has no row and a push of it
+ * still waits. A push still waiting after that is not counted (as on every node that lacks its commit).
  */
 async function defaultBranchCommit(deps: StartDeps, project: Project): Promise<string> {
   const { cfg, db, pool } = deps;
   const branch = project.defaultBranch;
   if (branch === null) throw new Error(`${project.name} has no default branch; name a revision`);
-  const missing = async (rows: readonly BranchRow[]) => {
-    for (const r of rows) if (r.commit !== null && !(await hasCommit(cfg, project.replica, r.commit))) return true;
-    return false;
-  };
+  const waiting = () => waitingBranchRows(db, project.id).some((r) => r.branch === branch);
   let rows = listBranchRows(db, project.id, branch);
-  if (pool !== undefined && (rows.length === 0 || (await missing(rows)))) {
+  if (pool !== undefined && (rows.length === 0 || waiting())) {
     await catchUp({ cfg, db, pool }, project.id, CATCH_UP_MS).catch(() => {});
     rows = listBranchRows(db, project.id, branch);
   }
-  if (await missing(rows)) throw new Error(`${branch} is not here yet; try again shortly`);
+  if (rows.length === 0 && waiting()) throw new Error(`${branch} is not here yet; try again shortly`);
   const state = await computeBranch(rows, gitGraph(cfg, project.replica));
   if (state.kind === "absent") throw new Error(`no bookmark ${branch} in ${project.name}`);
   if (state.kind === "conflicted") throw new Error(`${branch} is conflicted; push a merge of its siblings`);

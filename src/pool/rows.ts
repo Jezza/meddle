@@ -4,6 +4,10 @@
 // - A line row, keyed (project, task, name), is written by the task's holder; the greater (epoch, seq) wins.
 // - A branch row, keyed (project, branch, node), is written by that node; the greater seq wins.
 // Equal on those, the greater content wins, so that every node settles on the same row.
+// A peer's branch row waits (`branch_rows_waiting`) until this node holds the commit it names, and only then is it
+// used and relayed: a push is seen nowhere its commit is not, so no node judges a push against a row it can't read,
+// and every node that hands a row on can hand its commit on too. A waiting row's seq still counts for its writer's
+// next row here.
 import type { Database } from "bun:sqlite";
 import type { Subscribable } from "@earendil-works/chord";
 import { COMMIT_ID, SAFE_ID } from "../tasks/provision";
@@ -154,8 +158,10 @@ function lineRecord(db: Database, project: string, task: string, name: string): 
     .get(project, task, name);
 }
 
-function branchRecord(db: Database, project: string, branch: string, node: string): BranchRecord | null {
-  return db.query<BranchRecord, [string, string, string]>("SELECT * FROM branch_rows WHERE project = ? AND branch = ? AND node = ?")
+type BranchTable = "branch_rows" | "branch_rows_waiting";
+
+function branchRecord(db: Database, project: string, branch: string, node: string, table: BranchTable = "branch_rows"): BranchRecord | null {
+  return db.query<BranchRecord, [string, string, string]>(`SELECT * FROM ${table} WHERE project = ? AND branch = ? AND node = ?`)
     .get(project, branch, node);
 }
 
@@ -169,12 +175,16 @@ function putLine(db: Database, r: LineRow, seenSeq: number): void {
   ).run(r.project, r.task, r.name, r.holder, r.epoch, r.seq, r.commit, JSON.stringify(r.base), r.archived ? 1 : 0, seenSeq);
 }
 
-function putBranch(db: Database, r: BranchRow): void {
+function putBranch(db: Database, r: BranchRow, table: BranchTable = "branch_rows"): void {
   db.query(
-    `INSERT INTO branch_rows (project, branch, node, seq, commit_id, drops) VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO ${table} (project, branch, node, seq, commit_id, drops) VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT (project, branch, node) DO UPDATE SET seq = excluded.seq, commit_id = excluded.commit_id,
        drops = excluded.drops`,
   ).run(r.project, r.branch, r.node, r.seq, r.commit, JSON.stringify(r.drops));
+}
+
+function deleteBranch(db: Database, r: Pick<BranchRow, "project" | "branch" | "node">, table: BranchTable): void {
+  db.query(`DELETE FROM ${table} WHERE project = ? AND branch = ? AND node = ?`).run(r.project, r.branch, r.node);
 }
 
 /** Everything a line row carries but its key, epoch and seq, as one comparable string. */
@@ -232,10 +242,11 @@ export function mergeLineRows(db: Database, rows: readonly LineRow[]): { changed
 }
 
 /**
- * Merges a peer's branch rows: per (project, branch, node), the greater seq wins, then the greater content.
- * `changed` are the projects whose rows changed; `rejected` counts the rows dropped (a branch name failing
- * `git check-ref-format --branch` or under `meddle/`, a commit that is not 40 or 64 hex characters, a seq or a drop's
- * seq that is not an integer, a malformed field).
+ * Merges a peer's branch rows: per (project, branch, node), the greater seq wins, then the greater content. A winning
+ * row waits (`waitingBranchRows`) until `settleBranchRows` admits it. `changed` are the projects with a row waiting
+ * anew (`rowChanges` fires for each, so that the applier fetches its commit); `rejected` counts the rows dropped (a
+ * branch name failing `git check-ref-format --branch` or under `meddle/`, a commit that is not 40 or 64 hex
+ * characters, a seq or a drop's seq that is not an integer, a malformed field).
  */
 export function mergeBranchRows(db: Database, rows: readonly BranchRow[]): { changed: string[]; rejected: number } {
   const projects = new Set<string>();
@@ -249,12 +260,48 @@ export function mergeBranchRows(db: Database, rows: readonly BranchRow[]): { cha
       }
       const local = branchRecord(db, r.project, r.branch, r.node);
       if (local !== null && !branchWins(r, branchOf(local))) continue;
-      putBranch(db, r);
+      const waiting = branchRecord(db, r.project, r.branch, r.node, "branch_rows_waiting");
+      if (waiting !== null && !branchWins(r, branchOf(waiting))) continue;
+      putBranch(db, r, "branch_rows_waiting");
       projects.add(r.project);
     }
   }).immediate();
-  branchesChanged(projects);
+  changed(projects);
   return { changed: [...projects], rejected };
+}
+
+function listBranchTable(db: Database, table: BranchTable, project: string): BranchRow[] {
+  return db.query<BranchRecord, [string]>(`SELECT * FROM ${table} WHERE project = ? ORDER BY branch, node`).all(project).map(branchOf);
+}
+
+/**
+ * A project's branch rows waiting to be admitted, by branch and node: each a peer's row newer than its key's row in
+ * `listBranchRows`, if any, until the applier's next `settleBranchRows` (and after it while its commit is not here).
+ */
+export function waitingBranchRows(db: Database, project: string): BranchRow[] {
+  return listBranchTable(db, "branch_rows_waiting", project);
+}
+
+/**
+ * Admits each of project `project`'s waiting branch rows that is newer than its key's row and either deleted or at a
+ * commit of `present` (commits this node holds), and lets go of each its key's row beats. True (and `branchChanges`
+ * fires) when the rows `listBranchRows` lists changed.
+ */
+export function settleBranchRows(db: Database, project: string, present: ReadonlySet<string>): boolean {
+  const moved = db.transaction(() => {
+    let changes = false;
+    for (const w of listBranchTable(db, "branch_rows_waiting", project)) {
+      const local = branchRecord(db, project, w.branch, w.node);
+      const wins = local === null || branchWins(w, branchOf(local));
+      if (wins && w.commit !== null && !present.has(w.commit)) continue;
+      if (wins) putBranch(db, w);
+      deleteBranch(db, w, "branch_rows_waiting");
+      changes ||= wins;
+    }
+    return changes;
+  }).immediate();
+  if (moved) branchesChanged([project]);
+  return moved;
 }
 
 /** The line rows, of one project and one task of it when given, by project, task and name. */
@@ -273,7 +320,7 @@ export function listLineRows(db: Database, project?: string, task?: string): Lin
   return db.query<LineRecord, string[]>(`SELECT * FROM line_rows ${clause} ORDER BY project, task, name`).all(...args).map(lineOf);
 }
 
-/** The branch rows of a project, of one branch when given, by branch and node. */
+/** The branch rows of a project (not the ones waiting for their commits), of one branch when given, by branch and node. */
 export function listBranchRows(db: Database, project: string, branch?: string): BranchRow[] {
   const rows = branch === undefined
     ? db.query<BranchRecord, [string]>("SELECT * FROM branch_rows WHERE project = ? ORDER BY branch, node").all(project)
@@ -281,7 +328,7 @@ export function listBranchRows(db: Database, project: string, branch?: string): 
   return rows.map(branchOf);
 }
 
-/** Every branch row of every project, by project, branch and node: what pool sync carries. */
+/** Every branch row of every project (not the ones waiting for their commits), by project, branch and node: what pool sync carries. */
 export function allBranchRows(db: Database): BranchRow[] {
   return db.query<BranchRecord, []>("SELECT * FROM branch_rows ORDER BY project, branch, node").all().map(branchOf);
 }
@@ -302,16 +349,26 @@ export function writeLineRow(db: Database, row: Omit<LineRow, "seq">): LineRow {
   return written;
 }
 
-/** Writes this node's row of a branch at one above the highest seq seen for it. */
+/**
+ * Writes this node's row of a branch at one above the highest seq seen for it, a waiting row's included. A waiting row
+ * of this node's own (its row come back from a peer after this node lost it) is replaced, its drops kept: every node
+ * holding it still counts what it dropped, and a push carries its row's drops on.
+ */
 export function writeBranchRow(db: Database, selfId: string, row: Omit<BranchRow, "seq" | "node">): BranchRow {
   const written = db.transaction(() => {
     const local = branchRecord(db, row.project, row.branch, selfId);
-    // The greater seq always wins, so the stored row has the highest seq seen.
+    const waiting = branchRecord(db, row.project, row.branch, selfId, "branch_rows_waiting");
+    const drops = new Map<string, RowRef>();
+    for (const d of [...row.drops, ...(waiting === null ? [] : branchOf(waiting).drops)]) {
+      drops.set(JSON.stringify([d.node, d.seq]), { node: d.node, seq: d.seq });
+    }
+    // The greater seq always wins, so the stored rows have the highest seq seen.
     const r: BranchRow = {
-      project: row.project, branch: row.branch, node: selfId, seq: (local?.seq ?? 0) + 1, commit: row.commit,
-      drops: row.drops.map((d) => ({ node: d.node, seq: d.seq })),
+      project: row.project, branch: row.branch, node: selfId, seq: Math.max(local?.seq ?? 0, waiting?.seq ?? 0) + 1,
+      commit: row.commit, drops: [...drops.values()],
     };
     putBranch(db, r);
+    if (waiting !== null) deleteBranch(db, r, "branch_rows_waiting");
     return r;
   }).immediate();
   branchesChanged([written.project]);

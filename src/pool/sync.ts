@@ -1,6 +1,7 @@
 // Pool sync: each node holds every online peer's PoolObject (peer variant) over a chord link on iroh, merges the
-// peer's roster, settings, token rows and line and branch rows into its own (and so relays them), pulls the value of
-// each token it lists but lacks, by id, and deletes the value of each token the pool removed.
+// peer's roster, settings, token rows and line and branch rows into its own (and so relays them: a branch row once the
+// applier has its commit here), pulls the value of each token it lists but lacks, by id, and deletes the value of each
+// token the pool removed.
 import type { Database } from "bun:sqlite";
 import { createHost, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";

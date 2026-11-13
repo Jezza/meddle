@@ -226,7 +226,8 @@ const GROUPS: Group[] = [
         details:
           "A branch is never stored: every node computes it from each node's record of the pushes it took, so every " +
           "node prints the same once it has heard the same pushes. One line per branch, the default branch first: " +
-          "`<b>  <commit>`, or `still fetching its commits` while this node lacks a commit a push named. Two pushes " +
+          "`<b>  <commit>`, then `still fetching <commits>, pushed elsewhere` for other nodes' pushes of it whose commits " +
+          "have not reached this node: a push counts here only once its commit has. Two pushes " +
           "that could not see each other (machines offline, or not yet caught up) leave a branch conflicted, with " +
           "both commits kept as its siblings: a checkout fetches each as `meddle/conflict/<b>/<id>@meddle` (<id> is " +
           "its commit's first 12 characters), and the branch itself at their merge base. A task can't start from a " +

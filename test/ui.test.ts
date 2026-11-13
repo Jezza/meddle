@@ -59,7 +59,7 @@ test("a task moves only to another online member that hosts tasks and runs the s
 test("the projects view merges each project's holders by id, home's name first, holders in pool order", () => {
   const [a, b, c] = ["a", "b", "c"].map((x) => x.repeat(64)) as [string, string, string];
   const heads = [{ name: "trunk", remote: null, changeId: "kkkkkkkkkkkk", conflicted: false }];
-  const branches = [{ name: "main", state: "single" as const, commit: "1".repeat(40), siblings: [] }];
+  const branches = [{ name: "main", state: "single" as const, commit: "1".repeat(40), siblings: [], waiting: [] }];
   const rows = mergeProjects([
     { nodeId: c, id: "p1", name: "one", home: a, defaultBranch: "main", heads: [], branches: [], contextLoaded: true },
     { nodeId: a, id: "p1", name: "one", home: a, defaultBranch: "main", heads, branches, contextLoaded: true },
@@ -76,16 +76,16 @@ test("the projects view merges each project's holders by id, home's name first, 
   expect(headText({ name: "meddle/task/t1/one", remote: "0123456789", changeId: "", conflicted: true })).toBe("meddle/task/t1/one@0123456789 (conflicted)");
 });
 
-test("the project page marks a conflicted branch and names its siblings as a checkout fetches them", () => {
-  const [x, y, base, top] = ["a", "b", "c", "d"].map((h) => h.repeat(40)) as [string, string, string, string];
+test("the project page marks a conflicted branch, names its siblings as a checkout fetches them, and says what it is still fetching", () => {
+  const [x, y, base, top, far] = ["a", "b", "c", "d", "e"].map((h) => h.repeat(40)) as [string, string, string, string, string];
   const lines = branchLines([
-    { name: "feature", state: "conflicted", commit: base, siblings: [x, y] },
-    { name: "loose", state: "conflicted", commit: null, siblings: [x, y] },
-    { name: "main", state: "single", commit: top, siblings: [] },
-    { name: "next", state: "fetching", commit: null, siblings: [] },
+    { name: "feature", state: "conflicted", commit: base, siblings: [x, y], waiting: [] },
+    { name: "loose", state: "conflicted", commit: null, siblings: [x, y], waiting: [] },
+    { name: "main", state: "single", commit: top, siblings: [], waiting: [far] },
+    { name: "next", state: "fetching", commit: null, siblings: [], waiting: [far, x] },
   ], "main");
   expect(lines).toEqual([
-    { name: "main", isDefault: true, conflicted: false, text: "dddddddddddd", siblings: [] },
+    { name: "main", isDefault: true, conflicted: false, text: "dddddddddddd; still fetching eeeeeeeeeeee, pushed elsewhere", siblings: [] },
     {
       name: "feature", isDefault: false, conflicted: true, text: "conflicted, at its siblings' merge base cccccccccccc",
       siblings: ["meddle/conflict/feature/aaaaaaaaaaaa@meddle", "meddle/conflict/feature/bbbbbbbbbbbb@meddle"],
@@ -94,7 +94,9 @@ test("the project page marks a conflicted branch and names its siblings as a che
       name: "loose", isDefault: false, conflicted: true, text: "conflicted, not served: its siblings share no history",
       siblings: ["meddle/conflict/loose/aaaaaaaaaaaa@meddle", "meddle/conflict/loose/bbbbbbbbbbbb@meddle"],
     },
-    { name: "next", isDefault: false, conflicted: false, text: "still fetching its commits", siblings: [] },
+    {
+      name: "next", isDefault: false, conflicted: false, text: "still fetching eeeeeeeeeeee, aaaaaaaaaaaa, pushed elsewhere", siblings: [],
+    },
   ]);
 });
 

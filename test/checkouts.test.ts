@@ -8,8 +8,8 @@ import { paths } from "../src/config";
 import { startDashboard } from "../src/dashboard/server";
 import { acceptGitStreams } from "../src/git/serve";
 import { bookmarkRefs, git, jj, JjError, type BookmarkRef } from "../src/jj";
-import { listBranchRows, mergeBranchRows, writeBranchRow, type BranchRow } from "../src/pool/rows";
-import { applyProject } from "../src/projects/applier";
+import { listBranchRows, mergeBranchRows, settleBranchRows, waitingBranchRows, writeBranchRow, type BranchRow } from "../src/pool/rows";
+import { applyProject, projectBranches } from "../src/projects/applier";
 import { attachCheckout, makeCheckout } from "../src/projects/checkouts";
 import { addProjectFromFolder, getProject, listProjects } from "../src/projects/project";
 import { meddle } from "./helpers";
@@ -315,7 +315,8 @@ test("a conflicted branch refuses a push not descending from every sibling, and 
     const a = await commitIn(n1, co1, "main", "a");
     await pushMain(n1, co1, a);
     writeBranchRow(n2.db, n2.id, { project: P, branch: "main", commit: b, drops: [] });
-    await waitFor("n2's main row on n1", () => listBranchRows(n1.db, P, "main").some((r) => r.node === n2.id && r.commit === b));
+    // Waiting for b on n1, until the fetch below catches n1 up.
+    await waitFor("n2's main row on n1", () => waitingBranchRows(n1.db, P).some((r) => r.node === n2.id && r.commit === b));
 
     // The view: main at the merge base, each sibling under meddle/conflict/main/.
     await fetchIn(n1, co1);
@@ -341,7 +342,8 @@ test("a conflicted branch refuses a push not descending from every sibling, and 
     await git(["push", "meddle", `:refs/heads/meddle/conflict/main/${b.slice(0, 12)}`], co1, n1.cfg);
     const row = ownMainRow(n1, P);
     expect(row).toMatchObject({ seq: 3, commit: a, drops: [{ node: n2.id, seq: 1 }] });
-    await waitFor("n1's dropping row on n2", () => ownMainRow(n1, P)!.seq === listBranchRows(n2.db, P, "main").find((r) => r.node === n1.id)?.seq);
+    const onN2 = () => [...listBranchRows(n2.db, P, "main"), ...waitingBranchRows(n2.db, P)].filter((r) => r.node === n1.id);
+    await waitFor("n1's dropping row on n2", () => onN2().some((r) => r.seq === ownMainRow(n1, P)!.seq));
     for (const [n, co] of [[n1, co1], [n2, co2]] as const) {
       await fetchIn(n, co);
       expect(await remoteMain(n, co)).toMatchObject({ commitId: a });
@@ -353,33 +355,31 @@ test("a conflicted branch refuses a push not descending from every sibling, and 
   }
 }, 90_000);
 
-test("a push to a branch whose rows name a commit this node lacks is refused, never landed and undone", async () => {
+test("a peer's row naming a commit this node lacks waits unseen, and pushes to its branch go on", async () => {
   const { nodes, close } = await poolNodes(1);
   try {
     const [n] = nodes as [GitPoolNode];
     const P = n.project.id;
-    const m = ownMainRow(n, P)!.commit!;
     const co = await makeCheckout(n.cfg, n.id, n.project, `${n.home}/co`, helperEnv(n));
-    // Another node's row for main, at a commit that never reached this one.
+    // Another node's row for main, at a commit that never reached this one (its writer went before anyone fetched it).
     const other = "f".repeat(64);
-    mergeBranchRows(n.db, [{ project: P, branch: "main", node: other, seq: 1, commit: "e".repeat(40), drops: [] }]);
+    const theirs = { project: P, branch: "main", node: other, seq: 1, commit: "e".repeat(40), drops: [] };
+    mergeBranchRows(n.db, [theirs]);
     const rows = listBranchRows(n.db, P);
-    const view = () => git(["for-each-ref", "refs/namespaces/view/"], n.project.replica, n.cfg);
-    const before = await view();
+    expect(rows.some((r) => r.node === other)).toBe(false);
 
     const x = await commitIn(n, co, "main", "x");
-    const refused = await pushMain(n, co, x).catch((err: unknown) => err);
-    expect(refused).toBeInstanceOf(JjError);
-    expect((refused as JjError).stderr).toContain("remote: main: this node is still fetching it; push again shortly");
-    expect((refused as JjError).stderr).toContain("refs/heads/main (reason: pre-receive hook declined)");
-    expect(await view()).toBe(before);
-    expect(listBranchRows(n.db, P)).toEqual(rows);
-    expect(await read(n, n.project.replica, "main")).toBe(m);
-
-    // Another branch, whose rows are all here, is pushed as ever.
-    await jj(["bookmark", "create", "feature", "-r", x], co, n.cfg);
-    await jj(["git", "push", "--remote", "meddle", "-b", "feature"], co, n.cfg);
-    expect(listBranchRows(n.db, P, "feature")).toEqual([{ project: P, branch: "feature", node: n.id, seq: 1, commit: x, drops: [] }]);
+    await pushMain(n, co, x);
+    // It drops the rows it saw (this node's own), not the one still waiting.
+    expect(ownMainRow(n, P)).toMatchObject({ commit: x, drops: [{ node: n.id, seq: 1 }] });
+    expect(await read(n, n.project.replica, "main")).toBe(x);
+    // Still waiting for its commit, after the applier's pass that followed the push.
+    expect(waitingBranchRows(n.db, P)).toEqual([theirs]);
+    expect(listBranchRows(n.db, P, "main").map((r) => r.node)).toEqual([n.id]);
+    // Status says what it is still fetching.
+    expect(await projectBranches({ cfg: n.cfg, db: n.db }, P)).toEqual([
+      { name: "main", state: "single", commit: x, siblings: [], waiting: ["e".repeat(40)] },
+    ]);
     expect(n.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
   } finally {
     await close();
@@ -419,7 +419,9 @@ test("a push to a branch whose view is behind its rows is refused, and the row i
     const y = (await git(["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", `${x}^{tree}`, "-p", x, "-m", "y"], repo, n.cfg)).trim();
     const peer = "f".repeat(64);
     mergeBranchRows(n.db, [{ project: P, branch: "main", node: peer, seq: 1, commit: y, drops: [] }]);
+    settleBranchRows(n.db, P, new Set([x, y]));
     const rows = listBranchRows(n.db, P);
+    expect(rows.some((r) => r.node === peer)).toBe(true);
     expect(await git(["rev-parse", "refs/namespaces/view/refs/heads/main"], repo, n.cfg)).toBe(`${x}\n`);
 
     // z, a child of x: a fast-forward of what the checkout sees; judged against the rows it would drop y's row.

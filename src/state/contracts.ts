@@ -216,13 +216,15 @@ export const HeadSchema = Type.Object({ name: Type.String(), remote: Nullable(Ty
 /**
  * A shared branch of a project as its node computes it from every node's rows (`ProjectBranch`): `single` at `commit`;
  * `conflicted`, its `siblings` the heads concurrent pushes left, served at `commit`, their merge base (null when they
- * share no history); `fetching` while a commit its rows name is not on the node yet.
+ * share no history); `fetching` while it is only pushed elsewhere. `waiting` are the commits of other nodes' pushes of
+ * it not on the node yet.
  */
 export const BranchSchema = Type.Object({
   name: Type.String(),
   state: Type.Union([Type.Literal("single"), Type.Literal("conflicted"), Type.Literal("fetching")]),
   commit: Nullable(Type.String()),
   siblings: Type.Array(Type.String()),
+  waiting: Type.Array(Type.String()),
 });
 
 export const ProjectObject = remote("meddle.project", {

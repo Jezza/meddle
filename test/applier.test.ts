@@ -6,7 +6,7 @@ import { bookmarkRefs, changesIn, git, isJjRepo, jj, type BookmarkRef } from "..
 import { applyProject, catchUp, startApplier } from "../src/projects/applier";
 import { ensureServiceRepo, type ReplicaDeps } from "../src/projects/replicas";
 import { getProject } from "../src/projects/project";
-import { listBranchRows, listLineRows, writeBranchRow, writeLineRow, type BranchRow, type LineRow } from "../src/pool/rows";
+import { listBranchRows, listLineRows, waitingBranchRows, writeBranchRow, writeLineRow, type BranchRow, type LineRow } from "../src/pool/rows";
 import type { PoolRuntime } from "../src/pool/runtime";
 import { PeerObject } from "../src/state/contracts";
 import { acceptGitStreams } from "../src/git/serve";
@@ -64,9 +64,9 @@ function mainRow(n: GitPoolNode): string {
   return row.commit;
 }
 
-/** Waits until `n` holds the row `match` picks among `project`'s branch rows. */
+/** Waits until `n` holds the row `match` picks among `project`'s branch rows, admitted or waiting for its commit. */
 async function branchRowOn(n: GitPoolNode, project: string, match: (r: BranchRow) => boolean): Promise<void> {
-  await waitFor("a branch row", () => listBranchRows(n.db, project).some(match));
+  await waitFor("a branch row", () => [...listBranchRows(n.db, project), ...waitingBranchRows(n.db, project)].some(match));
 }
 
 async function lineRowOn(n: GitPoolNode, project: string, task: string, match: (r: LineRow) => boolean): Promise<void> {
@@ -203,6 +203,8 @@ test("a conflicted branch serves both siblings by id, and itself at their merge 
 
     // Deleted, dropping both siblings' rows: gone from the service repo and the view, its commits still visible.
     await branchRowOn(n1, P, (r) => r.node === n3.id && r.commit === y);
+    // n1's applier pass, which admits n3's row (y is here).
+    await applyProject(depsOf(n1), P);
     const live = listBranchRows(n1.db, P, "main").map((r) => ({ node: r.node, seq: r.seq }));
     const deleted = writeBranchRow(n1.db, n1.id, { project: P, branch: "main", commit: null, drops: live });
     await branchRowOn(n2, P, (r) => r.node === n1.id && r.commit === null && r.seq === deleted.seq);

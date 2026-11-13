@@ -6,7 +6,7 @@ import { startPool } from "../src/pool/runtime";
 import { PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
 import { addToken, listTokens, tokenFile, tokenId, tokenValue } from "../src/token";
-import { listBranchRows, writeBranchRow, writeLineRow } from "../src/pool/rows";
+import { listBranchRows, settleBranchRows, waitingBranchRows, writeBranchRow, writeLineRow } from "../src/pool/rows";
 import { HoldFailed } from "../src/pool/sync";
 import { POOL_ENV, poolSummaryOf, threeNodes, twoNodes, type PoolNode, type TappedFrame } from "./pool-helpers";
 
@@ -151,13 +151,21 @@ test("a peer's older row for a token does not overwrite a newer local one, and a
   }
 }, 15_000);
 
-test("a branch row written on one node reaches a node it is not linked to, relayed by the node between", async () => {
+test("a branch row written on one node reaches a node it is not linked to, relayed by the node between once it holds the commit", async () => {
   const { a, b, c, close } = await threeNodes({ links: [["a", "b"], ["b", "c"]] });
   try {
     // No `changed()`: the write itself tells the pool.
-    const written = writeBranchRow(a.db, a.id, { project: "p", branch: "main", commit: "d".repeat(40), drops: [] });
-    await until(() => JSON.stringify(listBranchRows(c.db, "p")) === JSON.stringify([written]));
+    const commit = "d".repeat(40);
+    const written = writeBranchRow(a.db, a.id, { project: "p", branch: "main", commit, drops: [] });
+    await until(() => JSON.stringify(waitingBranchRows(b.db, "p")) === JSON.stringify([written]));
+    // b lacks the commit: the row waits there, unused and unrelayed.
+    expect(listBranchRows(b.db, "p")).toEqual([]);
+    await Bun.sleep(200);
+    expect(waitingBranchRows(c.db, "p")).toEqual([]);
+    // b holds the commit now (as its applier would have fetched it): the row is admitted, and goes on to c.
+    expect(settleBranchRows(b.db, "p", new Set([commit]))).toBe(true);
     expect(listBranchRows(b.db, "p")).toEqual([written]);
+    await until(() => JSON.stringify(waitingBranchRows(c.db, "p")) === JSON.stringify([written]));
     expect(a.net.isOnline(c.id) || c.net.isOnline(a.id)).toBe(false);
     expect([...a.errors, ...b.errors, ...c.errors].map(String)).toEqual([]);
   } finally {

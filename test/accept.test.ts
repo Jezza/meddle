@@ -8,7 +8,7 @@ import { delimiter, join } from "node:path";
 import { paths, type NodeConfig } from "../src/config";
 import { git, initColocated, jj } from "../src/jj";
 import { shortId } from "../src/pool/ids";
-import { listLineRows, mergeBranchRows, writeBranchRow } from "../src/pool/rows";
+import { listLineRows, mergeBranchRows, settleBranchRows, writeBranchRow } from "../src/pool/rows";
 import { startApplier } from "../src/projects/applier";
 import { makeCheckout } from "../src/projects/checkouts";
 import { addProjectFromFolder, type Project } from "../src/projects/project";
@@ -216,6 +216,7 @@ test("a conflicted branch containing the task's line archives nothing, until it 
     const theirs = await read(A.cfg, repo, "@-");
     const other = "f".repeat(64);
     mergeBranchRows(A.db, [{ project: P.id, branch: "main", node: other, seq: 1, commit: theirs, drops: [] }]);
+    settleBranchRows(A.db, P.id, new Set([init, theirs]));
     // This node's push of main onto the task's line, not having seen that one: main is conflicted.
     writeBranchRow(A.db, A.id, { project: P.id, branch: "main", commit: head, drops: [] });
     const deps = { cfg: A.cfg, db: A.db, pool: A.pool };

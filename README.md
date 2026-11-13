@@ -627,8 +627,10 @@ own node at once, and reaches the others when they can see it; it never waits fo
 | On a conflicted branch, any other commit | Refused | `<b> is conflicted; push a merge of its siblings, or delete the ones you don't want`, then the siblings and the fix (below) |
 | A deletion of `meddle/conflict/<b>/<id>` | A drop of that sibling | That sibling is dropped everywhere |
 
-A push to a branch whose rows name a commit this node is still fetching is refused with `<b>: this node is still
-fetching it; push again shortly`.
+Another node's push counts on a node only once its commit is there: until then that node neither uses nor passes on
+its row, so a push whose machine went away before anyone fetched it never holds anyone else's push up (if the two
+diverge, the branch is conflicted once it arrives). A push to a branch whose view this node hasn't caught up with yet
+(a push it has only just taken) is refused with `<b>: this node is still fetching it; push again shortly`.
 
 **Conflicts.** Two pushes to one branch from machines that could not see each other are both kept: the branch is
 then **conflicted**, on every node, and the commits are its siblings. While it is conflicted, a checkout's fetch shows:
