@@ -9,7 +9,8 @@ export type ThreadItem =
     name: string;
     input: unknown;
     toolUseId: string;
-    result?: { text: string; isError: boolean };
+    /** `patch`: the hunks a call that changed a file reported (`EDITS`). */
+    result?: { text: string; isError: boolean; patch?: Hunk[] };
     children: ThreadItem[];
     agentId?: string;
   }
@@ -18,7 +19,10 @@ export type ThreadItem =
   | { kind: "status"; text: string }
   | { kind: "unknown"; type: string; raw: unknown };
 
-type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
+/** One hunk of a file change, as Claude Code's `structuredPatch` reports it: lines prefixed `-`, `+` or a space. */
+export type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] };
+
+export type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
 type AssistantItem = Extract<ThreadItem, { kind: "assistant" }>;
 type DeniedItem = Extract<ThreadItem, { kind: "denied" }>;
 type Block = { type?: unknown; [key: string]: unknown };
@@ -116,9 +120,11 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         const id = str(block.tool_use_id);
         const tool = tools.get(id);
         if (tool !== undefined) {
+          const result = (m.tool_use_result ?? {}) as { agentId?: unknown; structuredPatch?: unknown };
           tool.result = { text: contentText(block.content), isError: block.is_error === true };
-          const agentId = (m.tool_use_result as { agentId?: unknown } | undefined)?.agentId;
-          if (typeof agentId === "string") tool.agentId = agentId;
+          const patch = hunks(result.structuredPatch);
+          if (patch.length > 0) tool.result.patch = patch;
+          if (typeof result.agentId === "string") tool.agentId = result.agentId;
         } else if (!questions.has(id)) {
           list.push({ kind: "unknown", type: "tool_result", raw: block });
         }
@@ -153,7 +159,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         return;
       }
       case "init":
-        // The bar beneath the thread shows the model and permission mode.
+        // The bar beneath the thread shows the model.
         return;
       default:
         top.push(unknown(m));
@@ -226,6 +232,13 @@ function resultText(m: Message): string {
   return parts.join(" · ");
 }
 
+function hunks(value: unknown): Hunk[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((h): h is Hunk =>
+    typeof h?.oldStart === "number" && typeof h.oldLines === "number" && typeof h.newStart === "number" &&
+    typeof h.newLines === "number" && Array.isArray(h.lines) && h.lines.every((l: unknown) => typeof l === "string"));
+}
+
 function blocks(content: unknown): Block[] {
   return Array.isArray(content) ? (content.filter((b) => b !== null && typeof b === "object") as Block[]) : [];
 }
@@ -240,49 +253,81 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-type UnknownItem = Extract<ThreadItem, { kind: "unknown" }>;
-
-/** What happens between Claude's prose: a tool call, thinking with no text, or a message the thread does not know. */
-export type Step = ToolItem | AssistantItem | UnknownItem;
+/** A run of calls that only look (`LOOKS`), with the thinking between them: one "Explored" row. */
+export type Explored = { kind: "explored"; steps: Array<ToolItem | AssistantItem> };
 
 /**
- * A thread item as the view shows it: a run of steps (tool calls, thinking with no text, unknown messages) folds
- * into one `steps` line, which names its tool calls.
+ * A thread item as the view shows it: calls that only look fold with their neighbours into one `explored` row, and
+ * every other call stays a row of its own.
  */
-export type ShownItem =
-  | Exclude<ThreadItem, ToolItem | UnknownItem>
-  | { kind: "steps"; steps: Step[]; tools: ToolItem[] };
+export type ShownItem = ThreadItem | Explored;
 
-function isStep(item: ThreadItem): item is Step {
-  return item.kind === "tool" || item.kind === "unknown" || (item.kind === "assistant" && item.text === "");
-}
+/** What each call that only looks counts as in an "Explored" row, and the input field that tells two of them apart. */
+const LOOKS: Record<string, { one: string; many: string; key?: string }> = {
+  Read: { one: "file", many: "files", key: "file_path" },
+  NotebookRead: { one: "file", many: "files", key: "notebook_path" },
+  LS: { one: "directory", many: "directories", key: "path" },
+  Grep: { one: "search", many: "searches" },
+  Glob: { one: "search", many: "searches" },
+  ToolSearch: { one: "tool search", many: "tool searches" },
+  WebFetch: { one: "page", many: "pages", key: "url" },
+  WebSearch: { one: "web search", many: "web searches" },
+};
 
-/** Folds each run of consecutive steps into one item; the rest stay as they are. */
-export function foldSteps(items: readonly ThreadItem[]): ShownItem[] {
+export const isLook = (tool: ToolItem): boolean => Object.hasOwn(LOOKS, tool.name);
+
+/** Messages that only keep the session's books: shown only with Raw. Any other message the thread does not know shows. */
+const BOOKKEEPING: readonly string[] = ["command_lifecycle", "system:hook_started", "system:hook_response"];
+
+/**
+ * Folds each run of calls that only look into one `explored` item, with the thinking just before, between and just
+ * after them (so a thought does not show as a row and then vanish into the run once the next look lands);
+ * everything else stays as it is. Bookkeeping messages show only with `raw`.
+ */
+export function foldSteps(items: readonly ThreadItem[], raw = false): ShownItem[] {
   const shown: ShownItem[] = [];
   for (const item of items) {
-    if (!isStep(item)) {
-      shown.push(item as ShownItem);
-      continue;
-    }
+    if (item.kind === "unknown" && !raw && BOOKKEEPING.includes(item.type)) continue;
+    const thinking = item.kind === "assistant" && item.text === "";
     // Thinking whose text the API left out says nothing.
-    if (item.kind === "assistant" && (item.thinking ?? "") === "") continue;
-    let last = shown.at(-1);
-    if (last?.kind !== "steps") {
-      last = { kind: "steps", steps: [], tools: [] };
-      shown.push(last);
+    if (thinking && (item.thinking ?? "") === "") continue;
+    const last = shown.at(-1);
+    if (item.kind === "tool" && isLook(item)) {
+      if (last?.kind === "explored") last.steps.push(item);
+      else if (last?.kind === "assistant" && last.text === "") shown[shown.length - 1] = { kind: "explored", steps: [last, item] };
+      else shown.push({ kind: "explored", steps: [item] });
+    } else if (thinking && last?.kind === "explored") {
+      last.steps.push(item);
+    } else {
+      shown.push(item);
     }
-    last.steps.push(item);
-    if (item.kind === "tool") last.tools.push(item);
   }
   return shown;
+}
+
+/** An "Explored" row's line: what its calls looked at, counted by kind ("3 files, 1 search"), a file read twice once. */
+export function exploredLine(steps: Explored["steps"]): { text: string; running: boolean; failed: number } {
+  const tools = steps.filter((s): s is ToolItem => s.kind === "tool");
+  const groups = new Map<string, { one: string; many: string; seen: Set<string> }>();
+  for (const t of tools) {
+    const look = LOOKS[t.name]!;
+    const value = look.key === undefined ? undefined : (t.input as Record<string, unknown> | null)?.[look.key];
+    const group = groups.get(look.many) ?? { ...look, seen: new Set<string>() };
+    group.seen.add(typeof value === "string" ? value : t.toolUseId);
+    groups.set(look.many, group);
+  }
+  return {
+    text: [...groups.values()].map((g) => `${g.seen.size} ${g.seen.size === 1 ? g.one : g.many}`).join(", "),
+    running: tools.some((t) => t.result === undefined),
+    failed: tools.filter((t) => t.result?.isError === true).length,
+  };
 }
 
 /** The input field that says most about a call, for its one-line summary. */
 export function toolSummary(input: unknown, max = 120): string {
   if (input === null || typeof input !== "object") return "";
   const fields = input as Record<string, unknown>;
-  for (const key of ["command", "file_path", "path", "pattern", "url", "query", "description", "prompt"]) {
+  for (const key of ["command", "file_path", "notebook_path", "path", "pattern", "url", "query", "description", "prompt"]) {
     const value = fields[key];
     if (typeof value === "string") {
       const line = value.split("\n")[0]!;
@@ -292,50 +337,98 @@ export function toolSummary(input: unknown, max = 120): string {
   return "";
 }
 
-/** How a run names each kind of call: by what it does, present while one runs, and what it counts. */
-const KINDS: Array<{ tools: string[]; doing: string; did: string; one: string; many: string; label?: string }> = [
-  { tools: ["Bash", "BashOutput"], doing: "Running", did: "Ran", one: "command", many: "commands" },
-  { tools: ["Read", "NotebookRead"], doing: "Reading", did: "Read", one: "file", many: "files" },
-  { tools: ["Grep", "Glob"], doing: "Searching for", did: "Searched for", one: "pattern", many: "patterns" },
-  { tools: ["Edit", "MultiEdit", "NotebookEdit"], doing: "Editing", did: "Edited", one: "file", many: "files" },
-  { tools: ["Write"], doing: "Writing", did: "Wrote", one: "file", many: "files" },
-  { tools: ["WebFetch"], doing: "Fetching", did: "Fetched", one: "page", many: "pages" },
-  { tools: ["WebSearch"], doing: "Searching the web for", did: "Searched the web for", one: "query", many: "queries" },
-  { tools: ["Agent", "Task"], doing: "Running", did: "Ran", one: "agent", many: "agents", label: "agent: " },
-];
+/** What a row says a call acted on: a path relative to the session's directory, a pattern and where, a subagent's task. */
+export function toolTarget(tool: ToolItem, cwd: string): string {
+  const input = (tool.input ?? {}) as Record<string, unknown>;
+  const field = (key: string) => typeof input[key] === "string" ? input[key] as string : undefined;
+  const file = field("file_path") ?? field("notebook_path");
+  if (file !== undefined) return relativePath(file, cwd);
+  if (tool.name === "Agent" || tool.name === "Task") return field("description") ?? "";
+  const pattern = field("pattern");
+  const path = field("path");
+  if (pattern !== undefined) return path === undefined ? pattern : `${pattern} in ${relativePath(path, cwd)}`;
+  if (path !== undefined) return relativePath(path, cwd);
+  return toolSummary(input);
+}
+
+/** Where a row's `<details>` keeps its open state across renders: a call's id; undefined for an item without one. */
+export function keyOf(item: ShownItem): string | undefined {
+  if (item.kind === "tool" || item.kind === "question") return item.toolUseId || undefined;
+  if (item.kind === "explored") return item.steps.find((s): s is ToolItem => s.kind === "tool")?.toolUseId || undefined;
+  return undefined;
+}
+
+/** A path under the session's working directory, relative to it; any other as it is. */
+export function relativePath(path: string, cwd: string): string {
+  return cwd !== "" && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path;
+}
+
+/** The working directory the session's latest `init` reported; "" when the events hold none. */
+export function cwdOf(events: ReadonlyArray<{ message: unknown }>): string {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const m = events[i]!.message as Message | null;
+    if (m?.type === "system" && m.subtype === "init" && typeof m.cwd === "string") return m.cwd;
+  }
+  return "";
+}
+
+/** Calls that change a file, shown with their diff. */
+export const EDITS: readonly string[] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+
+export type DiffLine = { kind: "add" | "del" | "same"; text: string; line?: number } | { kind: "hunk"; text: string };
 
 /**
- * A run of steps in one line that keeps its shape as calls come in: a lone call says what it did ("Ran cargo
- * check"), more count by kind ("Read 2 files, searched for 1 pattern"), each kind in the present while one of its
- * calls runs. Thinking is not counted; a run of only thinking says nothing.
+ * What a call that changes a file changed: the hunks its result reported, numbered, else (still running, or a
+ * result without them, such as a new file) its input's old lines removed and new lines added.
  */
-export function stepsLine(steps: readonly Step[]): { text: string; running: boolean; failed: number } {
-  const tools = steps.filter((s): s is ToolItem => s.kind === "tool");
-  const events = steps.filter((s) => s.kind === "unknown").length;
-  const running = tools.some((t) => t.result === undefined);
-  const failed = tools.filter((t) => t.result?.isError === true).length;
-  const groups = new Map<string, ToolItem[]>();
-  for (const t of tools) {
-    const key = KINDS.findIndex((k) => k.tools.includes(t.name));
-    const id = key >= 0 ? String(key) : `tool:${t.name}`;
-    groups.set(id, [...(groups.get(id) ?? []), t]);
-  }
-  const parts: string[] = [];
-  for (const [id, calls] of groups) {
-    const busy = calls.some((t) => t.result === undefined);
-    const kind = id.startsWith("tool:") ? undefined : KINDS[Number(id)]!;
-    if (kind === undefined) {
-      const verb = busy ? "calling" : "called";
-      parts.push(calls.length === 1 ? `${verb} ${calls[0]!.name}` : `${verb} ${calls[0]!.name} ${calls.length} times`);
-      continue;
+export function editDiff(tool: ToolItem): { lines: DiffLine[]; added: number; removed: number } {
+  const lines: DiffLine[] = [];
+  const patch = tool.result?.patch ?? [];
+  if (patch.length > 0) {
+    for (const hunk of patch) {
+      lines.push({ kind: "hunk", text: `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@` });
+      let oldLine = hunk.oldStart;
+      let newLine = hunk.newStart;
+      for (const l of hunk.lines) {
+        const text = l.slice(1);
+        if (l.startsWith("-")) lines.push({ kind: "del", text, line: oldLine++ });
+        else if (l.startsWith("+")) lines.push({ kind: "add", text, line: newLine++ });
+        else if (l.startsWith(" ")) {
+          lines.push({ kind: "same", text, line: newLine++ });
+          oldLine++;
+        }
+      }
     }
-    const verb = (busy ? kind.doing : kind.did).toLowerCase();
-    const summary = tools.length === 1 ? toolSummary(calls[0]!.input, 100) : "";
-    parts.push(summary !== "" ? `${verb} ${kind.label ?? ""}${summary}` : `${verb} ${calls.length} ${calls.length === 1 ? kind.one : kind.many}`);
+  } else {
+    const input = (tool.input ?? {}) as Record<string, unknown>;
+    const edits = tool.name === "MultiEdit" && Array.isArray(input.edits) ? (input.edits as Array<Record<string, unknown>>) : [input];
+    for (const edit of edits) {
+      const old = edit.old_string;
+      const next = edit.new_string ?? edit.content ?? edit.new_source;
+      for (const text of textLines(old)) lines.push({ kind: "del", text });
+      for (const text of textLines(next)) lines.push({ kind: "add", text });
+    }
   }
-  if (events > 0) parts.push(`${events} event${events === 1 ? "" : "s"}`);
-  const text = parts.join(", ");
-  return { text: (text.charAt(0).toUpperCase() + text.slice(1)) + (running ? "…" : ""), running, failed };
+  return {
+    lines,
+    added: lines.filter((l) => l.kind === "add").length,
+    removed: lines.filter((l) => l.kind === "del").length,
+  };
+}
+
+/** A text's lines, a final newline not counted as one more empty line. */
+function textLines(text: unknown): string[] {
+  if (typeof text !== "string" || text === "") return [];
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
+}
+
+/** The exit code a failed command reported, from the start of its result. */
+export function exitCode(tool: ToolItem): number | undefined {
+  if (tool.result?.isError !== true) return undefined;
+  const match = /^(?:Error: )?Exit code (\d+)/.exec(tool.result.text);
+  return match === null ? undefined : Number(match[1]);
 }
 
 /**

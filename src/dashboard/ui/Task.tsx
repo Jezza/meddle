@@ -1,9 +1,9 @@
 // One task: its head (title, state, actions), the thread from the session's event log with what waits on you inline,
-// the composer, and the bar beneath (project, node, bookmark, the latest turn's tokens, mode, effort, model).
-import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
+// the composer, and the bar beneath (project, node, bookmark, the latest turn's tokens, model and effort).
 import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { createContext } from "preact";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
@@ -11,16 +11,17 @@ import { type Anchor, ModelPicker, MoveMenu, PaneHead, type PoolRef, RenameInput
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { usageShort } from "./sidebar-model";
-import { activity, activityLine, buildThread, duration, foldSteps, stepsLine, toolSummary, type ShownItem, type Step, type ThreadItem } from "./thread-model";
+import {
+  activity, activityLine, buildThread, cwdOf, type DiffLine, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps, isLook,
+  keyOf, type ShownItem, toolSummary, toolTarget, type ToolItem,
+} from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
 type TaskRef = Ref<typeof TaskObject>;
 type SessionRef = Ref<typeof SessionObject>;
 type Pending = TaskRef["pending"]["value"][number];
 type LogEvent = SessionRef["window"]["value"][number];
-type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
 
-const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"];
 const EARLIER_PAGE = 200;
 const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
 
@@ -81,15 +82,17 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const archived = state === "archived";
   const moving = state === "moving" || move !== null;
   const live = state === "running" || state === "waiting";
+  /** Shows every event in the thread, the ones it otherwise leaves out included. */
+  const [raw, setRaw] = useState(false);
   return (
     <div class="task">
       <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving}
-        partly={acceptance === "partly" && !archived && state !== "moved"} />
+        partly={acceptance === "partly" && !archived && state !== "moved"} raw={raw} onRaw={() => setRaw(!raw)} />
       {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
       {state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
       ) : (
-        <Thread session={session} readOnly={archived} working={state === "running"} after={<>
+        <Thread session={session} readOnly={archived} working={state === "running"} raw={raw} after={<>
           {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
           {queued.map((text, i) => <Queued key={i} text={text} />)}
         </>} />
@@ -102,10 +105,11 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
 
 // ─── the head ───
 
-function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly }: {
+function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, raw, onRaw }: {
   task: TaskRef; nodes: PoolRef["nodes"]["value"]; nodeId: string; title: string; state: string; pendingCount: number; moving: boolean;
   /** A pushed branch contains the task's line for some of its projects, not all: nothing is archived yet. */
   partly: boolean;
+  raw: boolean; onRaw: () => void;
 }) {
   const [renaming, setRenaming] = useState(false);
   const [restoreAt, setRestoreAt] = useState<Anchor | null>(null);
@@ -137,6 +141,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
       </div>
       <div class="head-actions">
         {action.error !== null && <span class="error" title={action.error}>{action.error}</span>}
+        <button class={raw ? "on" : ""} aria-pressed={raw} title="Show every event, bookkeeping included" onClick={onRaw}>Raw</button>
         {live && <button disabled={moving || action.busy} onClick={() => action.run(() => task.interrupt({}))}>■ Interrupt</button>}
         {/* Retry runs a parked turn (one that crashed the node too often) again, or carries on an idle task's last turn (interrupted or failed). */}
         {(live ? pendingCount === 0 : state === "idle") && !moving && (
@@ -199,7 +204,7 @@ function MoveBanner({ task, move, to }: { task: TaskRef; move: { to: string; pha
 
 type Block = { who: "user" | "claude" | "status"; items: ShownItem[] };
 
-/** The shown items in blocks: each user message alone, Claude's run of items under one avatar, status lines apart. */
+/** The shown items in blocks: each user message alone, Claude's run of items together, status lines apart. */
 function blocksOf(items: readonly ShownItem[]): Block[] {
   const out: Block[] = [];
   for (const item of items) {
@@ -211,7 +216,9 @@ function blocksOf(items: readonly ShownItem[]): Block[] {
   return out;
 }
 
-function Thread({ session, readOnly, working, after }: { session: SessionRef; readOnly: boolean; working: boolean; after: preact.ComponentChildren }) {
+function Thread({ session, readOnly, working, raw, after }: {
+  session: SessionRef; readOnly: boolean; working: boolean; raw: boolean; after: preact.ComponentChildren;
+}) {
   const window = useValue(session.window);
   const live = useValue(session.live);
   /** Every event seen since the view opened: the window slides past events, and "load earlier" adds older ones. */
@@ -222,7 +229,8 @@ function Thread({ session, readOnly, working, after }: { session: SessionRef; re
 
   const events = useMemo(() => [...merged(seen, window).values()].sort((a, b) => a.seq - b.seq), [seen, window]);
   const items = useMemo(() => buildThread(events), [events]);
-  const blocks = useMemo(() => blocksOf(foldSteps(items)), [items]);
+  const blocks = useMemo(() => blocksOf(foldSteps(items, raw)), [items, raw]);
+  const view = useMemo(() => ({ cwd: cwdOf(events), raw }), [events, raw]);
   const oldest = events[0]?.seq;
 
   // Kept at the bottom while you are there; left alone while you read further up.
@@ -248,6 +256,7 @@ function Thread({ session, readOnly, working, after }: { session: SessionRef; re
   /** Changes whenever anything streams or lands, so the activity line can tell a quiet turn from a busy one. */
   const pulse = `${events.at(-1)?.seq ?? 0}:${live?.text.length ?? -1}:${live?.thinking.length ?? -1}:${live?.block ?? ""}`;
   return (
+    <ThreadView.Provider value={view}>
     <div class="thread-scroll" ref={scroller}
       onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
       <div class="thread">
@@ -257,7 +266,7 @@ function Thread({ session, readOnly, working, after }: { session: SessionRef; re
         {action.error !== null && <p class="error">{action.error}</p>}
         {blocks.length === 0 && !tail && <p class="muted empty">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
         {blocks.map((b, i) => (
-          <BlockView key={i} block={b}>
+          <BlockView key={b.items.map(keyOf).find((k) => k !== undefined) ?? i} block={b}>
             {i === blocks.length - 1 && lastClaude && tail && <Live live={live} doing={doing} pulse={pulse} />}
           </BlockView>
         ))}
@@ -265,6 +274,7 @@ function Thread({ session, readOnly, working, after }: { session: SessionRef; re
         {after}
       </div>
     </div>
+    </ThreadView.Provider>
   );
 }
 
@@ -275,19 +285,17 @@ function merged(into: Map<number, LogEvent>, events: readonly LogEvent[]): Map<n
   return next;
 }
 
+/** A block: your message in a card, Claude's items, status lines on their own. */
 function BlockView({ block, children }: { block: Block; children?: preact.ComponentChildren }) {
-  if (block.who === "status") {
-    return <div class="status-block">{block.items.map((item, i) => <ShownView key={i} item={item} />)}{children}</div>;
-  }
-  return (
-    <div class={`msg ${block.who}`}>
-      <div class={`avatar ${block.who}`} title={block.who === "user" ? "you" : "Claude"}>{block.who === "user" ? "" : "✻"}</div>
-      <div class="msg-body">
-        {block.items.map((item, i) => <ShownView key={i} item={item} />)}
-        {children}
-      </div>
-    </div>
-  );
+  const items = <Items items={block.items} />;
+  if (block.who === "status") return <div class="status-block">{items}{children}</div>;
+  if (block.who === "user") return <div class="msg you">{items}</div>;
+  return <div class="msg claude">{items}{children}</div>;
+}
+
+/** Items keyed by their call where they have one, so a row you opened stays open as earlier items load or Raw toggles. */
+function Items({ items }: { items: readonly ShownItem[] }) {
+  return <>{items.map((item, i) => <ShownView key={keyOf(item) ?? i} item={item} />)}</>;
 }
 
 /**
@@ -338,17 +346,27 @@ function Markdown({ text }: { text: string }) {
   return <div class="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+/** What every row in the thread reads: the session's working directory (paths show relative to it) and the Raw toggle. */
+const ThreadView = createContext({ cwd: "", raw: false });
+
 function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
     case "user":
       return <div class="user-text">{item.text}</div>;
     case "assistant":
+      // Thinking alongside text is not shown; thinking on its own is, closed.
+      return item.text !== "" ? <Markdown text={item.text} /> : <Thinking text={item.thinking ?? ""} />;
+    case "explored":
+      return <ExploredRow steps={item.steps} />;
+    case "tool":
+      return <ToolRow tool={item} />;
+    case "unknown":
       return (
-        // Finished thinking is not shown in the thread; a run of steps keeps what thinking stood alone.
-        item.text !== "" && <Markdown text={item.text} />
+        <details class="step">
+          <summary><Chevron /><Icon name="raw" /><span class="verb">Event</span><span class="target">{item.type}</span></summary>
+          <div class="step-body"><pre class="out">{json(item.raw)}</pre></div>
+        </details>
       );
-    case "steps":
-      return <Steps steps={item.steps} />;
     case "question":
       return (
         <div class="asked">
@@ -365,71 +383,130 @@ function ShownView({ item }: { item: ShownItem }) {
         </div>
       );
     case "status":
-      return <div class={`status${/^(Turn failed|Turn aborted|Turn ended|Token |No usable token|Rate limit rejected)/.test(item.text) ? " bad" : ""}`}>{item.text}</div>;
+      if (/^Turn (finished|ended)/.test(item.text)) return <div class={`turn-end${item.text.startsWith("Turn ended") ? " bad" : ""}`}><i />{item.text}<i /></div>;
+      return <div class={`status${/^(Turn failed|Turn aborted|Token |No usable token|Rate limit rejected)/.test(item.text) ? " bad" : ""}`}>{item.text}</div>;
   }
 }
 
+/** Thinking as a row: its first line, closed; open, the whole of it. */
 function Thinking({ text }: { text: string }) {
-  return <details class="thinking"><summary>thinking</summary><div class="thinking-text">{text}</div></details>;
-}
-
-function StepView({ step }: { step: Step }) {
-  switch (step.kind) {
-    case "tool":
-      return <Tool tool={step} />;
-    case "assistant":
-      return <Thinking text={step.thinking ?? ""} />;
-    case "unknown":
-      return <details class="unknown muted"><summary>{step.type}</summary><pre>{json(step.raw)}</pre></details>;
-  }
-}
-
-/**
- * What Claude did between its prose, as one row from its first call on: a state dot and a line saying what the calls
- * did (`stepsLine`), closed until you open it. Calls coming in and finishing only change that line, so the thread
- * does not shift; a run of only thinking shows nothing.
- */
-function Steps({ steps }: { steps: Step[] }) {
-  const line = stepsLine(steps);
-  if (line.text === "") return null;
   return (
-    <details class="tools">
-      <summary>
-        <Dot state={line.running ? "running" : line.failed > 0 ? "error" : "ok"} />
-        {line.text}
-        {line.failed > 0 && <span class="error"> · {line.failed} failed</span>}
-      </summary>
-      <div class="tool-list">{steps.map((s, i) => <StepView key={s.kind === "tool" ? s.toolUseId : i} step={s} />)}</div>
+    <details class="step">
+      <summary><Chevron /><Icon name="thought" /><span class="verb">Thinking</span><span class="target plain muted">{text.split("\n")[0]}</span></summary>
+      <div class="step-body"><div class="thinking-text">{text}</div></div>
     </details>
   );
 }
 
-/** A call's state: blinking while it runs, then green, or red when it failed. */
-function Dot({ state }: { state: "running" | "ok" | "error" }) {
-  const label = state === "running" ? "running" : state === "ok" ? "done" : "failed";
-  return <span class={`dot ${state}`} role="img" aria-label={label} title={label} />;
+const ICONS = {
+  search: <><circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5 14 14" /></>,
+  edit: <path d="M10.5 2.5l3 3L6 13H3v-3z" />,
+  write: <><path d="M4 1.5h5l3 3v10H4z" /><path d="M8 7.5v4.5M5.75 9.75h4.5" /></>,
+  bash: <><path d="M2.5 4l4 4-4 4" /><path d="M8 12.5h5.5" /></>,
+  agent: <><circle cx="4" cy="3.5" r="1.5" /><circle cx="4" cy="12.5" r="1.5" /><circle cx="12" cy="6" r="1.5" /><path d="M4 5v6M12 7.5c0 2.5-3 3-6.5 4" /></>,
+  tool: <><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M5.5 8h5" /></>,
+  raw: <path d="M5 3.5 1.5 8 5 12.5M11 3.5 14.5 8 11 12.5" />,
+  thought: <path d="M3 3.5h10v7H7l-3 2.5v-2.5H3z" />,
+  failed: <><circle cx="8" cy="8" r="6" /><path d="M6 6l4 4M10 6l-4 4" /></>,
+  running: <path d="M8 2a6 6 0 1 1-6 6" />,
+} as const;
+
+function Icon({ name }: { name: keyof typeof ICONS }) {
+  return (
+    <svg class={name === "running" ? "ic spin" : "ic"} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
+      stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{ICONS[name]}</svg>
+  );
 }
 
-function Tool({ tool }: { tool: ToolItem }) {
-  const shown = useMemo(() => foldSteps(tool.children), [tool.children]);
-  const input = tool.input as { command?: unknown; description?: unknown } | null;
+function Chevron() {
+  return <svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>;
+}
+
+/** A row's state, for screen readers: its icon says it only by shape. */
+function StateText({ running, failed }: { running: boolean; failed: boolean }) {
+  return running ? <span class="sr">running</span> : failed ? <span class="sr">failed</span> : null;
+}
+
+/** Calls that only look, folded: what they looked at in one row, each call inside; open by itself once one fails. */
+function ExploredRow({ steps }: { steps: Explored["steps"] }) {
+  const line = exploredLine(steps);
   return (
-    <details class="tool">
+    <details class={`step${line.failed > 0 ? " bad" : line.running ? " live" : ""}`} open={line.failed > 0}>
       <summary>
-        <Dot state={tool.result === undefined ? "running" : tool.result.isError ? "error" : "ok"} />
-        <b>{tool.name}</b> <span class="muted">{toolSummary(tool.input)}</span>
+        <Chevron /><Icon name={line.running ? "running" : "search"} />
+        <span class="verb">{line.running ? "Exploring" : "Explored"}</span>
+        <span class="target plain">{line.text}</span>
+        {line.failed > 0 && <span class="meta">{line.failed} failed</span>}
       </summary>
-      {typeof input?.command === "string"
-        ? <>{typeof input.description === "string" && <p class="tool-note muted">{input.description}</p>}<pre>{input.command}</pre></>
-        : <pre>{json(tool.input)}</pre>}
-      {shown.length > 0 && (
-        <div class="children">
-          {tool.agentId !== undefined && <p class="muted">agent {tool.agentId}</p>}
-          {shown.map((child, i) => <ShownView key={i} item={child} />)}
-        </div>
-      )}
-      {tool.result !== undefined && <pre class={tool.result.isError ? "result error" : "result"}>{tool.result.text}</pre>}
+      <div class="sub">
+        {steps.map((s, i) => s.kind === "tool" ? <ToolRow key={s.toolUseId || i} tool={s} /> : <Thinking key={i} text={s.thinking ?? ""} />)}
+      </div>
     </details>
+  );
+}
+
+/**
+ * One call as a row: its icon (a spinner while it runs, a cross once it fails), its name, what it acted on, and what
+ * came of it; open, its diff, output or subagent. A failed call opens by itself.
+ */
+function ToolRow({ tool }: { tool: ToolItem }) {
+  const { cwd, raw } = useContext(ThreadView);
+  const running = tool.result === undefined;
+  const failed = tool.result?.isError === true;
+  const input = (tool.input ?? {}) as Record<string, unknown>;
+  const edit = EDITS.includes(tool.name);
+  const agent = tool.name === "Agent" || tool.name === "Task";
+  const diff = useMemo(() => edit ? editDiff(tool) : null, [edit, tool.input, tool.result]);
+  const children = useMemo(() => foldSteps(tool.children, raw), [tool.children, raw]);
+
+  const kind = edit ? (tool.name === "Write" ? "write" : "edit") : tool.name === "Bash" ? "bash" : agent ? "agent" : isLook(tool) ? "search" : "tool";
+  const target = toolTarget(tool, cwd);
+  const code = exitCode(tool);
+  const command = typeof input.command === "string" ? input.command : undefined;
+  const result = tool.result;
+  // Counts only for a change that landed: a running edit's input overstates it, a failed one's never applied.
+  const landed = diff !== null && result !== undefined && !failed;
+  return (
+    <details class={`step${failed ? " bad" : running ? " live" : ""}`} open={failed}>
+      <summary title={typeof input.file_path === "string" ? input.file_path : command}>
+        <Chevron /><Icon name={running ? "running" : failed ? "failed" : kind} /><StateText running={running} failed={failed} />
+        <span class="verb">{tool.name}</span>
+        <span class={agent ? "target plain" : "target"}>{target}</span>
+        {landed && (diff.added > 0 || diff.removed > 0) && (
+          <span class="meta"><span class="add">+{diff.added}</span> <span class="del">−{diff.removed}</span></span>
+        )}
+        {code !== undefined && <span class="meta">exit {code}</span>}
+      </summary>
+      <div class="step-body">
+        {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
+        {diff !== null && diff.lines.length > 0 && <DiffView lines={diff.lines} />}
+        {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
+        {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}
+        {(children.length > 0 || tool.agentId !== undefined) && (
+          <div class="sub">
+            {tool.agentId !== undefined && <p class="muted tool-note">agent {tool.agentId}</p>}
+            <Items items={children} />
+          </div>
+        )}
+        {result !== undefined && result.text !== "" && !(edit && !failed) && <pre class={failed ? "out error" : "out"}>{result.text}</pre>}
+      </div>
+    </details>
+  );
+}
+
+function DiffView({ lines }: { lines: DiffLine[] }) {
+  return (
+    <div class="diff">
+      {lines.map((l, i) => l.kind === "hunk"
+        ? <div key={i} class="dl hunk">{l.text}</div>
+        : (
+          <div key={i} class={`dl ${l.kind}`}>
+            <span class="n">{l.line ?? ""}</span>
+            <span class="s">{l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}</span>
+            {l.text}
+          </div>
+        ))}
+    </div>
   );
 }
 
@@ -552,12 +629,9 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 /** A text the task was sent and has not started on: it joins the thread where Claude takes it. */
 function Queued({ text }: { text: string }) {
   return (
-    <div class="msg user queued" title="Claude takes it at its next step, or once it is done with the current one">
-      <div class="avatar user" />
-      <div class="msg-body">
-        <div class="user-text">{text}</div>
-        <span class="chip">queued</span>
-      </div>
+    <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one">
+      <div class="user-text">{text}</div>
+      <span class="chip">queued</span>
     </div>
   );
 }
@@ -638,11 +712,10 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
   );
 }
 
-/** The task's permission mode, then its model and effort (the pool's defaults where it chose none). */
+/** The task's model and effort (the pool's defaults where it chose none). */
 function Settings({ task, node, pool, disabled }: { task: TaskRef; node: NodeRef; pool: PoolRef; disabled: boolean }) {
   const models = useValue(node.models);
   const defaults = useValue(pool.defaults);
-  const permissionMode = useValue(task.permissionMode);
   const model = useValue(task.model);
   const effort = useValue(task.effort);
   const action = useAction();
@@ -652,13 +725,6 @@ function Settings({ task, node, pool, disabled }: { task: TaskRef; node: NodeRef
   return (
     <>
       {action.error !== null && <span class="error" title={action.error}>!</span>}
-      <select class="pill" title="Permission mode" disabled={disabled} value={permissionMode ?? ""} onChange={(e) => {
-        const mode = e.currentTarget.value as PermissionMode;
-        void action.run(() => task.setPermissionMode({ mode }));
-      }}>
-        {permissionMode === null && <option value="">mode</option>}
-        {PERMISSION_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
-      </select>
       <ModelPicker models={models} model={pickedModel ?? model ?? defaults.model} effort={pickedEffort ?? effort ?? defaults.effort}
         disabled={disabled}
         onModel={(next) => {
