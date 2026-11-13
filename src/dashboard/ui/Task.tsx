@@ -23,6 +23,8 @@ type Pending = TaskRef["pending"]["value"][number];
 type LogEvent = SessionRef["window"]["value"][number];
 
 const EARLIER_PAGE = 200;
+/** Lines added and removed, at most, for a change's row to open by itself and show its diff. */
+const SMALL_DIFF = 12;
 const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
 
 // Links in the model's text open in a new tab, never in place of the dashboard.
@@ -407,14 +409,17 @@ const ICONS = {
   tool: <><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M5.5 8h5" /></>,
   raw: <path d="M5 3.5 1.5 8 5 12.5M11 3.5 14.5 8 11 12.5" />,
   thought: <path d="M3 3.5h10v7H7l-3 2.5v-2.5H3z" />,
-  failed: <><circle cx="8" cy="8" r="6" /><path d="M6 6l4 4M10 6l-4 4" /></>,
+  failed: <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />,
   running: <path d="M8 2a6 6 0 1 1-6 6" />,
 } as const;
 
+/** A call's icon in its small square, tinted by `name` (index.html's `.chip`). */
 function Icon({ name }: { name: keyof typeof ICONS }) {
   return (
-    <svg class={name === "running" ? "ic spin" : "ic"} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"
-      stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{ICONS[name]}</svg>
+    <span class={`chip ${name}`}>
+      <svg class={name === "running" ? "ic spin" : "ic"} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
+        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{ICONS[name]}</svg>
+    </span>
   );
 }
 
@@ -447,7 +452,8 @@ function ExploredRow({ steps }: { steps: Explored["steps"] }) {
 
 /**
  * One call as a row: its icon (a spinner while it runs, a cross once it fails), its name, what it acted on, and what
- * came of it; open, its diff, output or subagent. A failed call opens by itself.
+ * came of it; open, its diff, output or subagent. A failed call opens by itself, and so does a landed change of at
+ * most `SMALL_DIFF` lines.
  */
 function ToolRow({ tool }: { tool: ToolItem }) {
   const { cwd, raw } = useContext(ThreadView);
@@ -466,8 +472,9 @@ function ToolRow({ tool }: { tool: ToolItem }) {
   const result = tool.result;
   // Counts only for a change that landed: a running edit's input overstates it, a failed one's never applied.
   const landed = diff !== null && result !== undefined && !failed;
+  const model = agent && typeof input.model === "string" ? input.model : undefined;
   return (
-    <details class={`step${failed ? " bad" : running ? " live" : ""}`} open={failed}>
+    <details class={`step${failed ? " bad" : running ? " live" : ""}`} open={failed || (landed && diff.added + diff.removed <= SMALL_DIFF)}>
       <summary title={typeof input.file_path === "string" ? input.file_path : command}>
         <Chevron /><Icon name={running ? "running" : failed ? "failed" : kind} /><StateText running={running} failed={failed} />
         <span class="verb">{tool.name}</span>
@@ -476,6 +483,7 @@ function ToolRow({ tool }: { tool: ToolItem }) {
           <span class="meta"><span class="add">+{diff.added}</span> <span class="del">−{diff.removed}</span></span>
         )}
         {code !== undefined && <span class="meta">exit {code}</span>}
+        {model !== undefined && <span class="meta">{model}</span>}
       </summary>
       <div class="step-body">
         {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
