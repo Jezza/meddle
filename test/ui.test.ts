@@ -4,6 +4,9 @@ import { branchLines, headText, mergeProjects, moveTargets, projectChoices } fro
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
+import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
+import { nodeDot } from "../src/dashboard/ui/common";
+import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 
 test("the dashboard bundle builds", async () => {
   const build = await Bun.build({ entrypoints: ["src/dashboard/ui/main.tsx"], target: "browser", format: "esm" });
@@ -189,4 +192,70 @@ test("renderMarkdown highlights code blocks and shows raw HTML as text", () => {
   expect(html).not.toContain("<script>");
   expect(html).toContain("&lt;script&gt;");
   expect(highlight("<b>", "nope")).toBe("&lt;b&gt;");
+});
+
+/** A rollout of build `n3w` to a and b, started at 10:00 with 30m to confirm and 2m for each node's health. */
+function rollout(over: Partial<RolloutSummary> = {}, participants: Array<Partial<RolloutSummary["participants"][number]>> = [{}, {}]): RolloutSummary {
+  return {
+    id: "r1", build: "n3w", mode: "queued", startedBy: "a", startedAt: "2026-11-13T10:00:00.000Z", deadline: "2026-11-13T10:30:00.000Z",
+    healthMs: 120_000, platforms: ["linux-x64"], outcome: null, waiting: [],
+    participants: participants.map((p, i) => ({
+      node: i === 0 ? "a" : "b", state: "idle", step: null, reason: null, drained: false, waitingOn: [], online: true, at: null, ...p,
+    })),
+    ...over,
+  };
+}
+
+test("the blind covers the dashboard once a rollout swaps, and while this node awaits confirmation; the bar shows it before", () => {
+  const before = { awaitingConfirmation: false, rollout: rollout({}, [{ state: "draining", drained: true }, { state: "draining", waitingOn: ["0012"] }]) };
+  expect(blinded(before)).toBe(false);
+  expect(draining(before)?.id).toBe("r1");
+  const swapping = { awaitingConfirmation: false, rollout: rollout({}, [{ state: "swapped" }, { state: "draining", drained: true }]) };
+  expect(blinded(swapping)).toBe(true);
+  expect(draining(swapping)).toBeNull();
+  // This node's own wait counts, rollout or not.
+  expect(blinded({ awaitingConfirmation: true, rollout: null })).toBe(true);
+  // Once it is over, neither.
+  const done = { awaitingConfirmation: false, rollout: rollout({ outcome: { status: "confirmed", at: "2026-11-13T10:05:00.000Z" } }, [{ state: "healthy" }, { state: "healthy" }]) };
+  expect(blinded(done)).toBe(false);
+  expect(draining(done)).toBeNull();
+});
+
+test("a rollout's participants: one word for where each is, what else is known, and its health deadline once swapped", () => {
+  const r = rollout({}, [
+    { state: "swapped", at: "2026-11-13T10:10:00.000Z" },
+    { state: "draining", waitingOn: ["0012", "0013"], online: false },
+  ]);
+  expect(participantLines(r)).toEqual([
+    { node: "a", state: "swapped", detail: null, healthBy: "2026-11-13T10:12:00.000Z", failed: false },
+    { node: "b", state: "draining", detail: "2 turns, offline", healthBy: null, failed: false },
+  ]);
+  expect(participantLines(rollout({ mode: "forced" }, [{ state: "draining", waitingOn: ["0012"] }, { state: "idle", step: "preflight" }]))
+    .map((p) => [p.state, p.detail])).toEqual([["drained", null], ["preflight", null]]);
+  expect(participantLines(rollout({}, [{ state: "failed", reason: "serve failed: no database" }, { online: false }]))
+    .map((p) => [p.state, p.detail, p.failed])).toEqual([["failed", "serve failed: no database", true], ["idle", "offline", false]]);
+  const w = rollout({ waiting: [{ node: "b", state: "draining", step: null, turns: ["0012"] }, { node: "a", state: "idle", step: "fetching", turns: [] }] });
+  expect(waits(w)).toEqual([{ node: "b", turns: ["0012"], step: "draining" }, { node: "a", turns: [], step: "fetching" }]);
+  expect(timeLeft("2026-11-13T10:30:00.000Z", Date.parse("2026-11-13T10:18:00.000Z"))).toBe("12m");
+  expect(timeLeft("2026-11-13T10:30:00.000Z", Date.parse("2026-11-13T10:31:00.000Z"))).toBe("0s");
+});
+
+test("the last failure names its build, node and reason; a node behind the pool's build gets the red dot, with why", () => {
+  const name = (id: string) => (id === "b" ? "pi" : id);
+  expect(failureText({ lastFailure: null }, name)).toBeNull();
+  expect(failureText({ lastFailure: { rollout: "r1", build: "n3w", node: "b", reason: "not healthy within 2m", at: "x" } }, name))
+    .toEqual({ rollout: "r1", text: "Update to n3w failed on pi: not healthy within 2m" });
+  const node = (over: Partial<NodeBuildView>): NodeBuildView => ({
+    node: "b", build: "0ld", platform: "linux-arm64", state: "idle", reason: null, step: null, late: false, blocked: null, mismatched: true, binary: null, at: "x", ...over,
+  });
+  expect(buildAlert(undefined, "n3w")).toBeNull();
+  expect(buildAlert(node({ mismatched: false }), "n3w")).toBeNull();
+  expect(buildAlert(node({ state: "failed", reason: "preflight failed: exited 1", late: true }), "n3w")).toBe("Update failed: preflight failed: exited 1");
+  expect(buildAlert(node({ blocked: "its service unit has no update guard" }), "n3w"))
+    .toBe("On build 0ld, not the pool's n3w; cannot be updated: its service unit has no update guard");
+  expect(buildAlert(node({ state: "draining", late: true }), "n3w")).toBe("On build 0ld, not the pool's n3w; catching up (draining)");
+  expect(buildAlert(node({ build: "n3w", mismatched: false, binary: "binary on disk changed since start" }), "n3w")).toBe("Binary on disk changed since start");
+  expect([...buildAlerts({ poolBuild: "n3w", nodes: [node({}), node({ node: "a", build: "n3w", mismatched: false })] }).keys()]).toEqual(["b"]);
+  expect(nodeDot({ online: true, running: 2 }, "Update failed: x")).toBe("dot bad");
+  expect(nodeDot({ online: true, running: 2 })).toBe("dot busy");
 });

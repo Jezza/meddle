@@ -44,6 +44,18 @@ import { embedded } from "./embedded";
 import { helpRequest, usageFor } from "./help";
 import { highlightId, palette, table, wantsColour } from "./ansi";
 import { claudeCodeVersion, VERSION } from "./version";
+import { buildInfo, readBinary, CHECKOUT_BUILD, type BuildInfo } from "./update/build";
+import { acceptRolloutStreams } from "./update/channel";
+import {
+  performSwap, readPending, readState, runGuard, settleSwap, updateFiles, watchHealth, type SwapPlan, type UpdateFiles,
+} from "./update/files";
+import { parseDuration, formatDuration } from "./update/model";
+import { guardLine, preflightCommand, RESTART_STATUS, runPreflight, updateBlocked } from "./update/node";
+import { serveUpdate } from "./update/object";
+import { statusLines } from "./update/report";
+import { inputHeld, inputRefusal } from "./update/gate";
+import { bootUpdate, holdsAtBoot, Updater, type UpdateSnapshot } from "./update/updater";
+import { UpdateObject } from "./state/contracts";
 
 const USAGE = `usage: meddle --version
        meddle serve
@@ -67,6 +79,7 @@ const USAGE = `usage: meddle --version
        meddle task archive <id> | meddle task delete <id>
        meddle task restore <id> [--node <id|prefix> | --here]
        meddle service install [--dry-run]
+       meddle update [--force] [--within <duration>] [<binary>...]
        meddle git-remote <name> <url>   (git's remote helper for meddle:// remotes)
 
 meddle help [<command>] says what each command does.`;
@@ -95,6 +108,9 @@ type OpenNode = {
   stopApplier?: () => void;
   /** Stops checking whether tasks' work is accepted (`TaskRunner.close`). */
   stopAccepting?: () => void;
+  /** This node's part in pool updates, and the rollout channel's streams. */
+  updater?: Updater;
+  stopRollouts?: () => void;
 };
 
 /**
@@ -103,6 +119,8 @@ type OpenNode = {
  */
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
+  node.stopRollouts?.();
+  await node.updater?.stop();
   clearInterval(node.janitor);
   node.stopApplier?.();
   node.stopAccepting?.();
@@ -126,6 +144,26 @@ async function serve(): Promise<number> {
 
   const cfg = loadConfig();
   await ensureDataDirs(cfg);
+  const build = buildInfo();
+  const files = updateFiles(cfg.dataDir, process.execPath);
+  // A pool update's swap the unit's guard did not settle (it did not run, or another build is running than the one
+  // swapped in): before anything opens. The binary in place changed: systemd starts it.
+  const settled = await settleSwap(files, { running: build.buildId, log: (line) => console.error(line) });
+  if (settled.action === "rollback") console.error(`meddle: update: ${settled.text}`);
+  if (settled.restart) return RESTART_STATUS;
+  const boot = await bootUpdate(files, build);
+  // A new build has until its health deadline, however far it gets: past it unhealthy, it exits for the guard.
+  if (boot.awaiting !== null) {
+    watchHealth(files, boot.awaiting, () => {
+      console.error(`meddle: update: build ${build.buildId} is not healthy by its deadline; exiting for the guard to roll it back`);
+      process.exit(RESTART_STATUS);
+    });
+  }
+  /** What the update holds on this node; until the updater says, everything when it starts on a held build. */
+  const heldAtBoot = holdsAtBoot(boot, build);
+  let hosting: () => string | null = () => (heldAtBoot ? "update in progress" : null);
+  /** What the updater asked for once the node stopped: a swap, or a restart for the guard to roll back. */
+  let after: { swap: SwapPlan } | "restart" | null = null;
   // Before anything runs jj: git finds the helper for meddle:// remotes, and a push meets its hook.
   await writeHelperWrapper(cfg);
   await writePreReceiveHook(cfg);
@@ -139,6 +177,9 @@ async function serve(): Promise<number> {
   const claude = await runnerDeps(cfg);
 
   const node: OpenNode = {};
+  // Nothing is accepted from the database copy until the pool confirms the new build or rolls it back: on a build
+  // awaiting confirmation, from the start, until the updater says otherwise.
+  const inputHold = () => node.updater?.inputHold() ?? (boot.awaiting === null ? null : inputRefusal(boot.awaiting.build));
   try {
     const db = (node.db = openDb(paths(cfg).db));
     // The single token of an older meddle joins the list (last, behind any already there), once.
@@ -151,7 +192,8 @@ async function serve(): Promise<number> {
     const pool = (node.pool = await startPool(cfg, db, {
       version: VERSION,
       claudeCodeVersion: claudeCodeVersion(),
-      hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
+      // A node a pool update holds (unconfirmed, or behind the pool's build) takes no tasks.
+      hostsTasks: async () => (await checkTaskRoot(cfg)).ok && hosting() === null,
       taskCount: () => listLiveTasks(db).length,
       running: () => countRunningTasks(db),
       projects: () => listProjects(db).map((p) => ({ id: p.id, name: p.name, home: p.home, defaultBranch: p.defaultBranch })),
@@ -159,9 +201,23 @@ async function serve(): Promise<number> {
     const gitSocket = (node.gitSocket = new GitSocket(cfg, pool.net));
     await gitSocket.start();
     const logGit = dedupe((line) => console.error(line));
-    node.stopGit = acceptGitStreams(pool.net, { db, cfg, pool, selfId: pool.identity.id, isMember: (id) => pool.store.isMember(id), log: logGit });
-    const harness = (node.harness = await openHarness(cfg, createRegistry()));
+    node.stopGit = acceptGitStreams(pool.net, {
+      db, cfg, pool, selfId: pool.identity.id, isMember: (id) => pool.store.isMember(id), log: logGit, inputHold,
+    });
+    // On a held build nothing the Harness holds reruns until the updater lets it.
+    const harness = (node.harness = await openHarness(cfg, createRegistry(), { hold: heldAtBoot }));
     const runner = new TaskRunner(cfg, db, harness.harness, { ...claude, pool });
+    if (heldAtBoot) runner.setHolds({ turns: "update in progress", work: "update in progress", hosting: "update in progress" });
+    const updater = (node.updater = startUpdater(files, build, boot, pool, runner, {
+      swap: (plan) => { after = { swap: plan }; signalled.resolve(); },
+      restart: () => { after = "restart"; signalled.resolve(); },
+    }));
+    hosting = () => runner.holds().hosting;
+    node.stopRollouts = acceptRolloutStreams(pool.net, {
+      isMember: (id) => pool.store.isMember(id),
+      received: (from, msg) => updater.received(from, msg),
+      binaryFor: (b, platform, sha) => updater.binaryFor(b, platform, sha),
+    });
     node.stopAccepting = () => runner.close();
     node.stopBlobs = acceptBlobStreams(pool.net, runner);
     // Archives of tasks that moved away are kept for seven days (decision 18).
@@ -177,7 +233,13 @@ async function serve(): Promise<number> {
       dataDir: cfg.dataDir,
     }));
     metrics.start();
-    const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool }));
+    const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool, inputHold }));
+    serveUpdate(host, {
+      snapshot: () => updater.snapshot(),
+      startRollout: (req) => updater.startRollout(req),
+      changes: { subscribe: (cb) => updater.onChange(() => cb(null)) },
+      inputHold,
+    });
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();
     // Every project of the pool kept here, its rows applied to its service repo and view as they change.
@@ -190,10 +252,69 @@ async function serve(): Promise<number> {
   }
   console.log(`node ${node.pool!.identity.id}`);
   console.log(`dashboard at ${node.dashboard.url}`);
+  node.updater!.run();
+  node.updater!.serving();
 
   await signalled.promise;
   await shutdown(node);
+  const asked = after as { swap: SwapPlan } | "restart" | null;
+  if (asked === "restart") return RESTART_STATUS;
+  if (asked !== null) {
+    // The node is down, its databases closed: copied as a pair, then the new binary goes into place. A swap that fails
+    // is undone, and recorded as this node's failure, before the restart.
+    const log = (line: string) => console.error(line);
+    await performSwap(files, asked.swap, Date.now, log).catch((err: unknown) => log(`meddle: update: the swap failed: ${(err as Error).message}`));
+    return RESTART_STATUS;
+  }
   return 0;
+}
+
+/** A node as update messages name it: its hostname, else its short id. */
+function nodeName(pool: PoolRuntime, id: string): string {
+  const short = shortId(id);
+  const host = pool.store.row(id)?.hostname ?? "";
+  return host === "" || host === short ? short : host;
+}
+
+/**
+ * This node's `Updater`: the pool's net and roster, the pool's `update.*` settings, the runner's holds and drains, and
+ * the swap and restart, which `serve` performs once the node is down.
+ */
+function startUpdater(
+  files: UpdateFiles, build: BuildInfo, boot: Awaited<ReturnType<typeof bootUpdate>>, pool: PoolRuntime,
+  runner: TaskRunner, end: { swap(plan: SwapPlan): void; restart(): void },
+): Updater {
+  const updater = new Updater({
+    selfId: pool.identity.id,
+    build,
+    files,
+    net: pool.net,
+    isMember: (id) => pool.store.isMember(id),
+    members: () => pool.store.members().map((r) => r.nodeId),
+    name: (id) => nodeName(pool, id),
+    withinMs: () => pool.settings.updateWithinMs(),
+    healthMs: () => pool.settings.updateHealthMs(),
+    blocked: () => updateBlocked(build, files),
+    preflight: (path, b) => runPreflight(path, b),
+    busy: () => runner.busyTasks(),
+    hold: (holds) => {
+      const before = runner.holds();
+      runner.setHolds(holds);
+      // Turns held since the start (an unconfirmed or behind build) resume with the Harness once the hold lifts.
+      if (holds.turns === null && holds.work === null) runner.resumeHarness();
+      if (before.hosting !== holds.hosting) void pool.refresh();
+    },
+    swap: async (plan) => end.swap(plan),
+    restart: async () => end.restart(),
+    log: (line) => console.error(line),
+  }, boot);
+  // Tasks move only between nodes on one build (a checkout's is its own matter, as before updates).
+  runner.setMoveCheck((to) => {
+    const theirs = updater.view().nodes[to]?.build;
+    if (theirs === undefined || theirs === CHECKOUT_BUILD || build.buildId === CHECKOUT_BUILD || theirs === build.buildId) return null;
+    return `${nodeName(pool, to)} runs build ${theirs}, this node ${build.buildId}`;
+  });
+  return updater;
 }
 
 /**
@@ -224,8 +345,9 @@ async function runnerDeps(cfg: NodeConfig, env = process.env): Promise<RunnerDep
 }
 
 /**
- * Version, Claude Code version, data dir, task root, token, task count, node id and pool; reads the database
- * read-only and creates neither it nor the node's key.
+ * Version, Claude Code version, data dir, task root, token, task count, node id and pool, then pool updates: this
+ * node's build, the pool's, every node's build and update state, and the current rollout or its failure
+ * (`statusLines`). Reads the database read-only and creates neither it nor the node's key.
  */
 async function status(): Promise<number> {
   const cfg = loadConfig();
@@ -242,7 +364,17 @@ async function status(): Promise<number> {
   console.log(`tasks ${(await readDb(cfg, (db) => listLiveTasks(db).length)) ?? 0}`);
   console.log(`node ${existsSync(paths(cfg).irohKey) ? (await loadOrCreateIdentity(cfg)).id : "(none yet)"}`);
   console.log((await readDb(cfg, poolLine)) ?? "pool (none yet)");
+  // Pool updates, from the update's files: also while the node is down for its swap.
+  const files = updateFiles(cfg.dataDir, process.execPath);
+  const { self, view } = await readState(files);
+  const roster = (await readDb(cfg, (db) => (hasPool(db) ? new PoolStore(db).roster() : []))) ?? [];
+  for (const line of statusLines(buildInfo(), view, await readPending(files), self, (id) => nodeLabel(roster, id))) console.log(line);
   return 0;
+}
+
+/** The database has a pool table with the pool in it: a node of this meddle has served. */
+function hasPool(db: Database): boolean {
+  return db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pool'").get() !== null && db.query("SELECT 1 FROM pool").get() !== null;
 }
 
 /** `read` over the database opened read-only, or null when there is none yet. */
@@ -272,8 +404,7 @@ async function activeToken(cfg: NodeConfig, db: Database): Promise<string | null
  * first served (no pool table, or no pool in it).
  */
 function poolLine(db: Database): string | null {
-  if (db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pool'").get() === null) return null;
-  if (db.query("SELECT 1 FROM pool").get() === null) return null;
+  if (!hasPool(db)) return null;
   const store = new PoolStore(db);
   const pool = store.pool();
   return pool.poolSecret === "" ? "pool (no secret set)" : `pool ${pool.poolId} (${pool.poolName}) members ${store.members().length}`;
@@ -1121,7 +1252,9 @@ async function renderUnit(): Promise<string> {
   const dirs = (process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin").split(":").filter((d) => !/\/node_modules\/\.bin$|^\/tmp\/bun-node-/.test(d));
   const path = `PATH=${dirs.join(":").replaceAll("%", "%%")}`;
   const quoted = /[\s"\\]/.test(path) ? `"${path.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"` : path;
-  return template.replaceAll("{{exec}}", exec).replaceAll("{{dir}}", dir).replaceAll("{{path}}", quoted);
+  // The guard a pool update relies on to roll back a binary that cannot start (a checkout is never updated).
+  const guard = guardLine(packed !== null ? process.execPath : null);
+  return template.replaceAll("{{guard}}", guard).replaceAll("{{exec}}", exec).replaceAll("{{dir}}", dir).replaceAll("{{path}}", quoted);
 }
 
 /** The command that creates the task root, owned by the current user and their primary group. */
@@ -1161,6 +1294,110 @@ async function serviceInstall(dryRun: boolean): Promise<number> {
   runOrFail(["systemctl", "--user", "enable", "--now", "meddle.service"]);
   console.log(`installed ${join(dir, "meddle.service")}; run once:`);
   console.log(taskRootCommand());
+  return 0;
+}
+
+/** `[--force] [--within <duration>] [<binary>...]`, in any order; null for anything else. */
+function updateArgs(args: string[]): { force: boolean; withinMs: number | undefined; binaries: string[] } | { problem: string } | null {
+  let force = false;
+  let within: string | undefined;
+  const binaries: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--force" && !force) force = true;
+    else if (arg === "--within" && i + 1 < args.length && within === undefined) within = args[++i]!;
+    else if (arg.startsWith("--")) return null;
+    else binaries.push(arg);
+  }
+  if (within === undefined) return { force, withinMs: undefined, binaries };
+  const ms = parseDuration(within);
+  if (ms === null) return { problem: `--within takes a duration such as 90s, 30m or 1h, not ${within}` };
+  return { force, withinMs: ms, binaries };
+}
+
+/** A participant's state in words: `draining (waiting on 0012, 0013)`, `idle (fetching)`, `failed: <reason>`. */
+function participantText(p: NonNullable<UpdateSnapshot["rollout"]>["participants"][number]): string {
+  const extra = p.state === "draining"
+    ? (p.drained ? " (drained)" : p.waitingOn.length > 0 ? ` (waiting on ${p.waitingOn.join(", ")})` : "")
+    : p.step !== null ? ` (${p.step})` : "";
+  const why = p.state === "failed" && p.reason !== null ? `: ${p.reason}` : "";
+  return `${p.state}${extra}${why}${p.online ? "" : ", offline"}`;
+}
+
+/** Prints the current rollout: its build, mode and outcome, each participant's state, and what it waits on. */
+function printRollout(snap: UpdateSnapshot, names: (id: string) => string): void {
+  const r = snap.rollout;
+  console.log(`build ${snap.build.buildId} (${snap.build.platform}) here; the pool runs ${snap.poolBuild ?? "no build rolled out yet"}`);
+  if (r === null) {
+    console.log("no rollout yet");
+    return;
+  }
+  const status = r.outcome === null ? `in progress, until ${r.deadline}` : r.outcome.status === "confirmed" ? `confirmed at ${r.outcome.at}` : `failed at ${r.outcome.at}`;
+  console.log(`rollout of build ${r.build} (${r.mode}, ${r.platforms.join(" and ")}) started by ${names(r.startedBy)} at ${r.startedAt}: ${status}`);
+  for (const p of r.participants) console.log(`  ${names(p.node)}  ${participantText(p)}`);
+  if (r.outcome === null && r.waiting.length > 0) {
+    const turns = r.waiting.flatMap((w) => w.turns.map((t) => `${names(w.node)}'s turn in task ${t}`));
+    console.log(turns.length > 0 ? `waiting on ${turns.join(", ")} (meddle update --force to cut them off)` : `waiting on ${r.waiting.map((w) => names(w.node)).join(", ")}`);
+  }
+  if (r.outcome?.status === "failed") {
+    console.log(`failed${r.outcome.node === null ? "" : ` on ${names(r.outcome.node)}`}: ${r.outcome.reason}`);
+  }
+  for (const n of snap.nodes) {
+    if (n.mismatched) console.log(`${names(n.node)} runs build ${n.build}${n.state === "failed" && n.reason !== null ? `; its update failed: ${n.reason}` : `; it is catching up (${n.state})`}`);
+    if (n.binary !== null) console.log(`${names(n.node)}: ${n.binary}`);
+  }
+}
+
+/**
+ * `meddle update`: with binaries, reads each one's build and platform (and hashes it) without running it, and has the
+ * node roll them out to the pool; with `--force` and no binaries (or the open rollout's), forces the rollout in
+ * progress; with neither, reports the current rollout.
+ */
+async function update(force: boolean, withinMs: number | undefined, paths_: string[]): Promise<number> {
+  const binaries: { path: string; buildId: string; platform: string; sha256: string; size: number }[] = [];
+  for (const path of paths_) binaries.push({ path: resolve(path), ...(await readBinary(path)) });
+  return withNode(async (client) => {
+    const ref = await client.get(UpdateObject, {});
+    const pool = await poolView(client);
+    const names = (id: string) => nodeLabel(pool.nodes.value, id);
+    try {
+      if (binaries.length === 0 && !force) {
+        const snap: UpdateSnapshot = {
+          self: ref.self.value, build: ref.build.value, poolBuild: ref.poolBuild.value, rollout: ref.rollout.value as UpdateSnapshot["rollout"],
+          lastFailure: ref.lastFailure.value, awaitingConfirmation: ref.awaitingConfirmation.value, held: ref.held.value,
+          nodes: [...ref.nodes.value],
+        };
+        printRollout(snap, names);
+        return 0;
+      }
+      const started = await ref.start({ binaries, force, ...(withinMs === undefined ? {} : { withinMs }) });
+      if (started.escalated) console.log(`forced the rollout of build ${started.build}: running turns are cut off`);
+      else {
+        console.log(`rolling out build ${started.build} to ${started.participants.map(names).join(", ")}${force ? " (forced)" : ""}` +
+          (withinMs === undefined ? "" : `, within ${formatDuration(withinMs)}`));
+        console.log("meddle update shows how it goes");
+      }
+      return 0;
+    } finally {
+      pool.release();
+      ref.release();
+    }
+  });
+}
+
+/**
+ * `meddle update-guard`: the unit's `ExecStartPre`, run as the previous binary (when there is one: a swap is not
+ * settled); see `settleSwap`. Never fails the start.
+ */
+async function updateGuard(): Promise<number> {
+  // Run as `<binary>.previous`: the files are named after the binary the unit starts.
+  const exec = process.execPath.endsWith(".previous") ? process.execPath.slice(0, -".previous".length) : process.execPath;
+  const files = updateFiles(loadConfig().dataDir, exec);
+  try {
+    console.error(`meddle: update guard: ${await runGuard(files)}`);
+  } catch (err) {
+    console.error(`meddle: update guard: ${(err as Error).message}`);
+  }
   return 0;
 }
 
@@ -1240,8 +1477,41 @@ function taskNewArgs(
   return { prompt, title, projects, loose: hasLoose ? loose : null, where };
 }
 
-/** The subcommand `args` names, or null for a usage error. */
+/**
+ * Whether `args` is a command that changes nothing a rollback's restore would wipe (it reads, or it is not about the
+ * node's data): `status`, the lists, `update` with nothing to roll out, and what systemd and git run. Every other
+ * command, one added later included, is refused while an update awaits confirmation.
+ */
+function readOnly(args: string[]): boolean {
+  const [command, sub] = args;
+  switch (command) {
+    case "pool": return args.length === 1 || sub === "-v" || sub === "--verbose";
+    case "token": return sub === "list" || sub === "status";
+    case "config": return sub === "list";
+    case "project": return sub === "list" || sub === "status";
+    case "task": return sub === "list";
+    case "update": return args.length === 1;
+    default: return ["--version", "serve", "status", "checkout", "git-remote", "git-pre-receive", "update-guard", "update-preflight", "service"].includes(command ?? "");
+  }
+}
+
+/**
+ * The subcommand `args` names, or null for a usage error. One that is not read-only is refused first, before it does
+ * anything, while the node's update awaits confirmation (or its swap is under way, the node down): a rollback would
+ * wipe what it wrote. The node refuses the same through its objects; this also covers what the CLI writes directly.
+ */
 function dispatch(args: string[]): (() => Promise<number>) | null {
+  const run = route(args);
+  if (run === null || readOnly(args)) return run;
+  return async () => {
+    const held = await inputHeld(updateFiles(loadConfig().dataDir, process.execPath));
+    if (held !== null) throw new Error(held);
+    return run();
+  };
+}
+
+/** The subcommand `args` names, or null for a usage error. */
+function route(args: string[]): (() => Promise<number>) | null {
   const [command, sub, ...rest] = args;
   if (args.length === 1 && command === "--version") return async () => (console.log(`meddle ${VERSION}`), 0);
   if (args.length === 1 && command === "serve") return serve;
@@ -1317,6 +1587,14 @@ function dispatch(args: string[]): (() => Promise<number>) | null {
   if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);
   // git's pre-receive hook, as `writePreReceiveHook` writes it for the compiled binary.
   if (args.length === 1 && command === "git-pre-receive") return () => gitPreReceive();
+  if (command === "update") {
+    const parsed = updateArgs(args.slice(1));
+    if (parsed !== null && "problem" in parsed) return async () => (console.error(`meddle: ${parsed.problem}`), 2);
+    return parsed === null ? null : () => update(parsed.force, parsed.withinMs, parsed.binaries);
+  }
+  // Run by the unit before every start, and by a node on a staged binary; not for people.
+  if (args.length === 1 && command === "update-guard") return updateGuard;
+  if (args.length === 1 && command === "update-preflight") return () => preflightCommand(loadConfig());
   if (command === "service" && sub === "install" && rest.length === 0) return () => serviceInstall(false);
   if (command === "service" && sub === "install" && rest.length === 1 && rest[0] === "--dry-run") return () => serviceInstall(true);
   return null;

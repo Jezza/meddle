@@ -8,11 +8,16 @@ import { mb, nodeDot, PaneHead, type PoolNode, type PoolRef, StateDot, tokenText
 import { hashOf } from "./routes";
 import { nodeLineText, waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
+import { buildAlert, type UpdateView } from "./update-model";
 
 type NodeRef = Ref<typeof NodeObject>;
 
-export function NodePage({ hosts, pool, index, nodeId }: { hosts: Hosts; pool: PoolRef; index: PoolIndex; nodeId: string }) {
+export function NodePage({ hosts, pool, index, nodeId, update }: {
+  hosts: Hosts; pool: PoolRef; index: PoolIndex; nodeId: string; update: UpdateView | null;
+}) {
   const nodes = useValue(pool.nodes);
+  const build = update?.nodes.find((n) => n.node === nodeId);
+  const alert = buildAlert(build, update?.poolBuild ?? null);
   const selfId = useValue(pool.self);
   const row = nodes.find((n) => n.nodeId === nodeId);
   const selfRow = nodes.find((n) => n.nodeId === selfId);
@@ -22,13 +27,20 @@ export function NodePage({ hosts, pool, index, nodeId }: { hosts: Hosts; pool: P
   return (
     <>
       <PaneHead>
-        <span class={nodeDot(row)} />
+        <span class={nodeDot(row, alert)} title={alert ?? undefined} />
         <strong>{row.hostname}</strong>
         <span class="muted id" title={row.nodeId}>{shortId(row.nodeId)}</span>
         <span class="muted">{row.status === "removed" ? "removed from the pool" : nodeLineText(row, null, Date.now())}{nodeId === selfId && " · this node"}</span>
       </PaneHead>
       <div class="page">
         {row.status === "removed" && <p class="muted">Removed from the pool.</p>}
+        {alert !== null && <p class="error">{alert}</p>}
+        {build !== undefined && (
+          <dl>
+            <dt>Build</dt>
+            <dd><code>{build.build}</code> <span class="muted">{build.platform} · {build.step ?? build.state}</span></dd>
+          </dl>
+        )}
         {row.status === "member" && row.online && host === undefined && <Unavailable status={hosts.status(nodeId)} />}
         {host === undefined ? <Summary row={row} selfRow={selfRow} /> : <Live host={host} row={row} selfRow={selfRow} />}
         <h3>Tasks</h3>

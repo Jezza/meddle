@@ -40,6 +40,11 @@ export type GitServeDeps = {
   isMember(id: string): boolean;
   /** Where a refused stream is logged (`meddle: git: …`); the runtime passes a deduplicating sink. */
   log?(line: string): void;
+  /**
+   * Why this node accepts no input now (an update awaits confirmation), or null: a checkout's push meets it as the
+   * hook's refusal (`MEDDLE_REFUSE`), so git shows the reason.
+   */
+  inputHold?(): string | null;
   /** Called before each attempt to record a landed push as rows: a test makes it throw to fail one. */
   beforeRecord?(): void | Promise<void>;
 };
@@ -373,8 +378,9 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
       try {
         const rowsFile = join(dir, "rows.json");
         await writeFile(rowsFile, JSON.stringify({ selfId: deps.selfId, project, rows, stale } satisfies PushRows));
+        const held = deps.inputHold?.() ?? null;
         const done = await pipe(s, spawn(viewCommand(deps.cfg, request.service, gitDir), {
-          MEDDLE_HEADS: JSON.stringify(heads), MEDDLE_ROWS: rowsFile,
+          MEDDLE_HEADS: JSON.stringify(heads), MEDDLE_ROWS: rowsFile, ...(held === null ? {} : { MEDDLE_REFUSE: held }),
         }));
         // What landed is what changed in the view, whatever receive-pack's exit (0 also when the hook declined).
         ({ landed, retry: unrecorded } = await landPush(deps, repo, project, before, rows));

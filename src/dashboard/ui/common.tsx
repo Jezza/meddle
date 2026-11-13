@@ -34,9 +34,12 @@ export function Unavailable({ status }: { status: HostStatus }) {
   return <p class="muted">Connecting…</p>;
 }
 
-/** A node's dot class: green online, green with a halo while it runs tasks, grey offline. */
-export function nodeDot(node: { online: boolean; running: number }): string {
-  return `dot ${!node.online ? "off" : node.running > 0 ? "busy" : "ok"}`;
+/**
+ * A node's dot class: red while it is on a build other than the pool's (`alert` says why), else green online, green
+ * with a halo while it runs tasks, grey offline.
+ */
+export function nodeDot(node: { online: boolean; running: number }, alert: string | null = null): string {
+  return `dot ${alert !== null ? "bad" : !node.online ? "off" : node.running > 0 ? "busy" : "ok"}`;
 }
 
 /** A task's state as a dot: running, waiting on you, idle, moving, archived. */

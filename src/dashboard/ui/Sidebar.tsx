@@ -27,8 +27,11 @@ function store(key: string, on: boolean): void {
   }
 }
 
-export function Sidebar({ pool, index, view, selfId, onHide, onNavigate }: {
-  pool: PoolRef; index: PoolIndex; view: View; selfId: string; onHide(): void; onNavigate(): void;
+export function Sidebar({ pool, index, view, selfId, alerts, onHide, onNavigate }: {
+  pool: PoolRef; index: PoolIndex; view: View; selfId: string;
+  /** Nodes on a build other than the pool's, and why (`buildAlerts`): their dot is red. */
+  alerts: ReadonlyMap<string, string>;
+  onHide(): void; onNavigate(): void;
 }) {
   const nodes = useValue(pool.nodes);
   const mixedVersions = useValue(pool.mixedVersions);
@@ -84,17 +87,21 @@ export function Sidebar({ pool, index, view, selfId, onHide, onNavigate }: {
           <span>Nodes</span>
           {mixedVersions && <span class="flag" title="The pool's members run different meddle or Claude Code versions">⚠ versions differ</span>}
         </div>
-        {ordered.map((n) => <NodeRow key={n.nodeId} row={n} index={index} selected={view.name === "node" && view.nodeId === n.nodeId} self={n.nodeId === selfId} />)}
+        {ordered.map((n) => (
+          <NodeRow key={n.nodeId} row={n} index={index} selected={view.name === "node" && view.nodeId === n.nodeId} self={n.nodeId === selfId}
+            alert={alerts.get(n.nodeId) ?? null} />
+        ))}
       </div>
     </nav>
   );
 }
 
-function NodeRow({ row, index, selected, self }: { row: PoolNode; index: PoolIndex; selected: boolean; self: boolean }) {
+function NodeRow({ row, index, selected, self, alert }: { row: PoolNode; index: PoolIndex; selected: boolean; self: boolean; alert: string | null }) {
   const ref = index.nodes.get(row.nodeId);
   return (
-    <a class={`node-row${selected ? " sel" : ""}`} href={hashOf({ name: "node", nodeId: row.nodeId })} title={`${row.nodeId}${self ? " (this node)" : ""}`}>
-      <span class={nodeDot(row)} />
+    <a class={`node-row${selected ? " sel" : ""}`} href={hashOf({ name: "node", nodeId: row.nodeId })}
+      title={`${row.nodeId}${self ? " (this node)" : ""}${alert === null ? "" : `\n${alert}`}`}>
+      <span class={nodeDot(row, alert)} />
       <span class={row.online ? "" : "muted"}>{row.hostname}</span>
       {ref === undefined ? <span class="meta">{nodeLineText(row, null, Date.now())}</span> : <NodeLoad row={row} node={ref} />}
     </a>

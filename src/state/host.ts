@@ -30,6 +30,7 @@ import { taskNamespace, type Start, type TaskManifest } from "../tasks/manifest"
 import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
+import { gated } from "../update/gate";
 import { VERSION } from "../version";
 import {
   BranchSchema,
@@ -60,6 +61,11 @@ export type NodeHostDeps = {
   claudeCodeVersion: string;
   /** The node's pool: served as `PoolObject`, and its members' chord links are accepted on this host. */
   pool: PoolRuntime;
+  /**
+   * Why this node accepts no input now (its new build awaits confirmation: `Updater.inputHold`), or null. While it
+   * says, every method of `NodeObject`, `TaskObject` and `PoolObject`'s default variant is refused with it.
+   */
+  inputHold?(): string | null;
 };
 
 type TaskEvent = { taskId: string; seq: number; message: SDKMessage | MeddleEvent };
@@ -232,7 +238,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   };
 
   const host = createHost({ name: "node", self: "node" });
-  servePool(host, pool.objectDeps);
+  servePool(host, { ...pool.objectDeps, inputHold: deps.inputHold });
   servePeer(host, {
     cfg,
     db,
@@ -488,7 +494,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   host.serve(NodeObject, (_input, _principal, self) => {
     const store = self.get(NodeStore, {});
-    return {
+    return gated({
       variant: "default",
       nodeId: store.nodeId,
       hostname: store.hostname,
@@ -509,7 +515,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       addProjectFromUpstream: (input, ctx) => store.addProjectFromUpstream(input, ctx),
       setDefaultBranch: (input, ctx) => store.setDefaultBranch(input, ctx),
       dismiss: (input, ctx) => store.dismiss(input, ctx),
-    };
+    }, deps.inputHold);
   });
 
   host.serve(ProjectObject, ({ id }, _principal, self) => {
@@ -645,7 +651,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       approvals.answer(requestId, result(req));
     };
 
-    return {
+    return gated({
       variant: "default",
       manifest,
       state,
@@ -685,7 +691,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       // Here (`"here"`, this node's id), on another node through a move from the archive, or (null) where placement says.
       restore: ({ node }) => runner.restore(id, node),
       delete: () => runner.deleteTask(id),
-    };
+    }, deps.inputHold);
   });
 
   host.serve(SessionObject, ({ taskId }, _principal, self) => {

@@ -2,11 +2,16 @@
 Description=meddle node
 
 [Service]
+# Before every start: rolls back a pool update whose new binary had its chance and failed (run as the previous binary,
+# kept beside the new one until the update is confirmed; nothing to do otherwise).
+{{guard}}
 ExecStart={{exec}}
 WorkingDirectory={{dir}}
 # The PATH of the shell that ran `meddle service install`: tasks run jj and git from it (run it again after changing it).
 Environment={{path}}
-Restart=on-failure
+# Started again whenever it ends but by `systemctl stop`: a pool update swaps the binary and exits to be started again
+# on the new one, and a new binary that exits at once, even cleanly, must start again for the guard to roll it back.
+Restart=always
 RestartSec=2
 # The pool's iroh endpoint binds a UDP socket on iroh's default address; to pin it (for a firewall rule), add
 # Environment=MEDDLE_IROH_BIND=<ip>:<port>

@@ -92,6 +92,14 @@ export type RunnerHooks = {
   callMs?: number;
 };
 
+/**
+ * What a pool update holds on this node (`Updater`), each the reason given to whatever is refused or kept waiting:
+ * `turns`, no turn starts (prompts queue, a parked turn is not retried); `work`, no move, archive or restore starts;
+ * `hosting`, no task is created or received here. `moveTo(id)` says why a task may not move to member `id` (its build
+ * differs from this node's), or null.
+ */
+export type RunnerHolds = { turns: string | null; work: string | null; hosting: string | null };
+
 /** A move of a task in progress here: where to, the step it is at, and the error that is failing it (if any). */
 export type MoveState = { to: string; phase: string; error: string | null };
 
@@ -276,6 +284,10 @@ export class TaskRunner {
    */
   #tips = new Map<string, { version: number; tips: Promise<BranchTips> }>();
   #branchVersions = new Map<string, number>();
+  /** What a pool update holds here (`setHolds`); nothing until it says. */
+  #holds: RunnerHolds = { turns: null, work: null, hosting: null };
+  /** Why a task may not move to a member: a build other than this node's. */
+  #moveProblem: (to: string) => string | null = () => null;
   /** Stops the checks of tasks' acceptance on row changes (`#watchAcceptance`). */
   #stopAcceptance: (() => void) | undefined;
   #closed = false;
@@ -312,6 +324,57 @@ export class TaskRunner {
     this.#watchAcceptance();
   }
 
+  /**
+   * Sets what a pool update holds here. Lifting the hold on turns starts each idle task's queued prompts; lifting the
+   * one on work checks again whether each task's work is accepted (an accepted task is archived then). Turns the
+   * Harness holds (cut off by a restart) resume when the caller resumes the Harness.
+   */
+  setHolds(holds: RunnerHolds): void {
+    const was = this.#holds;
+    this.#holds = { ...holds };
+    if (was.turns !== null && holds.turns === null) {
+      for (const row of listLiveTasks(this.#db)) {
+        this.startQueued(row.id).catch((err: unknown) => {
+          this.#log(`meddle: task ${row.id}'s queued prompt did not start a turn after the update: ${messageOf(err)}`);
+        });
+      }
+    }
+    if (was.work !== null && holds.work === null) for (const row of listLiveTasks(this.#db)) this.#checkAcceptance(row.id);
+  }
+
+  /** Why a task may not move to member `to` (set by the node: builds that differ); null when it may. */
+  setMoveCheck(check: (to: string) => string | null): void {
+    this.#moveProblem = check;
+  }
+
+  /** What is held here now. */
+  holds(): RunnerHolds {
+    return { ...this.#holds };
+  }
+
+  /**
+   * The tasks whose turns or moves are in flight here: live or pending turns, and the Harness's unfinished turns and
+   * moves that can run (not parked; none while its scheduling is paused). What a queued update drains.
+   */
+  async busyTasks(): Promise<string[]> {
+    const busy = new Set<string>([...this.#live.keys(), ...this.#pending]);
+    const { scheduling, tasks } = await this.#harness.inspect(BACKGROUND_CONTEXT);
+    if (scheduling === "running") {
+      for (const t of tasks) {
+        if (t.record.state.status === "terminal" || isParked(t)) continue;
+        const kind = t.record.kind;
+        if (kind !== MeddleTurn.definition.name && kind !== MeddleMove.definition.name) continue;
+        busy.add((t.record.input as { taskId: string }).taskId);
+      }
+    }
+    return [...busy].sort();
+  }
+
+  /** Lets the Harness run its tasks: turns cut off by a restart resume (with `CARRY_ON_PROMPT`), held moves go on. */
+  resumeHarness(): void {
+    this.#harness.resume();
+  }
+
   /** Stops checking whether tasks' work is accepted, and drops the checks scheduled for later. */
   close(): void {
     this.#closed = true;
@@ -332,6 +395,7 @@ export class TaskRunner {
    */
   async create(input: { title: string; taskId: string; starts: Start[] }): Promise<TaskManifest> {
     const { taskId, starts } = input;
+    if (this.#holds.hosting !== null) throw new Error(`this node takes no tasks now: ${this.#holds.hosting}`);
     if (!SAFE_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
     if (getTask(this.#db, taskId) !== null) throw new Error(`task ${taskId} exists here`);
     if ((await pickToken(this.#cfg, this.#db)) === null) throw new Error("no usable token");
@@ -420,7 +484,8 @@ export class TaskRunner {
         return "queued";
       }
       const turn = await this.#durableTurn(taskId);
-      if (turn !== undefined && isParked(turn)) await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+      // Held: a parked turn waits for the hold to lift (retrying it would start it).
+      if (turn !== undefined && isParked(turn) && this.#holds.turns === null) await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
       if (turn !== undefined) return this.#enqueueNext(taskId, text);
       stale = true;
     }
@@ -431,6 +496,11 @@ export class TaskRunner {
     }
     // Reserved before the first await, so a concurrent prompt cannot create a second turn: it waits for the next.
     if (this.#pending.has(taskId)) return this.#enqueueNext(taskId, text);
+    // A pool update holds new turns: the prompt queues, and runs once the hold lifts.
+    if (this.#holds.turns !== null) {
+      if (stale) this.#setState(taskId, "idle");
+      return this.#enqueueNext(taskId, text);
+    }
     this.#pending.add(taskId);
     try {
       if (stale) this.#setState(taskId, "idle");
@@ -458,7 +528,7 @@ export class TaskRunner {
   async startQueued(taskId: string, options: { freshAfter?: number } = {}): Promise<void> {
     const row = getTask(this.#db, taskId);
     if (row === null || row.state !== "idle" || this.#moving.has(taskId) || this.#pending.has(taskId) || this.#live.has(taskId)) return;
-    if (this.#archiving.has(taskId)) return;
+    if (this.#archiving.has(taskId) || this.#holds.turns !== null) return;
     const [head] = queuedOf(row);
     if (head === undefined) return;
     this.#pending.add(taskId);
@@ -654,6 +724,7 @@ export class TaskRunner {
     this.#refuseElsewhere(taskId);
     const turn = await this.#durableTurn(taskId);
     if (turn !== undefined && isParked(turn)) {
+      if (this.#holds.turns !== null) throw new Error(this.#holds.turns);
       await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
       return;
     }
@@ -908,6 +979,7 @@ export class TaskRunner {
     if (version !== ours || ours === "unknown" || version === "unknown") return { ok: false, reason: `claude code ${ours} here, ${version} there` };
     const hosting = await checkTaskRoot(this.#cfg);
     if (!hosting.ok) return { ok: false, reason: `this node does not host tasks: ${hosting.reason}` };
+    if (this.#holds.hosting !== null) return { ok: false, reason: `this node takes no tasks now: ${this.#holds.hosting}` };
     const deps = this.#replicaDeps();
     if (deps === null) return { ok: false, reason: "this node has no pool" };
     try {
@@ -1180,6 +1252,7 @@ export class TaskRunner {
    * the task was archived.
    */
   async #archive(taskId: string, accepted: boolean): Promise<boolean> {
+    if (this.#holds.work !== null) throw new Error(this.#holds.work);
     const deps = this.#replicaDeps();
     if (deps === null) throw new Error("this node has no pool");
     const self = deps.pool.identity.id;
@@ -1268,6 +1341,8 @@ export class TaskRunner {
     const deps = this.#replicaDeps();
     if (deps === null) throw new Error("this node has no pool");
     if (this.#restoring.has(taskId)) throw new Error("task is being restored");
+    if (this.#holds.work !== null) throw new Error(this.#holds.work);
+    if (this.#holds.hosting !== null) throw new Error(`this node takes no tasks now: ${this.#holds.hosting}`);
     // Reserved before the first await: the row says `archived` until the restore is done, and a restore-move of it
     // started meanwhile would take the task away from under it.
     this.#restoring.add(taskId);
@@ -1331,6 +1406,7 @@ export class TaskRunner {
     const row = this.#row(taskId);
     if (this.#restoring.has(taskId)) throw new Error("task is being restored");
     if (this.#moving.has(taskId)) throw new Error("task is moving");
+    if (this.#holds.work !== null) throw new Error(this.#holds.work);
     if (row.state !== "archived") throw new Error(`task is ${row.state}`);
     if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
     let target: string;
@@ -1567,7 +1643,8 @@ export class TaskRunner {
       timer.unref?.();
       this.#acceptRetries.set(taskId, timer);
     }
-    if (verdict !== "accepted") return;
+    // Held by a pool update: checked again once the hold lifts (`setHolds`).
+    if (verdict !== "accepted" || this.#holds.work !== null) return;
     try {
       this.#refuseArchive(now);
     } catch {
@@ -1682,10 +1759,13 @@ export class TaskRunner {
       if (this.#archiving.has(row.id)) throw new Error("task is being archived");
       if (!own && this.#isMoving(row)) throw new Error("task is moving");
     }
+    if (!own && this.#holds.work !== null) throw new Error(this.#holds.work);
     const pool = this.#pool;
     if (pool === undefined) throw new Error("this node has no pool");
     const short = shortId(to);
     if (to === pool.identity.id) throw new Error("the task is already on this node");
+    const builds = this.#moveProblem(to);
+    if (builds !== null) throw new Error(builds);
     if (!pool.store.isMember(to)) throw new Error(`${short} is not a member of this pool`);
     if (!pool.net.isOnline(to)) throw new Error(`${short} is offline`);
     const summary = pool.store.row(to)?.summary ?? null;

@@ -82,6 +82,7 @@
   .dot.ok { background: var(--ok); }
   .dot.busy { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
   .dot.off { background: var(--faint); }
+  .dot.bad { background: var(--bad); }
 
   .boot { padding: 24px; }
   .app { display: grid; grid-template-columns: 290px minmax(0, 1fr); height: 100%; }
@@ -306,6 +307,16 @@
   .seg button.on { background: var(--sel); color: var(--fg); }
   .form .seg { margin: 0; align-self: flex-start; }
   .form .seg button { flex: none; white-space: nowrap; padding: 3px 12px; }
+
+  /* ─── pool updates ─── */
+  .update-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; padding: 6px 16px; background: var(--warn-bg); border-bottom: 1px solid var(--warn-line); font-size: 12.5px; flex: none; }
+  .update-bar code { font-size: 12px; }
+  .update-bar.failed { background: var(--bad-bg); color: var(--bad); flex-wrap: nowrap; }
+  .update-failure { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .update-failure.whole { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow-y: auto; }
+  .blind { position: fixed; inset: 0; z-index: 100; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .blind-box { width: min(520px, 100%); }
+  .blind-box h2 { font-size: 16px; margin: 0 0 4px; }
 
   /* ─── toasts ─── */
   .toasts { position: fixed; top: 48px; right: 14px; z-index: 40; display: flex; flex-direction: column; gap: 8px; width: min(340px, calc(100vw - 28px)); pointer-events: none; }

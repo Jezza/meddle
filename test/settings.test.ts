@@ -335,3 +335,15 @@ test("default model and effort: unset reads opus at medium, a bad effort or empt
   expect(() => settings.set("defaults.effort", "huge")).toThrow("defaults.effort must be one of");
   expect(() => settings.set("defaults.model", "")).toThrow("must not be empty");
 });
+
+test("update.within and update.health take durations, with their defaults when unset or not one", () => {
+  const { settings } = fresh();
+  expect(settings.updateWithinMs()).toBe(30 * 60_000);
+  expect(settings.updateHealthMs()).toBe(2 * 60_000);
+  settings.set("update.within", "1h");
+  settings.set("update.health", "90s");
+  expect(settings.updateWithinMs()).toBe(3_600_000);
+  expect(settings.updateHealthMs()).toBe(90_000);
+  expect(() => settings.set("update.within", "30")).toThrow("update.within must be a duration such as 90s, 30m or 1h");
+  expect(() => settings.set("update.health", "5s")).toThrow("update.health must be at least 30s");
+});

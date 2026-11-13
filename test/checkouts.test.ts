@@ -488,3 +488,31 @@ test("a push whose recording fails once stays in the view, through an applier pa
     await close();
   }
 }, 60_000);
+
+test("a checkout's push while an update awaits confirmation is refused whole, with why, and lands once it is over", async () => {
+  const { nodes, close } = await poolNodes(1, { nodes: [{ serveGit: false }] });
+  const [n] = nodes as [GitPoolNode];
+  let held: string | null = "update in progress (build 1ee71ee71ee7), try again shortly";
+  const stopServing = acceptGitStreams(n.net, {
+    cfg: n.cfg, db: n.db, pool: n.pool, log: (line: string) => n.logs.push(line), selfId: n.id, isMember: (id) => n.store.isMember(id),
+    inputHold: () => held,
+  });
+  try {
+    const P = n.project.id;
+    const co = await makeCheckout(n.cfg, n.id, n.project, `${n.home}/co`, helperEnv(n));
+    const before = listBranchRows(n.db, P);
+    const x = await commitIn(n, co, "main", "x");
+    const refused = await pushMain(n, co, x).catch((err: unknown) => err);
+    expect(refused).toBeInstanceOf(JjError);
+    expect((refused as JjError).stderr).toContain("remote: meddle: update in progress (build 1ee71ee71ee7), try again shortly");
+    expect((refused as JjError).stderr).toContain("refs/heads/main (reason: pre-receive hook declined)");
+    expect(listBranchRows(n.db, P)).toEqual(before);
+
+    held = null;
+    await pushMain(n, co, x);
+    await waitFor("the push's row", () => ownMainRow(n, P)?.commit === x);
+  } finally {
+    stopServing();
+    await close();
+  }
+}, 60_000);

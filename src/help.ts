@@ -33,19 +33,25 @@ const GROUPS: Group[] = [
       {
         name: "status",
         usage: ["status"],
-        summary: "Print this node's versions, data directory, task root, token, task count, id and pool.",
+        summary: "Print this node's versions, data directory, task root, token, task count, id and pool, and pool updates.",
         details:
           "Works with or without the node running, and creates nothing: before the node's first start it prints " +
-          "`node (none yet)` and `pool (none yet)`; before `pool secret` ran, `pool (no secret set)`.",
+          "`node (none yet)` and `pool (none yet)`; before `pool secret` ran, `pool (no secret set)`. Then pool updates: " +
+          "`build <id> (<platform>)` (with a swap in progress here, such as `awaiting confirmation of build <id>`), " +
+          "`pool build <id>` once a rollout was confirmed, a `node <name> build <id> <state>` line for every node this one " +
+          "has heard of, and the current rollout: what it waits on, or when it was confirmed or failed and why.",
       },
       {
         name: "service install",
         usage: ["service install [--dry-run]"],
         summary: "Install `meddle serve` as a systemd user service, and start it.",
         details:
-          "Writes ~/.config/systemd/user/meddle.service (running `serve` from this checkout), reloads systemd and " +
-          "enables and starts the service, then prints a command to run once to create the task root. --dry-run prints " +
-          "the unit and that command and changes nothing.",
+          "Writes ~/.config/systemd/user/meddle.service (running `serve` from this checkout, or from the binary), " +
+          "reloads systemd and enables and starts the service, then prints a command to run once to create the task " +
+          "root. --dry-run prints the unit and that command and changes nothing. The service is started again whenever it " +
+          "ends, unless stopped with systemctl. From the binary the unit also runs the update guard before every start, " +
+          "which rolls back a pool update whose new binary cannot start: run it again from a binary with updates in it " +
+          "before the first `meddle update`, and after moving the binary (a pool update swaps the binary the unit runs).",
       },
     ],
   },
@@ -161,7 +167,10 @@ const GROUPS: Group[] = [
           "Keys: jj.user and jj.email (the identity every node's jj and tasks commit with), env.<NAME> (an environment " +
           "variable for every task), lighthouse.url, limits.running (turns a node runs at once; 0 is no limit) and " +
           "roster.forget (seconds a member may go unheard of before it counts as gone; 0 is never), defaults.model and " +
-          "defaults.effort (low, medium, high, xhigh or max) for tasks that chose none (unset: opus, medium). Values replicate to " +
+          "defaults.effort (low, medium, high, xhigh or max) for tasks that chose none (unset: opus, medium), " +
+          "update.within (how long a rollout has to be confirmed; 30m by default) and update.health (how long a node " +
+          "has after its swap to report healthy; 2m by default, at least 30s), as durations such as 90s, 30m or 1h. " +
+          "Values replicate to " +
           "every member, so they are not for secrets. Needs the node running.",
       },
       {
@@ -350,6 +359,35 @@ const GROUPS: Group[] = [
         details:
           "Refused for any other task. An archived task's lines are released, so their commits stay only where a " +
           "branch or another line holds them; a moved task's lines stay with the node that has it.",
+      },
+    ],
+  },
+  {
+    title: "Pool updates",
+    commands: [
+      {
+        name: "update",
+        usage: ["update [--force] [--within <duration>] [<binary>...]"],
+        summary: "Roll a build out to every node of the pool, or (with no binaries) say how the current rollout goes.",
+        details:
+          "Give one binary per platform the pool runs, of one build (`bun run build --all` makes them). Every online " +
+          "node that runs a binary of another build (or another binary of this one) takes part: it fetches its " +
+          "platform's binary from the pool, checks it, starts no new turns (prompts queue), and waits for its running " +
+          "turns to end; `--force` cuts them off " +
+          "instead (they carry on after the restart), and given alone it forces the rollout draining now. Once every " +
+          "node has drained they swap together: each copies its databases, puts the new binary in place and restarts. " +
+          "From then until the pool confirms, they take no input (commands and pushes say `update in progress (build " +
+          "<id>), try again shortly`). It is confirmed once every one reports healthy on the new build; if one fails, " +
+          "or it is not confirmed within the pool's update.within (or `--within`, such as 90s, 30m or 1h), every one " +
+          "goes back to its old binary and databases, and the failure stays in `meddle update`, `meddle status` and " +
+          "the dashboard until the next rollout. A node that goes offline for a minute before it swaps fails it too. " +
+          "Refused before anything changes for a rollout in progress, the build the pool runs when no node is behind " +
+          "it (given again, it updates just the nodes behind it), and an online node " +
+          "that has no binary for its platform, speaks an OTA version this build cannot drive, or cannot be updated " +
+          "(a binary in a directory the service cannot write, or a unit from before updates or for another binary: " +
+          "run `service install` again). Nodes run from a checkout take no part. A node that was away catches up " +
+          "when it is back, from any member running its platform's binary; one whose update failed takes part in " +
+          "the next rollout. Needs the node running.",
       },
     ],
   },

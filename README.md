@@ -55,6 +55,7 @@ coloured (`NO_COLOR` turns that off, `FORCE_COLOR` on).
 ```sh
 bun run build                              # dist/meddle, for this machine
 bun run build --target=bun-linux-arm64     # for another platform (a Raspberry Pi)
+bun run build --all                        # dist/meddle-linux-x64 and dist/meddle-linux-arm64, one build
 bun run build --embed-claude               # with Claude Code inside, for machines that cannot reach the npm registry
 ```
 
@@ -83,6 +84,11 @@ platform's Agent SDK package installed when building; `bun install` brings only 
 Either way the binary reports the pinned version, so nodes running the same build can move tasks between them, and so
 can a node served from a checkout whose `node_modules` hold the same Agent SDK. Files of older versions in
 `<data dir>/bin` are not removed.
+
+Every binary carries its build id, the jj commit of the source it was built from (its first 12 hex digits;
+`MEDDLE_BUILD_ID` overrides it), and its platform. `--all` builds every platform the pool runs on from one source, so
+the binaries share a build id: `meddle update` takes them as one release and rolls them out to the pool together (see
+[Updating the pool](#updating-the-pool)). A node run from a checkout reports its build as `checkout`.
 
 ## Task root
 
@@ -339,6 +345,8 @@ one, and sets a key picked from the table below (an `env.` key with the name typ
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
 | `roster.forget` | How long, in seconds, a member may go unheard of before a node counts it gone ([Addresses and forgetting](#addresses-and-forgetting)): `0` never, else at least `60`; `900` (three lighthouse announce TTLs) when unset. A node that sets `MEDDLE_FORGET_MS` uses its own instead. |
 | `defaults.model`, `defaults.effort` | The model, and the effort (`low`, `medium`, `high`, `xhigh` or `max`), of a turn whose task chose none, and what the dashboard picks for a new task; unset, `opus` and `medium`. A model cannot be set empty. |
+| `update.within` | How long a rollout has, from its start, to be confirmed before it fails and rolls back ([Updating the pool](#updating-the-pool)): a duration such as `90s`, `30m` or `1h`; `30m` when unset. `meddle update --within` overrides it for one rollout. |
+| `update.health` | How long each node has, from its swap, to report healthy on the new build: a duration of at least `30s`; `2m` when unset. A rollout takes the value it starts with. |
 
 Each key replicates on its own, last writer wins on the time it was set, the roster's rule (on equal times, the
 setting from the node with the greater id wins, then the greater value); an unset replicates too. A value is at most
@@ -1082,7 +1090,11 @@ other node is asked anything.
   text you sent into that turn that Claude Code had not yet written to its transcript is not sent again.
 - Every node of a pool must be upgraded together: the nodes' peer interface gained calls without a new version, so a
   newer node cannot use an older node's at all (no task created there, no move to it), and placement tends to pick an
-  older node, which reports no running turns (see [Where a new task runs](#where-a-new-task-runs)).
+  older node, which reports no running turns (see [Where a new task runs](#where-a-new-task-runs)). `meddle update`
+  does that for nodes that run the single binary; a node run from a checkout is upgraded by hand.
+- A node offline for a whole rollout catches up when it is back, and until then runs a build other than the pool's
+  and takes no part in the pool's work. A rollout swaps the binary only: a changed service unit still needs
+  `meddle service install` on each node.
 - The commits meddle makes no longer need a jj user config on each node: the pool's `jj.user` and `jj.email` settings
   give every node one identity (see [Install](#install)). Without them, and without a node's own config, jj refuses to
   push the commits that node makes, so its memory syncs to a project's home fail.
@@ -1147,10 +1159,21 @@ Another node's tasks open through the pool: the browser opens `/ws/node/<node id
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an
 offline member 503.
 
+While a rollout drains, a bar over the pane says which build it rolls out, how long it has left, and what it waits
+on: each node still fetching or checking the binary, and each task whose turn it waits for (linked). From the moment
+the nodes swap until the pool confirms the new build or rolls back, a blind covers the whole dashboard, since nothing
+it sent then would be accepted: it lists each node of the rollout with its state and the time left to report healthy,
+and the rollout's own time left; once this node's socket closes for its restart, the page reloads when the node answers
+again. A rollout that failed leaves a bar with the build, the node and the reason (click it to read all of it; × hides
+it) until the next rollout. A node on a binary build other than the pool's (still catching up, unable to update, or
+whose own update failed), or whose binary is wrong (see [Binary hashes](#binary-hashes)), has a red dot in Nodes and
+on its page, with the reason; its page shows its build.
+
 Settings shows this node's id, the pool's name and id (or that no secret is set), the members (with Remove, and
 Allow again on a removed one); then the
 pool settings, as a table of key, value and the node that set it, each with Unset, and a form that sets a key picked
-from `jj.user`, `jj.email`, `lighthouse.url`, `limits.running` or `env.<NAME>` (see [Pool settings](#pool-settings)),
+from `jj.user`, `jj.email`, `lighthouse.url`, `limits.running`, `roster.forget`, `defaults.model`, `defaults.effort`,
+`update.within`, `update.health` or `env.<NAME>` (see [Pool settings](#pool-settings)),
 under a note that every member and its dashboard see these values, so none is for a secret; then the tokens in
 order (label, id, status, set by, expiry), with the one a turn would use now marked active and an Enable button on
 each `exhausted` or `disabled` one. Token values never pass through the dashboard: tokens are added and removed with
@@ -1171,7 +1194,198 @@ again after moving it. Without `--dry-run` it writes `~/.config/systemd/user/med
 and `systemctl --user enable --now meddle.service`, and prints the task-root command to run once. The unit sets
 `Environment=PATH=…` to the `PATH` of the shell you ran it from (less what `bun run` adds), because a user service
 otherwise runs with systemd's own, which often lacks `~/.cargo/bin` or wherever `jj` lives; run `service install`
-again after installing `jj` or `git` somewhere new.
+again after installing `jj` or `git` somewhere new. From the single binary the unit also runs the update guard before
+every start (`ExecStartPre=`, the previous binary's `update-guard` when there is one), which rolls back a pool update
+whose new binary cannot start (see [Updating the pool](#updating-the-pool)); a unit installed before updates has none,
+and its node cannot be updated until `service install` runs again from its binary. The unit has `Restart=always`: the
+service starts again whenever it ends, unless you stop it with `systemctl --user stop meddle`.
+
+## Updating the pool
+
+Build every platform once, on any machine, and hand the binaries to the node there; the pool spreads them over its
+own connections, and every node that runs the single binary swaps to its platform's, restarts, and checks itself:
+
+```sh
+bun run build --all
+meddle update dist/meddle-linux-x64 dist/meddle-linux-arm64
+meddle update                      # how it goes: each node's state, what it waits on, or why it failed
+```
+
+An update is all or nothing: it is confirmed only once every node taking part reports healthy on the new build, and
+if one fails, every one of them goes back to the build it ran, binary and databases, and the failure is kept for the
+pool to see.
+
+### Before the first update
+
+Each node must run a binary with updates in it (copied into place the old way, once), and must run it as the service
+(`meddle service install`, run again from that binary: the unit gained an `ExecStartPre=` guard, which rolls back a
+new binary that cannot start). The unit must start the very binary the node runs, with the guard for it: a unit
+installed from a binary somewhere else cannot be updated until `service install` runs again from this one. The
+binary's directory must be writable by the service's user, since the swap renames the new binary into it:
+`~/.local/bin`, not a `/usr/local/bin` that root owns. A node that cannot be updated says why (`meddle status`, the
+dashboard), and `meddle update` refuses before anything changes while any online node of the pool cannot.
+
+### Starting a rollout
+
+`meddle update <binary>...` takes one binary per platform, of one build. It reads each one's build and platform from
+the file without running it, and the node copies them into `<data dir>/update/binaries/<build>/<platform>`, from where
+it serves them to the pool. It keeps them only while the rollout is in progress; after it, every node serves only the
+binary it runs (see [Binary hashes](#binary-hashes)). The nodes taking part are those online at that
+moment that run a binary of another build, or of this build but not this binary, whatever build that is: a node with a
+red dot (its own update failed, see [Nodes that were away](#nodes-that-were-away), or its binary is wrong) takes part
+like any other, and its failure fails the rollout. A node run from a checkout takes no part (it reports its build
+as `checkout`, and keeps the version flag the Nodes header shows). It refuses, with nothing changed: binaries of
+different builds, or two for one platform; a rollout in progress; the build the pool already runs when no online node
+is behind it (`the pool already runs build <id>, and no node needs it`); an online node with no binary for its
+platform, one that has not reported its build yet (a meddle older than updates), one that speaks an OTA version this
+build cannot drive (see [Across versions](#across-versions)), or one that cannot be updated. Rolling out the pool's own
+build again updates just the nodes behind it (those with a red dot): the others, already on its binary, only judge the
+rollout, so a failure rolls back only the nodes that swapped. A build that failed before may be rolled out again. `--within <duration>` (`90s`, `30m`, `1h`) gives this rollout its own
+deadline instead of the pool's `update.within`.
+
+Each node then fetches its platform's binary from any member that has it, checks it against the SHA-256 the rollout
+names, and puts it next to its own as `<binary>.staged`. First it checks that its disks have room for the binary and
+for the swap's copy of its databases. A member that does not have the binary, or whose transfer fails or stalls for a
+minute, is the member's matter: the node asks the next, and when none can give it, looks again every 30 seconds (a
+node catching up alone fails instead, see [Nodes that were away](#nodes-that-were-away)). A binary of the wrong size
+or hash is asked of the next member too, but when none sends the right one, or the node cannot write it (its disk
+full), its update fails with why. It runs it once as `<binary> update-preflight`, which proves it runs on this machine
+and installs the Claude Code it pins before anything restarts (a download of about 140 MB). A preflight that fails
+fails the rollout, and nothing has swapped.
+
+### Queued and forced
+
+From the start, a node taking part starts no turns: prompts queue as they do while a turn runs. Without `--force` the
+rollout is queued: each node lets its running turns finish and is drained once it has none; everything else (new
+tasks, prompts, settings, pushes) is taken as usual until then. Once it has drained it holds moves, archives and
+restores too. With `--force`, running turns are cut off, and each node is drained at once; a cut-off turn carries on
+after the restart as after any restart of the service. `meddle update --force` while a queued rollout drains forces
+that one.
+
+The nodes swap together: none swaps until every one has drained. Until then the whole rollout waits on the slowest
+turn anywhere; `meddle update`, `meddle status` and the dashboard say which nodes and which tasks' turns it waits on.
+A node that goes offline (or to sleep) before it has swapped, draining or drained, holds the others' swap, and the
+rollout says it waits on it (`pi (offline)`); once it has been offline for a minute, it fails the rollout (`pi went
+offline`), and you run it again. Once every node has drained, a drained node that is offline may be down for its own
+swap (its word that it swapped not yet heard), so it gets as long as a node that swapped: `update.health` and a minute
+more. Nodes are never left out of a rollout they were part of.
+
+### The swap and confirmation
+
+Once all have drained, each node stops, copies `meddle.sqlite` and `durable.sqlite` (and their WAL files) into
+`<data dir>/update/backup/` as one pair, keeps its binary as `<binary>.previous`, renames the staged one over it, and
+exits so that systemd starts it again on the new build. Each step is on disk before the next, so a crash or a power
+loss at any point leaves what the next start rolls back. A swap that fails (a full disk, say) is undone at once, and
+fails the rollout with its error. From that copy until the rollout is confirmed or rolled back, the node accepts
+nothing that a rollback's restore would wipe: no tasks, prompts or turns, no approvals, token, setting or roster
+changes, no moves, archives or restores. The CLI's commands that change anything, and pushes from a checkout, are
+refused with `meddle: update in progress (build <id>), try again shortly`; the dashboard covers itself (see
+[Dashboard](#dashboard)). What other nodes replicate to it (rows, memory) still arrives: a restore that drops it loses
+nothing, since they still hold it and send it again.
+
+A node is healthy on the new build once `serve` has started (database open, Claude Code in place, dashboard listening)
+and it is connected to a member again (at once when alone in the pool, or after 20 seconds with none online). It has
+`update.health` (2 minutes by default) from its swap to say so: past it, a new build that is not healthy exits however
+far it got (a database that does not open, a pool that does not start), and the guard rolls it back. The other nodes
+give it a minute more, counted from its `swapped`, which it sends before its database copy. When every node of the
+rollout has, it is confirmed: each node deletes its database copy and previous binary, starts queued prompts and
+carries on cut-off turns, and takes input again.
+
+### Rollback and the failure record
+
+A rollout fails when a node's preflight fails, when a node is offline for a minute before it swapped, when `serve`
+fails on the new build or keeps crashing, when a node is not healthy within `update.health` of its swap (also one that
+went offline after it swapped), or when the rollout is
+not confirmed within its deadline (`update.within`, 30 minutes by default, counted on each node from when it first
+heard of the rollout, so that no node's clock decides it for the others; the reason names what it still waited on,
+`not confirmed within 30m: waiting on pi's turn in task 0012`). Then every node of it rolls back: a node that swapped
+restores its database pair and its previous binary and restarts on the old build, a node that had not drops the staged
+binary, and turns resume. Any node that hears of the failure rolls back, so news of it reaches a node through any
+other.
+
+All or nothing is what the pool aims at, not what it can promise across a network split. Nodes cut off from each
+other before the swap each fail the rollout. Cut off after it, one side may see every node healthy and confirm while
+the other fails on a health deadline. Once they meet again, confirmed wins: a node whose own update failed on the
+other side is behind the pool's build, and catches up as a node that was away does.
+
+A new binary that cannot start at all is rolled back without it: the unit's guard runs the previous binary
+(`<binary>.previous update-guard`) before every start, counts the new one's starts, and rolls back after three, or
+once its health deadline has passed, adding the service's last log lines to the reason. Nothing retries a failed
+rollout. Its failure (the build, the node, the reason and when) stays in `meddle update`, `meddle status` and the
+dashboard until the next rollout.
+
+### Nodes that were away
+
+A node that was offline when a rollout started finds on its return that the pool runs another build. Until it has
+caught up it hosts no tasks, takes no part in moves, and its own tasks' turns wait. It updates itself the same way
+(fetch, preflight, drain in the rollout's mode, swap, health), alone, and its failure rolls back only itself. It
+fetches its platform's binary from a member online that runs it. When none of the members online does (the Pi, alone
+on its platform), its update fails with that reason, and the next rollout takes it along. A node on the pool's build whose binary is not the pool's (see [Binary hashes](#binary-hashes))
+is behind it too, and catches up the same way. A node behind the pool's build has a red dot on the dashboard with the
+reason. One whose update failed tries again at its next restart (not the one its rollback causes), and the next
+`meddle update` takes it along as a participant: fix what failed (the build, or the machine) and roll out again, the
+pool's own build included. The pool's build changes only
+through `meddle update`: a binary copied onto one machine by hand is behind the pool, and updates itself to the pool's
+build.
+
+### Watching it
+
+`meddle update` with nothing to roll out prints this node's build and the pool's, then the current rollout (its build,
+mode and platforms, who started it and when, and its deadline, or when it was confirmed or failed and why), each node
+of it with its state (`idle (fetching)`, `idle (preflight)`, `staged`, `draining (waiting on 0012, 0013)`, `swapped`,
+`healthy`, `failed: <reason>`), what it waits on, and each node behind the pool's build. `meddle status` ends with the
+same in short, read from the update's files, so it also works while the node is down for its swap:
+
+```
+build 1ee71ee71ee7 (linux-x64), awaiting confirmation of build 1ee71ee71ee7
+pool build 0ld0ld0ld0ld
+node 1743a65f16 (desk) build 1ee71ee71ee7 healthy
+node 164ff3e5ed (pi) build 0ld0ld0ld0ld swapped
+rollout 1ee71ee71ee7 (queued) in progress until 2026-11-13T10:30:00.000Z, waiting on 164ff3e5ed (pi) (swapped)
+```
+
+A node's line adds `behind the pool's build <id>` while it runs another binary build than the pool's (or its binary
+is not the pool's), what is wrong with its binary (see [Binary hashes](#binary-hashes)), and `cannot be updated:
+<why>` when it cannot be; a failed rollout's line ends `failed at <time> on <node>: <reason>`.
+
+### What lives where
+
+In `<data dir>/update/`: `state.json`, this node's view of the rollouts and of every node's update (outside the
+database, so that a restore never forgets a rollout or its failure); `pending.json`, a swap in progress, from just
+before the database copy until confirmation or rollback; `backup/`, the database pair the swap copied;
+`binaries/<build>/<platform>`, the binaries `meddle update` gave this node, kept to serve while their rollout is in
+progress; `state.json` also counts the node's starts, so that a node behind the pool whose update failed tries again
+only at a later start. Beside the binary: `<binary>.staged` (fetched and checked, waiting for the swap) and
+`<binary>.previous` (the binary before the swap, kept until confirmation). A start settles a swap only from
+`pending.json`, which the swap writes before anything else and which goes after everything else: a
+`<binary>.previous` with no `pending.json` is a stray file, and is left alone. The record names the binary the swap
+replaced, so a start of a binary installed elsewhere meanwhile still settles it there. A rollback restores only a
+database the swap copied, and never touches one it has no copy of.
+
+### Binary hashes
+
+Each node hashes its binary (SHA-256) when it starts, and reports the hash with its build and platform. A node serves
+the binary it runs to any member that asks for that build, platform and hash, so a node catching up can fetch it from
+any member of its platform on the pool's build; the fetcher checks it against the hash the rollout names. Before it
+serves the file, the node hashes it again through the handle it then sends it from, and every five minutes it looks
+at the file's inode, size and times, hashing it again only when they changed (a file it cannot read is looked at
+again later). A file replaced under the running process (copied over by hand, say) is served no more, and the node
+gets a red dot, `binary on disk changed since start`. Its own swap's rename is not such a change. A node on the pool's
+build whose hash is not the one the confirmed rollout names for its platform gets a red dot, `binary differs from
+build <id>'s`: it is behind the pool, and catches up as a node that was away does. A rollout of a build that is open
+or failed says nothing about it. With no confirmed rollout of their build to say which is right, two nodes on one build and platform with
+different hashes both get a red dot, `binary differs from another node's of build <id>`. Every node with a red dot
+takes part in the next rollout, unless it already runs that rollout's very binary.
+
+### Across versions
+
+Rollout state travels between nodes on a channel of its own, versioned and readable across builds, so that a node on
+another build is still seen and can still say why it failed. Each node also advertises the **OTA version** its build
+speaks: one integer (`OTA_V` in `src/update/wire.ts`, now 1) for the steps of a rollout and what each record means
+for them. A build lists the OTA versions it can drive (`OTA_DRIVES`, now `[1]`), and `meddle update` refuses, naming
+the node and its version, while an online node speaks one it cannot. Bump `OTA_V` only when the rollout's steps or
+their wire meaning change so that a build speaking the old version could not take part correctly, and list the
+versions the new build can still drive; a new field older builds may ignore needs no bump.
 
 ## Links
 

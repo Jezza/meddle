@@ -316,9 +316,13 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
  * host (`createNodeHost`, which gives the runner the pool) serving it; the metrics sampler is not started; what the
  * runtime and the runner log is collected in `logs`; `hooks` are the runner's test hooks, set them at will; `token` is
  * `setupNode`'s (default `"tok"`, `null` for none); `secret` is the pool secret set before the pool starts (default
- * `POOL_SECRET`, `null` for none). `close()` stops the pool, the host and the harness.
+ * `POOL_SECRET`, `null` for none); `inputHold` is the host's input gate (an update awaiting confirmation). `close()` stops
+ * the pool, the host and the harness.
  */
-export async function startPoolNode(fixture?: string, extraEnv: Record<string, string> = {}, options: { token?: string | null; secret?: string | null } = {}) {
+export async function startPoolNode(
+  fixture?: string, extraEnv: Record<string, string> = {},
+  options: { token?: string | null; secret?: string | null; inputHold?: () => string | null } = {},
+) {
   /** The lines the runtime and the runner logged (instead of printing them). */
   const logs: string[] = [];
   const hooks: RunnerHooks = {};
@@ -335,7 +339,9 @@ export async function startPoolNode(fixture?: string, extraEnv: Record<string, s
   /** Everything the runtime's net and sync reported. */
   const errors: unknown[] = [];
   const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { onError: (err) => errors.push(err), log: (line) => logs.push(line) });
-  const host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool });
+  const host = createNodeHost({
+    cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool, ...(options.inputHold === undefined ? {} : { inputHold: options.inputHold }),
+  });
   return {
     ...node, metrics, pool, host, errors, logs, hooks,
     id: pool.identity.id, identity: pool.identity, store: pool.store, net: pool.net,

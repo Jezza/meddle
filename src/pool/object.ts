@@ -8,6 +8,7 @@ import {
   BranchRowSchema, LineRowSchema, NodeSummarySchema, PoolObject, RosterRowSchema, SettingRowSchema, TokenMetaSchema,
 } from "../state/contracts";
 import { TOKEN_ID, enableToken, listTokens, moveToken, pickToken, tokenRow, tokenValue, type TokenMeta } from "../token";
+import { gated } from "../update/gate";
 import { isNodeId } from "./identity";
 import { allBranchRows, listLineRows } from "./rows";
 import type { PoolSettings } from "./settings";
@@ -45,6 +46,8 @@ export type PoolObjectDeps = {
    * refresh.
    */
   changes: Subscribable<null>;
+  /** Why this node accepts no input now (an update awaits confirmation), or null: the default variant's methods refuse with it. */
+  inputHold?(): string | null;
 };
 
 export const PEER_PRINCIPAL_PREFIX = "peer:";
@@ -204,7 +207,7 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       poolName.replace(ctx, store.pool().poolName);
       await Promise.all([refreshActive(ctx), liveNow().then((l) => { if (!ctx.signal.aborted) live.replace(ctx, l); })]);
     });
-    return {
+    return gated({
       variant: "default",
       poolId,
       poolName,
@@ -233,6 +236,6 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       },
       setSetting: ({ key, value }) => deps.setSetting(key, value),
       unsetSetting: ({ key }) => deps.unsetSetting(key),
-    };
+    }, deps.inputHold);
   });
 }

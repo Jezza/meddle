@@ -15,6 +15,11 @@ import { Sidebar } from "./Sidebar";
 import { homeTask } from "./sidebar-model";
 import { type NodeRef, type PoolIndex, usePoolIndex } from "./sources";
 import { TaskView } from "./Task";
+import { Blind, UpdateBar, useUpdate } from "./Update";
+import { buildAlerts, type UpdateView } from "./update-model";
+import { shortId } from "../../pool/ids";
+
+const NO_ALERTS: ReadonlyMap<string, string> = new Map();
 
 const socket = nodeSocket("/ws");
 // This node's own server changed its link protocol (it was upgraded): a reload picks up its new bundle.
@@ -47,11 +52,17 @@ function App({ host }: { host: Host }) {
   if (pool.ref === undefined || pool.ref.variant !== "default" || node.ref === undefined) {
     return <div class="boot">{notice === undefined ? <p class="muted">Connecting…</p> : <p class="error">{notice}</p>}</div>;
   }
-  return <Shell host={host} pool={pool.ref} node={node.ref} view={view} notice={notice} />;
+  return <Shell host={host} pool={pool.ref} node={node.ref} view={view} notice={notice} connected={connected} />;
 }
 
-function Shell({ host, pool, node, view, notice }: { host: Host; pool: PoolRef; node: NodeRef; view: View; notice: string | undefined }) {
+function Shell({ host, pool, node, view, notice, connected }: {
+  host: Host; pool: PoolRef; node: NodeRef; view: View; notice: string | undefined; connected: boolean;
+}) {
   const selfId = useValue(pool.self);
+  const nodes = useValue(pool.nodes);
+  const update = useUpdate(host);
+  const alerts = update === null ? NO_ALERTS : buildAlerts(update);
+  const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
   const hosts = useMemo(() => new Hosts(selfId, host), [selfId, host]);
   // A node's host was dropped, its backoff ended or it is incompatible: render again, so the views ask anew.
   const [, tick] = useState(0);
@@ -83,26 +94,30 @@ function Shell({ host, pool, node, view, notice }: { host: Host; pool: PoolRef; 
     <Nav.Provider value={{ open, toggle }}>
       {sources}
       <div class={`app${open ? "" : " nav-closed"}${narrow ? " narrow" : ""}`}>
-        {open && <Sidebar pool={pool} index={index} view={view} selfId={selfId} onHide={toggle} onNavigate={() => setDrawer(false)} />}
+        {open && <Sidebar pool={pool} index={index} view={view} selfId={selfId} alerts={alerts} onHide={toggle} onNavigate={() => setDrawer(false)} />}
         {narrow && drawer && <div class="scrim" onClick={() => setDrawer(false)} />}
         <main class="pane">
           {notice !== undefined && <p class="error notice">{notice}</p>}
-          <Body hosts={hosts} pool={pool} node={node} index={index} view={view} open={openTask} />
+          {update !== null && <UpdateBar update={update} name={nameOf} tasks={index.tasks} />}
+          <Body hosts={hosts} pool={pool} node={node} index={index} view={view} open={openTask} update={update} />
         </main>
       </div>
       <Toasts index={index} pool={pool} open={openTask} />
+      {update !== null && <Blind update={update} name={nameOf} connected={connected} />}
     </Nav.Provider>
   );
 }
 
-function Body({ hosts, pool, node, index, view, open }: { hosts: Hosts; pool: PoolRef; node: NodeRef; index: PoolIndex; view: View; open: Open }) {
+function Body({ hosts, pool, node, index, view, open, update }: {
+  hosts: Hosts; pool: PoolRef; node: NodeRef; index: PoolIndex; view: View; open: Open; update: UpdateView | null;
+}) {
   switch (view.name) {
     case "home": return <Home hosts={hosts} pool={pool} index={index} open={open} />;
     case "task": return <TaskView key={`${view.nodeId}/${view.id}`} hosts={hosts} pool={pool} nodeId={view.nodeId} taskId={view.id} />;
     case "new": return <NewTask hosts={hosts} pool={pool} projectId={view.projectId} open={open} />;
     case "project": return <ProjectPage key={view.id} hosts={hosts} pool={pool} index={index} id={view.id} />;
     case "add-project": return <AddProject node={node} />;
-    case "node": return <NodePage key={view.nodeId} hosts={hosts} pool={pool} index={index} nodeId={view.nodeId} />;
+    case "node": return <NodePage key={view.nodeId} hosts={hosts} pool={pool} index={index} nodeId={view.nodeId} update={update} />;
     case "settings": return <Settings pool={pool} />;
   }
 }

@@ -10,11 +10,13 @@ import { MeddleMove } from "./move";
 /**
  * Installs the meddle extension in `registry`, opens the durable store and starts scheduling, which
  * reruns any turn or move the last process left unfinished. The extension's `harness` hook is how a turn's or a
- * move's phase finds the Harness it runs in, and through it the TaskRunner.
+ * move's phase finds the Harness it runs in, and through it the TaskRunner. With `hold`, scheduling waits (nothing
+ * reruns) until the caller resumes the Harness: a node on an unconfirmed build, or behind the pool's, holds its turns.
  */
 export async function openHarness(
   cfg: NodeConfig,
   registry: Registry,
+  options: { hold?: boolean } = {},
 ): Promise<{ harness: Harness; close(): Promise<void> }> {
   let opened: Harness | undefined;
   registry.install(defineExtension({
@@ -28,7 +30,7 @@ export async function openHarness(
     BACKGROUND_CONTEXT,
   );
   opened = harness;
-  harness.resume();
+  if (options.hold !== true) harness.resume();
   return { harness, close: () => harness.close(BACKGROUND_CONTEXT) };
 }
 

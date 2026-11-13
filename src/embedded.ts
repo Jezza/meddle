@@ -16,6 +16,11 @@ export type Embedded = {
   script: string;
   /** `install/meddle.service`. */
   unit: string;
+  /**
+   * The build's mark (`buildMark`: its build id and platform between two sentinels), which `meddle update` finds in the
+   * file without running it. Every binary `bun run build` makes has one; tests may leave it out.
+   */
+  build?: string;
 };
 
 let current: Embedded | null = null;

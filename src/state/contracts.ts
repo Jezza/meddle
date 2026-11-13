@@ -676,3 +676,110 @@ export const PoolObject = remote("meddle.pool", {
     },
   },
 });
+
+export const UpdateStateSchema = Type.Union([
+  Type.Literal("idle"), Type.Literal("staged"), Type.Literal("draining"), Type.Literal("swapped"), Type.Literal("healthy"),
+  Type.Literal("failed"),
+]);
+
+const RolloutOutcomeSchema = Nullable(Type.Union([
+  Type.Object({ status: Type.Literal("confirmed"), at: Type.String() }),
+  Type.Object({ status: Type.Literal("failed"), at: Type.String(), node: Nullable(Type.String()), reason: Type.String() }),
+]));
+
+/** One participant of a rollout: where it is, and (draining) the tasks whose turns it waits for. */
+export const RolloutParticipantSchema = Type.Object({
+  node: Type.String(),
+  state: UpdateStateSchema,
+  /** What it is doing within its state (`fetching`, `preflight`, …), or null. */
+  step: Nullable(Type.String()),
+  reason: Nullable(Type.String()),
+  drained: Type.Boolean(),
+  waitingOn: Type.Array(Type.String()),
+  online: Type.Boolean(),
+  /** When its record about the rollout last changed (for `swapped`, the swap: its health deadline counts from it), or null. */
+  at: Nullable(Type.String()),
+});
+
+/** The current rollout (open, or the newest done). */
+export const RolloutSummarySchema = Type.Object({
+  id: Type.String(),
+  build: Type.String(),
+  mode: Type.Union([Type.Literal("queued"), Type.Literal("forced")]),
+  startedBy: Type.String(),
+  startedAt: Type.String(),
+  /** When it fails unless confirmed. */
+  deadline: Type.String(),
+  /** How long each participant has, from its swap, to report healthy. */
+  healthMs: Type.Number(),
+  platforms: Type.Array(Type.String()),
+  outcome: RolloutOutcomeSchema,
+  participants: Type.Array(RolloutParticipantSchema),
+  /** While open: each participant not yet healthy (nor drained and ready), its state and the tasks whose turns it waits for. */
+  waiting: Type.Array(Type.Object({
+    node: Type.String(), state: UpdateStateSchema, step: Nullable(Type.String()), turns: Type.Array(Type.String()),
+  })),
+});
+
+/** A node's build and update state, as the rollout channel last told this node. */
+export const NodeBuildSchema = Type.Object({
+  node: Type.String(),
+  build: Type.String(),
+  platform: Type.String(),
+  state: UpdateStateSchema,
+  reason: Nullable(Type.String()),
+  step: Nullable(Type.String()),
+  /** Its update is its own, catching up with a confirmed rollout. */
+  late: Type.Boolean(),
+  /** Why it cannot be updated (a checkout, a binary it cannot replace, no guard in its unit), or null. */
+  blocked: Nullable(Type.String()),
+  /** A binary on a build other than the pool's: it is out of the pool's work until it has caught up (the red dot). */
+  mismatched: Type.Boolean(),
+  /** What is wrong with its binary (replaced on disk since it started, or not its build's), or null: a red dot too. */
+  binary: Nullable(Type.String()),
+  at: Type.String(),
+});
+
+/** Pool updates as dashboards and the CLI see them (`meddle update`): builds, the current rollout, the last failure. */
+export const UpdateObject = remote("meddle.update", {
+  version: 1,
+  input: Type.Object({}),
+  host: hostNamed("node"),
+  variants: {
+    default: {
+      state: {
+        self: Type.String(),
+        build: Type.Object({ buildId: Type.String(), platform: Type.String() }),
+        /** The build the pool runs (its newest confirmed rollout's), or null before the first rollout. */
+        poolBuild: Nullable(Type.String()),
+        rollout: Nullable(RolloutSummarySchema),
+        /** The newest rollout when it failed, until another starts. */
+        lastFailure: Nullable(Type.Object({
+          rollout: Type.String(), build: Type.String(), node: Nullable(Type.String()), reason: Type.String(), at: Type.String(),
+        })),
+        /** This node runs a new build not yet confirmed: it accepts no input until the pool confirms or rolls back. */
+        awaitingConfirmation: Type.Boolean(),
+        /** Why turns are held on this node, or null. */
+        held: Nullable(Type.String()),
+        nodes: Type.Array(NodeBuildSchema),
+      },
+      methods: {
+        /**
+         * Rolls these binaries out to the pool (their files on this machine, read by the node), or with `force` and no
+         * binaries (or the open rollout's) forces the open rollout. `withinMs` overrides the pool's `update.within`.
+         * Refused before anything changes as `Updater.startRollout` says.
+         */
+        start: method(
+          Type.Object({
+            binaries: Type.Array(Type.Object({
+              path: Type.String(), buildId: Type.String(), platform: Type.String(), sha256: Type.String(), size: Type.Number(),
+            })),
+            force: Type.Boolean(),
+            withinMs: Type.Optional(Type.Number()),
+          }),
+          Type.Object({ rollout: Type.String(), build: Type.String(), escalated: Type.Boolean(), participants: Type.Array(Type.String()) }),
+        ),
+      },
+    },
+  },
+});

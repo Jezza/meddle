@@ -313,7 +313,23 @@ card). A `.claude/settings.json` in the project is layered under it as Claude Co
 
 ## Updating
 
-On every machine, together:
+Nodes that run the single binary update together, from any one of them:
+
+```sh
+cd ~/projects/meddle
+jj git fetch && jj new main
+bun install
+bun run build --all
+meddle update dist/meddle-linux-x64 dist/meddle-linux-arm64
+meddle update            # how it goes
+```
+
+The pool spreads the binaries, and every node swaps to its platform's, restarts and checks itself; if any fails, they
+all go back, and `meddle update` says which node failed and why. Running turns finish first (`--force` cuts them off).
+Before the first time, each node needs a binary with updates in it and `meddle service install` run again from it.
+[Updating the pool](../README.md#updating-the-pool) says everything.
+
+Nodes run from a checkout are updated by hand. On every such machine, together:
 
 ```sh
 cd ~/projects/meddle

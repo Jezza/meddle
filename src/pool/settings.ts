@@ -2,14 +2,22 @@
 // that gives every node of the pool the same jj identity, task environment, lighthouse and running limit.
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
+import { parseDuration } from "../update/model";
 
 /** The keys a pool setting may have; `env.<NAME>` sets `<NAME>` for jj and for every task's Claude Code. */
-export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|roster\.forget|defaults\.model|defaults\.effort|env\.[A-Z_][A-Z0-9_]*)$/;
+export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|roster\.forget|defaults\.model|defaults\.effort|update\.within|update\.health|env\.[A-Z_][A-Z0-9_]*)$/;
 
 /** How long a member goes unheard of before it is gone (`roster.forget`'s default): three lighthouse announce TTLs. */
 export const DEFAULT_FORGET_SECS = 900;
 /** The shortest `roster.forget` other than 0: a member is reported every 15 s, so a shorter one would make it flap. */
 export const MIN_FORGET_SECS = 60;
+
+/** How long a rollout has to be confirmed before it rolls back (`update.within`'s default). */
+export const DEFAULT_UPDATE_WITHIN_MS = 30 * 60_000;
+/** How long a node has, from its swap, to report healthy on the new build (`update.health`'s default). */
+export const DEFAULT_UPDATE_HEALTH_MS = 2 * 60_000;
+/** The shortest `update.health`: a node needs some seconds to restart, open its database and reconnect. */
+const MIN_UPDATE_HEALTH_MS = 30_000;
 
 /**
  * Environment names an `env.*` setting may not set (besides those starting with a `RESERVED_ENV_PREFIXES` entry):
@@ -88,6 +96,10 @@ function valueProblem(key: string, value: string): string | null {
   if (NON_EMPTY.has(key) && value === "") return `${key} must not be empty`;
   if (key === "limits.running" && nonNegativeInteger(value) === null) return "limits.running must be a non-negative integer";
   if (key === "defaults.effort" && !EFFORT_LEVELS.includes(value)) return `defaults.effort must be one of ${EFFORT_LEVELS.join(", ")}`;
+  if ((key === "update.within" || key === "update.health") && parseDuration(value) === null) {
+    return `${key} must be a duration such as 90s, 30m or 1h`;
+  }
+  if (key === "update.health" && parseDuration(value)! < MIN_UPDATE_HEALTH_MS) return "update.health must be at least 30s";
   if (key === "roster.forget") {
     const secs = nonNegativeInteger(value);
     if (secs === null || (secs !== 0 && secs < MIN_FORGET_SECS)) return `roster.forget must be 0 or at least ${MIN_FORGET_SECS} (seconds)`;
@@ -287,6 +299,19 @@ export class PoolSettings {
     const raw = this.get("roster.forget");
     const secs = raw === null ? DEFAULT_FORGET_SECS : nonNegativeInteger(raw) ?? DEFAULT_FORGET_SECS;
     return secs === 0 ? null : Math.max(secs, MIN_FORGET_SECS) * 1000;
+  }
+
+  /** `update.within`, how long a rollout has to be confirmed, in ms; its default when unset or not a duration. */
+  updateWithinMs(): number {
+    const raw = this.get("update.within");
+    return (raw === null ? null : parseDuration(raw)) ?? DEFAULT_UPDATE_WITHIN_MS;
+  }
+
+  /** `update.health`, how long a node has from its swap to report healthy, in ms; its default when unset or invalid. */
+  updateHealthMs(): number {
+    const raw = this.get("update.health");
+    const ms = raw === null ? null : parseDuration(raw);
+    return ms === null || ms < MIN_UPDATE_HEALTH_MS ? DEFAULT_UPDATE_HEALTH_MS : ms;
   }
 
   /** `defaults.model`, the model of a task that chose none; `FALLBACK_MODEL` when unset or empty. */

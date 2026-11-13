@@ -116,13 +116,16 @@ async function unfetched(pushed: PushedRef[], rows: readonly BranchRow[], env: R
 }
 
 /**
- * Why a push of `pushed` is refused, or null when it is accepted. `MEDDLE_REPO_KIND` names the repo: a memory repo
- * takes only `refs/heads/memory`, and never its deletion. A project's push goes through `refusePush`, with the branches' heads from
+ * Why a push of `pushed` is refused, or null when it is accepted. `MEDDLE_REFUSE`, when the node set it, refuses any
+ * push with its reason (the node takes no input while an update awaits confirmation). `MEDDLE_REPO_KIND` names the
+ * repo: a memory repo takes only `refs/heads/memory`, and never its deletion. A project's push goes through `refusePush`, with the branches' heads from
  * `MEDDLE_HEADS`, then is planned (`planPush`) from the rows the file `MEDDLE_ROWS` names (both the node's, when it
  * spawned `receive-pack`): refused with `<b>: this node is still fetching it; push again shortly` while the view shows a
  * pushed branch behind its rows or a live row of one names a commit this repo lacks, and refused when planning fails.
  */
 export async function preReceiveRefusal(pushed: PushedRef[], env: Record<string, string | undefined>): Promise<string | null> {
+  // The node takes no input now (an update awaits confirmation): the push is refused whole, with why.
+  if (env.MEDDLE_REFUSE !== undefined && env.MEDDLE_REFUSE !== "") return `meddle: ${env.MEDDLE_REFUSE}`;
   const kind = env.MEDDLE_REPO_KIND;
   if (kind === "memory") {
     const other = pushed.find((p) => p.ref !== "refs/heads/memory");

@@ -195,3 +195,22 @@ test("help documents checkout, project set-default and project status, and how a
   }
   expect(readme).not.toContain("meddle migrate");
 });
+
+test("update says how a build is rolled out, refused and rolled back; status and config set name its parts", async () => {
+  const update = await meddle(["help", "update"], await env());
+  expect(update.code).toBe(0);
+  expect(update.stdout).toStartWith("usage: meddle update [--force] [--within <duration>] [<binary>...]\n");
+  const text = update.stdout.replace(/\s+/g, " ");
+  for (const part of ["bun run build --all", "--force", "update in progress (build <id>), try again shortly", "update.within", "service install"]) {
+    expect(text).toContain(part);
+  }
+  // The guard and preflight are the node's, not for people.
+  const all = await meddle(["help"], await env());
+  expect(all.stdout).toContain("  meddle update [--force] [--within <duration>] [<binary>...]");
+  expect(all.stdout).not.toContain("update-guard");
+  expect(all.stdout).not.toContain("update-preflight");
+  expect((await meddle(["help", "config", "set"], await env())).stdout.replace(/\s+/g, " ")).toContain("update.health");
+  expect((await meddle(["help", "status"], await env())).stdout.replace(/\s+/g, " ")).toContain("pool build <id>");
+  const readme = await Bun.file(`${import.meta.dir}/../README.md`).text();
+  for (const part of ["## Updating the pool", "`update.within`", "`update.health`", "bun run build --all"]) expect(readme).toContain(part);
+});
