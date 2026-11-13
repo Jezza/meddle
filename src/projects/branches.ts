@@ -176,13 +176,10 @@ export async function planPush(
       record(branch, commit, live.filter((r) => r.commit === sibling).map(refOf));
     } else if (ref.startsWith(HEADS) && !isReserved(ref)) {
       const branch = ref.slice(HEADS.length);
-      const { state, live } = await resolve(ofBranch(working, branch), g);
-      const fastForward = next !== null && (
-        (state.kind === "single" && await g.isAncestor(state.commit, next))
-        || (state.kind === "conflicted" && await descendsFromAll(next, state.siblings, g))
-      );
-      // A forced push (a rewind, a sideways move or a deletion) drops every current row, not only the heads.
-      record(branch, next, fastForward ? [] : live.map(refOf));
+      // Every push drops every current row, not only the heads. A fast-forward that left the rows under it live would
+      // let them resurface, one drop at a time, once a sibling above them is dropped.
+      const { live } = await resolve(ofBranch(working, branch), g);
+      record(branch, next, live.map(refOf));
     }
     // `refs/meddle/incoming/*` records nothing.
   }

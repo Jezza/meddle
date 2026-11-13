@@ -236,7 +236,8 @@ test("a checkout tracks main@meddle, and a fast-forward it pushes is a row that 
 
     const x = await commitIn(n1, co1, "main", "x");
     await pushMain(n1, co1, x);
-    expect(listBranchRows(n1.db, P, "main")).toEqual([{ project: P, branch: "main", node: n1.id, seq: 2, commit: x, drops: [] }]);
+    expect(listBranchRows(n1.db, P, "main"))
+      .toEqual([{ project: P, branch: "main", node: n1.id, seq: 2, commit: x, drops: [{ node: n1.id, seq: 1 }] }]);
     // The view on n1 followed at once: a fetch there changes nothing.
     await fetchIn(n1, co1);
     expect(await remoteMain(n1, co1)).toMatchObject({ commitId: x, tracked: true });
@@ -259,15 +260,16 @@ test("a rewind pushed from a checkout drops every current row, and the branch is
     await fetchIn(n2, co2);
     const y = await commitIn(n2, co2, "main", "y");
     await pushMain(n2, co2, y);
-    // n2 saw n1's row: y is a fast-forward of x.
-    expect(ownMainRow(n2, P)).toEqual({ project: P, branch: "main", node: n2.id, seq: 1, commit: y, drops: [] });
+    // n2 saw n1's row: y is a fast-forward of x, and drops it.
+    expect(ownMainRow(n2, P)).toEqual({ project: P, branch: "main", node: n2.id, seq: 1, commit: y, drops: [{ node: n1.id, seq: 2 }] });
 
     await fetchIn(n1, co1);
     expect(await remoteMain(n1, co1)).toMatchObject({ commitId: y });
     await pushMain(n1, co1, m);
     const row = ownMainRow(n1, P);
     expect(row).toMatchObject({ seq: 3, commit: m });
-    expect(sortedDrops(row)).toEqual([{ node: n1.id, seq: 2 }, { node: n2.id, seq: 1 }].sort((a, b) => a.node.localeCompare(b.node)));
+    // n1's own row was already dropped by n2's, so only n2's is current.
+    expect(sortedDrops(row)).toEqual([{ node: n2.id, seq: 1 }]);
 
     await fetchIn(n2, co2);
     expect(await remoteMain(n2, co2)).toMatchObject({ commitId: m });
@@ -429,12 +431,13 @@ test("a push to a branch whose view is behind its rows is refused, and the row i
     expect(listBranchRows(n.db, P)).toEqual(rows);
     expect(await git(["rev-parse", "refs/namespaces/view/refs/heads/main"], repo, n.cfg)).toBe(`${x}\n`);
 
-    // Once a fetch has caught the view up, a push on top of y is a fast-forward that keeps y's row.
+    // Once a fetch has caught the view up, a push on top of y is a fast-forward, which drops y's row.
     await fetchIn(n, co);
     expect(await remoteMain(n, co)).toMatchObject({ commitId: y });
     const w = await commitIn(n, co, y, "w");
     await pushMain(n, co, w);
-    expect(ownMainRow(n, P)).toMatchObject({ commit: w, drops: [] });
+    expect(sortedDrops(ownMainRow(n, P))).toEqual([{ node: n.id, seq: 2 }, { node: peer, seq: 1 }].sort((a, b) => a.node.localeCompare(b.node)));
+    expect(ownMainRow(n, P)).toMatchObject({ commit: w });
     expect(listBranchRows(n.db, P, "main").find((r) => r.node === peer)).toMatchObject({ seq: 1, commit: y });
     expect(n.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
   } finally {

@@ -53,12 +53,12 @@ async function pushed(self: string, refs: PushedRef[], rows: BranchRow[]): Promi
   return next;
 }
 
-test("a fast-forward records the new commit, and the branch moves to it", async () => {
+test("a fast-forward records the new commit, drops every current row, and the branch moves to it", async () => {
   const rows = [row("A", 1, X), row("B", 1, X)];
   expect(await planPush("A", "p", [push("main", X, Z)], rows, g))
-    .toEqual([{ project: "p", branch: "main", commit: Z, drops: [] }]);
+    .toEqual([{ project: "p", branch: "main", commit: Z, drops: [ref("A", 1), ref("B", 1)] }]);
   expect(await computeBranch(await pushed("A", [push("main", X, Z)], rows), g))
-    .toEqual({ kind: "single", commit: Z, live: [ref("B", 1), ref("A", 2)] });
+    .toEqual({ kind: "single", commit: Z, live: [ref("A", 2)] });
   expect(await planPush("A", "p", [{ ref: `refs/meddle/incoming/${Z}`, old: null, new: Z }], rows, g)).toEqual([]);
 });
 
@@ -71,9 +71,9 @@ test("a merge of the siblings resolves the branch", async () => {
   const rows = [row("A", 1, X), row("B", 1, Y)];
   expect(await refusePush([push("main", Y, M)], [{ branch: "main", commits: [X, Y] }], g)).toBeNull();
   expect(await planPush("B", "p", [push("main", Y, M)], rows, g))
-    .toEqual([{ project: "p", branch: "main", commit: M, drops: [] }]);
+    .toEqual([{ project: "p", branch: "main", commit: M, drops: [ref("A", 1), ref("B", 1)] }]);
   expect(await computeBranch(await pushed("B", [push("main", Y, M)], rows), g))
-    .toEqual({ kind: "single", commit: M, live: [ref("A", 1), ref("B", 2)] });
+    .toEqual({ kind: "single", commit: M, live: [ref("B", 2)] });
 });
 
 test("a rewind drops every current row, the stale ancestor row included", async () => {
@@ -95,7 +95,7 @@ test("a re-push of a dropped commit makes a fresh row that counts again", async 
   const rewound = [row("A", 1, X), row("B", 2, O, [ref("A", 1), ref("B", 1)])];
   expect(await computeBranch(rewound, g)).toEqual({ kind: "single", commit: O, live: [ref("B", 2)] });
   expect(await computeBranch(await pushed("A", [push("main", O, X)], rewound), g))
-    .toEqual({ kind: "single", commit: X, live: [ref("B", 2), ref("A", 2)] });
+    .toEqual({ kind: "single", commit: X, live: [ref("A", 2)] });
 });
 
 test("dropping another node's sibling keeps your commit", async () => {
@@ -154,7 +154,7 @@ test("a dropped row stays dropped through the dropper's fast-forward, until its 
   let rows = await pushed("A", [dropSibling(Y)], [row("A", 1, X), row("B", 3, Y)]);
   expect(rows).toEqual([row("B", 3, Y), row("A", 2, X, [ref("B", 3)])]);
   rows = await pushed("A", [push("main", X, Z)], rows);
-  expect(rows).toEqual([row("B", 3, Y), row("A", 3, Z, [ref("B", 3)])]);
+  expect(rows).toEqual([row("B", 3, Y), row("A", 3, Z, [ref("B", 3), ref("A", 2)])]);
   expect(await computeBranch(rows, g)).toEqual({ kind: "single", commit: Z, live: [ref("A", 3)] });
 
   rows = [row("B", 4, Y), rows[1]!];
@@ -163,6 +163,18 @@ test("a dropped row stays dropped through the dropper's fast-forward, until its 
   // B's seq 4 supersedes the drop of (B, 3), so A's next row prunes it.
   expect(await planPush("A", "p", [dropSibling(Y)], rows, g))
     .toEqual([{ project: "p", branch: "main", commit: Z, drops: [ref("B", 4)] }]);
+});
+
+test("dropping a sibling doesn't resurface the fast-forwarded rows under it", async () => {
+  // B creates main at O, C and A fast-forward it to X and Z; D's concurrent P makes Z and P siblings.
+  let rows = await pushed("B", [push("main", null, O)], []);
+  rows = await pushed("C", [push("main", O, X)], rows);
+  rows = await pushed("A", [push("main", X, Z)], rows);
+  rows = [...rows, row("D", 1, P)];
+  expect(await computeBranch(rows, g))
+    .toEqual({ kind: "conflicted", siblings: [P, Z], served: O, live: [ref("A", 1), ref("D", 1)] });
+  expect(await computeBranch(await pushed("E", [dropSibling(Z)], rows), g))
+    .toEqual({ kind: "single", commit: P, live: [ref("D", 1)] });
 });
 
 test("dropping a dropper doesn't resurrect what it dropped", async () => {

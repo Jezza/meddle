@@ -178,14 +178,17 @@ clients already make you do something explicit to send a non-fast-forward (git `
 So the meaning comes from the commit graph:
 
 Every row a node writes carries forward the `drops` its previous row had. In the table, "the drops it carried" means
-those. "Every current row" means every row that survives step 2 of the computation below, not only the heads.
+those. "Every current row" means every row that survives step 2 of the computation below, not only the heads. A
+fast-forward drops them too: rows left live under the new head would resurface, one drop at a time, once a sibling
+above them is dropped. So what a push records doesn't depend on whether it is a fast-forward; that matters only for
+refusing a push onto a conflicted branch.
 
 | You push | It counts as | What it records |
 |---|---|---|
-| A commit descending from the branch's single computed position | A fast-forward | Your node's row: that commit, plus the drops it carried |
+| A commit descending from the branch's single computed position | A fast-forward | Your node's row: that commit, plus the drops it carried, plus every current row |
 | A commit not descending from it (a rewind or sideways move) | A forced push | The commit, plus the drops it carried, plus every current row of the branch |
 | A deletion of the branch | A forced push | Deleted, plus the drops it carried, plus every current row |
-| On a conflicted branch: a commit descending from *every* sibling | A fast-forward, which resolves it | The commit, plus the drops it carried |
+| On a conflicted branch: a commit descending from *every* sibling | A fast-forward, which resolves it | The commit, plus the drops it carried, plus every current row |
 | On a conflicted branch: a commit not descending from every sibling | Refused | `<b> is conflicted; push a merge of its siblings, or delete the ones you don't want` |
 | A deletion of `meddle/conflict/<b>/<id>` | A drop of that sibling | See below |
 

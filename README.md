@@ -605,15 +605,15 @@ whole push.
 
 ### Branches
 
-A push to a branch is recorded as your node's own row for it: the commit, and the rows it replaced (its drops). Every
-node computes the branch from every node's row for it: leave out the deleted rows and those some other row drops; the
-branch is the heads of the commits left. Your push lands on your own node at once, and reaches the others when they
-can see it; it never waits for another machine.
+A push to a branch is recorded as your node's own row for it: the commit, and the rows it replaces (its drops), which
+are every row the branch had when you pushed. Every node computes the branch from every node's row for it: leave out
+the deleted rows and those some other row drops; the branch is the heads of the commits left. Your push lands on your
+own node at once, and reaches the others when they can see it; it never waits for another machine.
 
 | You push | It counts as | What happens |
 |---|---|---|
 | A commit descending from the branch | A fast-forward | The branch moves there, everywhere |
-| A commit not descending from it (`--allow-backwards` in jj, `--force` in git) | A forced push | Your row drops every current row: the branch is at your commit everywhere, a rewind included |
+| A commit not descending from it (`--allow-backwards` in jj, `--force` in git) | A forced push | The branch is at your commit everywhere, a rewind included |
 | A deletion of the branch | A forced push | The branch is gone everywhere |
 | On a conflicted branch, a commit descending from every sibling | A fast-forward | It resolves the conflict, everywhere |
 | On a conflicted branch, any other commit | Refused | `<b> is conflicted; push a merge of its siblings, or delete the ones you don't want`, then the siblings and the fix (below) |
