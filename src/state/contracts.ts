@@ -178,7 +178,14 @@ const nodeMethods = {
     }),
     Type.Object({ manifest: TaskManifestSchema, nodeId: Type.String() }),
   ),
-  addProjectFromFolder: method(Type.Object({ path: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
+  /**
+   * Adds the project in folder `path`, or answers the one it already is: `projectId` (the project its `meddle` remote
+   * names) when this node has it, else the one added from `path`.
+   */
+  addProjectFromFolder: method(
+    Type.Object({ path: Type.String(), name: Type.Optional(Type.String()), projectId: Type.Optional(Type.String()) }),
+    ProjectSchema,
+  ),
   addProjectFromUpstream: method(Type.Object({ url: Type.String(), name: Type.Optional(Type.String()) }), ProjectSchema),
   /** Sets the default branch of project `projectId` on this node (`no project <short id>` when it has none). */
   setDefaultBranch: method(Type.Object({ projectId: Type.String(), branch: Type.String() }), ProjectSchema),

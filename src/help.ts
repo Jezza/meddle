@@ -207,7 +207,11 @@ const GROUPS: Group[] = [
           "anything is added. Every node of the pool keeps a service repo of the project. A checkout's fetch shows each " +
           "branch where the pool's pushes put it (see `project status`) and every task's work as its line, " +
           "`meddle/task/<task id>/<project>@meddle`, read-only; a push records branches. --name names it (else after " +
-          "the folder, or the repo in the URL). Prints the project id. Needs the node running. The dashboard's add " +
+          "the folder, or the repo in the URL). Prints the project id. Run again on a folder that is already a project " +
+          "(the one its `meddle` remote names, or the one added from that path), it adds nothing and repairs the " +
+          "checkout: the remote, the fetch, and, when meddle holds no default branch for it, a push of the folder's " +
+          "`main` (else `master`), made the default branch if the project had none; a different --name is refused. " +
+          "An upstream URL already added prints its project. Needs the node running. The dashboard's add " +
           "form builds the service repo too, but does not make the folder a checkout.",
       },
       {

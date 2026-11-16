@@ -583,6 +583,11 @@ that for `project add`). They differ in where the repo comes from:
   `master` (for a URL, the upstream's HEAD branch). The folder must be a jj repo colocated with git, or not a jj repo at
   all, in which case the command makes it one; a jj repo that keeps its git repo elsewhere is refused with `<folder> is
   a jj repo without a colocated git repo`. The node only reads your folder (`git fetch <folder> <branch>`).
+  Run again on a folder that is already a project (the one its `meddle` remote names, or the one added from that
+  path), it adds nothing: it prints that project's id and repairs the checkout. A project with no default branch takes
+  the folder's `main`, else `master`; when this node holds no such branch at all (not even one still fetching or
+  conflicted), the folder's is pushed, as your own push would be. A different `--name` is refused, and so is a folder
+  whose remote names a project of the pool this node does not hold yet.
 - `checkout` clones a new checkout from this node's service repo into `<dir>` (default `./<project name>`; refused
   `<dir> exists and is not empty`), and prints its path.
 

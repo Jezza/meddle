@@ -135,19 +135,39 @@ function saveWithBranch(db: Database, project: Project, commit: string | null): 
 }
 
 /**
+ * The project of this node that `known` names, else the one added from `source` (of kind `kind`); null for none.
+ * Rejects `<label> is already project <id> (<name>)` when `name` is given and is not that project's.
+ */
+function existingProject(
+  db: Database, kind: Project["source"]["kind"], source: string, label: string, name?: string, known?: string,
+): Project | null {
+  const row = (known === undefined ? null : getProjectRow(db, known))
+    ?? listProjectRows(db).find((r) => r.source_kind === kind && r.source === source);
+  if (row === undefined) return null;
+  if (name !== undefined && name !== row.name) throw new Error(`${label} is already project ${row.id} (${row.name})`);
+  return toProject(row);
+}
+
+/**
  * Adds the project in `folder`, a colocated jj repo (read only: the folder is the user's checkout, attached by the CLI),
  * with its home `home` (this node). Its service repo holds the folder's default branch,
  * `main`, else `master` (none when it has neither). Rejects `not a directory: <folder>`, `<folder> is not a jj repo`
- * and `<folder> is a jj repo without a colocated git repo`.
+ * and `<folder> is a jj repo without a colocated git repo`. A folder that is already a project (`known`, the project
+ * its `meddle` remote names, when this node has it; else one added from the same path) answers that project, adding
+ * nothing but, when it has no default branch, the folder's `main`, else `master`; it rejects a differing `name`
+ * (`existingProject`).
  */
 export async function addProjectFromFolder(
-  cfg: NodeConfig, db: Database, folder: string, home: string, name?: string,
+  cfg: NodeConfig, db: Database, folder: string, home: string, name?: string, known?: string,
 ): Promise<Project> {
   const path = resolve(folder);
   if (!(await isDirectory(path))) throw new Error(`not a directory: ${folder}`);
   await checkColocated(path);
-  const id = newId();
+  const existing = existingProject(db, "folder", path, folder, name, known);
+  if (existing !== null && existing.defaultBranch !== null) return existing;
   const defaultBranch = await firstBranch(cfg, path, ["main", "master"]);
+  if (existing !== null) return defaultBranch === null ? existing : setDefaultBranch(db, existing.id, defaultBranch)!;
+  const id = newId();
   const { replica, commit } = await buildServiceRepo(cfg, id, path, defaultBranch);
   await ensureMemoryReplica(cfg, id);
   await importMemory(cfg, id, path);
@@ -180,11 +200,13 @@ export async function upstreamDefaultBranch(url: string, cfg: NodeConfig): Promi
 /**
  * Adds a project from the upstream at `url`, with its home `home` (this node). Its service repo, in the replicas
  * directory, holds the upstream's default branch (its `HEAD`'s; none when it names none), and has the upstream as its
- * remote `origin`.
+ * remote `origin`. A URL already added answers its project, adding nothing (`existingProject`).
  */
 export async function addProjectFromUpstream(
   cfg: NodeConfig, db: Database, url: string, home: string, name?: string,
 ): Promise<Project> {
+  const existing = existingProject(db, "upstream", url, url, name);
+  if (existing !== null) return existing;
   const id = newId();
   const defaultBranch = await upstreamDefaultBranch(url, cfg);
   const { replica, commit } = await buildServiceRepo(cfg, id, url, defaultBranch);

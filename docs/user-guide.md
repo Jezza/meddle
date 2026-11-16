@@ -160,7 +160,9 @@ meddle task new "Find out why test_sync is flaky and fix it"
 and makes the folder a **checkout**: it gets a git remote `meddle` pointing at this node. Without the helper on your
 `PATH` it is refused (`git-remote-meddle is not on your PATH; add <data>/bin to it`). On any other machine of the
 pool, `meddle checkout myproject` clones a checkout of your own. (The dashboard can add a project too, but it cannot
-make your folder a checkout: use `meddle project add` for that.)
+make your folder a checkout: use `meddle project add` for that.) Running `project add` again on a folder that is
+already a project adds nothing: it prints the project's id and repairs the checkout, pushing the folder's `main` when
+meddle holds no default branch for the project.
 
 `task new` prints `task <id> on <short id>` once the first turn has started. Open `http://127.0.0.1:7777/`: the pool
 view shows this node and its task; the task's view shows the conversation as it goes, with Approve and Deny for the

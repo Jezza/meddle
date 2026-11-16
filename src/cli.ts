@@ -704,7 +704,10 @@ function configList(): Promise<number> {
  * Adds an existing directory as a folder project, anything else as an upstream URL; prints the project id. A folder is
  * first made a colocated jj repo when it is not a jj repo, and, once the node has built the project's service repo from
  * it, attached to it as a checkout (`attachCheckout`; with `fetch` false, without fetching). Both happen here, in the
- * folder the user named; the node only reads it.
+ * folder the user named; the node only reads it. Run again on a folder that is already a project (the one its `meddle`
+ * remote names, or the one added from it), it repairs that project's checkout instead, and `attachCheckout` pushes the
+ * folder's default branch when this node holds that branch in no state (not even still fetching or conflicted).
+ * Refuses a folder whose remote names a project of the pool this node does not hold yet, rather than minting another.
  */
 function projectAdd(source: string, name: string | undefined, fetch: boolean): Promise<number> {
   return withNode(async (client) => {
@@ -721,14 +724,46 @@ function projectAdd(source: string, name: string | undefined, fetch: boolean): P
       // Refused before anything is added: a project whose folder could not be attached would be left behind.
       checkHelperOnPath(cfg);
       await colocate(cfg, folder);
-      const project = await node.addProjectFromFolder({ path: folder, ...named });
-      await attachCheckout(cfg, project.home, folder, { id: project.id, defaultBranch: project.defaultBranch ?? null }, process.env, { fetch });
+      const self = node.nodeId.value;
+      const known = (await checkoutAt(cfg, folder))?.projectId;
+      if (known !== undefined) await refuseUnheld(client, self, folder, known);
+      const project = await node.addProjectFromFolder({ path: folder, ...named, ...(known === undefined ? {} : { projectId: known }) });
+      const defaultBranch = project.defaultBranch ?? null;
+      const push = fetch && defaultBranch !== null && !(await holdsBranch(client, project.id, defaultBranch));
+      // This node, not the project's home: a folder already a project may be a checkout of a replica of another's.
+      await attachCheckout(cfg, self, folder, { id: project.id, defaultBranch }, process.env, { fetch, push });
       console.log(project.id);
       return 0;
     } finally {
       node.release();
     }
   });
+}
+
+/**
+ * Rejects `<folder> is a checkout of project <id>, which this node does not hold yet` when the pool lists project
+ * `projectId` but not on this node (`self`): adding the folder then would mint a second project of it.
+ */
+async function refuseUnheld(client: Host, self: string, folder: string, projectId: string): Promise<void> {
+  const pool = await poolView(client);
+  try {
+    const listed = poolProjects(pool.nodes.value).find((p) => p.id === projectId);
+    if (listed !== undefined && !listed.holders.includes(self)) {
+      throw new Error(`${folder} is a checkout of project ${projectId}, which this node does not hold yet`);
+    }
+  } finally {
+    pool.release();
+  }
+}
+
+/** Whether this node has branch `branch` of project `projectId` in any state: single, conflicted or still fetching. */
+async function holdsBranch(client: Host, projectId: string, branch: string): Promise<boolean> {
+  const ref = await client.get(ProjectObject, { id: projectId });
+  try {
+    return ref.branches.value.some((b) => b.name === branch);
+  } finally {
+    ref.release();
+  }
 }
 
 /** The id of project `project` (an id or name of the pool, see `resolveProject`) and this node's id. */

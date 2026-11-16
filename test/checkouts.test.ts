@@ -11,7 +11,7 @@ import { bookmarkRefs, git, jj, JjError, type BookmarkRef } from "../src/jj";
 import { listBranchRows, mergeBranchRows, settleBranchRows, waitingBranchRows, writeBranchRow, type BranchRow } from "../src/pool/rows";
 import { applyProject, projectBranches } from "../src/projects/applier";
 import { attachCheckout, makeCheckout } from "../src/projects/checkouts";
-import { addProjectFromFolder, getProject, listProjects } from "../src/projects/project";
+import { addProjectFromFolder, addProjectFromUpstream, getProject, listProjects } from "../src/projects/project";
 import { meddle } from "./helpers";
 import { peerReady, poolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -89,6 +89,119 @@ test("project add of a folder fetches the node's view into it, tracking main@med
     expect(added.code).toBe(0);
     expect(await remoteMain(n, folder)).toMatchObject({ commitId: main, tracked: true });
     expect(n.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("project add again on a folder already a project adds nothing and repairs its checkout; a different --name is refused", async () => {
+  const { n, cli, close } = await node();
+  try {
+    const folder = `${n.home}/mine`;
+    const main = await folderWithMainAndWip(n, folder);
+    const id = (await cli(["project", "add", folder, "--name", "mine"])).stdout.trim();
+    const before = listProjects(n.db).length;
+    const rows = listBranchRows(n.db, id);
+    await git(["remote", "remove", "meddle"], folder, n.cfg);
+
+    // The same path, spelt differently, is the same project.
+    const again = await cli(["project", "add", `${folder}/./`]);
+    expect(again).toEqual({ stdout: `${id}\n`, stderr: "", code: 0 });
+    expect(listProjects(n.db)).toHaveLength(before);
+    expect((await git(["remote", "get-url", "meddle"], folder, n.cfg)).trim()).toBe(`meddle://${n.id}/project/${id}`);
+    expect(await remoteMain(n, folder)).toMatchObject({ commitId: main, tracked: true });
+    // meddle held main already: nothing was pushed.
+    expect(listBranchRows(n.db, id)).toEqual(rows);
+
+    const renamed = await cli(["project", "add", folder, "--name", "other"]);
+    expect(renamed).toEqual({ stdout: "", stderr: `meddle: ${folder} is already project ${id} (mine)\n`, code: 1 });
+    expect(listProjects(n.db)).toHaveLength(before);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("project add again records the folder's main when meddle holds no default branch, making it the default", async () => {
+  const { n, cli, close } = await node();
+  try {
+    const folder = `${n.home}/mine`;
+    await mkdir(folder);
+    await jj(["git", "init", "--colocate"], folder, n.cfg);
+    await writeFile(`${folder}/README`, "first\n");
+    await jj(["commit", "-m", "first"], folder, n.cfg);
+    await jj(["bookmark", "set", "trunk", "-r", "@-"], folder, n.cfg);
+    const id = (await cli(["project", "add", folder])).stdout.trim();
+    expect(getProject(n.db, id)!.defaultBranch).toBeNull();
+    expect(listBranchRows(n.db, id)).toEqual([]);
+
+    await jj(["bookmark", "set", "main", "-r", "trunk"], folder, n.cfg);
+    const main = await read(n, folder, "main");
+    // Without a fetch it pushes nothing, but the project does take main as its default.
+    expect(await cli(["project", "add", folder, "--no-fetch"])).toEqual({ stdout: `${id}\n`, stderr: "", code: 0 });
+    expect(getProject(n.db, id)!.defaultBranch).toBe("main");
+    expect(listBranchRows(n.db, id)).toEqual([]);
+
+    const again = await cli(["project", "add", folder]);
+    expect(again).toEqual({ stdout: `${id}\n`, stderr: "", code: 0 });
+    expect(getProject(n.db, id)!.defaultBranch).toBe("main");
+    expect(listBranchRows(n.db, id)).toMatchObject([{ branch: "main", node: n.id, commit: main }]);
+    expect(await remoteMain(n, folder)).toMatchObject({ commitId: main, tracked: true });
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("project add again pushes nothing while the node is still fetching another node's push of the default branch", async () => {
+  const { n, cli, close } = await node();
+  try {
+    const folder = `${n.home}/mine`;
+    await mkdir(folder);
+    await jj(["git", "init", "--colocate"], folder, n.cfg);
+    await writeFile(`${folder}/README`, "first\n");
+    await jj(["commit", "-m", "first"], folder, n.cfg);
+    await jj(["bookmark", "set", "trunk", "-r", "@-"], folder, n.cfg);
+    const id = (await cli(["project", "add", folder])).stdout.trim();
+    // Another node's row for main, at a commit that has not reached this one.
+    const theirs = { project: id, branch: "main", node: "f".repeat(64), seq: 1, commit: "e".repeat(40), drops: [] };
+    mergeBranchRows(n.db, [theirs]);
+
+    await jj(["bookmark", "set", "main", "-r", "trunk"], folder, n.cfg);
+    expect(await cli(["project", "add", folder])).toEqual({ stdout: `${id}\n`, stderr: "", code: 0 });
+    expect(listBranchRows(n.db, id)).toEqual([]);
+    expect(waitingBranchRows(n.db, id)).toEqual([theirs]);
+    expect(await remoteMain(n, folder)).toBeUndefined();
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("project add on a checkout made by `checkout` answers the project its remote names", async () => {
+  const { n, cli, close } = await node();
+  try {
+    const folder = `${n.home}/mine`;
+    await folderWithMainAndWip(n, folder);
+    const id = (await cli(["project", "add", folder, "--name", "mine"])).stdout.trim();
+    const clone = `${n.home}/clone`;
+    expect((await cli(["checkout", "mine", clone])).code).toBe(0);
+    const before = listProjects(n.db).length;
+    expect(await cli(["project", "add", clone])).toEqual({ stdout: `${id}\n`, stderr: "", code: 0 });
+    expect(listProjects(n.db)).toHaveLength(before);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("adding an upstream URL already added answers its project", async () => {
+  const { n, close } = await node();
+  try {
+    const folder = `${n.home}/up`;
+    await folderWithMainAndWip(n, folder);
+    const url = `file://${folder}`;
+    const first = await addProjectFromUpstream(n.cfg, n.db, url, n.id, "up");
+    const before = listProjects(n.db).length;
+    expect((await addProjectFromUpstream(n.cfg, n.db, url, n.id)).id).toBe(first.id);
+    await expect(addProjectFromUpstream(n.cfg, n.db, url, n.id, "down")).rejects.toThrow(`${url} is already project ${first.id} (up)`);
+    expect(listProjects(n.db)).toHaveLength(before);
   } finally {
     await close();
   }

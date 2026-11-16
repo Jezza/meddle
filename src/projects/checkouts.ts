@@ -40,12 +40,14 @@ export async function colocate(cfg: NodeConfig, dir: string): Promise<void> {
 /**
  * Attaches the colocated jj repo `dir` to `project` on this node (`selfId`) as a checkout: the remote `meddle`
  * (`git remote add`, or its url corrected), then `jj git fetch --remote meddle`, tracking `<default>@meddle` when the
- * project's default branch arrived. Without `fetch` (default true), only the remote. Rejects first, with nothing done,
- * unless `git-remote-meddle` is on `env.PATH`.
+ * project's default branch arrived. With `push` (default false; the caller found that the node holds no such branch in
+ * any state: a project added before branches were recorded, or one whose branch was deleted), when it did not arrive
+ * and `dir` has it, pushes `dir`'s and tracks it, as a user's push would. Without `fetch` (default true), only the
+ * remote. Rejects first, with nothing done, unless `git-remote-meddle` is on `env.PATH`.
  */
 export async function attachCheckout(
   cfg: NodeConfig, selfId: string, dir: string, project: Pick<Project, "id" | "defaultBranch">,
-  env: Record<string, string | undefined> = process.env, options: { fetch?: boolean } = {},
+  env: Record<string, string | undefined> = process.env, options: { fetch?: boolean; push?: boolean } = {},
 ): Promise<void> {
   checkHelperOnPath(cfg, env);
   const url = checkoutUrl(selfId, project.id);
@@ -56,8 +58,16 @@ export async function attachCheckout(
   await jj(["git", "fetch", "--remote", CHECKOUT_REMOTE], dir, cfg, { timeoutMs: networkMs(cfg) });
   const branch = project.defaultBranch;
   if (branch === null) return;
-  const fetched = (await bookmarkRefs(dir, `exact:${branch}`, cfg)).find((r) => r.remote === CHECKOUT_REMOTE);
-  if (fetched !== undefined && !fetched.tracked) await track(dir, `exact:${branch}`, CHECKOUT_REMOTE, cfg);
+  const refs = await bookmarkRefs(dir, `exact:${branch}`, cfg);
+  const fetched = refs.find((r) => r.remote === CHECKOUT_REMOTE);
+  if (fetched !== undefined) {
+    if (!fetched.tracked) await track(dir, `exact:${branch}`, CHECKOUT_REMOTE, cfg);
+    return;
+  }
+  if (options.push !== true || !refs.some((r) => r.remote === null)) return;
+  // jj pushes a bookmark the remote lacks only once it is tracked.
+  await track(dir, `exact:${branch}`, CHECKOUT_REMOTE, cfg);
+  await jj(["git", "push", "--remote", CHECKOUT_REMOTE, "-b", `exact:${branch}`], dir, cfg, { timeoutMs: networkMs(cfg) });
 }
 
 /**

@@ -451,8 +451,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           throw err;
         }
       },
-      addProjectFromFolder: async ({ path, name }, ctx) => {
-        const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name);
+      addProjectFromFolder: async ({ path, name, projectId }, ctx) => {
+        const project = await addProjectFromFolder(cfg, db, path, pool.identity.id, name, projectId);
         projectIds.replace(ctx, projectIdsNow());
         return project;
       },
