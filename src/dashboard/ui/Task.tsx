@@ -2,12 +2,13 @@
 // the composer, and the bar beneath (project, node, bookmark, the latest turn's tokens, model and effort).
 import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
-import { createContext } from "preact";
-import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { createContext, type RefObject } from "preact";
+import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
-import { type Hosts, useAction, useObject, useValue } from "./hooks";
+import { errorText, type Hosts, useAction, useObject, useValue } from "./hooks";
 import { type Anchor, ModelPicker, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { usageShort } from "./sidebar-model";
@@ -86,6 +87,18 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const live = state === "running" || state === "waiting";
   /** Shows every event in the thread, the ones it otherwise leaves out included. */
   const [raw, setRaw] = useState(false);
+  // What the composer holds, here so that a failed text's Edit can put it back.
+  const [draft, setDraft] = useState("");
+  const box = useRef<HTMLTextAreaElement>(null);
+  /** Texts the task could not be sent: this page's own, so they go with it. */
+  const [failed, setFailed] = useState<Failed[]>([]);
+  const failedId = useRef(0);
+  const dropFailed = (id: number) => setFailed((all) => all.filter((f) => f.id !== id));
+  const editFailed = (f: Failed) => {
+    dropFailed(f.id);
+    setDraft((d) => (d.trim() === "" ? f.text : `${d}\n\n${f.text}`));
+    box.current?.focus();
+  };
   return (
     <div class="task">
       <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving}
@@ -97,9 +110,15 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
         <Thread session={session} readOnly={archived} working={state === "running"} raw={raw} after={<>
           {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
           {queued.map((text, i) => <Queued key={i} text={text} />)}
+          {!archived && failed.map((f) => (
+            <FailedMessage key={f.id} task={task} failed={f} disabled={moving} onSent={() => dropFailed(f.id)} onEdit={() => editFailed(f)} />
+          ))}
         </>} />
       )}
-      {!archived && state !== "moved" && <Composer task={task} running={live} disabled={moving} />}
+      {!archived && state !== "moved" && (
+        <Composer task={task} running={live} disabled={moving} text={draft} setText={setDraft} box={box}
+          onFailed={(text, error) => setFailed((all) => [...all, { id: ++failedId.current, text, error }])} />
+      )}
       <BottomBar task={task} pool={pool} node={node} nodeId={nodeId} archived={archived} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} moving={moving} />
     </div>
   );
@@ -644,35 +663,73 @@ function Queued({ text }: { text: string }) {
   );
 }
 
-function Composer({ task, running, disabled }: { task: TaskRef; running: boolean; disabled: boolean }) {
-  const [text, setText] = useState("");
+type Failed = { id: number; text: string; error: string };
+
+/** A text the task could not be sent: it stays in the thread, marked, to send again or take back into the composer. */
+function FailedMessage({ task, failed, disabled, onSent, onEdit }: {
+  task: TaskRef; failed: Failed; disabled: boolean; onSent(): void; onEdit(): void;
+}) {
   const action = useAction();
+  const retry = async () => { if (await action.run(() => task.prompt({ text: failed.text }))) onSent(); };
+  return (
+    <div class="msg you failed">
+      <div class="user-text">{failed.text}</div>
+      <div class="failed-line error">
+        <Iconoir name="warning" /><span>Not sent: {action.error ?? failed.error}</span>
+        <span class="failed-acts">
+          <button disabled={disabled || action.busy} onClick={retry}>{action.busy ? "Retrying…" : "Retry"}</button>
+          <button disabled={action.busy} onClick={onEdit} title="Put it back in the box">Edit</button>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function Composer({ task, running, disabled, text, setText, box, onFailed }: {
+  task: TaskRef; running: boolean; disabled: boolean;
+  text: string; setText: Dispatch<StateUpdater<string>>; box: RefObject<HTMLTextAreaElement | null>;
+  onFailed(text: string, error: string): void;
+}) {
+  const [busy, setBusy] = useState(false);
   // Grows with what is typed, up to the stylesheet's max-height, instead of a drag handle.
-  const box = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
     const el = box.current;
     if (el === null) return;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight + 2}px`;
   }, [text]);
+  // Sent or not, the text leaves the box: a failed one goes into the thread (FailedMessage). What was typed meanwhile stays.
   const send = async () => {
-    if (disabled || text.trim() === "") return;
-    if (await action.run(() => task.prompt({ text }))) setText("");
+    const sent = text;
+    if (disabled || busy || sent.trim() === "") return;
+    setBusy(true);
+    try {
+      await task.prompt({ text: sent });
+    } catch (err) {
+      onFailed(sent, errorText(err));
+    } finally {
+      setBusy(false);
+    }
+    setText((now) => (now === sent ? "" : now));
   };
+  // The button takes the accent only once there is something to send.
+  const ready = !disabled && text.trim() !== "";
+  const verb = running ? "Queue" : "Send";
   return (
     <div class="composer">
-      <textarea
-        ref={box}
-        rows={1}
-        disabled={disabled}
-        value={text}
-        placeholder={disabled ? "Moving: prompts wait until it lands" : running ? "Message Claude: it takes it at its next step…" : "Reply…"}
-        onInput={(e) => setText(e.currentTarget.value)}
-        onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); } }}
-      />
-      <div class="composer-row">
-        {action.error !== null ? <span class="error">{action.error}</span> : <span class="muted">Ctrl+Enter sends</span>}
-        <button class="primary" disabled={disabled || action.busy || text.trim() === ""} onClick={send}>{running ? "Queue" : "Send"}</button>
+      <div class="composer-field">
+        <textarea
+          ref={box}
+          rows={1}
+          disabled={disabled}
+          value={text}
+          placeholder={disabled ? "Moving: prompts wait until it lands" : running ? "Message Claude: it takes it at its next step…" : "Reply…"}
+          onInput={(e) => setText(e.currentTarget.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); } }}
+        />
+        <button class={ready ? "send ready" : "send"} disabled={!ready || busy} onClick={send} title={`${verb} (Ctrl+Enter)`} aria-label={verb}>
+          <Iconoir name="send" />
+        </button>
       </div>
     </div>
   );
