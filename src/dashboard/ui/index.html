@@ -290,7 +290,17 @@
   .bar > * { flex: none; }
   .bar > .bar-item { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bar > .bar-gap { flex: 1 1 0; }
-  .bar > .bar-project { flex: none; max-width: 30%; }
+  .bar > .bar-projects { display: flex; align-items: center; gap: 14px; flex: 0 1 auto; min-width: 0; overflow: hidden; }
+  .bar-entry { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; min-width: 0; }
+  .bar-name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; }
+  .bar-projects + .bar-collapsed { display: none; }
+  .bar-sep { width: 1px; height: 14px; background: var(--line-strong); }
+  .rev { display: inline-flex; align-items: center; gap: 5px; background: none; border: none; border-radius: 4px; padding: 0 4px; color: var(--fg-soft); font: 12px ui-monospace, "JetBrains Mono", Menlo, monospace; white-space: nowrap; }
+  .rev:hover { background: var(--hover); }
+  .rev .ico { color: var(--muted); }
+  span.rev.flag { color: var(--warn); }
+  .menu-row { display: flex; align-items: center; gap: 10px; padding: 5px 12px; color: var(--fg); }
+  .menu-row .rev { margin-left: auto; }
   .bar-gap { flex: 1; }
   .pill, select.pill { background: var(--hover); border: 1px solid transparent; border-radius: 5px; padding: 1px 8px; color: var(--fg); font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
   .pill.add { background: none; border: 1px dashed var(--line-strong); color: var(--muted); }
@@ -345,7 +355,8 @@
     .head-actions button { padding: 3px 7px; }
     .page { padding: 8px 14px 40px; }
     .bar { overflow-x: auto; }
-    .bar > .bar-item:not(.bar-project) { display: none; }
+    .bar > .bar-item:not(:first-child), .bar > .bar-sep, .bar > .bar-projects { display: none; }
+    .bar-projects + .bar-collapsed { display: inline-flex; }
   }
 </style>
 </head>

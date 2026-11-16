@@ -1,5 +1,5 @@
 // One task: its head (title, state, actions), the thread from the session's event log with what waits on you inline,
-// the composer, and the bar beneath (project, node, bookmark, the latest turn's tokens, model and effort).
+// the composer, and the bar beneath (each project with its line, the latest turn's tokens; the node, model and effort).
 import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
 import { createContext, type RefObject } from "preact";
@@ -7,11 +7,11 @@ import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffec
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useObject, useValue } from "./hooks";
-import { type Anchor, ModelPicker, MoveMenu, PaneHead, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
-import { usageShort } from "./sidebar-model";
+import { type ProjectLine, projectLines, usageShort } from "./sidebar-model";
 import {
   activity, activityLine, buildThread, cwdOf, type DiffLine, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps, isLook,
   keyOf, type ShownItem, toolSummary, toolTarget, type ToolItem,
@@ -741,12 +741,7 @@ function Composer({ task, running, disabled, text, setText, box, onFailed }: {
 }
 
 /** A task bookmark as the bar shows it: its name after `meddle/task/<id>/`, then its change (or "conflicted"). */
-function bookmarkText(taskId: string, b: { name: string; changeId: string }): string {
-  const prefix = `meddle/task/${taskId}/`;
-  const name = b.name.startsWith(prefix) ? b.name.slice(prefix.length) : b.name;
-  return b.changeId === "" ? `${name} (conflicted)` : `${name} ${b.changeId.slice(0, 8)}`;
-}
-
+/** The bar beneath the composer: each project with its line, the latest turn's tokens; the node, model and effort. */
 function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
   task: TaskRef; pool: PoolRef; node: NodeRef; nodeId: string; archived: boolean; archivedOn: string | null; moving: boolean;
 }) {
@@ -756,29 +751,70 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
   const nodes = useValue(pool.nodes);
   const hostname = useValue(node.hostname);
   const [moveAt, setMoveAt] = useState<Anchor | null>(null);
+  const [projectsAt, setProjectsAt] = useState<Anchor | null>(null);
   const usage = usageShort(contextUsage);
-  const projects = manifest.projects;
-  const own = bookmarks.find((b) => b.name === `meddle/task/${manifest.id}/${projects[0]?.name ?? ""}`) ?? bookmarks[0];
+  const lines = projectLines(manifest.id, manifest.projects, bookmarks);
   return (
     <footer class="bar">
-      <span class="bar-item bar-project" title={projects.map((p) => `${p.name} (${p.workspace})`).join("\n") || "no project"}>
-        ◉ {projects.length === 0 ? "no project" : projects.length === 1 ? projects[0]!.name : `${projects[0]!.name} +${projects.length - 1}`}
-      </span>
+      {lines.length === 0 ? <span class="bar-item">◉ no project</span> : <>
+        {/* Inline up to two projects; more, or a phone, collapse to the pill and its list. */}
+        {lines.length <= 2 && (
+          <span class="bar-projects">
+            {lines.map((l) => (
+              <span key={l.name} class="bar-entry" title={`${l.name} (${l.workspace})`}>
+                <span class="bar-name">◉ {l.name}</span>
+                <Revision line={l} />
+              </span>
+            ))}
+          </span>
+        )}
+        <button class="pill bar-collapsed" title={lines.map((l) => `${l.name} (${l.workspace})`).join("\n")}
+          onClick={(e) => setProjectsAt({ el: e.currentTarget, above: true })}>
+          ◉ {lines[0]!.name}{lines.length > 1 && <span class="muted"> +{lines.length - 1}</span>} ▾
+        </button>
+      </>}
+      {usage !== null && <>
+        <span class="bar-sep" />
+        <span class="bar-item" title="The latest turn's tokens, summed over its API calls">{usage}</span>
+      </>}
+      <span class="bar-gap" />
       {archived ? (
         <span class="bar-item" title={nodeId}>⌂ archived on {archivedOn ?? hostname}</span>
       ) : (
         <button class="pill" disabled={moving} title={`${nodeId}\nMove to another node`} onClick={(e) => setMoveAt({ el: e.currentTarget, above: true })}>⌂ {hostname} ▾</button>
       )}
-      {own !== undefined && (
-        <span class={`bar-item${own.changeId === "" ? " flag" : ""}`} title={bookmarks.map((b) => bookmarkText(manifest.id, b)).join("\n")}>
-          {bookmarkText(manifest.id, own)}{bookmarks.length > 1 && ` +${bookmarks.length - 1}`}
-        </span>
-      )}
-      {usage !== null && <span class="bar-item" title="The latest turn's tokens, summed over its API calls">{usage}</span>}
-      <span class="bar-gap" />
       {!archived && <Settings task={task} node={node} pool={pool} disabled={moving} />}
       {moveAt !== null && <MoveMenu task={task} nodes={nodes} from={nodeId} anchor={moveAt} onClose={() => setMoveAt(null)} />}
+      {projectsAt !== null && (
+        <Popover anchor={projectsAt} onClose={() => setProjectsAt(null)} wide>
+          <div class="menu-head">Projects</div>
+          {lines.map((l) => (
+            <div key={l.name} class="menu-row" title={l.workspace}>
+              <span class="menu-label">{l.name}</span>
+              <Revision line={l} />
+            </div>
+          ))}
+        </Popover>
+      )}
     </footer>
+  );
+}
+
+/** A project's line: its change id, which copies the whole id when clicked; `conflicted`; or nothing before it has one. */
+function Revision({ line }: { line: ProjectLine }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(t);
+  }, [copied]);
+  if (line.conflicted) return <span class="rev flag" title="Its bookmark points at several changes">conflicted</span>;
+  if (line.changeId === null) return null;
+  const id = line.changeId;
+  return (
+    <button class="rev" title={`Copy ${id}`} onClick={() => void copyText(id).then(setCopied)}>
+      {id.slice(0, 8)}<Iconoir name={copied ? "check" : "copy"} />
+    </button>
   );
 }
 

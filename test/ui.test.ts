@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import { branchLines, headText, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
-import { ago, groupTasks, homeTask, moveChoices, nodeLineText, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
+import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
@@ -184,6 +184,23 @@ test("nodeLineText sums a node up for the footer", () => {
 test("usageShort: the latest turn's tokens in short", () => {
   expect(usageShort(null)).toBeNull();
   expect(usageShort({ usage: { input_tokens: 10, cache_read_input_tokens: 40_000, output_tokens: 2100 } })).toBe("40k in · 2.1k out");
+});
+
+test("projectLines: each project with its own line's change id, in manifest order", () => {
+  const t = "t1";
+  const bm = [
+    { name: "meddle/task/t1/swarm", changeId: "tplnrwsvqkxm0000" },
+    { name: "meddle/task/t1/meddle.before-1", changeId: "zzzzzzzz" },
+    { name: "meddle/task/t1/meddle", changeId: "kqxyzmwnrstl0000" },
+    { name: "meddle/task/t1/broken", changeId: "" },
+  ];
+  expect(projectLines(t, [{ name: "meddle", workspace: "meddle" }, { name: "swarm", workspace: "swarm" }], bm)).toEqual([
+    { name: "meddle", workspace: "meddle", changeId: "kqxyzmwnrstl0000", conflicted: false },
+    { name: "swarm", workspace: "swarm", changeId: "tplnrwsvqkxm0000", conflicted: false },
+  ]);
+  expect(projectLines(t, [{ name: "broken", workspace: "broken" }], bm)).toEqual([{ name: "broken", workspace: "broken", changeId: null, conflicted: true }]);
+  expect(projectLines(t, [{ name: "fresh", workspace: "fresh" }], bm)).toEqual([{ name: "fresh", workspace: "fresh", changeId: null, conflicted: false }]);
+  expect(projectLines(t, [], bm)).toEqual([]);
 });
 
 test("renderMarkdown highlights code blocks and shows raw HTML as text", () => {

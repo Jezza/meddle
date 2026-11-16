@@ -94,6 +94,35 @@ export function Popover({ anchor, onClose, children, wide = false }: { anchor: A
   );
 }
 
+/**
+ * Puts `text` on the clipboard: the Clipboard API where the page has it (a secure context), else a hidden textarea
+ * and `execCommand("copy")`, as over plain http from another host. False when neither worked; never throws.
+ */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard !== undefined) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Refused (no focus, no permission): try the fallback.
+  }
+  const box = document.createElement("textarea");
+  box.value = text;
+  box.setAttribute("readonly", "");
+  box.style.position = "fixed";
+  box.style.opacity = "0";
+  document.body.appendChild(box);
+  try {
+    box.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    box.remove();
+  }
+}
+
 /** One line of a menu. */
 export function MenuItem({ onClick, disabled = false, children, meta, title }: {
   onClick?: () => void; disabled?: boolean; children: ComponentChildren; meta?: ComponentChildren; title?: string;

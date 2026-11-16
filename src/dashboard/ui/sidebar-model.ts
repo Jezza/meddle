@@ -124,6 +124,24 @@ export function ago(ms: number): string {
   return `${Math.floor(s / 86_400)}d`;
 }
 
+/** A project of a task as the bar shows it: its own line's change id (null: none yet, or conflicted). */
+export type ProjectLine = { name: string; workspace: string; changeId: string | null; conflicted: boolean };
+
+/**
+ * Each project of task `taskId`, in the manifest's order, with its own line: the bookmark `meddle/task/<id>/<name>`,
+ * side lines (`<name>.before-<n>`) left out. A conflicted bookmark has `changeId` "".
+ */
+export function projectLines(
+  taskId: string,
+  projects: readonly { name: string; workspace: string }[],
+  bookmarks: readonly { name: string; changeId: string }[],
+): ProjectLine[] {
+  return projects.map(({ name, workspace }) => {
+    const own = bookmarks.find((b) => b.name === `meddle/task/${taskId}/${name}`);
+    return { name, workspace, changeId: own === undefined || own.changeId === "" ? null : own.changeId, conflicted: own?.changeId === "" };
+  });
+}
+
 type Usage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
 
 /**
