@@ -20,8 +20,6 @@ export type ThreadItem =
   | { kind: "status"; text: string }
   | { kind: "unknown"; type: string; raw: unknown };
 
-export type { Hunk };
-
 export type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
 type AssistantItem = Extract<ThreadItem, { kind: "assistant" }>;
 type DeniedItem = Extract<ThreadItem, { kind: "denied" }>;

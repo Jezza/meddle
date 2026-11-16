@@ -7,7 +7,7 @@ export function DiffView({ hunks, file }: { hunks: readonly Hunk[]; file: readon
   const [opened, setOpened] = useState<Opened>(new Map());
   const rows = useMemo(() => diffRows(hunks, file, opened), [hunks, file, opened]);
   const open = (key: number) => setOpened((current) => new Map(current).set(key, nextOpen(current.get(key))));
-  return <div class="diff"><DiffRows rows={rows} onOpen={open} /></div>;
+  return <div class={opened.size > 0 ? "diff open" : "diff"}><DiffRows rows={rows} onOpen={open} /></div>;
 }
 
 /** Diff rows as lines: old and new numbers, the sign, the text; a gap is a bar, a button when it can open. */
@@ -21,7 +21,7 @@ export function DiffRows({ rows, onOpen }: { rows: readonly DiffRow[]; onOpen?: 
             : <div key={`g${row.key}`} class="dl gap">{gapLabel(row)}</div>;
         }
         return (
-          <div key={i} class={`dl ${row.kind}`}>
+          <div key={row.kind === "add" ? (row.new !== undefined ? `n${row.new}` : i) : row.old !== undefined ? `o${row.old}` : i} class={`dl ${row.kind}`}>
             <span class="n">{row.old ?? ""}</span>
             <span class="n">{row.new ?? ""}</span>
             <span class="s">{row.kind === "add" ? "+" : row.kind === "del" ? "-" : " "}</span>
