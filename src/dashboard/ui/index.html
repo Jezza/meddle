@@ -286,14 +286,21 @@
   button.send.ready:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
   .new-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 15px; }
   .new-empty b { color: var(--fg); margin-left: 4px; }
-  .bar { display: flex; align-items: center; gap: 6px 14px; padding: 5px 14px; border-top: 1px solid var(--line); background: var(--side); color: var(--muted); font-size: 12px; flex: none; min-width: 0; }
+  .bar { display: flex; align-items: center; gap: 6px 14px; padding: 5px 14px; border-top: 1px solid var(--line); background: var(--side); color: var(--muted); font-size: 12px; flex: none; min-width: 0; container-type: inline-size; }
   .bar > * { flex: none; }
   .bar > .bar-item { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bar > .bar-gap { flex: 1 1 0; }
-  .bar > .bar-projects { display: flex; align-items: center; gap: 14px; flex: 0 1 auto; min-width: 0; overflow: hidden; }
-  .bar-entry { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; min-width: 0; }
-  .bar-name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; }
+  /* The projects never shrink: a name stays whole up to 16ch, and below 760px of bar they collapse to the pill. */
+  .bar > .bar-projects { display: flex; align-items: center; gap: 14px; }
+  .bar-entry { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .bar-name { color: var(--fg); max-width: 16ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar-projects + .bar-collapsed { display: none; }
+  .bar > .bar-collapsed { flex: 0 1 auto; min-width: 0; white-space: nowrap; }
+  .bar-collapsed .bar-name { min-width: 0; }
+  @container (max-width: 760px) {
+    .bar > .bar-projects { display: none; }
+    .bar-projects + .bar-collapsed { display: inline-flex; }
+  }
   .bar-sep { width: 1px; height: 14px; background: var(--line-strong); }
   .rev { display: inline-flex; align-items: center; gap: 5px; background: none; border: none; border-radius: 4px; padding: 0 4px; color: var(--fg-soft); font: 12px ui-monospace, "JetBrains Mono", Menlo, monospace; white-space: nowrap; }
   .rev:hover { background: var(--hover); }
@@ -355,8 +362,7 @@
     .head-actions button { padding: 3px 7px; }
     .page { padding: 8px 14px 40px; }
     .bar { overflow-x: auto; }
-    .bar > .bar-item:not(:first-child), .bar > .bar-sep, .bar > .bar-projects { display: none; }
-    .bar-projects + .bar-collapsed { display: inline-flex; }
+    .bar > .bar-item:not(:first-child), .bar > .bar-sep { display: none; }
   }
 </style>
 </head>

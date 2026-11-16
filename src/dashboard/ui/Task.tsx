@@ -770,7 +770,7 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
         )}
         <button class="pill bar-collapsed" title={lines.map((l) => `${l.name} (${l.workspace})`).join("\n")}
           onClick={(e) => setProjectsAt({ el: e.currentTarget, above: true })}>
-          ◉ {lines[0]!.name}{lines.length > 1 && <span class="muted"> +{lines.length - 1}</span>} ▾
+          ◉ <span class="bar-name">{lines[0]!.name}</span>{lines.length > 1 && <span class="muted"> +{lines.length - 1}</span>} ▾
         </button>
       </>}
       {usage !== null && <>
