@@ -1,5 +1,6 @@
 // The thread a task's event log renders as: pure, so it is tested without a DOM or a link.
 import { isProgress, type Live } from "../../state/contracts";
+import type { Hunk } from "./diff-model";
 
 export type ThreadItem =
   | { kind: "user"; text: string }
@@ -19,8 +20,7 @@ export type ThreadItem =
   | { kind: "status"; text: string }
   | { kind: "unknown"; type: string; raw: unknown };
 
-/** One hunk of a file change, as Claude Code's `structuredPatch` reports it: lines prefixed `-`, `+` or a space. */
-export type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] };
+export type { Hunk };
 
 export type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
 type AssistantItem = Extract<ThreadItem, { kind: "assistant" }>;
