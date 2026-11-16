@@ -8,12 +8,13 @@ import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from ".
 import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useObject, useValue } from "./hooks";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { DiffRows, DiffView } from "./diff";
 import { Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { type ProjectLine, projectLines, usageShort } from "./sidebar-model";
 import {
-  activity, activityLine, buildThread, cwdOf, type DiffLine, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps, isLook,
+  activity, activityLine, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps, isLook,
   keyOf, type ShownItem, toolSummary, toolTarget, type ToolItem,
 } from "./thread-model";
 
@@ -506,7 +507,9 @@ function ToolRow({ tool }: { tool: ToolItem }) {
       </summary>
       <div class="step-body">
         {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
-        {diff !== null && diff.lines.length > 0 && <DiffView lines={diff.lines} />}
+        {diff !== null && (diff.hunks.length > 0
+          ? <DiffView hunks={diff.hunks} file={result?.original ?? null} />
+          : diff.fallback.length > 0 && <div class="diff"><DiffRows rows={diff.fallback} /></div>)}
         {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
         {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}
         {(children.length > 0 || tool.agentId !== undefined) && (
@@ -518,22 +521,6 @@ function ToolRow({ tool }: { tool: ToolItem }) {
         {result !== undefined && result.text !== "" && !(edit && !failed) && <pre class={failed ? "out error" : "out"}>{result.text}</pre>}
       </div>
     </details>
-  );
-}
-
-function DiffView({ lines }: { lines: DiffLine[] }) {
-  return (
-    <div class="diff">
-      {lines.map((l, i) => l.kind === "hunk"
-        ? <div key={i} class="dl hunk">{l.text}</div>
-        : (
-          <div key={i} class={`dl ${l.kind}`}>
-            <span class="n">{l.line ?? ""}</span>
-            <span class="s">{l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}</span>
-            {l.text}
-          </div>
-        ))}
-    </div>
   );
 }
 

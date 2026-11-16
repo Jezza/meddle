@@ -1,6 +1,6 @@
 // The thread a task's event log renders as: pure, so it is tested without a DOM or a link.
 import { isProgress, type Live } from "../../state/contracts";
-import type { Hunk } from "./diff-model";
+import type { DiffRow, Hunk } from "./diff-model";
 
 export type ThreadItem =
   | { kind: "user"; text: string }
@@ -10,8 +10,8 @@ export type ThreadItem =
     name: string;
     input: unknown;
     toolUseId: string;
-    /** `patch`: the hunks a call that changed a file reported (`EDITS`). */
-    result?: { text: string; isError: boolean; patch?: Hunk[] };
+    /** `patch`: the hunks a call that changed a file reported (`EDITS`); `original`: the file's lines before it. */
+    result?: { text: string; isError: boolean; patch?: Hunk[]; original?: string[] };
     children: ThreadItem[];
     agentId?: string;
   }
@@ -120,10 +120,11 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         const id = str(block.tool_use_id);
         const tool = tools.get(id);
         if (tool !== undefined) {
-          const result = (m.tool_use_result ?? {}) as { agentId?: unknown; structuredPatch?: unknown };
+          const result = (m.tool_use_result ?? {}) as { agentId?: unknown; structuredPatch?: unknown; originalFile?: unknown };
           tool.result = { text: contentText(block.content), isError: block.is_error === true };
           const patch = hunks(result.structuredPatch);
           if (patch.length > 0) tool.result.patch = patch;
+          if (typeof result.originalFile === "string") tool.result.original = textLines(result.originalFile);
           if (typeof result.agentId === "string") tool.agentId = result.agentId;
         } else if (!questions.has(id)) {
           list.push({ kind: "unknown", type: "tool_result", raw: block });
@@ -375,44 +376,40 @@ export function cwdOf(events: ReadonlyArray<{ message: unknown }>): string {
 /** Calls that change a file, shown with their diff. */
 export const EDITS: readonly string[] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
 
-export type DiffLine = { kind: "add" | "del" | "same"; text: string; line?: number } | { kind: "hunk"; text: string };
-
 /**
- * What a call that changes a file changed: the hunks its result reported, numbered, else (still running, or a
- * result without them, such as a new file) its input's old lines removed and new lines added.
+ * What a call that changes a file changed: the hunks its result reported, else (still running, or a result without
+ * them, such as a new file) a `fallback` of its input's old lines removed and new lines added, a Write's numbered
+ * from 1 as the whole new file. `added`/`removed` count the hunks' lines, else the fallback's.
  */
-export function editDiff(tool: ToolItem): { lines: DiffLine[]; added: number; removed: number } {
-  const lines: DiffLine[] = [];
-  const patch = tool.result?.patch ?? [];
-  if (patch.length > 0) {
-    for (const hunk of patch) {
-      lines.push({ kind: "hunk", text: `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@` });
-      let oldLine = hunk.oldStart;
-      let newLine = hunk.newStart;
-      for (const l of hunk.lines) {
-        const text = l.slice(1);
-        if (l.startsWith("-")) lines.push({ kind: "del", text, line: oldLine++ });
-        else if (l.startsWith("+")) lines.push({ kind: "add", text, line: newLine++ });
-        else if (l.startsWith(" ")) {
-          lines.push({ kind: "same", text, line: newLine++ });
-          oldLine++;
-        }
-      }
-    }
+export function editDiff(tool: ToolItem): { hunks: Hunk[]; fallback: DiffRow[]; added: number; removed: number } {
+  const hunks = tool.result?.patch ?? [];
+  if (hunks.length > 0) {
+    const lines = hunks.flatMap((h) => h.lines);
+    return {
+      hunks,
+      fallback: [],
+      added: lines.filter((l) => l.startsWith("+")).length,
+      removed: lines.filter((l) => l.startsWith("-")).length,
+    };
+  }
+  const fallback: DiffRow[] = [];
+  const input = (tool.input ?? {}) as Record<string, unknown>;
+  if (tool.name === "Write") {
+    textLines(input.content).forEach((text, i) => fallback.push({ kind: "add", text, new: i + 1 }));
   } else {
-    const input = (tool.input ?? {}) as Record<string, unknown>;
     const edits = tool.name === "MultiEdit" && Array.isArray(input.edits) ? (input.edits as Array<Record<string, unknown>>) : [input];
     for (const edit of edits) {
       const old = edit.old_string;
       const next = edit.new_string ?? edit.content ?? edit.new_source;
-      for (const text of textLines(old)) lines.push({ kind: "del", text });
-      for (const text of textLines(next)) lines.push({ kind: "add", text });
+      for (const text of textLines(old)) fallback.push({ kind: "del", text });
+      for (const text of textLines(next)) fallback.push({ kind: "add", text });
     }
   }
   return {
-    lines,
-    added: lines.filter((l) => l.kind === "add").length,
-    removed: lines.filter((l) => l.kind === "del").length,
+    hunks,
+    fallback,
+    added: fallback.filter((l) => l.kind === "add").length,
+    removed: fallback.filter((l) => l.kind === "del").length,
   };
 }
 

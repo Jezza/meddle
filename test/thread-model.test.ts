@@ -108,31 +108,22 @@ test("exploredLine counts what a run looked at by kind, a file read twice once",
   expect(toolSummary({ prompt: "x".repeat(10) }, 4)).toBe("xxxx…");
 });
 
-test("an Edit's result keeps its patch, and editDiff numbers its lines", () => {
+test("an Edit's result keeps its patch and the original file", () => {
+  const hunk = { oldStart: 4, oldLines: 2, newStart: 4, newLines: 3, lines: [" a", "-b", "+B", "+c"] };
   const [edit] = buildThread([
     { seq: 1, message: { type: "assistant", message: { id: "m", content: [{ type: "tool_use", id: "e", name: "Edit", input: { file_path: "/w/a.ts", old_string: "b", new_string: "B\nc" } }] } } },
     { seq: 2, message: {
       type: "user", message: { content: [{ type: "tool_result", tool_use_id: "e", content: "updated" }] },
-      tool_use_result: { structuredPatch: [{ oldStart: 4, oldLines: 2, newStart: 4, newLines: 3, lines: [" a", "-b", "+B", "+c"] }, { bad: true }] },
+      tool_use_result: { structuredPatch: [hunk, { bad: true }], originalFile: "a\nb\nz\n" },
     } },
   ]) as [ToolItem];
-  expect(edit.result?.patch).toHaveLength(1);
-  expect(editDiff(edit)).toEqual({
-    lines: [
-      { kind: "hunk", text: "@@ -4,2 +4,3 @@" },
-      { kind: "same", text: "a", line: 4 },
-      { kind: "del", text: "b", line: 5 },
-      { kind: "add", text: "B", line: 5 },
-      { kind: "add", text: "c", line: 6 },
-    ],
-    added: 2,
-    removed: 1,
-  });
+  expect(edit.result?.original).toEqual(["a", "b", "z"]);
+  expect(editDiff(edit)).toEqual({ hunks: [hunk], fallback: [], added: 2, removed: 1 });
 });
 
-test("editDiff without a patch shows the input's old lines removed and new lines added", () => {
+test("editDiff without a patch falls back to the input's lines", () => {
   expect(editDiff(tool("Edit", { old_string: "a\nb", new_string: "c" }))).toEqual({
-    lines: [{ kind: "del", text: "a" }, { kind: "del", text: "b" }, { kind: "add", text: "c" }], added: 1, removed: 2,
+    hunks: [], fallback: [{ kind: "del", text: "a" }, { kind: "del", text: "b" }, { kind: "add", text: "c" }], added: 1, removed: 2,
   });
   expect(editDiff(tool("Write", { content: "x\ny" }, done))).toMatchObject({ added: 2, removed: 0 });
   // A final newline is not one more line.
@@ -141,15 +132,18 @@ test("editDiff without a patch shows the input's old lines removed and new lines
     .toMatchObject({ added: 2, removed: 2 });
 });
 
-test("editDiff numbers each hunk from its own start", () => {
-  const patch = [
-    { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] },
-    { oldStart: 40, oldLines: 2, newStart: 40, newLines: 1, lines: [" c", "-d", "\\ No newline at end of file"] },
-  ];
-  expect(editDiff(tool("Edit", {}, { ...done, patch })).lines).toEqual([
-    { kind: "hunk", text: "@@ -1,1 +1,1 @@" }, { kind: "del", text: "a", line: 1 }, { kind: "add", text: "b", line: 1 },
-    { kind: "hunk", text: "@@ -40,2 +40,1 @@" }, { kind: "same", text: "c", line: 40 }, { kind: "del", text: "d", line: 41 },
-  ]);
+test("a Write that creates a file numbers its lines", () => {
+  const [edit] = buildThread([
+    { seq: 1, message: { type: "assistant", message: { id: "m", content: [{ type: "tool_use", id: "w", name: "Write", input: { file_path: "/w/n.ts", content: "x\ny\n" } }] } } },
+    { seq: 2, message: {
+      type: "user", message: { content: [{ type: "tool_result", tool_use_id: "w", content: "created" }] },
+      tool_use_result: { type: "create", filePath: "/w/n.ts", content: "x\ny\n", structuredPatch: [], originalFile: null },
+    } },
+  ]) as [ToolItem];
+  expect(edit.result?.original).toBeUndefined();
+  expect(editDiff(edit)).toEqual({
+    hunks: [], fallback: [{ kind: "add", text: "x", new: 1 }, { kind: "add", text: "y", new: 2 }], added: 2, removed: 0,
+  });
 });
 
 test("toolTarget names a path relative to the session, a pattern and where, or a subagent's task", () => {
