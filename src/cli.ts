@@ -53,7 +53,7 @@ import { parseDuration, formatDuration } from "./update/model";
 import { guardLine, preflightCommand, RESTART_STATUS, runPreflight, updateBlocked } from "./update/node";
 import { serveUpdate } from "./update/object";
 import { statusLines } from "./update/report";
-import { inputHeld, inputRefusal } from "./update/gate";
+import { inputHeld, nodeInputHold } from "./update/gate";
 import { bootUpdate, holdsAtBoot, Updater, type UpdateSnapshot } from "./update/updater";
 import { UpdateObject } from "./state/contracts";
 
@@ -179,7 +179,7 @@ async function serve(): Promise<number> {
   const node: OpenNode = {};
   // Nothing is accepted from the database copy until the pool confirms the new build or rolls it back: on a build
   // awaiting confirmation, from the start, until the updater says otherwise.
-  const inputHold = () => node.updater?.inputHold() ?? (boot.awaiting === null ? null : inputRefusal(boot.awaiting.build));
+  const inputHold = () => nodeInputHold(node.updater, boot.awaiting);
   try {
     const db = (node.db = openDb(paths(cfg).db));
     // The single token of an older meddle joins the list (last, behind any already there), once.

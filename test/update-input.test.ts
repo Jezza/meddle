@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { NodeObject, PoolObject, TaskObject, UpdateObject } from "../src/state/contracts";
 import { getTask } from "../src/store/records";
-import { gated, inputRefusal } from "../src/update/gate";
+import { gated, inputRefusal, nodeInputHold } from "../src/update/gate";
 import { serveUpdate } from "../src/update/object";
 import { updateFiles, writePending } from "../src/update/files";
 import type { UpdateSnapshot } from "../src/update/updater";
@@ -30,6 +30,18 @@ async function refusal(p: Promise<unknown>): Promise<string> {
 
 test("the refusal names the build and says to try again", () => {
   expect(HELD).toBe(`update in progress (build ${BUILD}), try again shortly`);
+});
+
+test("a node started awaiting confirmation is held until its updater starts, then as long as the updater says", () => {
+  const awaiting = { build: BUILD };
+  expect(nodeInputHold(undefined, awaiting)).toBe(HELD);
+  expect(nodeInputHold(undefined, null)).toBeNull();
+  let held: string | null = HELD;
+  const updater = { inputHold: () => held };
+  expect(nodeInputHold(updater, awaiting)).toBe(HELD);
+  // Confirmed: the updater's word wins over what the node started with.
+  held = null;
+  expect(nodeInputHold(updater, awaiting)).toBeNull();
 });
 
 test("gated refuses an implementation's methods while held and leaves its other members alone", async () => {

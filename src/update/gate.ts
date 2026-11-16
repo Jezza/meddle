@@ -18,6 +18,18 @@ export async function inputHeld(files: UpdateFiles): Promise<string | null> {
 }
 
 /**
+ * Why a running node accepts no input now: once its updater has started, whatever the updater says (null once the
+ * rollout is confirmed or rolled back); before that, held if it started on a build awaiting confirmation (`awaiting`).
+ */
+export function nodeInputHold(
+  updater: { inputHold(): string | null } | undefined,
+  awaiting: { build: string } | null,
+): string | null {
+  if (updater !== undefined) return updater.inputHold();
+  return awaiting === null ? null : inputRefusal(awaiting.build);
+}
+
+/**
  * The methods of a served object's implementation, each refused while `hold` gives a reason (the reason is the
  * error); everything else in `impl` (its cells) as it is. Every method is gated, so one added later is too.
  */
