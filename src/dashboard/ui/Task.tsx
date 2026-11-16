@@ -691,12 +691,17 @@ function Composer({ task, running, disabled, text, setText, box, onFailed }: {
   onFailed(text: string, error: string): void;
 }) {
   const [busy, setBusy] = useState(false);
-  // Grows with what is typed, up to the stylesheet's max-height, instead of a drag handle.
+  // Grows with what is typed, up to the stylesheet's max-height, instead of a drag handle. Measuring drops the box to
+  // its natural height for a moment, so the field holds its height meanwhile: otherwise the thread above grows for that
+  // moment and, scrolled to the bottom, Firefox clamps its scroll and the thread lands a couple of pixels lower.
   useLayoutEffect(() => {
     const el = box.current;
-    if (el === null) return;
+    const field = el?.parentElement;
+    if (el == null || field == null) return;
+    field.style.minHeight = `${field.offsetHeight}px`;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight + 2}px`;
+    field.style.minHeight = "";
   }, [text]);
   // Sent or not, the text leaves the box: a failed one goes into the thread (FailedMessage). What was typed meanwhile stays.
   const send = async () => {
