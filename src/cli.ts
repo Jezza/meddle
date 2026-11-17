@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "./config";
+import { BlobStore } from "./blobs/store";
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { gitRemote } from "./git/remote-main";
@@ -188,6 +189,8 @@ async function serve(): Promise<number> {
     await sweepTokenValues(cfg, db);
     // And in the archives directory: a half-written archive.
     await sweepArchiveTemps(cfg);
+    // And in the blobs directory: a half-written upload.
+    await new BlobStore(paths(cfg).blobs).sweepTemps();
     // The pool and git first: the Harness reruns unfinished turns as it opens, and their turn ends push to homes.
     const pool = (node.pool = await startPool(cfg, db, {
       version: VERSION,
