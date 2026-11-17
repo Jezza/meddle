@@ -112,9 +112,9 @@ test("a task is received, imported, activated and resumed", async () => {
         ...m,
         projects: [{ ...m.projects[0]!, replica: replicaB, parent: await commitAt(A, A.project.replica, `meddle/task/${m.id}/a`) }],
       });
-      // The workspace starts on A's change; B's own task bookmark points at it.
+      // The workspace carries on in A's change, empty and undescribed; B's own task bookmark points at it.
       const workspace = join(paths(B.cfg).task(m.id), "a");
-      expect(await changeAt(B, workspace, "@-")).toBe(atA!);
+      expect(await changeAt(B, workspace, "@")).toBe(atA!);
       expect(await taskBookmark(B, replicaB, m.id)).toBe(atA!);
       expect(B.runner.state(m.id)).toBe("receiving");
       await expect(B.runner.prompt(m.id, "hi")).rejects.toThrow("task is being received");
