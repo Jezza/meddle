@@ -7,6 +7,8 @@ import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
+import { BlobFetcher } from "../blobs/pool";
+import { BlobStore } from "../blobs/store";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
@@ -223,6 +225,8 @@ function messageOf(err: unknown): string {
 /** Creates tasks and drives their turns as durable `meddle.turn` tasks on one Harness. */
 export class TaskRunner {
   readonly approvals = new Approvals();
+  /** This node's files (the ones attached to prompts), and the way to fetch those it lacks from the pool. */
+  readonly blobs: BlobFetcher;
   #cfg: NodeConfig;
   #db: Database;
   #harness: Harness;
@@ -299,6 +303,7 @@ export class TaskRunner {
     this.#harness = harness;
     this.#deps = deps;
     this.#pool = deps.pool;
+    this.blobs = new BlobFetcher(new BlobStore(paths(cfg).blobs), deps.pool?.net ?? null);
     const sink = deps.log ?? ((line: string) => console.error(line));
     this.#log = dedupe((line) => sink(line));
     this.#sessionStore = new SqliteSessionStore(db);

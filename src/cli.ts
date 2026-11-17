@@ -222,7 +222,7 @@ async function serve(): Promise<number> {
       binaryFor: (b, platform, sha) => updater.binaryFor(b, platform, sha),
     });
     node.stopAccepting = () => runner.close();
-    node.stopBlobs = acceptBlobStreams(pool.net, runner);
+    node.stopBlobs = acceptBlobStreams(pool.net, runner, runner.blobs.store);
     // Archives of tasks that moved away are kept for seven days (decision 18).
     const janitor = () => {
       runJanitor(cfg).catch((err: unknown) => console.error("meddle: archive janitor:", err));

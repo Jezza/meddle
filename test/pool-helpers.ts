@@ -414,7 +414,7 @@ export async function poolNodes(
         });
         stops.push(async () => stopAccepting());
       }
-      const stopBlobs = acceptBlobStreams(node.net, node.runner);
+      const stopBlobs = acceptBlobStreams(node.net, node.runner, node.runner.blobs.store);
       stops.push(async () => stopBlobs());
     }
     for (const [i, a] of nodes.entries()) for (const b of nodes.slice(i + 1)) await linkNodes(a, b);
