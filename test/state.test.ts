@@ -7,10 +7,11 @@ import { errorResultFixture } from "./helpers";
 import { linkClient, peerReady, startPoolNode, twoPoolNodes } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
 import { getTask } from "../src/store/records";
+import { getProject, setDefaultBranch } from "../src/projects/project";
 import { readManifest } from "../src/tasks/manifest";
 import { createHash } from "node:crypto";
 import { remoteReason } from "../src/pool/object";
-import { writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { paths, type NodeConfig } from "../src/config";
 import { jj } from "../src/jj";
 import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
@@ -393,7 +394,8 @@ test("changes come back over the object and follow a turn", async () => {
     const node = await client.get(NodeObject, {});
     const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
     const task = await client.get(TaskObject, { id: manifest.id });
-    expect(task.changes.value).toEqual([
+    // Read once the object is up, not before it.
+    expect(await until(task.changes, (list) => list.length > 0)).toEqual([
       { project: project.id, name: project.name, start: "main", conflicted: false, changes: [expect.objectContaining({ workingCopy: true, files: 0, empty: true })] },
     ]);
     // What the agent writes in its workspace shows once its turn's end snapshots it and moves the line.
@@ -412,6 +414,8 @@ test("changes come back over the object and follow a turn", async () => {
     // A malformed id reaches the caller with its code.
     expect(await task.changeFile({ project: project.id, rev: "x|y", path: "notes.txt" }).then(() => "", remoteReason)).toStartWith("bad-id:");
     expect(await task.changeDiff({ project: "nope", change }).then(() => "", remoteReason)).toStartWith("project:");
+    // An id that is not (or no longer) there: jj's own reason.
+    expect(await task.changeDiff({ project: project.id, change: "kkkkkkkkkkkk" }).then(() => "", remoteReason)).toStartWith("jj:");
     task.release();
     node.release();
   } finally {
@@ -433,6 +437,44 @@ test("workspaceFile refuses outside the workspace", async () => {
     await until(task.changes, (list) => list.length === 0);
     expect(await task.workspaceFile({ path: inside }).then(() => "", remoteReason)).toStartWith("archived:");
     expect(await task.changeDiff({ project: project.id, change: "all" }).then(() => "", remoteReason)).toStartWith("archived:");
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a trigger with the task's line where it was does not read its changes again", async () => {
+  const { client, project, cfg, db, home, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await until(task.changes, (list) => list.length > 0);
+    expect(getProject(db, project.id)?.defaultBranch).toBe("main");
+    // Every jj call from here on is logged (`<data>/bin` is first on jj's PATH), its end too.
+    const log = `${home}/jj.log`;
+    await writeFile(log, "");
+    await mkdir(paths(cfg).bin, { recursive: true });
+    const wrapper = `${paths(cfg).bin}/jj`;
+    await writeFile(wrapper, `#!/bin/sh\nprintf 'start %s\\n' "$*" >> '${log}'\n'${Bun.which("jj")}' "$@"\ns=$?\nprintf 'done %s\\n' "$*" >> '${log}'\nexit $s\n`);
+    await chmod(wrapper, 0o755);
+    const lines = async () => (await Bun.file(log).text()).split("\n");
+    const line = `meddle/task/${manifest.id}/${project.name}`;
+
+    // A project registration with the line where it was: probed, not read.
+    setDefaultBranch(db, project.id, "main");
+    for (let i = 0; !(await lines()).some((l) => l.startsWith("done") && l.includes(`exact:"${line}"`)); i++) {
+      if (i > 100) throw new Error("the line was not probed");
+      await Bun.sleep(50);
+    }
+    await Bun.sleep(300);
+    // Moved: read.
+    await jj(["--ignore-working-copy", "bookmark", "set", line, "-r", manifest.projects[0]!.base[0]!, "--allow-backwards"], project.replica, cfg);
+    setDefaultBranch(db, project.id, "main");
+    await until(task.changes, (list) => list[0]?.changes.length === 0);
+    const reads = (await lines()).filter((l) => l.startsWith("start") && l.includes("diff().files()"));
+    expect(reads).toHaveLength(1);
     task.release();
     node.release();
   } finally {

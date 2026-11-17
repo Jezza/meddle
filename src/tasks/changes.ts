@@ -104,15 +104,37 @@ function baseRevset(p: ManifestProject): string {
   return commits.length === 0 ? "root()" : commits.join(" | ");
 }
 
-/** The state of the task's line in `p`: its local bookmark absent, conflicted or pointing at one commit. */
-async function lineState(cfg: NodeConfig, p: ManifestProject, taskId: string): Promise<"absent" | "conflicted" | "normal"> {
+/**
+ * The task's line in `p`: its local bookmark absent, conflicted or pointing at one commit, with the commit ids it
+ * points at (several when conflicted).
+ */
+async function lineTarget(cfg: NodeConfig, p: ManifestProject, taskId: string): Promise<{ state: "absent" | "conflicted" | "normal"; commits: string }> {
   const out = await jj(
-    ["--ignore-working-copy", "bookmark", "list", "-T", 'if(present, remote ++ "\\t" ++ conflict ++ "\\n")', `exact:${lineSymbol(p, taskId)}`],
+    [
+      "--ignore-working-copy", "bookmark", "list", "-T",
+      'if(present, remote ++ "\\t" ++ conflict ++ "\\t" ++ added_targets.map(|c| c.commit_id()).join(",") ++ "\\n")',
+      `exact:${lineSymbol(p, taskId)}`,
+    ],
     p.replica, cfg,
   );
   const local = out.split("\n").find((row) => row.startsWith("\t"));
-  if (local === undefined) return "absent";
-  return local === "\ttrue" ? "conflicted" : "normal";
+  if (local === undefined) return { state: "absent", commits: "" };
+  const [, conflict = "", commits = ""] = local.split("\t");
+  return { state: conflict === "true" ? "conflicted" : "normal", commits };
+}
+
+/** The state of the task's line in `p`: its local bookmark absent, conflicted or pointing at one commit. */
+async function lineState(cfg: NodeConfig, p: ManifestProject, taskId: string): Promise<"absent" | "conflicted" | "normal"> {
+  return (await lineTarget(cfg, p, taskId)).state;
+}
+
+/**
+ * What `taskChanges` reads from in `p`, in one jj call: the line's commit ids (or its absence) and the base commits.
+ * The same probe twice means the same changes, but for `start`, which also follows bookmarks set on a base commit.
+ */
+export async function changesProbe(cfg: NodeConfig, p: ManifestProject, taskId: string): Promise<string> {
+  const { state, commits } = await lineTarget(cfg, p, taskId);
+  return `${p.base.join(",")} ${state} ${commits}`;
 }
 
 /** A change or commit id, or its parent as `<id>-`; never a wider revset. */

@@ -14,7 +14,7 @@ import type { PoolRuntime } from "../pool/runtime";
 import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
 import { listBranchRows, listLineRows, rowChanges } from "../pool/rows";
-import { bookmarkList, isJjRepo } from "../jj";
+import { bookmarkList, isJjRepo, JjError } from "../jj";
 import { paths } from "../paths";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
@@ -29,7 +29,7 @@ import {
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
-import { ChangesError, changeDiff, changeFile, taskChanges, workspaceFile, type ProjectChanges } from "../tasks/changes";
+import { ChangesError, changeDiff, changeFile, changesProbe, taskChanges, workspaceFile, type ProjectChanges } from "../tasks/changes";
 import { taskNamespace, type ManifestProject, type Start, type TaskManifest } from "../tasks/manifest";
 import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
@@ -665,7 +665,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const queued = self.state("queued", members.queued, { init: () => runner.queued(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
-    const changes = self.state("changes", members.changes, { init: () => taskChangesNow(id) });
+    // Read once the object is up (`self.task` below), not before: a dashboard opens one per task it lists.
+    const changes = self.state("changes", members.changes, { init: () => [] });
     const activityAt = self.state("activityAt", members.activityAt, { init: () => getTask(db, id)?.updated_at ?? "" });
     /** Brings the manifest and the activity time up to the row (a rename, a restore). */
     const refreshRow = (ctx: Ctx) => {
@@ -675,10 +676,27 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (row.updated_at !== activityAt.value) activityAt.replace(ctx, row.updated_at);
     };
     const refreshBookmarks = latest(() => taskBookmarksNow(id), bookmarks);
-    const refreshChanges = latest(() => taskChangesNow(id), changes);
-    /** Both read off the task's lines, so re-read on the same triggers. */
-    const refreshLines = async (ctx: Ctx) => {
-      await Promise.all([refreshBookmarks(ctx), refreshChanges(ctx)]);
+    /** The probe (`changesProbeNow`) `changes` was last read at; null before the first read. */
+    let probed: string | null = null;
+    /** Whether the next read of `changes` is a full one whatever the probe says (a turn's end, the first read). */
+    let fullNext = true;
+    const refreshChanges = latest(async () => {
+      const full = fullNext;
+      fullNext = false;
+      const probe = await changesProbeNow(id);
+      if (!full && probe !== null && probe === probed) return changes.value;
+      const next = await taskChangesNow(id);
+      probed = probe;
+      return next;
+    }, changes);
+    /**
+     * Both read off the task's lines, so re-read on the same triggers; `full` re-reads the changes whatever their probe
+     * says. The bookmarks first: their listing imports what was pushed into the replica's git.
+     */
+    const refreshLines = async (ctx: Ctx, full: boolean) => {
+      if (full) fullNext = true;
+      await refreshBookmarks(ctx);
+      await refreshChanges(ctx);
     };
 
     /** Brings the cells up to the runner, the approvals and the event log. */
@@ -696,12 +714,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (on !== archivedOn.value) archivedOn.replace(ctx, on);
       refreshRow(ctx);
       // A turn's end set (and pushed) them; a move fetched or forgot them.
-      return refreshLines(ctx);
+      return refreshLines(ctx, true);
     });
     self.on("manifests", manifests, (event, ctx) => { if (event.taskId === id) refreshRow(ctx); });
-    self.on("projects", projectChanges, (_event, ctx) => refreshLines(ctx));
+    self.on("projects", projectChanges, (_event, ctx) => refreshLines(ctx, false));
     // What the agent bookmarks during a turn, or the user by hand, tells nothing: a slow re-read catches it.
-    self.on("ticks", headTicks, (_event, ctx) => refreshLines(ctx));
+    self.on("ticks", headTicks, (_event, ctx) => refreshLines(ctx, false));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
@@ -717,6 +735,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       queued.replace(ctx, runner.queued(id));
       refreshRow(ctx);
       catchUpLog(ctx);
+      await refreshChanges(ctx);
     });
 
     const answer = (requestId: string, result: (req: PendingApproval) => PermissionResult) => {
@@ -738,12 +757,19 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (p === undefined) throw new ChordError("invalid", `project: not a project of the task: ${JSON.stringify(projectId)}`);
       return p;
     };
-    /** A read of the task's changes, its refusals (`ChangesError`) with their code first; any other failure as it is. */
+    /**
+     * A read of the task's changes, its refusals (`ChangesError`) with their code first, and jj's failures (an id that
+     * is gone) as `jj: <jj's first line>`; any other failure as it is.
+     */
     const read = async <T>(run: () => Promise<T>): Promise<T> => {
       try {
         return await run();
       } catch (err) {
         if (err instanceof ChangesError) throw new ChordError("invalid", err.message);
+        if (err instanceof JjError) {
+          const line = err.stderr.split("\n").map((l) => l.trim()).find((l) => l !== "") ?? `exited with code ${err.code}`;
+          throw new ChordError("invalid", `jj: ${line}`);
+        }
         throw err;
       }
     };
@@ -868,6 +894,25 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const read = await Promise.all(projects.map((p) =>
       taskChanges(cfg, p, taskId, { defaultBranch: getProject(db, p.id)?.defaultBranch ?? null }).catch(() => null)));
     return read.filter((c) => c !== null);
+  }
+
+  /**
+   * What task `taskId`'s changes are read from (`changesProbe` and the default branch per project), one jj call per
+   * project; its state while it is not live here; null when a call fails, so that the changes are read in full.
+   */
+  async function changesProbeNow(taskId: string): Promise<string | null> {
+    const row = getTask(db, taskId);
+    if (row === null) return null;
+    // Its changes are [] then, whatever its lines are.
+    if (row.state === "moved" || row.state === "archived") return row.state;
+    const projects = (JSON.parse(row.manifest) as TaskManifest).projects;
+    try {
+      const probes = await Promise.all(projects.map(async (p) =>
+        `${p.id} ${getProject(db, p.id)?.defaultBranch ?? ""} ${await changesProbe(cfg, p, taskId)}`));
+      return JSON.stringify(probes);
+    } catch {
+      return null;
+    }
   }
 
   function manifestOf(taskId: string): TaskManifest {
