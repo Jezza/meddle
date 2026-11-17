@@ -676,7 +676,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (row.updated_at !== activityAt.value) activityAt.replace(ctx, row.updated_at);
     };
     const refreshBookmarks = latest(() => taskBookmarksNow(id), bookmarks);
-    /** The probe (`changesProbeNow`) `changes` was last read at; null before the first read. */
+    /** The probe (`changesProbeNow`) `changes` was last read in full at; null before, and after an incomplete read. */
     let probed: string | null = null;
     /** Whether the next read of `changes` is a full one whatever the probe says (a turn's end, the first read). */
     let fullNext = true;
@@ -685,9 +685,10 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       fullNext = false;
       const probe = await changesProbeNow(id);
       if (!full && probe !== null && probe === probed) return changes.value;
-      const next = await taskChangesNow(id);
-      probed = probe;
-      return next;
+      const { read, complete } = await taskChangesNow(id);
+      // A project left out is read again on the next trigger, whatever the probe says then.
+      probed = complete ? probe : null;
+      return read;
     }, changes);
     /**
      * Both read off the task's lines, so re-read on the same triggers; `full` re-reads the changes whatever their probe
@@ -884,16 +885,17 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   /**
    * Task `taskId`'s changes in each of its projects (the manifest's order); [] while it is not live here (moved,
-   * archived). A project jj cannot read is left out, and read again on the next trigger. Without the repo lock, like
-   * `taskBookmarksNow`: `taskChanges` never snapshots.
+   * archived). A project jj cannot read is left out (`complete` false). Without the repo lock, like `taskBookmarksNow`:
+   * `taskChanges` never snapshots.
    */
-  async function taskChangesNow(taskId: string): Promise<ProjectChanges[]> {
+  async function taskChangesNow(taskId: string): Promise<{ read: ProjectChanges[]; complete: boolean }> {
     const row = getTask(db, taskId);
-    if (row === null || row.state === "moved" || row.state === "archived") return [];
+    if (row === null || row.state === "moved" || row.state === "archived") return { read: [], complete: true };
     const projects = (JSON.parse(row.manifest) as TaskManifest).projects;
-    const read = await Promise.all(projects.map((p) =>
+    const all = await Promise.all(projects.map((p) =>
       taskChanges(cfg, p, taskId, { defaultBranch: getProject(db, p.id)?.defaultBranch ?? null }).catch(() => null)));
-    return read.filter((c) => c !== null);
+    const read = all.filter((c) => c !== null);
+    return { read, complete: read.length === all.length };
   }
 
   /**

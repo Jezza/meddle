@@ -444,6 +444,29 @@ test("workspaceFile refuses outside the workspace", async () => {
   }
 }, 15_000);
 
+/**
+ * Logs every jj call `cfg`'s node makes from now on, its end too (`<data>/bin` is first on jj's PATH); with
+ * `failOnce`, the first call whose arguments contain it fails instead. Answers the log's lines so far.
+ */
+async function logJj(cfg: NodeConfig, dir: string, failOnce?: string): Promise<() => Promise<string[]>> {
+  const log = `${dir}/jj.log`;
+  await writeFile(log, "");
+  await mkdir(paths(cfg).bin, { recursive: true });
+  const wrapper = `${paths(cfg).bin}/jj`;
+  await writeFile(wrapper, [
+    "#!/bin/sh",
+    `printf 'start %s\\n' "$*" >> '${log}'`,
+    ...(failOnce === undefined ? [] : [`case "$*" in *'${failOnce}'*) if [ ! -e '${log}.failed' ]; then : > '${log}.failed'; exit 1; fi;; esac`]),
+    `'${Bun.which("jj")}' "$@"`,
+    "s=$?",
+    `printf 'done %s\\n' "$*" >> '${log}'`,
+    "exit $s",
+    "",
+  ].join("\n"));
+  await chmod(wrapper, 0o755);
+  return async () => (await Bun.file(log).text()).split("\n");
+}
+
 test("a trigger with the task's line where it was does not read its changes again", async () => {
   const { client, project, cfg, db, home, close } = await connect();
   try {
@@ -452,14 +475,7 @@ test("a trigger with the task's line where it was does not read its changes agai
     const task = await client.get(TaskObject, { id: manifest.id });
     await until(task.changes, (list) => list.length > 0);
     expect(getProject(db, project.id)?.defaultBranch).toBe("main");
-    // Every jj call from here on is logged (`<data>/bin` is first on jj's PATH), its end too.
-    const log = `${home}/jj.log`;
-    await writeFile(log, "");
-    await mkdir(paths(cfg).bin, { recursive: true });
-    const wrapper = `${paths(cfg).bin}/jj`;
-    await writeFile(wrapper, `#!/bin/sh\nprintf 'start %s\\n' "$*" >> '${log}'\n'${Bun.which("jj")}' "$@"\ns=$?\nprintf 'done %s\\n' "$*" >> '${log}'\nexit $s\n`);
-    await chmod(wrapper, 0o755);
-    const lines = async () => (await Bun.file(log).text()).split("\n");
+    const lines = await logJj(cfg, home);
     const line = `meddle/task/${manifest.id}/${project.name}`;
 
     // A project registration with the line where it was: probed, not read.
@@ -475,6 +491,50 @@ test("a trigger with the task's line where it was does not read its changes agai
     await until(task.changes, (list) => list[0]?.changes.length === 0);
     const reads = (await lines()).filter((l) => l.startsWith("start") && l.includes("diff().files()"));
     expect(reads).toHaveLength(1);
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a project whose changes failed to read is read again on the next trigger", async () => {
+  const { client, project, cfg, db, home, close } = await connect();
+  try {
+    // The first read of the task's range fails.
+    await logJj(cfg, home, "diff().files()");
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    for (let i = 0; !(await Bun.file(`${home}/jj.log.failed`).exists()); i++) {
+      if (i > 100) throw new Error("the range was not read");
+      await Bun.sleep(50);
+    }
+    await Bun.sleep(300);
+    expect(task.changes.value).toEqual([]);
+    // Nothing moved, but the project was left out: read again.
+    setDefaultBranch(db, project.id, "main");
+    const changes = await until(task.changes, (list) => list.length === 1);
+    expect(changes[0]).toMatchObject({ project: project.id, start: "main" });
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a trigger after the start's bookmark moved off the base names the start again", async () => {
+  const { client, project, cfg, db, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await until(task.changes, (list) => list[0]?.start === "main");
+    await jj(["--ignore-working-copy", "bookmark", "delete", "main"], project.replica, cfg);
+    setDefaultBranch(db, project.id, "main");
+    // No bookmark on the base now: its short change id.
+    const changes = await until(task.changes, (list) => list[0]?.start !== "main");
+    expect(changes[0]!.start).toMatch(/^[k-z]{8}$/);
     task.release();
     node.release();
   } finally {
