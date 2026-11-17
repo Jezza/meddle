@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import type { TaskObject } from "../../state/contracts";
 import { remoteReason } from "../../projects/memory-names";
 import type { ProjectChanges, TaskChange } from "../../tasks/changes";
-import { changeLabel, diffVersion, summary, totals } from "./changes-model";
+import { changeLabel, diffVersion, patchHash, summary, totals } from "./changes-model";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
 import { useValue } from "./hooks";
@@ -22,7 +22,7 @@ export function Changes({ task }: { task: TaskRef }) {
   const changes = useValue(task.changes);
   const manifest = useValue(task.manifest);
   const [chosen, setChosen] = useState<string | null>(null);
-  // Only projects whose changes were read; one that failed is read again on the next trigger.
+  // Only projects whose changes were read; one whose read failed since keeps its last.
   const p = changes.find((c) => c.project === chosen) ?? changes[0];
   if (p === undefined) return null;
   const picker = changes.length > 1 && (
@@ -43,8 +43,8 @@ function ProjectView({ task, p, base, picker }: { task: TaskRef; p: ProjectChang
   const current = selected === "all" ? undefined
     : p.changes.find((c) => c.commit === selected.commit)
       ?? (p.changes.filter((c) => c.change === selected.change).length === 1 ? p.changes.find((c) => c.change === selected.change) : undefined);
-  const all = useDiff(task, p.project, p.conflicted ? null : "all", diffVersion(p, "all", base));
-  const one = useDiff(task, p.project, current?.commit ?? null, diffVersion(p, current?.commit ?? "all", base));
+  const all = useDiff(task, p.project, p.conflicted ? null : "all", diffVersion(p, "all"));
+  const one = useDiff(task, p.project, current?.commit ?? null, diffVersion(p, current?.commit ?? "all"));
   const shown = current === undefined ? all : one;
   const sum = all.patches === null ? null : totals(all.patches);
   return (
@@ -86,8 +86,9 @@ function ProjectView({ task, p, base, picker }: { task: TaskRef; p: ProjectChang
           {shown.patches?.map((patch) => {
             // The old side: the change's parent, or for the whole line its start.
             const rev = current === undefined ? base : `${current.commit}-`;
+            // A file whose patch is unchanged by a read again keeps what was opened in it.
             return (
-              <FileDiff key={`${current?.commit ?? "all"}\0${shown.generation}\0${patch.path}`} task={task} project={p.project} patch={patch}
+              <FileDiff key={`${current?.commit ?? "all"}\0${patch.path}\0${patchHash(patch)}`} task={task} project={p.project} patch={patch}
                 rev={patch.status === "added" ? undefined : rev} />
             );
           })}
@@ -149,6 +150,7 @@ function FileDiff({ task, project, patch, rev }: { task: TaskRef; project: strin
   const load = rev === undefined ? undefined : async () => {
     try {
       const text = await task.changeFile({ project, rev, path: patch.oldPath ?? patch.path });
+      setError(null);
       return text === null ? null : textLines(text);
     } catch (err) {
       setError(remoteReason(err));
@@ -164,32 +166,31 @@ function FileDiff({ task, project, patch, rev }: { task: TaskRef; project: strin
   );
 }
 
-/** A diff as read: its files (null until the first read lands), the read's refusal, and which read it is. */
-type Read = { patches: FilePatch[] | null; error: string | null; generation: number };
+/** A diff as read: its files (null until the first read lands) and the read's refusal. */
+type Read = { patches: FilePatch[] | null; error: string | null };
 
 /**
  * `change`'s diff in `project` (`"all"` for the whole line, null for none), read again whenever `version` changes. A
  * new `change` drops what was shown; a read again keeps it until the new one lands, and a failed one keeps it beside
- * its refusal. Each landed read is a new
- * `generation`, so that diffs keyed by it start over rather than keep a file loaded for other hunks.
+ * its refusal.
  */
 function useDiff(task: TaskRef, project: string, change: string | null, version: string): Read {
-  const [read, setRead] = useState<Read & { change: string | null }>({ patches: null, error: null, generation: 0, change });
+  const [read, setRead] = useState<Read & { change: string | null }>({ patches: null, error: null, change });
   const latest = useRef(0);
   useEffect(() => {
     const n = ++latest.current;
     if (change === null) {
-      setRead((r) => r.change === null && r.patches === null && r.error === null ? r : { patches: null, error: null, generation: r.generation, change });
+      setRead((r) => r.change === null && r.patches === null && r.error === null ? r : { patches: null, error: null, change });
       return;
     }
-    setRead((r) => r.change === change ? r : { patches: null, error: null, generation: r.generation, change });
+    setRead((r) => r.change === change ? r : { patches: null, error: null, change });
     task.changeDiff({ project, change }).then(
-      (text) => { if (n === latest.current) setRead((r) => ({ patches: parseGitDiff(text), error: null, generation: r.generation + 1, change })); },
+      (text) => { if (n === latest.current) setRead({ patches: parseGitDiff(text), error: null, change }); },
       (err: unknown) => {
-        if (n === latest.current) setRead((r) => ({ patches: r.change === change ? r.patches : null, error: remoteReason(err), generation: r.generation, change }));
+        if (n === latest.current) setRead((r) => ({ patches: r.change === change ? r.patches : null, error: remoteReason(err), change }));
       },
     );
   }, [task, project, change, version]);
   // Until the effect has run for a new change, what is held is another change's.
-  return read.change === change ? read : { patches: null, error: null, generation: read.generation };
+  return read.change === change ? read : { patches: null, error: null };
 }

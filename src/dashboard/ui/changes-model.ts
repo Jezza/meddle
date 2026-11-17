@@ -15,10 +15,21 @@ export function summary(p: ProjectChanges): string {
 
 /**
  * What a diff of `change` (a commit id, or `"all"`) in `p` depends on, to read it again only when that moves: nothing
- * for a commit, whose diff never changes; for the whole line, its start (`base`, the first base commit) and its commits.
+ * for a commit, whose diff never changes; for the whole line, its commits (its start never moves).
  */
-export function diffVersion(p: ProjectChanges, change: string, base: string | undefined): string {
-  return change === "all" ? [base ?? "", ...p.changes.map((c) => c.commit)].join(",") : "";
+export function diffVersion(p: ProjectChanges, change: string): string {
+  return change === "all" ? p.changes.map((c) => c.commit).join(",") : "";
+}
+
+/**
+ * A short hash of a file's patch (its hunks, status and old path): the same for the same patch, so that a file's
+ * diff read again unchanged keeps what was opened in it. FNV-1a, 32 bits.
+ */
+export function patchHash(patch: FilePatch): string {
+  const text = JSON.stringify([patch.status, patch.oldPath ?? null, patch.hunks]);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(36);
 }
 
 /** A diff's file count and lines added and removed. */

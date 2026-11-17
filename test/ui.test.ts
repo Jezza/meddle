@@ -9,7 +9,7 @@ import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
-import { changeCount, changeLabel, diffVersion, summary, totals } from "../src/dashboard/ui/changes-model";
+import { changeCount, changeLabel, diffVersion, patchHash, summary, totals } from "../src/dashboard/ui/changes-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 
@@ -367,13 +367,24 @@ test("summary counts the non-empty changes", () => {
   expect(summary(project({}))).toBe("0 changes");
 });
 
-test("diffVersion moves for the whole line with its commits and start, never for one commit", () => {
+test("diffVersion moves for the whole line with its commits, never for one commit", () => {
   const p = project({ changes: [change({ commit: "a" }), change({ commit: "b" })] });
-  expect(diffVersion(p, "all", "base")).toBe("base,a,b");
-  expect(diffVersion(project({ changes: [change({ commit: "a2" }), change({ commit: "b" })] }), "all", "base")).not.toBe(diffVersion(p, "all", "base"));
-  expect(diffVersion(p, "all", "other")).not.toBe(diffVersion(p, "all", "base"));
-  expect(diffVersion(p, "all", undefined)).toBe(",a,b");
-  expect(diffVersion(p, "b", "base")).toBe(diffVersion(project({}), "b", "other"));
+  expect(diffVersion(p, "all")).toBe("a,b");
+  expect(diffVersion(project({ changes: [change({ commit: "a2" }), change({ commit: "b" })] }), "all")).not.toBe(diffVersion(p, "all"));
+  expect(diffVersion(p, "b")).toBe(diffVersion(project({}), "b"));
+});
+
+test("patchHash is the same for the same patch and moves with its hunks", () => {
+  const patch = (lines: string[], over: Partial<FilePatch> = {}): FilePatch => ({
+    path: "a", status: "modified", binary: false, added: 1, removed: 1,
+    hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines }], ...over,
+  });
+  const hash = patchHash(patch(["-a", "+b"]));
+  expect(hash).toMatch(/^[0-9a-z]{1,7}$/);
+  expect(patchHash(patch(["-a", "+b"]))).toBe(hash);
+  expect(patchHash(patch(["-a", "+c"]))).not.toBe(hash);
+  expect(patchHash(patch(["-a", "+b"], { hunks: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ["-a", "+b"] }] }))).not.toBe(hash);
+  expect(patchHash(patch(["-a", "+b"], { status: "renamed", oldPath: "z" }))).not.toBe(hash);
 });
 
 test("totals sums a diff's files and lines", () => {
