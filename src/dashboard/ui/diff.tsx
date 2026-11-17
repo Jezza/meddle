@@ -6,7 +6,7 @@ import type { FilePatch } from "./git-diff";
 /** What a diff's head shows: the file's path, what happened to it, its line counts and whether it is binary. */
 export type DiffHead = { path: string; status: FilePatch["status"]; added: number; removed: number; binary?: boolean };
 
-/** A file's lines once a load has run: `null` when it failed, came back empty-handed or did not fit. */
+/** A file's lines once a load has landed: `null` when it came back empty-handed or did not fit. */
 type Loaded = { file: readonly string[] | null };
 
 /**
@@ -38,14 +38,20 @@ export function DiffView({ hunks, file: given, load, side = "old", head, closed 
     anchor.current = null;
     if (kept && box.current) box.current.scrollTop += kept.row.offsetTop - kept.top;
   });
-  // The file to open gaps from, loading it first when it can still come; null when there is none to use.
+  // The file to open gaps from, loading it first when it can still come; null when there is none to use. A load that
+  // failed is tried again on the next click, its bars buttons still.
   const fileNow = async (): Promise<readonly string[] | null> => {
     if (!loadable) return file;
-    loading.current ??= load!().then(
+    const pending = loading.current ??= load!().then(
       (lines) => ({ file: lines !== null && (side === "old" || fitsNewSide(hunks, lines)) ? lines : null }),
-      () => ({ file: null }),
     );
-    const result = await loading.current;
+    let result: Loaded;
+    try {
+      result = await pending;
+    } catch {
+      if (loading.current === pending) loading.current = null;
+      return null;
+    }
     setLoaded(result);
     return result.file;
   };
@@ -70,7 +76,7 @@ export function DiffView({ hunks, file: given, load, side = "old", head, closed 
       {head && (
         <div class="diff-head">
           {closed !== undefined && !head.binary
-            ? <button type="button" class="path" onClick={() => setShut((s) => !s)}>{head.path}</button>
+            ? <button type="button" class="path" aria-expanded={!shut} onClick={() => setShut((s) => !s)}>{head.path}</button>
             : <span class="path">{head.path}</span>}
           {head.status !== "modified" && <span class="tag">{head.status === "added" ? "new" : head.status}</span>}
           {head.binary

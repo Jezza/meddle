@@ -57,74 +57,22 @@ export function parseGitDiff(text: string): FilePatch[] {
       patch.hunks.push(hunk);
     } else if (line.startsWith("new file mode")) patch.status = "added";
     else if (line.startsWith("deleted file mode")) patch.status = "deleted";
-    else if (line.startsWith("rename from ")) { patch.oldPath = unquote(line.slice("rename from ".length)); patch.status = "renamed"; }
-    else if (line.startsWith("rename to ")) patch.path = unquote(line.slice("rename to ".length));
+    else if (line.startsWith("rename from ")) { patch.oldPath = line.slice("rename from ".length); patch.status = "renamed"; }
+    else if (line.startsWith("rename to ")) patch.path = line.slice("rename to ".length);
     else if (line.startsWith("Binary files ")) patch.binary = true;
-    else if (line.startsWith("+++ ")) {
-      const path = unquote(line.slice("+++ ".length));
-      if (path.startsWith("b/")) patch.path = path.slice(2);
-    } else if (line.startsWith("--- ") && patch.status === "deleted") {
-      const path = unquote(line.slice("--- ".length));
-      if (path.startsWith("a/")) patch.path = path.slice(2);
-    }
+    else if (line.startsWith("+++ b/")) patch.path = line.slice("+++ b/".length);
+    else if (line.startsWith("--- a/") && patch.status === "deleted") patch.path = line.slice("--- a/".length);
   }
   return patches;
 }
 
 /**
- * The path from a `diff --git a/<old> b/<new>` header's rest: `<new>`, read as the two halves when they match.
- * Either half may be quoted, as git quotes a path with unusual characters.
+ * The path from a `diff --git a/<old> b/<new>` header's rest: `<new>`, read as the two halves when they match. jj
+ * writes paths as they are, never quoted.
  */
 function headerPath(rest: string): string {
-  if (rest.startsWith('"')) {
-    const end = quotedEnd(rest);
-    const second = rest.slice(end + 1).trimStart();
-    return stripB(unquote(second === "" ? rest : second));
-  }
-  if (rest.endsWith('"')) {
-    const open = rest.lastIndexOf(' "');
-    if (open >= 0) return stripB(unquote(rest.slice(open + 1)));
-  }
   const half = (rest.length - 1) / 2;
   if (Number.isInteger(half) && rest.slice(2, half) === rest.slice(half + 3)) return rest.slice(half + 3);
   const b = rest.lastIndexOf(" b/");
   return b >= 0 ? rest.slice(b + 3) : rest;
-}
-
-function stripB(path: string): string {
-  return path.startsWith("b/") ? path.slice(2) : path;
-}
-
-/** The index just past the closing quote of the quoted string that `text` starts with (as if one followed, if unclosed). */
-function quotedEnd(text: string): number {
-  for (let i = 1; i < text.length; i++) {
-    if (text[i] === "\\") i++;
-    else if (text[i] === '"') return i + 1;
-  }
-  return text.length + 1;
-}
-
-const ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
-
-/**
- * A path as git writes it, read back: a path in double quotes has C-style escapes (`\t`, `\"`, `\\`, and octal
- * `\303\257` for each byte of a non-ASCII character, read as UTF-8). Any other path is as it is.
- */
-function unquote(text: string): string {
-  if (!text.startsWith('"')) return text;
-  const body = text.slice(1, quotedEnd(text) - 1);
-  const bytes: number[] = [];
-  const encoder = new TextEncoder();
-  for (let i = 0; i < body.length; i++) {
-    const c = body[i]!;
-    if (c !== "\\") { bytes.push(...encoder.encode(c)); continue; }
-    const octal = /^[0-7]{1,3}/.exec(body.slice(i + 1, i + 4));
-    if (octal) { bytes.push(parseInt(octal[0], 8) & 0xff); i += octal[0].length; continue; }
-    const e = body[i + 1];
-    if (e === undefined) { bytes.push(92); continue; }
-    if (ESCAPES[e] !== undefined) bytes.push(ESCAPES[e]);
-    else bytes.push(...encoder.encode(e));
-    i++;
-  }
-  return new TextDecoder().decode(new Uint8Array(bytes));
 }
