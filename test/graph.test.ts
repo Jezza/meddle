@@ -45,6 +45,8 @@ async function graphRepo() {
 
 const ids = (commits: GraphCommit[]) => commits.map((c) => c.commit);
 
+const ROOT = "0".repeat(40);
+
 /** Whether every commit comes before its parents in `commits` (newest first). */
 function newestFirst(commits: GraphCommit[]): boolean {
   const at = new Map(commits.map((c, i) => [c.commit, i]));
@@ -52,7 +54,7 @@ function newestFirst(commits: GraphCommit[]): boolean {
 }
 
 test("graphProbe counts branches and live task lines", async () => {
-  const { cfg, replica, archived, c3, t1b, t2, spike, close } = await graphRepo();
+  const { cfg, replica, archived, c3, t1b, t2, t3, spike, close } = await graphRepo();
   try {
     const probe = await graphProbe(cfg, replica, "a", archived);
     expect(probe.heads).toEqual([
@@ -61,6 +63,8 @@ test("graphProbe counts branches and live task lines", async () => {
       { bookmark: { kind: "task", task: "t1" }, commit: t1b },
       { bookmark: { kind: "task", task: "t2" }, commit: t2 },
     ]);
+    // t3's line is left out only for being archived.
+    expect((await graphProbe(cfg, replica, "a", new Set())).heads).toContainEqual({ bookmark: { kind: "task", task: "t3" }, commit: t3 });
     // The same bookmarks give the same key; a moved one another.
     expect((await graphProbe(cfg, replica, "a", archived)).key).toBe(probe.key);
     await bookmarkSet(replica, "spike", c3, cfg, { ignoreWorkingCopy: true });
@@ -89,11 +93,20 @@ test("projectGraph reads from the default branch's parent up", async () => {
     const time = Date.parse((await jj(["--ignore-working-copy", "log", "-r", c3, "--no-graph", "-T", 'committer.timestamp().format("%+")'], replica, cfg)).trim());
     expect(byId.get(c3)!.time).toBe(time);
 
-    expect(ids(await projectGraph(cfg, replica, probe, null))).toContain(c1);
-    // A default branch it does not have: as without one.
-    expect(ids(await projectGraph(cfg, replica, probe, "trunk"))).toContain(c1);
-    expect(await projectGraph(cfg, replica, probe, "main", 2)).toHaveLength(2);
+    // Without a default branch (or with one it does not have), down to c1, never the root.
+    const all = [c1, c2, c3, t1a, t1b, t2, spike].toSorted();
+    expect(ids(await projectGraph(cfg, replica, probe, null)).toSorted()).toEqual(all);
+    expect(ids(await projectGraph(cfg, replica, probe, "trunk")).toSorted()).toEqual(all);
+    // The newest two.
+    const two = await projectGraph(cfg, replica, probe, "main", 2);
+    expect(ids(two)).toEqual(ids(graph).slice(0, 2));
+    expect(two[0]!.bookmarks).not.toEqual([]);
     expect(await projectGraph(cfg, replica, { key: "", heads: [] }, "main")).toEqual([]);
+
+    // A bookmark named like `main`'s commit id is not that commit.
+    await bookmarkSet(replica, c3, c1, cfg, { ignoreWorkingCopy: true });
+    const named = await graphProbe(cfg, replica, "a", archived);
+    expect(ids(await projectGraph(cfg, replica, named, "main")).toSorted()).toEqual(ids(graph).toSorted());
   } finally {
     await close();
   }
@@ -105,6 +118,7 @@ test("olderGraph reads past the default branch's parent", async () => {
     const probe = await graphProbe(cfg, replica, "a", archived);
     const older = await olderGraph(cfg, replica, probe, 400);
     expect(ids(older)).toContain(c1);
+    expect(ids(older)).not.toContain(ROOT);
     expect(newestFirst(older)).toBe(true);
     expect(await olderGraph(cfg, replica, probe, 3)).toHaveLength(3);
   } finally {

@@ -43,7 +43,7 @@ const COMMIT_TEMPLATE = [
   "change_id",
   'parents.map(|c| c.commit_id()).join(",")',
   "immutable",
-  "committer.timestamp()",
+  'committer.timestamp().utc().format("%Y-%m-%dT%H:%M:%S%.3fZ")',
   "description.first_line()",
 ].join(' ++ "\\x1f" ++ ') + ' ++ "\\n"';
 
@@ -76,24 +76,27 @@ export async function graphProbe(
   return { key: keys.join("\n"), heads: keys.map((k) => heads.get(k)!) };
 }
 
-/** `commits` as a revset, each checked to be a commit id: they come from a probe a caller may have kept. */
+/**
+ * `commits` as a revset, each checked to be a commit id (they come from a probe a caller may have kept) and named as one:
+ * a bookmark named like it would win over a bare id.
+ */
 function revset(commits: Iterable<string>): string {
   const all = [...new Set(commits)];
   for (const c of all) if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(c)) throw new Error(`not a commit id: ${c}`);
-  return all.join(" | ");
+  return all.map((c) => `commit_id(${c})`).join(" | ");
 }
 
 /**
  * The commits under the probe's heads (`B`), newest first, at most `limit`, each with the probe's bookmarks on it: from
  * the parent of `defaultBranch`'s commit up (`::B ~ ::(<default>--)`), or all of them (`::B`) when the probe has no
- * such branch. None when it has no heads.
+ * such branch; never the root, which is no commit to draw. None when it has no heads.
  */
 export async function projectGraph(
   cfg: NodeConfig, replica: string, probe: GraphProbe, defaultBranch: string | null, limit = GRAPH_MAX,
 ): Promise<GraphCommit[]> {
   if (probe.heads.length === 0) return [];
   const main = probe.heads.filter((h) => h.bookmark.kind === "branch" && h.bookmark.name === defaultBranch).map((h) => h.commit);
-  const range = `::(${revset(probe.heads.map((h) => h.commit))})${main.length === 0 ? "" : ` ~ ::((${revset(main)})--)`}`;
+  const range = `::(${revset(probe.heads.map((h) => h.commit))})${main.length === 0 ? "" : ` ~ ::((${revset(main)})--)`} ~ root()`;
   const out = await jj(
     ["--ignore-working-copy", "log", "--no-graph", "--limit", String(limit), "-r", range, "-T", COMMIT_TEMPLATE],
     replica, cfg,
@@ -106,14 +109,13 @@ export async function projectGraph(
       parents: parents === "" ? [] : parents.split(","),
       description: rest.join(FIELD),
       immutable: immutable === "true",
-      // `2026-11-17 14:45:38.000 +01:00` made ISO 8601, which `Date.parse` is sure to read.
-      time: Date.parse(time.replace(" ", "T").replace(" ", "")),
+      time: Date.parse(time),
       bookmarks: probe.heads.filter((h) => h.commit === commit).map((h) => h.bookmark),
     };
   });
 }
 
-/** The commits under the probe's heads with no lower bound (`::B`), newest first, at most `limit`: what `Older` shows. */
+/** The commits under the probe's heads with no lower bound (`::B`, less the root), newest first, at most `limit`: `Older`. */
 export async function olderGraph(cfg: NodeConfig, replica: string, probe: GraphProbe, limit: number): Promise<GraphCommit[]> {
   return projectGraph(cfg, replica, probe, null, limit);
 }
