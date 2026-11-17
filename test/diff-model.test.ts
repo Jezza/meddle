@@ -1,6 +1,6 @@
 // test/diff-model.test.ts
 import { test, expect } from "bun:test";
-import { diffRows, gapLabel, nextOpen, type DiffRow, type Hunk } from "../src/dashboard/ui/diff-model";
+import { diffRows, fitsNewSide, gapLabel, nextOpen, type DiffRow, type Hunk } from "../src/dashboard/ui/diff-model";
 
 const file = Array.from({ length: 100 }, (_, i) => `l${i + 1}`);
 const hunks: Hunk[] = [
@@ -99,4 +99,35 @@ test("gapLabel and nextOpen", () => {
   expect(nextOpen(undefined)).toBe("step");
   expect(nextOpen("step")).toBe("all");
   expect(nextOpen("all")).toBe("all");
+});
+
+/** The fixture's new side: the old file with the hunks applied. */
+const newFile = [...file.slice(0, 29), "a", "B", "c", "d", ...file.slice(32, 59), "y", ...file.slice(60)];
+const all = new Map([[1, "all"], [33, "all"], [61, "all"]] as const);
+const sames = (rows: DiffRow[]) => rows.filter((r) => r.kind === "same");
+
+test("new-side reading uses the offset", () => {
+  const oldSide = diffRows(hunks, file, all);
+  const newSide = diffRows(hunks, newFile, all, { side: "new" });
+  expect(sames(newSide)).toEqual(sames(oldSide));
+  expect(gaps(newSide)).toEqual([]);
+  expect(newSide).toEqual(oldSide);
+  expect(diffRows(hunks, newFile, new Map(), { side: "new" })).toEqual(diffRows(hunks, file));
+  // A new side too short for the between gap cannot open it.
+  expect(gaps(diffRows(hunks, newFile.slice(0, 59), new Map(), { side: "new" })))
+    .toEqual([gap(1, "above", 29), gap(33, "between", 27, false)]);
+});
+
+test("loadable shows counts and an unknown below", () => {
+  const rows = gaps(diffRows(hunks, null, new Map(), { loadable: true }));
+  expect(rows).toEqual([gap(1, "above", 29), gap(33, "between", 27), { kind: "gap", key: 61, where: "below", count: null, canOpen: true }]);
+  expect(gapLabel(rows[2]!)).toBe("↓ lines");
+  expect(gaps(diffRows(hunks, null, all, { loadable: true }))).toEqual(rows);
+});
+
+test("fitsNewSide refuses a file that moved on", () => {
+  expect(fitsNewSide(hunks, newFile)).toBe(true);
+  expect(fitsNewSide(hunks, newFile.map((l) => (l === "B" ? "b" : l)))).toBe(false);
+  expect(fitsNewSide(hunks, file)).toBe(false);
+  expect(fitsNewSide(hunks, newFile.slice(0, 60))).toBe(false);
 });

@@ -119,3 +119,25 @@ test("parses several files in order", () => {
 test("parses empty text as no files", () => {
   expect(parseGitDiff("")).toEqual([]);
 });
+
+test("parseGitDiff unquotes git-quoted paths", () => {
+  const quoted = (q: string) => lines(
+    `diff --git "a/${q}" "b/${q}"`,
+    "index 1111111111..2222222222 100644",
+    `--- "a/${q}"`,
+    `+++ "b/${q}"`,
+    "@@ -1,1 +1,1 @@",
+    "-a",
+    "+b",
+  );
+  expect(parseGitDiff(quoted("na\\303\\257ve.md"))[0]!.path).toBe("naïve.md");
+  expect(parseGitDiff(quoted("a\\tb.md"))[0]!.path).toBe("a\tb.md");
+  expect(parseGitDiff(quoted('say \\"hi\\" \\\\ there.md'))[0]!.path).toBe('say "hi" \\ there.md');
+  // The header alone names the file when there are no ---/+++ lines.
+  expect(parseGitDiff(lines('diff --git "a/na\\303\\257ve.md" "b/na\\303\\257ve.md"', "old mode 100644", "new mode 100755"))[0]!.path)
+    .toBe("naïve.md");
+  // A quoted rename.
+  const renamed = parseGitDiff(lines('diff --git "a/\\303\\251.md" b/e.md', 'rename from "\\303\\251.md"', "rename to e.md"))[0]!;
+  expect(renamed.oldPath).toBe("é.md");
+  expect(renamed.path).toBe("e.md");
+});

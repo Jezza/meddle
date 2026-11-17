@@ -287,12 +287,14 @@
   .diff { border: 1px solid var(--line-strong); border-radius: 8px; background: var(--code-bg); font: 12px/1.55 ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; max-height: 420px; overflow: auto; overflow-anchor: none; }
   .diff.open { max-height: 70vh; }
   .diff-head { display: flex; align-items: center; gap: 10px; padding: 5px 10px; background: var(--side); border-bottom: 1px solid var(--line-strong); font: 12px system-ui, sans-serif; position: sticky; top: 0; z-index: 1; }
+  .diff-head:last-child { border-bottom: none; }
   .diff-head .path { font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }
   .diff-head .tag { font-size: 10.5px; border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 5px; color: var(--muted); }
   .diff-head .add { color: var(--add); }
   .diff-head .del { color: var(--bad); }
   .diff-head button { margin-left: auto; background: none; border: none; padding: 0; color: var(--accent); }
   .diff-head button:hover:not(:disabled) { background: none; text-decoration: underline; }
+  .diff-head button.path { margin-left: 0; background: none; border: none; padding: 0; font: inherit; font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; color: var(--fg); cursor: pointer; }
   .dl { display: flex; white-space: pre; padding-right: 10px; min-width: max-content; }
   .dl .n { flex: none; width: 40px; padding-right: 8px; text-align: right; color: var(--faint); user-select: none; }
   .dl .s { flex: none; width: 14px; color: var(--muted); user-select: none; }
