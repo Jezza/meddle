@@ -523,6 +523,34 @@ test("a project whose changes failed to read is read again on the next trigger",
   }
 }, 15_000);
 
+test("a project whose re-read fails keeps its changes until a read lands", async () => {
+  const { client, project, cfg, db, home, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    const earlier = await until(task.changes, (list) => list.length > 0);
+    // The line moves, and the read that follows fails.
+    await logJj(cfg, home, "diff().files()");
+    const line = `meddle/task/${manifest.id}/${project.name}`;
+    await jj(["--ignore-working-copy", "bookmark", "set", line, "-r", manifest.projects[0]!.base[0]!, "--allow-backwards"], project.replica, cfg);
+    setDefaultBranch(db, project.id, "main");
+    for (let i = 0; !(await Bun.file(`${home}/jj.log.failed`).exists()); i++) {
+      if (i > 100) throw new Error("the range was not read");
+      await Bun.sleep(50);
+    }
+    await Bun.sleep(300);
+    expect(task.changes.value).toEqual(earlier);
+    // The next trigger reads it again, though nothing moved since.
+    setDefaultBranch(db, project.id, "main");
+    await until(task.changes, (list) => list[0]?.changes.length === 0);
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
 test("a trigger after the start's bookmark moved off the base names the start again", async () => {
   const { client, project, cfg, db, close } = await connect();
   try {

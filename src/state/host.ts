@@ -29,7 +29,9 @@ import {
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
-import { ChangesError, changeDiff, changeFile, changesProbe, taskChanges, workspaceFile, type ProjectChanges } from "../tasks/changes";
+import {
+  ChangesError, changeDiff, changeFile, changesProbe, taskChanges, workspaceFile, type ChangesProbe, type ProjectChanges,
+} from "../tasks/changes";
 import { taskNamespace, type ManifestProject, type Start, type TaskManifest } from "../tasks/manifest";
 import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
@@ -76,6 +78,11 @@ export type NodeHostDeps = {
 
 type TaskEvent = { taskId: string; seq: number; message: SDKMessage | MeddleEvent };
 type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
+/** A task's `changesProbe`s (`changesProbeNow`). */
+type ChangesProbes = {
+  key: string | null;
+  projects: Array<{ p: ManifestProject; defaultBranch: string | null; probe: ChangesProbe | null }> | null;
+};
 
 const NOTIFICATIONS_KEPT = 50;
 /** How often a `ProjectObject` re-reads its replica's bookmarks when nothing told it they changed (pushes from peers). */
@@ -676,26 +683,21 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (row.updated_at !== activityAt.value) activityAt.replace(ctx, row.updated_at);
     };
     const refreshBookmarks = latest(() => taskBookmarksNow(id), bookmarks);
-    /** The probe (`changesProbeNow`) `changes` was last read in full at; null before, and after an incomplete read. */
+    /** The probe key (`changesProbeNow`) `changes` was last read in full at; null before, and after an incomplete read. */
     let probed: string | null = null;
-    /** Whether the next read of `changes` is a full one whatever the probe says (a turn's end, the first read). */
-    let fullNext = true;
     const refreshChanges = latest(async () => {
-      const full = fullNext;
-      fullNext = false;
       const probe = await changesProbeNow(id);
-      if (!full && probe !== null && probe === probed) return changes.value;
-      const { read, complete } = await taskChangesNow(id);
-      // A project left out is read again on the next trigger, whatever the probe says then.
-      probed = complete ? probe : null;
+      if (probe.key !== null && probe.key === probed) return changes.value;
+      const { read, complete } = await taskChangesNow(id, probe, changes.value);
+      // A project that failed is read again on the next trigger, whatever the probe says then.
+      probed = complete ? probe.key : null;
       return read;
     }, changes);
     /**
-     * Both read off the task's lines, so re-read on the same triggers; `full` re-reads the changes whatever their probe
-     * says. The bookmarks first: their listing imports what was pushed into the replica's git.
+     * Both read off the task's lines, so re-read on the same triggers. The bookmarks first: their listing imports what
+     * was pushed into the replica's git.
      */
-    const refreshLines = async (ctx: Ctx, full: boolean) => {
-      if (full) fullNext = true;
+    const refreshLines = async (ctx: Ctx) => {
       await refreshBookmarks(ctx);
       await refreshChanges(ctx);
     };
@@ -715,12 +717,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (on !== archivedOn.value) archivedOn.replace(ctx, on);
       refreshRow(ctx);
       // A turn's end set (and pushed) them; a move fetched or forgot them.
-      return refreshLines(ctx, true);
+      return refreshLines(ctx);
     });
     self.on("manifests", manifests, (event, ctx) => { if (event.taskId === id) refreshRow(ctx); });
-    self.on("projects", projectChanges, (_event, ctx) => refreshLines(ctx, false));
+    self.on("projects", projectChanges, (_event, ctx) => refreshLines(ctx));
     // What the agent bookmarks during a turn, or the user by hand, tells nothing: a slow re-read catches it.
-    self.on("ticks", headTicks, (_event, ctx) => refreshLines(ctx, false));
+    self.on("ticks", headTicks, (_event, ctx) => refreshLines(ctx));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
@@ -884,37 +886,43 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   }
 
   /**
-   * Task `taskId`'s changes in each of its projects (the manifest's order); [] while it is not live here (moved,
-   * archived). A project jj cannot read is left out (`complete` false). Without the repo lock, like `taskBookmarksNow`:
-   * `taskChanges` never snapshots.
+   * Task `taskId`'s changes in each of its projects (the manifest's order), read off `probe` (`changesProbeNow`); []
+   * while it is not live here (moved, archived). A project whose probe or read failed keeps its entry in `previous`
+   * (`complete` false). Without the repo lock, like `taskBookmarksNow`: `taskChanges` never snapshots.
    */
-  async function taskChangesNow(taskId: string): Promise<{ read: ProjectChanges[]; complete: boolean }> {
-    const row = getTask(db, taskId);
-    if (row === null || row.state === "moved" || row.state === "archived") return { read: [], complete: true };
-    const projects = (JSON.parse(row.manifest) as TaskManifest).projects;
-    const all = await Promise.all(projects.map((p) =>
-      taskChanges(cfg, p, taskId, { defaultBranch: getProject(db, p.id)?.defaultBranch ?? null }).catch(() => null)));
-    const read = all.filter((c) => c !== null);
-    return { read, complete: read.length === all.length };
+  async function taskChangesNow(
+    taskId: string, probe: ChangesProbes, previous: readonly ProjectChanges[],
+  ): Promise<{ read: ProjectChanges[]; complete: boolean }> {
+    if (probe.projects === null) return { read: [], complete: true };
+    const all = await Promise.all(probe.projects.map(async ({ p, defaultBranch, probe: rows }) => {
+      if (rows === null) return null;
+      return taskChanges(cfg, p, taskId, { defaultBranch, probe: rows }).catch(() => null);
+    }));
+    const read = all.flatMap((c, i) => {
+      if (c !== null) return [c];
+      const kept = previous.find((q) => q.project === probe.projects![i]!.p.id);
+      return kept === undefined ? [] : [kept];
+    });
+    return { read, complete: all.every((c) => c !== null) };
   }
 
   /**
-   * What task `taskId`'s changes are read from (`changesProbe` and the default branch per project), one jj call per
-   * project; its state while it is not live here; null when a call fails, so that the changes are read in full.
+   * What task `taskId`'s changes are read from: each project's `changesProbe` for its default branch, one jj call per
+   * project, or null for one whose call failed; `projects` null while the task is not live here (or has no row). `key`
+   * stands for them all, null when one failed (or there is no row), so that the changes are read then.
    */
-  async function changesProbeNow(taskId: string): Promise<string | null> {
+  async function changesProbeNow(taskId: string): Promise<ChangesProbes> {
     const row = getTask(db, taskId);
-    if (row === null) return null;
+    if (row === null) return { key: null, projects: null };
     // Its changes are [] then, whatever its lines are.
-    if (row.state === "moved" || row.state === "archived") return row.state;
-    const projects = (JSON.parse(row.manifest) as TaskManifest).projects;
-    try {
-      const probes = await Promise.all(projects.map(async (p) =>
-        `${p.id} ${getProject(db, p.id)?.defaultBranch ?? ""} ${await changesProbe(cfg, p, taskId)}`));
-      return JSON.stringify(probes);
-    } catch {
-      return null;
-    }
+    if (row.state === "moved" || row.state === "archived") return { key: row.state, projects: null };
+    const projects = await Promise.all((JSON.parse(row.manifest) as TaskManifest).projects.map(async (p) => {
+      const defaultBranch = getProject(db, p.id)?.defaultBranch ?? null;
+      const probe = await changesProbe(cfg, p, taskId, defaultBranch).catch(() => null);
+      return { p, defaultBranch, probe };
+    }));
+    const key = projects.some((q) => q.probe === null) ? null : JSON.stringify(projects.map((q) => `${q.p.id} ${q.probe!.key}`));
+    return { key, projects };
   }
 
   function manifestOf(taskId: string): TaskManifest {

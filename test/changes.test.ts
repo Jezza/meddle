@@ -87,6 +87,32 @@ test("taskChanges lists only the task's own work", async () => {
   }
 });
 
+test("taskChanges leaves out what the default branch has", async () => {
+  const { cfg, replica, project, base, first, second, close } = await taskRepo({ main: true });
+  try {
+    const line = `meddle/task/${TASK}/a`;
+    const lineAt = () => commitOf(replica, JSON.stringify(line), cfg);
+    // `main` moves on past the task's start, and the task's line is rebased onto it.
+    await jj(["--ignore-working-copy", "new", "--no-edit", base.commit, "-m", "upstream"], replica, cfg);
+    const upstream = (await jj(["--ignore-working-copy", "log", "--no-graph", "-r", 'description(exact:"upstream\n")', "-T", "commit_id"], replica, cfg)).trim();
+    await bookmarkSet(replica, "main", upstream, cfg, { ignoreWorkingCopy: true });
+    await jj(["--ignore-working-copy", "rebase", "-s", first.commit, "-d", upstream], replica, cfg);
+    expect((await taskChanges(cfg, project, TASK)).changes.map((c) => c.description)).toEqual(["", "second", "first", "upstream"]);
+    const rebased = await taskChanges(cfg, project, TASK, { defaultBranch: "main" });
+    expect(rebased).toMatchObject({ start: "feature", conflicted: false });
+    expect(rebased.changes.map((c) => c.description)).toEqual(["", "second", "first"]);
+    expect(rebased.changes.map((c) => c.workingCopy)).toEqual([true, false, false]);
+    expect(rebased.changes[0]!.commit).toBe(await lineAt());
+    expect(rebased.changes[1]!.change).toBe(second.change);
+
+    // The line merged into `main`: none left.
+    await bookmarkSet(replica, "main", await lineAt(), cfg, { ignoreWorkingCopy: true });
+    expect((await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).changes).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
 test("changeDiff gives one change or the whole range", async () => {
   const { cfg, project, first, close } = await taskRepo({ main: true });
   try {
@@ -136,6 +162,10 @@ test("workspaceFile stays inside the workspace", async () => {
     await symlink(join(home, "secret"), join(ws, "link"));
     await expect(workspaceFile(cfg, [project], TASK, join(ws, "link"))).rejects.toThrow(/^outside: /);
     await expect(workspaceFile(cfg, [project], TASK, "a.txt")).rejects.toThrow(/^outside: /);
+    // A task with no project works in its own folder.
+    expect(await workspaceFile(cfg, [], TASK, join(home, "tasks", TASK, "x"))).toBe("outside\n");
+    await expect(workspaceFile(cfg, [], TASK, join(home, "secret"))).rejects.toThrow(/^outside: /);
+    await expect(workspaceFile(cfg, [], "t2", join(home, "tasks", TASK, "x"))).rejects.toThrow(/^outside: /);
 
     await mkdir(join(ws, "dir"));
     await expect(workspaceFile(cfg, [project], TASK, join(ws, "dir"))).rejects.toThrow(/^not-a-file: /);

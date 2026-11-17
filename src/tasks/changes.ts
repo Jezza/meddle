@@ -40,7 +40,10 @@ export type ProjectChanges = {
   start: string;
   /** Whether the line's bookmark is conflicted; its changes are then not listed. */
   conflicted: boolean;
-  /** `<base>..<line>`, newest first; none when the line is absent or conflicted. */
+  /**
+   * `<base>..<line>` less what is on the project's default branch, newest first, at most `CHANGES_MAX`; none when the
+   * line is absent or conflicted.
+   */
   changes: TaskChange[];
 };
 
@@ -55,11 +58,13 @@ export class ChangesError extends Error {
   }
 }
 
+/** The most changes `taskChanges` lists. */
+export const CHANGES_MAX = 200;
+
 /** The most `workspaceFile` reads. */
 export const WORKSPACE_FILE_MAX = 2 * 1024 * 1024;
 
 const FIELD = "\x1f";
-const LIST = "\x1e";
 
 /** One line per change; the description last, since it is the only free text. */
 const CHANGE_TEMPLATE = [
@@ -70,13 +75,16 @@ const CHANGE_TEMPLATE = [
   "self.diff().stat().total_removed()",
   "empty",
   "conflict",
-  'local_bookmarks.map(|b| b.name()).join("\\x1e")',
   "description.first_line()",
 ].join(' ++ "\\x1f" ++ ') + ' ++ "\\n"';
 
-/** One line per base commit: its id, short change id and local bookmarks. */
-const BASE_TEMPLATE = ['commit_id', "change_id.short(8)", 'local_bookmarks.map(|b| b.name()).join("\\x1e")']
-  .join(' ++ "\\x1f" ++ ') + ' ++ "\\n"';
+/** One line per bookmark the probe lists: its remote (empty for a local one), name, conflict and target commits. */
+const PROBE_TEMPLATE = 'if(present, ' + [
+  "remote",
+  "name",
+  "conflict",
+  'added_targets.map(|c| c.commit_id()).join(",")',
+].join(' ++ "\\x1f" ++ ') + ' ++ "\\n")';
 
 /** Where every task's line bookmarks are (`taskNamespace`). */
 const TASK_BOOKMARKS = "meddle/task/";
@@ -104,34 +112,32 @@ function baseRevset(p: ManifestProject): string {
   return commits.length === 0 ? "root()" : commits.join(" | ");
 }
 
-/** The state of the task's line in `p`: its local bookmark absent, conflicted or pointing at one commit. */
-async function lineState(cfg: NodeConfig, p: ManifestProject, taskId: string): Promise<"absent" | "conflicted" | "normal"> {
-  const out = await jj(
-    ["--ignore-working-copy", "bookmark", "list", "-T", 'if(present, remote ++ "\\t" ++ conflict ++ "\\n")', `exact:${lineSymbol(p, taskId)}`],
-    p.replica, cfg,
-  );
-  const local = out.split("\n").find((row) => row.startsWith("\t"));
-  if (local === undefined) return "absent";
-  return local === "\ttrue" ? "conflicted" : "normal";
-}
+/** A local bookmark as the probe lists it: its name, whether it is conflicted, and the commits it points at. */
+type ProbeRow = { name: string; conflicted: boolean; targets: string[] };
 
 /**
- * What `taskChanges` reads from in `p`, in one jj call: the base commits, and the local bookmarks on them (they name
- * the start) and the task's line, each with the commits it points at. The same probe twice means the same
- * `ProjectChanges` (for the same default branch).
+ * What `taskChanges` reads from in `p`: `rows`, the local bookmarks on the base commits (they name the start), the
+ * task's line and the default branch, each with the commits it points at; `key`, the same twice for the same
+ * `ProjectChanges`.
  */
-export async function changesProbe(cfg: NodeConfig, p: ManifestProject, taskId: string): Promise<string> {
+export type ChangesProbe = { key: string; rows: ProbeRow[] };
+
+/** `p`'s `ChangesProbe` for task `taskId` and the project's default branch, in one jj call. */
+export async function changesProbe(
+  cfg: NodeConfig, p: ManifestProject, taskId: string, defaultBranch: string | null,
+): Promise<ChangesProbe> {
   // Names and `-r` list their union.
+  const names = [lineSymbol(p, taskId), ...(defaultBranch === null ? [] : [JSON.stringify(defaultBranch)])].map((n) => `exact:${n}`);
   const out = await jj(
-    [
-      "--ignore-working-copy", "bookmark", "list", "-T",
-      'if(present, remote ++ "\\t" ++ name ++ "\\t" ++ conflict ++ "\\t" ++ added_targets.map(|c| c.commit_id()).join(",") ++ "\\n")',
-      `exact:${lineSymbol(p, taskId)}`, "-r", baseRevset(p),
-    ],
+    ["--ignore-working-copy", "bookmark", "list", "-T", PROBE_TEMPLATE, ...names, "-r", baseRevset(p)],
     p.replica, cfg,
   );
-  const local = out.split("\n").filter((row) => row.startsWith("\t"));
-  return [p.base.join(","), ...local].join("\n");
+  const local = out.split("\n").filter((row) => row.startsWith(FIELD));
+  const rows = local.map((row): ProbeRow => {
+    const [, name = "", conflict = "", targets = ""] = row.split(FIELD);
+    return { name, conflicted: conflict === "true", targets: targets === "" ? [] : targets.split(",") };
+  });
+  return { key: [p.base.join(","), defaultBranch ?? "", ...local].join("\n"), rows };
 }
 
 /** A change or commit id, or its parent as `<id>-`; never a wider revset. */
@@ -141,21 +147,31 @@ function revision(id: string): string {
 }
 
 /**
- * The task's changes in project `p`: `<base>..<line>` in the project's replica, newest first; none when the line's
- * bookmark is not there. `options.defaultBranch` (the project's) is the start's name when it is on a base commit.
+ * The task's changes in project `p`: `<base>..<line>` in the project's replica, less what is on
+ * `options.defaultBranch` (the project's, when given), newest first and at most `CHANGES_MAX`; none when the line's
+ * bookmark is not there, or is conflicted (`conflicted` then). The default branch is also the start's name when it is
+ * on a base commit. Read off `options.probe` when given (`changesProbe` for the same default branch), else a new one.
  */
 export async function taskChanges(
-  cfg: NodeConfig, p: ManifestProject, taskId: string, options: { defaultBranch?: string | null } = {},
+  cfg: NodeConfig, p: ManifestProject, taskId: string,
+  options: { defaultBranch?: string | null; probe?: ChangesProbe } = {},
 ): Promise<ProjectChanges> {
-  const line = lineName(p, taskId);
-  const [state, start] = await Promise.all([lineState(cfg, p, taskId), startName(cfg, p, options.defaultBranch ?? null)]);
-  const conflicted = state === "conflicted";
-  if (state !== "normal") return { project: p.id, name: p.name, start, conflicted, changes: [] };
-  // `present()` on the line: it may have gone since `lineState`.
-  const range = `(${baseRevset(p)})..present(${lineSymbol(p, taskId)})`;
-  const listed = await jj(["--ignore-working-copy", "log", "--no-graph", "-r", range, "-T", CHANGE_TEMPLATE], p.replica, cfg);
+  const defaultBranch = options.defaultBranch ?? null;
+  const { rows } = options.probe ?? await changesProbe(cfg, p, taskId, defaultBranch);
+  const lineRow = rows.find((r) => r.name === lineName(p, taskId));
+  const start = await startName(cfg, p, rows, defaultBranch);
+  const conflicted = lineRow?.conflicted === true;
+  const at = lineRow?.targets[0];
+  if (at === undefined || conflicted) return { project: p.id, name: p.name, start, conflicted, changes: [] };
+  // The commits the probe saw, so that the list is the one its key stands for.
+  const main = rows.find((r) => r.name === defaultBranch)?.targets ?? [];
+  const range = `(${baseRevset(p)})..${at}${main.length === 0 ? "" : ` ~ ::(${main.join(" | ")})`}`;
+  const listed = await jj(
+    ["--ignore-working-copy", "log", "--no-graph", "--limit", String(CHANGES_MAX), "-r", range, "-T", CHANGE_TEMPLATE],
+    p.replica, cfg,
+  );
   const changes = listed.split("\n").filter(Boolean).map((row): TaskChange => {
-    const [change = "", commit = "", files = "0", added = "0", removed = "0", empty = "", conflict = "", bookmarks = "", ...rest] = row.split(FIELD);
+    const [change = "", commit = "", files = "0", added = "0", removed = "0", empty = "", conflict = "", ...rest] = row.split(FIELD);
     return {
       change,
       commit,
@@ -165,7 +181,7 @@ export async function taskChanges(
       removed: Number(removed),
       empty: empty === "true",
       conflicted: conflict === "true",
-      workingCopy: bookmarks.split(LIST).includes(line),
+      workingCopy: commit === at,
     };
   });
   return { project: p.id, name: p.name, start, conflicted, changes };
@@ -173,33 +189,31 @@ export async function taskChanges(
 
 /**
  * A local bookmark on a base commit (`defaultBranch` first, then any but a task's line, then a task's line, each by
- * name), else the first base's short change id.
+ * name), from the probe's `rows`; else the first base's short change id.
  */
-async function startName(cfg: NodeConfig, p: ManifestProject, defaultBranch: string | null): Promise<string> {
-  const out = await jj(["--ignore-working-copy", "log", "--no-graph", "-r", baseRevset(p), "-T", BASE_TEMPLATE], p.replica, cfg);
-  const rows = new Map(out.split("\n").filter(Boolean).map((row) => {
-    const [commit = "", short = "", bookmarks = ""] = row.split(FIELD);
-    return [commit, { short, bookmarks: bookmarks === "" ? [] : bookmarks.split(LIST) }] as const;
-  }));
-  const bases = p.base.map((c) => rows.get(c)).filter((r) => r !== undefined);
+async function startName(cfg: NodeConfig, p: ManifestProject, rows: readonly ProbeRow[], defaultBranch: string | null): Promise<string> {
   const rank = (name: string) => (name === defaultBranch ? 0 : name.startsWith(TASK_BOOKMARKS) ? 2 : 1);
-  const bookmarks = [...new Set(bases.flatMap((r) => r.bookmarks))].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
-  return bookmarks[0] ?? bases[0]?.short ?? (p.base[0] ?? "root").slice(0, 8);
+  const named = rows.filter((r) => r.targets.some((c) => p.base.includes(c))).map((r) => r.name);
+  const first = named.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))[0];
+  if (first !== undefined) return first;
+  const base = bases(p)[0];
+  if (base === undefined) return "root";
+  return (await jj(["--ignore-working-copy", "log", "--no-graph", "-r", base, "-T", "change_id.short(8)"], p.replica, cfg)).trim();
 }
 
 /**
- * A change's diff against its parent, in git's format; for `"all"`, the line's whole diff from its start, `""` when the
- * line is not there; rejects `conflicted` when the line's bookmark is. A task with several base commits (an edit start on a merge) is diffed from the first: what
- * `--from` their merge would be is not well defined.
+ * A change's diff against its parent, in git's format; for `"all"`, the line's whole diff from its start, `""` when
+ * the line is not there; rejects `conflicted` when the line's bookmark is. A task with several base commits (an edit
+ * start on a merge) is diffed from the first: what `--from` their merge would be is not well defined.
  */
 export async function changeDiff(cfg: NodeConfig, p: ManifestProject, taskId: string, change: string | "all"): Promise<string> {
   if (change !== "all") return jj(["--ignore-working-copy", "diff", "--git", "-r", revision(change)], p.replica, cfg);
   const from = bases(p)[0] ?? "root()";
-  const line = lineSymbol(p, taskId);
-  const state = await lineState(cfg, p, taskId);
-  if (state === "absent") return "";
-  if (state === "conflicted") throw new ChangesError("conflicted", lineName(p, taskId));
-  return jj(["--ignore-working-copy", "diff", "--git", "--from", from, "--to", line], p.replica, cfg);
+  const { rows } = await changesProbe(cfg, p, taskId, null);
+  const line = rows.find((r) => r.name === lineName(p, taskId));
+  if (line?.conflicted === true) throw new ChangesError("conflicted", lineName(p, taskId));
+  if (line === undefined || line.targets[0] === undefined) return "";
+  return jj(["--ignore-working-copy", "diff", "--git", "--from", from, "--to", line.targets[0]], p.replica, cfg);
 }
 
 /**
@@ -222,8 +236,9 @@ function inside(root: string, path: string): boolean {
 }
 
 /**
- * The file at `path` (absolute) as it is now in task `taskId`'s workspace of one of `projects`, or null when it is
- * absent. Its real path must be in one of the workspaces' real paths (`..` and symlinks resolved), else `outside`; it
+ * The file at `path` (absolute) as it is now in task `taskId`'s workspace of one of `projects` (for a task with none,
+ * its folder, where its agent works: `cwdFor`), or null when it is absent. Its real path must be in one of those
+ * folders' real paths (`..` and symlinks resolved), else `outside`; it
  * must be a regular file, else `not-a-file`, of at most `WORKSPACE_FILE_MAX` bytes, else `too-large`.
  *
  * The check stops a caller naming an arbitrary path. A folder on the path swapped for a symlink between the realpath
@@ -232,7 +247,8 @@ function inside(root: string, path: string): boolean {
  */
 export async function workspaceFile(cfg: NodeConfig, projects: readonly ManifestProject[], taskId: string, path: string): Promise<string | null> {
   if (!isAbsolute(path)) throw new ChangesError("outside", path);
-  const roots = projects.map((p) => join(paths(cfg).task(taskId), p.workspace));
+  const task = paths(cfg).task(taskId);
+  const roots = projects.length === 0 ? [task] : projects.map((p) => join(task, p.workspace));
   const reals = (await Promise.all(roots.map((r) => realpath(r).catch(() => null)))).filter((r) => r !== null);
   // Refused before it is looked up, so that an absent path outside reads as outside, not as absent.
   if (![...roots, ...reals].some((r) => inside(r, resolve(path)))) throw new ChangesError("outside", path);
