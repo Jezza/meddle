@@ -51,3 +51,23 @@ export function stripFrontmatter(text: string): string {
   const m = /^---[ \t]*\r?\n(?:.*\r?\n)*?---[ \t]*(?:\r?\n|$)/.exec(text);
   return m === null ? text : text.slice(m[0].length);
 }
+
+/** Whether `New` may save as `name`: a memory file's name that no listed entry has (a listed one is edited instead). */
+export function canSaveNew(name: string, listed: readonly string[]): boolean {
+  return isMemoryName(name) && !listed.includes(name);
+}
+
+/** History rows as loaded: newest first, and whether `Older` has more below them. */
+export type HistoryRows = { list: MemoryChange[]; more: boolean };
+
+/**
+ * The rows after reading the first page (`size` changes) again: that page on top, then the loaded rows below its
+ * last change, so rows already open or paged in stay. A short page is the whole history; a page whose last change
+ * was never loaded replaces what was.
+ */
+export function mergeFirstPage(loaded: HistoryRows | null, first: MemoryChange[], size: number): HistoryRows {
+  if (first.length < size) return { list: first, more: false };
+  const at = loaded?.list.findIndex((c) => c.change === first.at(-1)!.change) ?? -1;
+  if (loaded === null || at < 0) return { list: first, more: true };
+  return { list: [...first, ...loaded.list.slice(at + 1)], more: loaded.more };
+}

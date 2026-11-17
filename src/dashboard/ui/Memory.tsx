@@ -7,7 +7,7 @@ import type { MemoryChange, MemoryEntry } from "../../projects/memory-view";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
 import { errorText, type Hosts, useObject, useValue } from "./hooks";
-import { changeWho, isMemoryName, noMemoryRepo, stripFrontmatter, writeError } from "./memory-model";
+import { canSaveNew, changeWho, type HistoryRows, isMemoryName, mergeFirstPage, noMemoryRepo, stripFrontmatter, writeError } from "./memory-model";
 import { hashOf } from "./routes";
 import { ago } from "./sidebar-model";
 import type { ListedTask } from "./sources";
@@ -99,7 +99,7 @@ function MemoryLoaded({ project, editable, context }: { project: ProjectRef; edi
       {error !== null && <p class="error">{error}</p>}
       {creating && (
         <div class="mem-entry">
-          <Editor project={project} path={null} initial="" base={null} reload={load}
+          <Editor project={project} path={null} initial="" base={null} listed={entries?.map((e) => e.path) ?? []} reload={load}
             onSaved={(path) => { setCreating(false); toggle(path, true); }} onCancel={() => setCreating(false)} />
         </div>
       )}
@@ -132,25 +132,31 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
   project: ProjectRef; entry: MemoryEntry; editable: boolean; open: boolean;
   onToggle(): void; onHistory(): void; reload(): Promise<MemoryEntry[] | null>; context: Context;
 }) {
-  const [text, setText] = useState<string | null>(null);
+  // The file as last read, with the hash the entry had when that read was asked for: if the file moved on before the
+  // read, the text is newer than the hash and a save from it is refused `Changed`, never saved over unseen text.
+  const [read, setRead] = useState<{ text: string | null; hash: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ text: string; base: string } | null>(null);
   const [deleting, setDeleting] = useState(false);
   useEffect(() => {
     if (!open) return;
     let live = true;
+    const hash = entry.hash;
     project.memoryFile({ path: entry.path }).then(
-      (t) => { if (live) { setText(t); setError(null); } },
+      (text) => { if (live) { setRead({ text, hash }); setError(null); } },
       (err: unknown) => { if (live) setError(errorText(err)); },
     );
     return () => { live = false; };
   }, [project, entry.path, entry.hash, open]);
+  const text = read?.text ?? null;
+  // Edit and Delete only from a read of the entry as it is listed now, against the hash that read was asked for under.
+  const current = read !== null && read.text !== null && read.hash === entry.hash ? { text: read.text, base: read.hash } : null;
   const remove = async () => {
-    if (!confirm(`Delete ${entry.path}?`)) return;
+    if (current === null || !confirm(`Delete ${entry.path}?`)) return;
     setDeleting(true);
     setError(null);
     try {
-      await project.deleteMemory({ path: entry.path, base: entry.hash });
+      await project.deleteMemory({ path: entry.path, base: current.base });
       await reload();
     } catch (err) {
       const word = writeError(err);
@@ -171,7 +177,7 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
       </button>
       {open && (editing !== null
         ? (
-          <Editor project={project} path={entry.path} initial={editing.text} base={editing.base} reload={reload}
+          <Editor project={project} path={entry.path} initial={editing.text} base={editing.base} listed={[]} reload={reload}
             onSaved={() => setEditing(null)} onCancel={() => setEditing(null)} />
         )
         : (
@@ -180,9 +186,9 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
             <div class="mem-foot">
               {entry.last !== null && <span>{ago(Date.now() - Date.parse(entry.last.at))} ago<Who change={entry.last} context={context} sep /></span>}
               <span class="bar-gap" />
-              {editable && <button type="button" disabled={text === null} onClick={() => text !== null && setEditing({ text, base: entry.hash })}>Edit</button>}
+              {editable && <button type="button" disabled={current === null} onClick={() => current !== null && setEditing(current)}>Edit</button>}
               <button type="button" class="quiet" onClick={onHistory}>History</button>
-              {editable && <button type="button" class="quiet danger" disabled={deleting} onClick={() => void remove()}>Delete</button>}
+              {editable && <button type="button" class="quiet danger" disabled={deleting || current === null} onClick={() => void remove()}>Delete</button>}
             </div>
             {error !== null && <p class="error">{error}</p>}
           </div>
@@ -192,11 +198,12 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
 }
 
 /**
- * The raw file in a box, `Save` and `Cancel`; with `path` null, a name for a new file first. A refused save keeps the
- * text and says `Changed` (the file moved on: it is read again, so the next Save is against what is there now) or `Busy`.
+ * The raw file in a box, `Save` and `Cancel`; with `path` null, a name for a new file first (one not `listed`). A
+ * refused save keeps the text and says `Changed` or `Busy`. Editing an entry, `Changed` reads it again so the next Save
+ * is against what is there now; a new file never takes another's hash, so it never saves over a file it did not show.
  */
-function Editor({ project, path, initial, base: opened, reload, onSaved, onCancel }: {
-  project: ProjectRef; path: string | null; initial: string; base: string | null;
+function Editor({ project, path, initial, base: opened, listed, reload, onSaved, onCancel }: {
+  project: ProjectRef; path: string | null; initial: string; base: string | null; listed: readonly string[];
   reload(): Promise<MemoryEntry[] | null>; onSaved(path: string): void; onCancel(): void;
 }) {
   const [name, setName] = useState("");
@@ -208,8 +215,9 @@ function Editor({ project, path, initial, base: opened, reload, onSaved, onCance
   const nameBox = useRef<HTMLInputElement>(null);
   useEffect(() => { nameBox.current?.focus(); }, []);
   const target = path ?? name.trim();
+  const savable = path !== null || canSaveNew(target, listed);
   const save = async () => {
-    if (!isMemoryName(target)) return;
+    if (!savable) return;
     setBusy(true);
     setRefused(null);
     setError(null);
@@ -221,7 +229,7 @@ function Editor({ project, path, initial, base: opened, reload, onSaved, onCance
       const word = writeError(err);
       if (word === null) setError(errorText(err));
       else setRefused(word);
-      if (word === "Changed") {
+      if (word === "Changed" && path !== null) {
         const fresh = await reload();
         if (fresh !== null) setBase(fresh.find((e) => e.path === target)?.hash ?? null);
       }
@@ -236,7 +244,7 @@ function Editor({ project, path, initial, base: opened, reload, onSaved, onCance
         : <label class="mem-file" for={`mem-${path}`}>{path}</label>}
       <textarea id={path === null ? undefined : `mem-${path}`} class="mem-text" value={text} onInput={(e) => setText(e.currentTarget.value)} />
       <div class="mem-foot">
-        <button type="button" class="primary" disabled={busy || !isMemoryName(target)} onClick={() => void save()}>Save</button>
+        <button type="button" class="primary" disabled={busy || !savable} onClick={() => void save()}>Save</button>
         <button type="button" onClick={onCancel}>Cancel</button>
         {refused !== null && <span class="flag">{refused}</span>}
       </div>
@@ -263,7 +271,7 @@ function Who({ change, context, sep = false }: { change: MemoryChange; context: 
 
 /** The history under `memory`, newest first, 50 at a time; only changes touching `path` when it is set. */
 function History({ project, head, path, context }: { project: ProjectRef; head: string | null; path: string | null; context: Context }) {
-  const [rows, setRows] = useState<{ list: MemoryChange[]; more: boolean } | null>(null);
+  const [rows, setRows] = useState<HistoryRows | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const reads = useRef(0);
@@ -273,7 +281,9 @@ function History({ project, head, path, context }: { project: ProjectRef; head: 
     try {
       const list = await project.memoryHistory({ limit: HISTORY_PAGE, ...(before === undefined ? {} : { before }), ...(path === null ? {} : { path }) });
       if (n !== reads.current) return;
-      setRows((current) => ({ list: before === undefined ? list : [...(current?.list ?? []), ...list], more: list.length === HISTORY_PAGE }));
+      setRows((current) => before === undefined
+        ? mergeFirstPage(current, list, HISTORY_PAGE)
+        : { list: [...(current?.list ?? []), ...list], more: list.length === HISTORY_PAGE });
       setError(null);
     } catch (err) {
       if (n === reads.current) setError(errorText(err));
@@ -281,8 +291,13 @@ function History({ project, head, path, context }: { project: ProjectRef; head: 
       if (n === reads.current) setLoading(false);
     }
   };
+  // Another project or path starts over; a new head only reads the first page again, keeping open rows and pages below.
+  const shown = useRef<{ project: ProjectRef; path: string | null } | null>(null);
   useEffect(() => {
-    setRows(null);
+    if (shown.current?.project !== project || shown.current.path !== path) {
+      shown.current = { project, path };
+      setRows(null);
+    }
     void page(undefined);
   }, [project, head, path]);
   return (
@@ -320,10 +335,13 @@ function Change({ project, change: c, context }: { project: ProjectRef; change: 
   const node = c.node === null ? null : context.nodeName(c.node);
   return (
     <div class="mem-entry">
-      <div class="mem-row hist" role="button" onClick={() => setOpen(!open)}>
-        <span class="caret">{open ? "▾" : "▸"}</span>
-        <span class="id muted">{c.change.slice(0, 8)}</span>
-        <span>{ago(Date.now() - Date.parse(c.at))} ago</span>
+      {/* The row opens on a click anywhere but its task link; the button's own click (a key on it too) bubbles here. */}
+      <div class="mem-row hist" onClick={() => setOpen(!open)}>
+        <button type="button" class="hist-toggle" aria-expanded={open}>
+          <span class="caret">{open ? "▾" : "▸"}</span>
+          <span class="id muted">{c.change.slice(0, 8)}</span>
+          <span>{ago(Date.now() - Date.parse(c.at))} ago</span>
+        </button>
         <Who change={c} context={context} />
         {node !== null && <span class="muted" title={c.node ?? undefined}>{node}</span>}
         <span class="bar-gap" />

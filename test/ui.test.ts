@@ -6,7 +6,7 @@ import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usa
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
-import { changeWho, memorySource, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
+import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 
@@ -314,4 +314,28 @@ test("stripFrontmatter leaves the body", () => {
   expect(stripFrontmatter("---\r\nname: a\r\n---\r\nBody")).toBe("Body");
   expect(stripFrontmatter("# No frontmatter\n")).toBe("# No frontmatter\n");
   expect(stripFrontmatter("---\nunclosed\n")).toBe("---\nunclosed\n");
+});
+
+test("canSaveNew wants a memory name not listed yet", () => {
+  expect(canSaveNew("a.md", ["MEMORY.md"])).toBe(true);
+  expect(canSaveNew("MEMORY.md", ["MEMORY.md"])).toBe(false);
+  expect(canSaveNew("a/b.md", [])).toBe(false);
+  expect(canSaveNew("", [])).toBe(false);
+});
+
+test("mergeFirstPage puts new changes on top and keeps the pages loaded below", () => {
+  const c = (change: string): MemoryChange =>
+    ({ change, at: "2026-11-17T00:00:00.000Z", node: null, task: null, kind: "other", description: "", files: [], added: 0, removed: 0 });
+  const ids = (r: { list: MemoryChange[] }) => r.list.map((x) => x.change);
+  const loaded = { list: ["d", "c", "b", "a"].map(c), more: true };
+  // Two new changes; the fresh page of 3 ends on `d`, so everything loaded below `d` stays.
+  const merged = mergeFirstPage(loaded, ["f", "e", "d"].map(c), 3);
+  expect(ids(merged)).toEqual(["f", "e", "d", "c", "b", "a"]);
+  expect(merged.more).toBe(true);
+  // The fresh page ends on something not loaded: only it, with more to load.
+  expect(mergeFirstPage(loaded, ["h", "g", "f"].map(c), 3)).toEqual({ list: ["h", "g", "f"].map(c), more: true });
+  // A short page is the whole history.
+  expect(mergeFirstPage(loaded, ["e", "d"].map(c), 3)).toEqual({ list: ["e", "d"].map(c), more: false });
+  // Nothing loaded yet: the page as it is.
+  expect(mergeFirstPage(null, ["b", "a"].map(c), 2)).toEqual({ list: ["b", "a"].map(c), more: true });
 });
