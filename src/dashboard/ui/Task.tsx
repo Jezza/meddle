@@ -9,6 +9,7 @@ import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
+import { composerKey } from "./composer-model";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Chevron, Iconoir } from "./icons";
@@ -132,7 +133,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
         <div class="pending-strip">{pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}</div>
       )}
       {!archived && state !== "moved" && !showChanges && (
-        <Composer task={task} running={live} disabled={moving} text={draft} setText={setDraft} box={box}
+        <Composer task={task} running={live} anyQueued={queued.length > 0} disabled={moving} text={draft} setText={setDraft} box={box}
           onFailed={(text, error) => setFailed((all) => [...all, { id: ++failedId.current, text, error }])} />
       )}
       <BottomBar task={task} pool={pool} node={node} nodeId={nodeId} archived={archived} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} moving={moving} />
@@ -685,7 +686,7 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 /** A text the task was sent and has not started on: it joins the thread where Claude takes it. */
 function Queued({ text }: { text: string }) {
   return (
-    <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one">
+    <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one; Ctrl+Enter in an empty box sends it now">
       <div class="user-text">{text}</div>
       <span class="chip">queued</span>
     </div>
@@ -714,12 +715,18 @@ function FailedMessage({ task, failed, disabled, onSent, onEdit }: {
   );
 }
 
-function Composer({ task, running, disabled, text, setText, box, onFailed }: {
-  task: TaskRef; running: boolean; disabled: boolean;
+function Composer({ task, running, anyQueued, disabled, text, setText, box, onFailed }: {
+  task: TaskRef; running: boolean;
+  /** The task has texts it has not started on: Ctrl+Enter in an empty box sends them now. */
+  anyQueued: boolean;
+  disabled: boolean;
   text: string; setText: Dispatch<StateUpdater<string>>; box: RefObject<HTMLTextAreaElement | null>;
   onFailed(text: string, error: string): void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [nowError, setNowError] = useState<string | null>(null);
+  // A phone's keyboard has no Shift for a new line: there Enter makes one, and the button sends.
+  const touch = matchMedia("(pointer: coarse)").matches;
   // Grows with what is typed, up to the stylesheet's max-height, instead of a drag handle. Measuring drops the box to
   // its natural height for a moment, so the field holds its height meanwhile: otherwise the thread above grows for that
   // moment and, scrolled to the bottom, Firefox clamps its scroll and the thread lands a couple of pixels lower.
@@ -733,22 +740,29 @@ function Composer({ task, running, disabled, text, setText, box, onFailed }: {
     field.style.minHeight = "";
   }, [text]);
   // Sent or not, the text leaves the box: a failed one goes into the thread (FailedMessage). What was typed meanwhile stays.
-  const send = async () => {
+  // `now` then sends what the running turn has not taken now, the text last, as Claude Code does; with an empty box,
+  // just what is queued.
+  const send = async (now: boolean) => {
     const sent = text;
-    if (disabled || busy || sent.trim() === "") return;
+    const empty = sent.trim() === "";
+    if (disabled || busy || (empty && !(now && anyQueued))) return;
     setBusy(true);
+    setNowError(null);
     try {
-      await task.prompt({ text: sent });
-    } catch (err) {
-      onFailed(sent, errorText(err));
+      if (!empty) {
+        const prompted = await task.prompt({ text: sent }).then(() => true, (err: unknown) => { onFailed(sent, errorText(err)); return false; });
+        setText((t) => (t === sent ? "" : t));
+        if (!prompted) return;
+      }
+      if (now) await task.sendNow({}).catch((err: unknown) => setNowError(errorText(err)));
     } finally {
       setBusy(false);
     }
-    setText((now) => (now === sent ? "" : now));
   };
   // The button takes the accent only once there is something to send.
   const ready = !disabled && text.trim() !== "";
   const verb = running ? "Queue" : "Send";
+  const keys = touch ? "" : running ? " (Enter; Ctrl+Enter sends now)" : " (Enter)";
   return (
     <div class="composer">
       <div class="composer-field">
@@ -757,14 +771,20 @@ function Composer({ task, running, disabled, text, setText, box, onFailed }: {
           rows={1}
           disabled={disabled}
           value={text}
-          placeholder={disabled ? "Moving: prompts wait until it lands" : running ? "Message Claude: it takes it at its next step…" : "Reply…"}
+          placeholder={disabled ? "Moving: prompts wait until it lands" : running ? `Message Claude: it takes it at its next step${touch ? "" : " · Ctrl+Enter sends now"}…` : "Reply…"}
           onInput={(e) => setText(e.currentTarget.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); } }}
+          onKeyDown={(e) => {
+            const action = composerKey(e, { running, touch });
+            if (action === null) return;
+            e.preventDefault();
+            void send(action === "send-now");
+          }}
         />
-        <button class={ready ? "send ready" : "send"} disabled={!ready || busy} onClick={send} title={`${verb} (Ctrl+Enter)`} aria-label={verb}>
+        <button class={ready ? "send ready" : "send"} disabled={!ready || busy} onClick={() => send(false)} title={`${verb}${keys}`} aria-label={verb}>
           <Iconoir name="send" />
         </button>
       </div>
+      {nowError !== null && <div class="composer-row error">Not sent now: {nowError}</div>}
     </div>
   );
 }

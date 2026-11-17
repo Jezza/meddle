@@ -326,6 +326,27 @@ test("a steer Claude Code folds into the running turn is queued until it takes i
   expect(listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started")).toHaveLength(1);
   await steering.h.close();
 });
+test("send now cuts a running task's turn short for the steer Claude Code has not taken, which runs next", async () => {
+  const { db, h, m, open } = await setup();
+  await h.close();
+  const stalling = await open({ MEDDLE_FIXTURE_STALL: "1" });
+  const { runner } = stalling;
+  const STEER = "Stop that, and say why instead.";
+  const prompts = () => listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  // an idle task has nothing waiting to send
+  expect(await runner.sendNow(m.id)).toBe("nothing_waiting");
+  let sent: Promise<unknown> | undefined;
+  runner.onEvent((tid, _s, msg: any) => {
+    if (tid === m.id && msg.type === "assistant" && sent === undefined) sent = runner.prompt(m.id, STEER).then(() => runner.sendNow(m.id));
+  });
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await eventually(() => sent !== undefined, () => "no reply to steer");
+  expect(await sent).toBe("stopped");
+  // the stand-in ends rather than run the steer, so it runs as the task's next turn (which stalls in its turn)
+  await eventually(() => prompts().length === 2, () => JSON.stringify(prompts()));
+  expect(prompts()).toEqual(["Reply with the single word ok.", STEER]);
+  await stalling.h.close();
+}, 30_000);
 test("a prompt to a task whose turn is parked retries the turn and queues the message for after it", async () => {
   const { insertTask } = await import("../src/store/records");
   const home = await mkdtemp("/tmp/meddle-dur-");

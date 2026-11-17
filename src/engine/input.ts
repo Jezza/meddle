@@ -13,6 +13,9 @@ export class InputQueue implements AsyncIterable<SDKUserMessage> {
   #ended = false;
   #untaken = new Map<string, string>();
   #wake: (() => void) | undefined;
+  /** The reader has an item and has not come back for the next one yet. */
+  #reading = false;
+  #writtenWaiters: (() => void)[] = [];
 
   /** Queues `text`; answers the uuid it is sent with. */
   push(text: string, priority: "now" | "next" = "next"): string {
@@ -37,6 +40,15 @@ export class InputQueue implements AsyncIterable<SDKUserMessage> {
     return [...this.#untaken].map(([uuid, text]) => ({ uuid, text }));
   }
 
+  /**
+   * Resolves once every text pushed so far is written to Claude Code, or there is no more input. The SDK writes a
+   * message before it reads the next, so a text is written once the reader has come back past it.
+   */
+  written(): Promise<void> {
+    if (this.#isWritten()) return Promise.resolve();
+    return new Promise((resolve) => this.#writtenWaiters.push(resolve));
+  }
+
   /** Whether `end()` was called: a push now throws. */
   get ended(): boolean {
     return this.#ended;
@@ -46,15 +58,31 @@ export class InputQueue implements AsyncIterable<SDKUserMessage> {
   end(): void {
     this.#ended = true;
     this.#notify();
+    this.#tellWritten();
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     for (;;) {
       const next = this.#items.shift();
-      if (next !== undefined) { yield next; continue; }
+      if (next !== undefined) {
+        this.#reading = true;
+        yield next;
+        this.#reading = false;
+        this.#tellWritten();
+        continue;
+      }
       if (this.#ended) return;
       await new Promise<void>((resolve) => { this.#wake = resolve; });
     }
+  }
+
+  #isWritten(): boolean {
+    return this.#ended || (this.#items.length === 0 && !this.#reading);
+  }
+
+  #tellWritten(): void {
+    if (!this.#isWritten()) return;
+    for (const resolve of this.#writtenWaiters.splice(0)) resolve();
   }
 
   #notify(): void {

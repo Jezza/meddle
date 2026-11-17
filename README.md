@@ -458,6 +458,13 @@ one the turn ended without taking (it was killed, say). Until Claude takes it, a
 task's thread and is not in its log; it enters the log where Claude took it. Interrupt is what cuts a turn short.
 `task prompt` to a busy task waits for the turn that takes its text and follows that one to its end.
 
+In the dashboard's composer, Enter sends and Shift+Enter makes a new line (on a touch screen Enter makes one, and the
+button sends). Ctrl+Enter (or Cmd+Enter) sends now, as in Claude Code: every message the running turn has not taken
+goes at once, in the order sent, the new one last, into the turn if Claude Code can fit them in, or else Claude Code
+cuts the turn short and runs them next. In an empty box, Ctrl+Enter sends the queued ones now. A message waiting for
+the task's next turn is not among them; it runs next already. Send now asks Claude Code with a field its SDK does not
+document (`send_now` on an interrupt), which the Claude Code meddle pins takes.
+
 `task list` prints a table of every task of the pool, node by node (this node first), the archived ones after the
 others: `ID`, `STATE`, `NODE`, `HOST`, `PROJECTS` (comma-separated, `-` for none) and `TITLE`; nothing when there are
 none. It reads each online member's tasks over the pool, as the dashboard does; an offline member's are not listed,

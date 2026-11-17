@@ -149,8 +149,12 @@ export type RunTurnArgs = {
  * Background work Claude Code says is live (`background_tasks_changed`) at a `result` keeps the turn going too, the
  * child and its input open, with no grace: when it ends Claude Code wakes for it in a turn of its own (an `init`, then
  * its own `result`), which this turn ends with. Closing the child at that `result` would kill the work unseen.
+ *
+ * `sendNow` does what Claude Code's own "send now" key does: every steer it has not taken goes now, in order, into
+ * the running turn when Claude Code can fit them in, or else it cuts the turn short and runs them next. A steer pushed
+ * just before is among them. Answers what Claude Code says it did; rejects for a Claude Code that does not offer it.
  */
-export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKResultMessage> } {
+export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKResultMessage>; sendNow: () => Promise<SendNowOutcome | undefined> } {
   const { input } = args;
   const taskId = input.manifest.id;
   const record = recorder(args);
@@ -181,7 +185,9 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
     throw err;
   }
   let fault: TokenFault | null = null;
+  let capabilities: string[] | undefined; // what the turn's `init` says this Claude Code takes
   const watch = (m: SDKMessage) => {
+    if (m.type === "system" && m.subtype === "init") capabilities = m.capabilities ?? [];
     const found = tokenFaultOf(m);
     if (found !== null) fault = moreTelling(fault, found);
   };
@@ -201,8 +207,29 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
       throw err;
     },
   );
-  return { query: q, done };
+  const sendNow = async (): Promise<SendNowOutcome | undefined> => {
+    if (capabilities !== undefined && !capabilities.includes(SEND_NOW)) throw new Error("this Claude Code cannot send now");
+    // Claude Code sends only what it has read: the steers pushed so far go to it first.
+    await queue.written();
+    const reply = await (q as unknown as ControlRequests).request({ subtype: "interrupt", send_now: true });
+    return reply.response?.send_now;
+  };
+  return { query: q, done, sendNow };
 }
+
+/** What Claude Code says a send now did: put what waits into the running turn, cut the turn for it, or found nothing. */
+export type SendNowOutcome = "delivering" | "stopped" | "nothing_waiting";
+
+/** The capability an `init` lists when Claude Code takes an `interrupt` with `send_now`. */
+const SEND_NOW = "interrupt_send_now_v1";
+
+/**
+ * How the SDK's Query sends a control request, which its types leave out: `interrupt()` cannot ask for `send_now`.
+ * meddle pins the SDK and the Claude Code it carries (package.json), so both work as read here.
+ */
+type ControlRequests = {
+  request(request: { subtype: "interrupt"; send_now: true }): Promise<{ response?: { send_now?: SendNowOutcome } }>;
+};
 
 /** Appends an event to the task's log, then tells `onMessage`. */
 function recorder(args: RunTurnArgs): (m: SDKMessage | MeddleEvent) => void {
