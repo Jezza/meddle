@@ -200,14 +200,15 @@
   button.chg:hover:not(:disabled) { background: var(--hover); }
   button.chg.sel, button.chg.sel:hover:not(:disabled) { background: var(--sel); }
   .chg.quiet, .chg.start { color: var(--muted); }
-  .chg-text { min-width: 0; }
-  .chg-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chg-text { min-width: 0; padding: 5px 0; }
+  .chg-label { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
   .chg .meta { display: block; color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chg .add, .chg-sum .add { color: var(--add); }
   .chg .del, .chg-sum .del { color: var(--bad); }
   .chg-space { height: 6px; }
   .chg-start { background: var(--hover); color: var(--fg); border-radius: 4px; padding: 0 6px; font-size: 11.5px; }
-  .chg-graph { display: block; }
+  .chg-rail { position: relative; align-self: stretch; }
+  .chg-graph { position: absolute; inset: 0; width: 28px; height: 100%; display: block; overflow: visible; }
   .chg-graph line { stroke: var(--faint); stroke-width: 1.5; }
   .chg-graph .pt { fill: var(--bg); stroke: var(--fg-soft); stroke-width: 1.5; }
   .chg-graph .pt.wc { fill: var(--accent); stroke: none; }
@@ -220,6 +221,10 @@
   .chg-file { margin: 0 0 12px; }
   .chg-file .diff { max-height: none; }
   .chg-file .error { margin: 4px 0 0; font-size: 12px; }
+  .chg-main > .error { margin: 0 0 12px; }
+  /* What waits on you, beneath the changes. */
+  .pending-strip { flex: none; max-height: 45vh; overflow-y: auto; padding: 10px 22px 0; border-top: 1px solid var(--line); }
+  .pending-strip .ask { max-width: 860px; margin: 0 auto 10px; }
   .banner { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 7px 16px; background: var(--warn-bg); color: var(--warn); border-bottom: 1px solid var(--warn-line); flex: none; }
   .banner-actions { margin-left: auto; display: flex; gap: 6px; }
   .thread-scroll { flex: 1; overflow-y: auto; min-height: 0; }
@@ -449,6 +454,7 @@
     .changes { flex-direction: column; overflow-y: auto; }
     .chg-list { flex: none; max-width: none; border-right: none; border-bottom: 1px solid var(--line); overflow: visible; }
     .chg-main { flex: none; overflow: visible; padding: 14px 14px 40px; }
+    .pending-strip { padding: 10px 14px 0; }
   }
 </style>
 </head>

@@ -9,7 +9,7 @@ import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
-import { changeCount, changeLabel, summary, totals } from "../src/dashboard/ui/changes-model";
+import { changeCount, changeLabel, diffVersion, summary, totals } from "../src/dashboard/ui/changes-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 
@@ -361,10 +361,19 @@ test("changeCount counts the non-empty changes of every project", () => {
   ])).toBe(3);
 });
 
-test("summary says how many changes since the start", () => {
-  expect(summary(project({ changes: [change({ workingCopy: true, empty: true }), change({}), change({})] }))).toBe("2 changes on main");
-  expect(summary(project({ start: "xqttoluq", changes: [change({})] }))).toBe("1 change on xqttoluq");
-  expect(summary(project({}))).toBe("0 changes on main");
+test("summary counts the non-empty changes", () => {
+  expect(summary(project({ changes: [change({ workingCopy: true, empty: true }), change({}), change({})] }))).toBe("2 changes");
+  expect(summary(project({ start: "xqttoluq", changes: [change({})] }))).toBe("1 change");
+  expect(summary(project({}))).toBe("0 changes");
+});
+
+test("diffVersion moves for the whole line with its commits and start, never for one commit", () => {
+  const p = project({ changes: [change({ commit: "a" }), change({ commit: "b" })] });
+  expect(diffVersion(p, "all", "base")).toBe("base,a,b");
+  expect(diffVersion(project({ changes: [change({ commit: "a2" }), change({ commit: "b" })] }), "all", "base")).not.toBe(diffVersion(p, "all", "base"));
+  expect(diffVersion(p, "all", "other")).not.toBe(diffVersion(p, "all", "base"));
+  expect(diffVersion(p, "all", undefined)).toBe(",a,b");
+  expect(diffVersion(p, "b", "base")).toBe(diffVersion(project({}), "b", "other"));
 });
 
 test("totals sums a diff's files and lines", () => {

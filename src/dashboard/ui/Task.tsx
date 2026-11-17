@@ -126,6 +126,10 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
           ))}
         </>} />
       )}
+      {/* The thread holds what waits on you; beside the changes, it waits beneath them. */}
+      {showChanges && pending.length > 0 && (
+        <div class="pending-strip">{pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}</div>
+      )}
       {!archived && state !== "moved" && !showChanges && (
         <Composer task={task} running={live} disabled={moving} text={draft} setText={setDraft} box={box}
           onFailed={(text, error) => setFailed((all) => [...all, { id: ++failedId.current, text, error }])} />
@@ -142,7 +146,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
   /** A pushed branch contains the task's line for some of its projects, not all: nothing is archived yet. */
   partly: boolean;
   raw: boolean; onRaw: () => void;
-  /** The `Thread` / `Changes n` switch: the non-empty changes, and whether they show; null hides it. */
+  /** The `Thread` / `Changes n` switch: the non-empty changes (no number for none), and whether they show; null hides it. */
   changes: { count: number; on: boolean } | null;
 }) {
   const [renaming, setRenaming] = useState(false);
@@ -180,7 +184,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
             <a class={changes.on ? "" : "on"} aria-current={changes.on ? undefined : "page"}
               href={hashOf({ name: "task", nodeId, id: task.manifest.value.id })}>Thread</a>
             <a class={changes.on ? "on" : ""} aria-current={changes.on ? "page" : undefined}
-              href={hashOf({ name: "task", nodeId, id: task.manifest.value.id, tab: "changes" })}>Changes {changes.count}</a>
+              href={hashOf({ name: "task", nodeId, id: task.manifest.value.id, tab: "changes" })}>Changes{changes.count > 0 && ` ${changes.count}`}</a>
           </nav>
         )}
         <button class={raw ? "on" : ""} aria-pressed={raw} title="Show every event, bookkeeping included" onClick={onRaw}>Raw</button>

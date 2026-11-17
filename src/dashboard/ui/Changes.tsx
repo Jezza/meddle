@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import type { TaskObject } from "../../state/contracts";
 import { remoteReason } from "../../projects/memory-names";
 import type { ProjectChanges, TaskChange } from "../../tasks/changes";
-import { changeLabel, summary, totals } from "./changes-model";
+import { changeLabel, diffVersion, summary, totals } from "./changes-model";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
 import { useValue } from "./hooks";
@@ -43,8 +43,8 @@ function ProjectView({ task, p, base, picker }: { task: TaskRef; p: ProjectChang
   const current = selected === "all" ? undefined
     : p.changes.find((c) => c.commit === selected.commit)
       ?? (p.changes.filter((c) => c.change === selected.change).length === 1 ? p.changes.find((c) => c.change === selected.change) : undefined);
-  const all = useDiff(task, p.project, p.conflicted ? null : "all", p);
-  const one = useDiff(task, p.project, current?.commit ?? null, p);
+  const all = useDiff(task, p.project, p.conflicted ? null : "all", diffVersion(p, "all", base));
+  const one = useDiff(task, p.project, current?.commit ?? null, diffVersion(p, current?.commit ?? "all", base));
   const shown = current === undefined ? all : one;
   const sum = all.patches === null ? null : totals(all.patches);
   return (
@@ -73,10 +73,10 @@ function ProjectView({ task, p, base, picker }: { task: TaskRef; p: ProjectChang
       <div class="chg-main">
         <div class="chg-sum">
           {p.conflicted ? <span class="flag">conflicted</span> : <>
-            <span>{summary(p)}</span>
+            <span>{summary(p)} on <span class="chg-start">{p.start}</span></span>
             {sum !== null && <>
               <span class="muted">·</span><span>{files(sum.files)}</span>
-              <span class="add">+{sum.added}</span><span class="del">−{sum.removed}</span>
+              <span class="muted">·</span><span><span class="add">+{sum.added}</span> <span class="del">−{sum.removed}</span></span>
             </>}
             {current !== undefined && all.error !== null && <span class="error">{all.error}</span>}
           </>}
@@ -114,19 +114,28 @@ function ChangeRow({ c, first, selected, onSelect }: { c: TaskChange; first: boo
   );
 }
 
-/** A row's piece of the graph: the line through it (from its dot down, on the first row) and its dot, or the start's diamond. */
+/**
+ * A row's piece of the graph, as tall as the row: the line through it (from its dot down, on the first row) and its
+ * dot, or the start's diamond.
+ */
 function Graph({ first, change, start }: { first: boolean; change?: TaskChange; start?: boolean }) {
   const dot = change === undefined ? "" : change.workingCopy ? (change.empty ? "pt empty" : "pt wc") : change.conflicted ? "pt bad" : "pt";
   return (
-    <svg class="chg-graph" width="28" height="44" aria-hidden="true">
-      {!(first && start) && <line x1="14" y1={first ? 22 : 0} x2="14" y2={start ? 22 : 44} />}
-      {start ? <polygon class="diamond" points="14,16.5 19.5,22 14,27.5 8.5,22" /> : <circle class={dot} cx="14" cy="22" r="4" />}
-    </svg>
+    <span class="chg-rail">
+      <svg class="chg-graph" aria-hidden="true">
+        {!(first && start) && <line x1="14" y1={first ? "50%" : "0"} x2="14" y2={start ? "50%" : "100%"} />}
+        {start
+          ? <svg x="0" y="50%" overflow="visible"><polygon class="diamond" points="14,-5.5 19.5,0 14,5.5 8.5,0" /></svg>
+          : <circle class={dot} cx="14" cy="50%" r="4" />}
+      </svg>
+    </span>
   );
 }
 
+/** ` · +a −r`, each count only when it is not 0. */
 function Lines({ added, removed }: { added: number; removed: number }) {
-  return <>{added > 0 && <> <span class="add">+{added}</span></>}{removed > 0 && <> <span class="del">−{removed}</span></>}</>;
+  if (added === 0 && removed === 0) return null;
+  return <> · {added > 0 && <span class="add">+{added}</span>}{added > 0 && removed > 0 && " "}{removed > 0 && <span class="del">−{removed}</span>}</>;
 }
 
 const files = (n: number) => `${n} ${n === 1 ? "file" : "files"}`;
@@ -160,10 +169,11 @@ type Read = { patches: FilePatch[] | null; error: string | null; generation: num
 
 /**
  * `change`'s diff in `project` (`"all"` for the whole line, null for none), read again whenever `version` changes. A
- * new `change` drops what was shown; a read again keeps it until the new one lands. Each landed read is a new
+ * new `change` drops what was shown; a read again keeps it until the new one lands, and a failed one keeps it beside
+ * its refusal. Each landed read is a new
  * `generation`, so that diffs keyed by it start over rather than keep a file loaded for other hunks.
  */
-function useDiff(task: TaskRef, project: string, change: string | null, version: unknown): Read {
+function useDiff(task: TaskRef, project: string, change: string | null, version: string): Read {
   const [read, setRead] = useState<Read & { change: string | null }>({ patches: null, error: null, generation: 0, change });
   const latest = useRef(0);
   useEffect(() => {
@@ -175,7 +185,9 @@ function useDiff(task: TaskRef, project: string, change: string | null, version:
     setRead((r) => r.change === change ? r : { patches: null, error: null, generation: r.generation, change });
     task.changeDiff({ project, change }).then(
       (text) => { if (n === latest.current) setRead((r) => ({ patches: parseGitDiff(text), error: null, generation: r.generation + 1, change })); },
-      (err: unknown) => { if (n === latest.current) setRead((r) => ({ patches: null, error: remoteReason(err), generation: r.generation, change })); },
+      (err: unknown) => {
+        if (n === latest.current) setRead((r) => ({ patches: r.change === change ? r.patches : null, error: remoteReason(err), generation: r.generation, change }));
+      },
     );
   }, [task, project, change, version]);
   // Until the effect has run for a new change, what is held is another change's.

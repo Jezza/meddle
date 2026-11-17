@@ -7,10 +7,18 @@ export function changeCount(projects: readonly ProjectChanges[]): number {
   return projects.reduce((n, p) => n + p.changes.filter((c) => !c.empty).length, 0);
 }
 
-/** `n changes on <start>`, n the project's non-empty changes; the files and `+n −n` are drawn beside it. */
+/** `n changes`, n the project's non-empty changes: the summary line's start, ` on <start>` and the files drawn after it. */
 export function summary(p: ProjectChanges): string {
   const n = p.changes.filter((c) => !c.empty).length;
-  return `${n} ${n === 1 ? "change" : "changes"} on ${p.start}`;
+  return `${n} ${n === 1 ? "change" : "changes"}`;
+}
+
+/**
+ * What a diff of `change` (a commit id, or `"all"`) in `p` depends on, to read it again only when that moves: nothing
+ * for a commit, whose diff never changes; for the whole line, its start (`base`, the first base commit) and its commits.
+ */
+export function diffVersion(p: ProjectChanges, change: string, base: string | undefined): string {
+  return change === "all" ? [base ?? "", ...p.changes.map((c) => c.commit)].join(",") : "";
 }
 
 /** A diff's file count and lines added and removed. */
