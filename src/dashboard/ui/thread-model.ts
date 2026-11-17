@@ -290,18 +290,15 @@ const LOOKS: Record<string, { one: string; many: string; key?: string }> = {
 
 export const isLook = (tool: ToolItem): boolean => Object.hasOwn(LOOKS, tool.name);
 
-/** Messages that only keep the session's books: shown only with Raw. Any other message the thread does not know shows. */
-const BOOKKEEPING: readonly string[] = ["command_lifecycle", "system:hook_started", "system:hook_response"];
-
 /**
  * Folds each run of calls that only look into one `explored` item, with the thinking just before, between and just
  * after them (so a thought does not show as a row and then vanish into the run once the next look lands);
- * everything else stays as it is. Bookkeeping messages show only with `raw`.
+ * everything else stays as it is. Messages the thread does not know show only with `raw`.
  */
 export function foldSteps(items: readonly ThreadItem[], raw = false): ShownItem[] {
   const shown: ShownItem[] = [];
   for (const item of items) {
-    if (item.kind === "unknown" && !raw && BOOKKEEPING.includes(item.type)) continue;
+    if (item.kind === "unknown" && !raw) continue;
     const thinking = item.kind === "assistant" && item.text === "";
     // Thinking whose text the API left out says nothing.
     if (thinking && (item.thinking ?? "") === "") continue;

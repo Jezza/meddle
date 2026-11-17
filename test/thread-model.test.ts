@@ -89,9 +89,10 @@ test("foldSteps folds runs of calls that only look, with their thinking, and lea
   expect(foldSteps(items, true).map((i) => i.kind)).toEqual(["user", "explored", "unknown", "explored", "tool", "tool", "explored"]);
   // Thinking with no look after it stays on its own.
   expect(foldSteps([thinking, edit])).toEqual([thinking, edit]);
-  // Prose between two looks splits them; a message the thread does not know shows, unless it only keeps the books.
+  // Prose between two looks splits them; a message the thread does not know shows only with Raw.
   const odd: ThreadItem = { kind: "unknown", type: "system:api_retry", raw: {} };
-  expect(foldSteps([read, { kind: "assistant", text: "so" }, grep, odd]).map((i) => i.kind)).toEqual(["explored", "assistant", "explored", "unknown"]);
+  expect(foldSteps([read, { kind: "assistant", text: "so" }, grep, odd]).map((i) => i.kind)).toEqual(["explored", "assistant", "explored"]);
+  expect(foldSteps([read, { kind: "assistant", text: "so" }, grep, odd], true).map((i) => i.kind)).toEqual(["explored", "assistant", "explored", "unknown"]);
   expect(keyOf(foldSteps([read, grep])[0]!)).toBe(read.toolUseId);
   expect(keyOf(edit)).toBe(edit.toolUseId);
   expect(keyOf({ kind: "user", text: "x" })).toBeUndefined();

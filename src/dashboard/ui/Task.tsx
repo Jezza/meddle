@@ -188,7 +188,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
               href={hashOf({ name: "task", nodeId, id: task.manifest.value.id, tab: "changes" })}>Changes{changes.count > 0 && ` ${changes.count}`}</a>
           </nav>
         )}
-        {!changes?.on && <button class={raw ? "on" : ""} aria-pressed={raw} title="Show every event, bookkeeping included" onClick={onRaw}>Raw</button>}
+        {!changes?.on && <button class={raw ? "on" : ""} aria-pressed={raw} title="Show every event, those the thread does not know included" onClick={onRaw}>Raw</button>}
         {live && <button disabled={moving || action.busy} onClick={() => action.run(() => task.interrupt({}))}>■ Interrupt</button>}
         {/* Retry runs a parked turn (one that crashed the node too often) again, or carries on an idle task's last turn (interrupted or failed). */}
         {(live ? pendingCount === 0 : state === "idle") && !moving && (
