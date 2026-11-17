@@ -116,7 +116,8 @@ export function resultError(m: { subtype?: unknown; is_error?: unknown }): strin
 
 /**
  * How long the child may outlive its `result` (stdin closed) before it is closed for it; and how long a `result` with
- * steers Claude Code has not taken waits for it to take one before the turn ends without them.
+ * steers Claude Code has not taken, or after which the last background task ended, waits for Claude Code to go on
+ * before the turn ends without it.
  */
 const EXIT_GRACE_MS = 5_000;
 
@@ -144,6 +145,10 @@ export type RunTurnArgs = {
  * Code takes it, which it does into the running turn or, after that turn's `result`, as a turn of its own (an `init`,
  * then its own `result`). That is still this turn: it ends at a `result` once no steer is left untaken. A steer Claude
  * Code has not taken `EXIT_GRACE_MS` after a `result` stays untaken in `queue` when the turn ends, unlogged.
+ *
+ * Background work Claude Code says is live (`background_tasks_changed`) at a `result` keeps the turn going too, the
+ * child and its input open, with no grace: when it ends Claude Code wakes for it in a turn of its own (an `init`, then
+ * its own `result`), which this turn ends with. Closing the child at that `result` would kill the work unseen.
  */
 export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKResultMessage> } {
   const { input } = args;
@@ -225,6 +230,7 @@ async function drive(
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
   let graceOver: Promise<"grace"> | undefined;
   let result: SDKResultMessage | undefined;
+  let background = 0; // live background tasks, from the latest `background_tasks_changed`
   let ended = false; // the iterator finished on its own: the child has gone
   let closed = false;
   let logged = false; // a turn_aborted or turn_failed is in the log
@@ -235,6 +241,16 @@ async function drive(
     result = undefined;
     clearTimeout(graceTimer);
     graceOver = undefined;
+  };
+  /** After a `result`, the grace runs while no background work is live. */
+  const settle = () => {
+    if (result === undefined) return;
+    if (background > 0) {
+      clearTimeout(graceTimer);
+      graceOver = undefined;
+    } else {
+      graceOver ??= new Promise((resolve) => { graceTimer = setTimeout(() => resolve("grace"), EXIT_GRACE_MS); });
+    }
   };
 
   try {
@@ -266,13 +282,19 @@ async function drive(
       }
       record(m);
       watch(m);
-      // A turn Claude Code starts after a `result` (a steer's own, should Claude Code not say it took the steer).
+      // A turn Claude Code starts after a `result`: a steer's own, should Claude Code not say it took the steer, or its
+      // wake for background work that ended.
       if (m.type === "system" && m.subtype === "init") goOn();
-      else if (m.type === "result" && result === undefined) {
+      else if (m.type === "system" && m.subtype === "background_tasks_changed") {
+        background = m.tasks.filter((t) => t.ambient !== true).length;
+        settle();
+      } else if (m.type === "result" && result === undefined) {
         result = m;
-        // With every steer taken the input closes, so the child goes; an untaken one keeps it open for Claude Code.
-        if (queue.untaken().length === 0) queue.end();
-        graceOver = new Promise((resolve) => { graceTimer = setTimeout(() => resolve("grace"), EXIT_GRACE_MS); });
+        // With every steer taken and no background work the input closes, so the child goes. An untaken steer keeps it
+        // open for Claude Code, and so does background work, which Claude Code wakes for when it ends: then the input
+        // stays open after it too, until the `result` of that wake.
+        if (queue.untaken().length === 0 && background === 0) queue.end();
+        settle();
       }
     }
     if (result !== undefined) return result;

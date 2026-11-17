@@ -187,6 +187,22 @@ test("a steer Claude Code never takes ends the turn after the exit grace, unlogg
   expect(queue.untaken()).toEqual([{ uuid: steer!, text: STEER }]);
   expect(listEvents(db, "abc").map(e => e.message as any).filter(m => m.type === "user").map(m => m.message.content)).toEqual(["Reply with the single word ok."]);
 }, 15_000);
+test("background work live at a result keeps the child past the exit grace, and the turn ends with the result of Claude Code's wake for it", async () => {
+  const { db, input, fixture } = await setup();
+  const queue = new InputQueue();
+  let openAfterFirstResult: boolean | undefined;
+  const { done } = runTurn({
+    input: { ...input, extraEnv: { ...fixture("background-wake"), MEDDLE_FIXTURE_BACKGROUND_MS: "6000" } }, prompt: "Run the suite.", db, approvals: new Approvals(), queue,
+    onMessage: (m) => { if (m.type === "result") openAfterFirstResult ??= !queue.ended; },
+  });
+  expect(await done).toMatchObject({ subtype: "success", result: "The suite passed." });
+  expect(openAfterFirstResult).toBe(true);
+  const s = shape(listEvents(db, "abc").map(e => e.message as any));
+  expect(s.filter(x => x === "result/success")).toHaveLength(2);
+  expect(s.indexOf("system/task_notification")).toBeGreaterThan(s.indexOf("result/success"));
+  expect(s.lastIndexOf("system/init")).toBeGreaterThan(s.indexOf("system/task_notification"));
+  expect(s).not.toContain("meddle/turn_failed");
+}, 20_000);
 test("input queue: every text pushed is untaken, in order, until taken by its uuid; taken ones are told once", () => {
   const q = new InputQueue();
   const a = q.push("a"), b = q.push("b"), c = q.push("c", "now");
