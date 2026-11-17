@@ -221,6 +221,21 @@ test("a rate limit event says something only when the limit is not plainly allow
   expect(items).toEqual([{ kind: "status", text: "Rate limit allowed_warning (five_hour)" }]);
 });
 
+test("a task notification shows its summary, with how the task ended when the summary does not say", () => {
+  const note = (seq: number, status: string, summary: string) =>
+    ({ seq, message: { type: "system", subtype: "task_notification", task_id: "b1", status, summary } });
+  const items = buildThread([
+    note(1, "completed", "Sleep 3 seconds then echo first"),
+    note(2, "failed", 'Background command "make" failed with exit code 2'),
+    note(3, "stopped", ""),
+  ]);
+  expect(items).toEqual([
+    { kind: "status", text: "Sleep 3 seconds then echo first (completed)" },
+    { kind: "status", text: 'Background command "make" failed with exit code 2' },
+    { kind: "status", text: "Task stopped" },
+  ]);
+});
+
 test("progress frames and bare request statuses leave no item", () => {
   const items = buildThread([
     { seq: 1, message: { type: "system", subtype: "status", status: "requesting" } },

@@ -164,6 +164,14 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         top.push({ kind: "status", text: `Conversation compacted (${String(meta.trigger)}, ${tokens} tokens)` });
         return;
       }
+      case "task_notification": {
+        // A summary may already say how the task ended ("… completed (exit code 0)"), or only what it was.
+        const summary = str(m.summary);
+        const status = str(m.status);
+        const text = summary === "" ? `Task ${status}` : status === "" || summary.includes(status) ? summary : `${summary} (${status})`;
+        top.push({ kind: "status", text });
+        return;
+      }
       case "init":
         // The bar beneath the thread shows the model.
         return;
