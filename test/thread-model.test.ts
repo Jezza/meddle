@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import {
   activity, activityLine, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, keyOf, relativePath, toolSummary,
-  toolTarget, type ThreadItem, type ToolItem,
+  toolTarget, type ThreadItem, type ToolItem, workspaceSource,
 } from "../src/dashboard/ui/thread-model";
 test("tool calls get their results and subagent messages nest", () => {
   const items = buildThread([
@@ -119,6 +119,18 @@ test("an Edit's result keeps its patch and the original file", () => {
   ]) as [ToolItem];
   expect(edit.result?.original).toEqual(["a", "b", "z"]);
   expect(editDiff(edit)).toEqual({ hunks: [hunk], fallback: [], added: 2, removed: 1 });
+});
+
+test("workspaceSource picks large-file edits", () => {
+  const hunk = { oldStart: 4, oldLines: 1, newStart: 4, newLines: 1, lines: ["-b", "+B"] };
+  const edit = (result: Record<string, unknown>) => (buildThread([
+    { seq: 1, message: { type: "assistant", message: { id: "m", content: [{ type: "tool_use", id: "e", name: "Edit", input: { file_path: "/w/a.ts", old_string: "b", new_string: "B" } }] } } },
+    { seq: 2, message: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "e", content: "updated" }] }, tool_use_result: result } },
+  ]) as [ToolItem])[0];
+  // Too large for the log to carry the file: it opens from the workspace.
+  expect(workspaceSource(edit({ structuredPatch: [hunk] }))).toEqual({ path: "/w/a.ts" });
+  expect(workspaceSource(edit({ structuredPatch: [hunk], originalFile: "a\nb\n" }))).toBeNull();
+  expect(workspaceSource(edit({ structuredPatch: [] }))).toBeNull();
 });
 
 test("editDiff without a patch falls back to the input's lines", () => {

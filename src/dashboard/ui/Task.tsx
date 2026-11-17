@@ -15,7 +15,7 @@ import { hashOf } from "./routes";
 import { type ProjectLine, projectLines, usageShort } from "./sidebar-model";
 import {
   activity, activityLine, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps, isLook,
-  keyOf, type ShownItem, toolSummary, toolTarget, type ToolItem,
+  keyOf, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
 } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -108,7 +108,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
       {state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
       ) : (
-        <Thread session={session} readOnly={archived} working={state === "running"} raw={raw} after={<>
+        <Thread task={task} session={session} readOnly={archived} working={state === "running"} raw={raw} after={<>
           {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
           {queued.map((text, i) => <Queued key={i} text={text} />)}
           {!archived && failed.map((f) => (
@@ -238,8 +238,8 @@ function blocksOf(items: readonly ShownItem[]): Block[] {
   return out;
 }
 
-function Thread({ session, readOnly, working, raw, after }: {
-  session: SessionRef; readOnly: boolean; working: boolean; raw: boolean; after: preact.ComponentChildren;
+function Thread({ task, session, readOnly, working, raw, after }: {
+  task: TaskRef; session: SessionRef; readOnly: boolean; working: boolean; raw: boolean; after: preact.ComponentChildren;
 }) {
   const window = useValue(session.window);
   const live = useValue(session.live);
@@ -252,7 +252,7 @@ function Thread({ session, readOnly, working, raw, after }: {
   const events = useMemo(() => [...merged(seen, window).values()].sort((a, b) => a.seq - b.seq), [seen, window]);
   const items = useMemo(() => buildThread(events), [events]);
   const blocks = useMemo(() => blocksOf(foldSteps(items, raw)), [items, raw]);
-  const view = useMemo(() => ({ cwd: cwdOf(events), raw }), [events, raw]);
+  const view = useMemo(() => ({ cwd: cwdOf(events), raw, task }), [events, raw, task]);
   const oldest = events[0]?.seq;
 
   // Kept at the bottom while you are there; left alone while you read further up.
@@ -368,8 +368,11 @@ export function Markdown({ text }: { text: string }) {
   return <div class="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-/** What every row in the thread reads: the session's working directory (paths show relative to it) and the Raw toggle. */
-const ThreadView = createContext({ cwd: "", raw: false });
+/**
+ * What every row in the thread reads: the session's working directory (paths show relative to it), the Raw toggle,
+ * and the task, whose workspace a large file's diff opens from.
+ */
+const ThreadView = createContext<{ cwd: string; raw: boolean; task: TaskRef | null }>({ cwd: "", raw: false, task: null });
 
 function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
@@ -476,7 +479,7 @@ function ExploredRow({ steps }: { steps: Explored["steps"] }) {
  * most `SMALL_DIFF` lines.
  */
 function ToolRow({ tool }: { tool: ToolItem }) {
-  const { cwd, raw } = useContext(ThreadView);
+  const { cwd, raw, task } = useContext(ThreadView);
   const running = tool.result === undefined;
   const failed = tool.result?.isError === true;
   const input = (tool.input ?? {}) as Record<string, unknown>;
@@ -493,6 +496,12 @@ function ToolRow({ tool }: { tool: ToolItem }) {
   // Counts only for a change that landed: a running edit's input overstates it, a failed one's never applied.
   const landed = diff !== null && result !== undefined && !failed;
   const model = agent && typeof input.model === "string" ? input.model : undefined;
+  // A file too large for the log to carry opens from the task's workspace as it is now, the diff's new side.
+  const source = workspaceSource(tool);
+  const fromWorkspace = source === null || task === null ? {} : {
+    side: "new" as const,
+    load: () => task.workspaceFile({ path: source.path }).then((text) => text === null ? null : textLines(text)),
+  };
   return (
     <details class={`step${failed ? " bad" : running ? " live" : ""}`} open={failed || (landed && diff.added + diff.removed <= SMALL_DIFF)}>
       <summary title={typeof input.file_path === "string" ? input.file_path : command}>
@@ -508,7 +517,7 @@ function ToolRow({ tool }: { tool: ToolItem }) {
       <div class="step-body">
         {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
         {diff !== null && (diff.hunks.length > 0
-          ? <DiffView hunks={diff.hunks} file={result?.original ?? null} />
+          ? <DiffView hunks={diff.hunks} file={result?.original ?? null} {...fromWorkspace} />
           : diff.fallback.length > 0 && <div class="diff"><DiffRows rows={diff.fallback} /></div>)}
         {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
         {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}

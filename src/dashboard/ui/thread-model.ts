@@ -411,6 +411,18 @@ export function editDiff(tool: ToolItem): { hunks: Hunk[]; fallback: DiffRow[]; 
   };
 }
 
+/**
+ * Where a landed change's file can be read from when its result left the original out (a file too large for the
+ * log): the call's absolute `file_path`, read now from the task's workspace as the new side. Null when the result
+ * carries the original, has no hunks, or the call names no absolute path.
+ */
+export function workspaceSource(tool: ToolItem): { path: string } | null {
+  const result = tool.result;
+  if (result === undefined || result.original !== undefined || (result.patch ?? []).length === 0) return null;
+  const path = ((tool.input ?? {}) as Record<string, unknown>).file_path;
+  return typeof path === "string" && path.startsWith("/") ? { path } : null;
+}
+
 /** A text's lines, a final newline not counted as one more empty line. */
 export function textLines(text: unknown): string[] {
   if (typeof text !== "string" || text === "") return [];
