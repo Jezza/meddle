@@ -92,9 +92,11 @@ test("taskChanges leaves out what the default branch has", async () => {
   try {
     const line = `meddle/task/${TASK}/a`;
     const lineAt = () => commitOf(replica, JSON.stringify(line), cfg);
-    // `main` moves on past the task's start, and the task's line is rebased onto it.
-    await jj(["--ignore-working-copy", "new", "--no-edit", base.commit, "-m", "upstream"], replica, cfg);
-    const upstream = (await jj(["--ignore-working-copy", "log", "--no-graph", "-r", 'description(exact:"upstream\n")', "-T", "commit_id"], replica, cfg)).trim();
+    // `main` moves on past the task's start with a file of its own, and the task's line is rebased onto it.
+    await jj(["new", base.commit], replica, cfg);
+    await writeFile(join(replica, "up.txt"), "up\n");
+    await jj(["commit", "-m", "upstream"], replica, cfg);
+    const upstream = await commitOf(replica, "@-", cfg);
     await bookmarkSet(replica, "main", upstream, cfg, { ignoreWorkingCopy: true });
     await jj(["--ignore-working-copy", "rebase", "-s", first.commit, "-d", upstream], replica, cfg);
     expect((await taskChanges(cfg, project, TASK)).changes.map((c) => c.description)).toEqual(["", "second", "first", "upstream"]);
@@ -104,10 +106,19 @@ test("taskChanges leaves out what the default branch has", async () => {
     expect(rebased.changes.map((c) => c.workingCopy)).toEqual([true, false, false]);
     expect(rebased.changes[0]!.commit).toBe(await lineAt());
     expect(rebased.changes[1]!.change).toBe(second.change);
+    // `All changes` is diffed from where the line leaves `main`, so `main`'s file is not in it.
+    expect(rebased.from).toBe(upstream);
+    const all = await changeDiff(cfg, project, rebased.changes[0]!.commit, rebased.from!);
+    expect(all).toContain("diff --git a/a.txt b/a.txt");
+    expect(all).not.toContain("up.txt");
+    // Without the default branch, from the task's base: `main`'s file is in it.
+    const plain = await taskChanges(cfg, project, TASK);
+    expect(plain.from).toBe(base.commit);
+    expect(await changeDiff(cfg, project, plain.changes[0]!.commit, plain.from!)).toContain("up.txt");
 
     // The line merged into `main`: none left.
     await bookmarkSet(replica, "main", await lineAt(), cfg, { ignoreWorkingCopy: true });
-    expect((await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).changes).toEqual([]);
+    expect(await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).toMatchObject({ from: await lineAt(), changes: [] });
   } finally {
     await close();
   }
@@ -116,20 +127,21 @@ test("taskChanges leaves out what the default branch has", async () => {
 test("changeDiff gives one change or the whole range", async () => {
   const { cfg, project, first, close } = await taskRepo({ main: true });
   try {
-    const one = await changeDiff(cfg, project, TASK, first.change);
+    const one = await changeDiff(cfg, project, first.change);
     expect(one).toContain("diff --git a/a.txt b/a.txt");
     expect(one).toContain("+one");
     expect(one).not.toContain("b.txt");
 
-    const all = await changeDiff(cfg, project, TASK, "all");
+    const listed = await taskChanges(cfg, project, TASK);
+    const all = await changeDiff(cfg, project, listed.changes[0]!.commit, listed.from!);
     expect(all).toContain("diff --git a/a.txt b/a.txt");
     expect(all).toContain("diff --git a/b.txt b/b.txt");
     expect(all).toContain("+three");
     expect(all).not.toContain("other.txt");
 
-    expect(await changeDiff(cfg, project, "t2", "all")).toBe("");
     for (const bad of ["@", "all()", `${first.change} | root()`, `${first.change}--`]) {
-      await expect(changeDiff(cfg, project, TASK, bad)).rejects.toThrow(/^bad-id: /);
+      await expect(changeDiff(cfg, project, bad)).rejects.toThrow(/^bad-id: /);
+      await expect(changeDiff(cfg, project, first.change, bad)).rejects.toThrow(/^bad-id: /);
     }
   } finally {
     await close();
@@ -166,6 +178,14 @@ test("workspaceFile stays inside the workspace", async () => {
     expect(await workspaceFile(cfg, [], TASK, join(home, "tasks", TASK, "x"))).toBe("outside\n");
     await expect(workspaceFile(cfg, [], TASK, join(home, "secret"))).rejects.toThrow(/^outside: /);
     await expect(workspaceFile(cfg, [], "t2", join(home, "tasks", TASK, "x"))).rejects.toThrow(/^outside: /);
+    // Nor its own files: its transcripts are there.
+    await mkdir(join(home, "tasks", TASK, ".meddle"), { recursive: true });
+    await writeFile(join(home, "tasks", TASK, ".meddle", "t.jsonl"), "{}\n");
+    await expect(workspaceFile(cfg, [], TASK, join(home, "tasks", TASK, ".meddle", "t.jsonl"))).rejects.toThrow(/^outside: /);
+    // Absent there too: outside, not absent.
+    await expect(workspaceFile(cfg, [], TASK, join(home, "tasks", TASK, ".meddle", "gone.jsonl"))).rejects.toThrow(/^outside: /);
+    await symlink(join(home, "tasks", TASK, ".meddle", "t.jsonl"), join(home, "tasks", TASK, "y"));
+    await expect(workspaceFile(cfg, [], TASK, join(home, "tasks", TASK, "y"))).rejects.toThrow(/^outside: /);
 
     await mkdir(join(ws, "dir"));
     await expect(workspaceFile(cfg, [project], TASK, join(ws, "dir"))).rejects.toThrow(/^not-a-file: /);
@@ -183,15 +203,15 @@ test("workspaceFile stays inside the workspace", async () => {
 });
 
 test("reads write nothing to the replica", async () => {
-  const { cfg, replica, ws, project, first, close } = await taskRepo({ main: true });
+  const { cfg, replica, ws, project, base, first, close } = await taskRepo({ main: true });
   try {
     await writeFile(join(ws, "c.txt"), "unsnapshotted\n");
     await writeFile(join(replica, "d.txt"), "the user's\n");
     const op = () => jj(["--ignore-working-copy", "op", "log", "-n", "1", "--no-graph", "-T", "id"], replica, cfg);
     const before = await op();
     await taskChanges(cfg, project, TASK);
-    await changeDiff(cfg, project, TASK, "all");
-    await changeDiff(cfg, project, TASK, first.change);
+    await changeDiff(cfg, project, first.change, base.commit);
+    await changeDiff(cfg, project, first.change);
     await changeFile(cfg, project, first.change, "a.txt");
     await workspaceFile(cfg, [project], TASK, join(ws, "c.txt"));
     expect(await op()).toBe(before);
@@ -208,8 +228,7 @@ test("a conflicted line is reported, not listed", async () => {
     await bookmarkSet(replica, line, first.commit, cfg, { ignoreWorkingCopy: true });
     await jj(["--ignore-working-copy", "--at-op", op, "bookmark", "set", line, "-r", second.commit, "--allow-backwards"], replica, cfg);
 
-    expect(await taskChanges(cfg, project, TASK)).toEqual({ project: "p1", name: "a", start: "feature", conflicted: true, changes: [] });
-    await expect(changeDiff(cfg, project, TASK, "all")).rejects.toThrow(/^conflicted: /);
+    expect(await taskChanges(cfg, project, TASK)).toEqual({ project: "p1", name: "a", start: "feature", conflicted: true, from: null, changes: [] });
   } finally {
     await close();
   }
@@ -220,7 +239,6 @@ test("a base missing from the replica fails loudly", async () => {
   try {
     const unknown = { ...project, base: ["f".repeat(40)] };
     await expect(taskChanges(cfg, unknown, TASK)).rejects.toThrow();
-    await expect(changeDiff(cfg, unknown, TASK, "all")).rejects.toThrow();
   } finally {
     await close();
   }

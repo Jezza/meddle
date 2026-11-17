@@ -396,7 +396,7 @@ test("changes come back over the object and follow a turn", async () => {
     const task = await client.get(TaskObject, { id: manifest.id });
     // Read once the object is up, not before it.
     expect(await until(task.changes, (list) => list.length > 0)).toEqual([
-      { project: project.id, name: project.name, start: "main", conflicted: false, changes: [expect.objectContaining({ workingCopy: true, files: 0, empty: true })] },
+      { project: project.id, name: project.name, start: "main", conflicted: false, from: manifest.projects[0]!.base[0], changes: [expect.objectContaining({ workingCopy: true, files: 0, empty: true })] },
     ]);
     // What the agent writes in its workspace shows once its turn's end snapshots it and moves the line.
     const workspace = `${paths(cfg).task(manifest.id)}/${manifest.projects[0]!.workspace}`;
@@ -407,7 +407,7 @@ test("changes come back over the object and follow a turn", async () => {
 
     const change = changes[0]!.changes[0]!.change;
     expect(await task.changeDiff({ project: project.id, change })).toContain("+two");
-    expect(await task.changeDiff({ project: project.id, change: "all" })).toContain("notes.txt");
+    expect(await task.changeDiff({ project: project.id, change: changes[0]!.changes[0]!.commit, from: changes[0]!.from! })).toContain("notes.txt");
     expect(await task.changeFile({ project: project.id, rev: change, path: "notes.txt" })).toBe("one\ntwo\n");
     expect(await task.changeFile({ project: project.id, rev: `${change}-`, path: "notes.txt" })).toBeNull();
     expect(await task.workspaceFile({ path: `${workspace}/notes.txt` })).toBe("one\ntwo\n");
@@ -436,7 +436,7 @@ test("workspaceFile refuses outside the workspace", async () => {
     await task.archive({});
     await until(task.changes, (list) => list.length === 0);
     expect(await task.workspaceFile({ path: inside }).then(() => "", remoteReason)).toStartWith("archived:");
-    expect(await task.changeDiff({ project: project.id, change: "all" }).then(() => "", remoteReason)).toStartWith("archived:");
+    expect(await task.changeDiff({ project: project.id, change: "abc" }).then(() => "", remoteReason)).toStartWith("archived:");
     task.release();
     node.release();
   } finally {

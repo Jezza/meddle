@@ -41,6 +41,11 @@ export type ProjectChanges = {
   /** Whether the line's bookmark is conflicted; its changes are then not listed. */
   conflicted: boolean;
   /**
+   * The commit the line leaves its start at (`forkRevset`): what `All changes` is diffed from, and its old lines read
+   * at; the line's own commit once the default branch has all of it. Null when the line is absent or conflicted.
+   */
+  from: string | null;
+  /**
    * `<base>..<line>` less what is on the project's default branch, newest first, at most `CHANGES_MAX`; none when the
    * line is absent or conflicted.
    */
@@ -50,7 +55,7 @@ export type ProjectChanges = {
 /** Why a read was refused; its message is `<code>: <detail>`. */
 export class ChangesError extends Error {
   constructor(
-    public code: "bad-id" | "conflicted" | "outside" | "not-a-file" | "too-large",
+    public code: "bad-id" | "outside" | "not-a-file" | "too-large",
     detail: string,
   ) {
     super(`${code}: ${detail}`);
@@ -162,14 +167,14 @@ export async function taskChanges(
   const start = await startName(cfg, p, rows, defaultBranch);
   const conflicted = lineRow?.conflicted === true;
   const at = lineRow?.targets[0];
-  if (at === undefined || conflicted) return { project: p.id, name: p.name, start, conflicted, changes: [] };
+  if (at === undefined || conflicted) return { project: p.id, name: p.name, start, conflicted, from: null, changes: [] };
   // The commits the probe saw, so that the list is the one its key stands for.
   const main = rows.find((r) => r.name === defaultBranch)?.targets ?? [];
   const range = `(${baseRevset(p)})..${at}${main.length === 0 ? "" : ` ~ ::(${main.join(" | ")})`}`;
-  const listed = await jj(
-    ["--ignore-working-copy", "log", "--no-graph", "--limit", String(CHANGES_MAX), "-r", range, "-T", CHANGE_TEMPLATE],
-    p.replica, cfg,
-  );
+  const [listed, from] = await Promise.all([
+    jj(["--ignore-working-copy", "log", "--no-graph", "--limit", String(CHANGES_MAX), "-r", range, "-T", CHANGE_TEMPLATE], p.replica, cfg),
+    forkCommit(cfg, p, at, main),
+  ]);
   const changes = listed.split("\n").filter(Boolean).map((row): TaskChange => {
     const [change = "", commit = "", files = "0", added = "0", removed = "0", empty = "", conflict = "", ...rest] = row.split(FIELD);
     return {
@@ -184,7 +189,18 @@ export async function taskChanges(
       workingCopy: commit === at,
     };
   });
-  return { project: p.id, name: p.name, start, conflicted, changes };
+  return { project: p.id, name: p.name, start, conflicted, from, changes };
+}
+
+/**
+ * Where line commit `at` leaves its start: the newest of `at`'s ancestors that are the task's base or on the default
+ * branch (`main`, its commits): the base, or once the line is rebased onto a newer default branch, that branch's
+ * commit under it. Several only when the line merged two of them (a base off the default branch, then a merge of it):
+ * the newest is taken, so that a diff from it also holds the other's own commits. Their merge is no commit to diff from.
+ */
+async function forkCommit(cfg: NodeConfig, p: ManifestProject, at: string, main: readonly string[]): Promise<string> {
+  const revset = `latest(heads(::${at} & ::(${[baseRevset(p), ...main].join(" | ")})))`;
+  return (await jj(["--ignore-working-copy", "log", "--no-graph", "-r", revset, "-T", "commit_id"], p.replica, cfg)).trim();
 }
 
 /**
@@ -202,18 +218,12 @@ async function startName(cfg: NodeConfig, p: ManifestProject, rows: readonly Pro
 }
 
 /**
- * A change's diff against its parent, in git's format; for `"all"`, the line's whole diff from its start, `""` when
- * the line is not there; rejects `conflicted` when the line's bookmark is. A task with several base commits (an edit
- * start on a merge) is diffed from the first: what `--from` their merge would be is not well defined.
+ * A change's diff in git's format: against its parent, or from `from` (the whole line: `ProjectChanges.from` to its
+ * newest change).
  */
-export async function changeDiff(cfg: NodeConfig, p: ManifestProject, taskId: string, change: string | "all"): Promise<string> {
-  if (change !== "all") return jj(["--ignore-working-copy", "diff", "--git", "-r", revision(change)], p.replica, cfg);
-  const from = bases(p)[0] ?? "root()";
-  const { rows } = await changesProbe(cfg, p, taskId, null);
-  const line = rows.find((r) => r.name === lineName(p, taskId));
-  if (line?.conflicted === true) throw new ChangesError("conflicted", lineName(p, taskId));
-  if (line === undefined || line.targets[0] === undefined) return "";
-  return jj(["--ignore-working-copy", "diff", "--git", "--from", from, "--to", line.targets[0]], p.replica, cfg);
+export async function changeDiff(cfg: NodeConfig, p: ManifestProject, change: string, from?: string): Promise<string> {
+  const range = from === undefined ? ["-r", revision(change)] : ["--from", revision(from), "--to", revision(change)];
+  return jj(["--ignore-working-copy", "diff", "--git", ...range], p.replica, cfg);
 }
 
 /**
@@ -238,7 +248,8 @@ function inside(root: string, path: string): boolean {
 /**
  * The file at `path` (absolute) as it is now in task `taskId`'s workspace of one of `projects` (for a task with none,
  * its folder, where its agent works: `cwdFor`), or null when it is absent. Its real path must be in one of those
- * folders' real paths (`..` and symlinks resolved), else `outside`; it
+ * folders' real paths (`..` and symlinks resolved) and not in the task's own files (`taskMeta`: its transcripts), else
+ * `outside`; it
  * must be a regular file, else `not-a-file`, of at most `WORKSPACE_FILE_MAX` bytes, else `too-large`.
  *
  * The check stops a caller naming an arbitrary path. A folder on the path swapped for a symlink between the realpath
@@ -250,8 +261,9 @@ export async function workspaceFile(cfg: NodeConfig, projects: readonly Manifest
   const task = paths(cfg).task(taskId);
   const roots = projects.length === 0 ? [task] : projects.map((p) => join(task, p.workspace));
   const reals = (await Promise.all(roots.map((r) => realpath(r).catch(() => null)))).filter((r) => r !== null);
+  const meta = paths(cfg).taskMeta(taskId);
   // Refused before it is looked up, so that an absent path outside reads as outside, not as absent.
-  if (![...roots, ...reals].some((r) => inside(r, resolve(path)))) throw new ChangesError("outside", path);
+  if (![...roots, ...reals].some((r) => inside(r, resolve(path))) || inside(meta, resolve(path))) throw new ChangesError("outside", path);
   let real: string;
   try {
     real = await realpath(path);
@@ -260,7 +272,8 @@ export async function workspaceFile(cfg: NodeConfig, projects: readonly Manifest
     if (code === "ENOENT" || code === "ENOTDIR") return null;
     throw err;
   }
-  if (!reals.some((r) => inside(r, real))) throw new ChangesError("outside", path);
+  const metaReal = await realpath(meta).catch(() => meta);
+  if (!reals.some((r) => inside(r, real)) || inside(metaReal, real)) throw new ChangesError("outside", path);
   let file;
   try {
     // Its real path: a symlink put there since is not followed. Non-blocking: a FIFO opens at once, and is no file.

@@ -127,7 +127,7 @@ test("while an update awaits confirmation, every method of NodeObject, TaskObjec
     expect(Object.keys(calls.node!).sort()).toEqual(Object.keys(NodeObject.def.variants.default.methods).sort());
     // The task's reads, which are not held.
     const taskReads: Record<string, () => Promise<unknown>> = {
-      changeDiff: () => task.changeDiff({ project: A.project.id, change: "all" }),
+      changeDiff: () => task.changeDiff({ project: A.project.id, change: m.projects[0]!.base[0]!, from: m.projects[0]!.base[0]! }),
       changeFile: () => task.changeFile({ project: A.project.id, rev: m.projects[0]!.base[0]!, path: "README" }),
       workspaceFile: () => task.workspaceFile({ path: `${A.cfg.taskRoot}/${m.id}/a/README` }),
     };

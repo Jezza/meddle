@@ -819,7 +819,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       restore: ({ node }) => runner.restore(id, node),
       delete: () => runner.deleteTask(id),
       // Reads: not held while an update awaits confirmation.
-      changeDiff: ({ project, change }) => read(() => changeDiff(cfg, projectOf(project), id, change)),
+      changeDiff: ({ project, change, from }) => read(() => changeDiff(cfg, projectOf(project), change, from)),
       changeFile: ({ project, rev, path }) => read(() => changeFile(cfg, projectOf(project), rev, path)),
       workspaceFile: ({ path }) => read(() => workspaceFile(cfg, here(), id, path)),
     }, deps.inputHold, ["changeDiff", "changeFile", "workspaceFile"]);

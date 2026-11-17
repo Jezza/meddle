@@ -14,14 +14,6 @@ export function summary(p: ProjectChanges): string {
 }
 
 /**
- * What a diff of `change` (a commit id, or `"all"`) in `p` depends on, to read it again only when that moves: nothing
- * for a commit, whose diff never changes; for the whole line, its commits (its start never moves).
- */
-export function diffVersion(p: ProjectChanges, change: string): string {
-  return change === "all" ? p.changes.map((c) => c.commit).join(",") : "";
-}
-
-/**
  * A short hash of a file's patch (its hunks, status and old path): the same for the same patch, so that a file's
  * diff read again unchanged keeps what was opened in it. FNV-1a, 32 bits.
  */

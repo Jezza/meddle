@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import type { TaskObject } from "../../state/contracts";
 import { remoteReason } from "../../projects/memory-names";
 import type { ProjectChanges, TaskChange } from "../../tasks/changes";
-import { changeLabel, diffVersion, patchHash, summary, totals } from "./changes-model";
+import { changeLabel, patchHash, summary, totals } from "./changes-model";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
 import { useValue } from "./hooks";
@@ -20,7 +20,6 @@ const OPEN_LINES = 200;
 /** The task's changes: one project at a time, picked above the list when it has several. */
 export function Changes({ task }: { task: TaskRef }) {
   const changes = useValue(task.changes);
-  const manifest = useValue(task.manifest);
   const [chosen, setChosen] = useState<string | null>(null);
   // Only projects whose changes were read; one whose read failed since keeps its last.
   const p = changes.find((c) => c.project === chosen) ?? changes[0];
@@ -30,21 +29,22 @@ export function Changes({ task }: { task: TaskRef }) {
       {changes.map((c) => <option key={c.project} value={c.project}>{c.name}</option>)}
     </select>
   );
-  const base = manifest.projects.find((m) => m.id === p.project)?.base[0];
-  return <ProjectView key={p.project} task={task} p={p} base={base} picker={picker} />;
+  return <ProjectView key={p.project} task={task} p={p} picker={picker} />;
 }
 
 /** What is selected: the whole line, or one change (its commit, and its change id to follow it once rewritten). */
 type Selection = "all" | { change: string; commit: string };
 
-function ProjectView({ task, p, base, picker }: { task: TaskRef; p: ProjectChanges; base: string | undefined; picker: ComponentChildren }) {
+function ProjectView({ task, p, picker }: { task: TaskRef; p: ProjectChanges; picker: ComponentChildren }) {
   const [selected, setSelected] = useState<Selection>("all");
   // The selected change as listed now: the same commit, else the one change with its change id; else the whole line.
   const current = selected === "all" ? undefined
     : p.changes.find((c) => c.commit === selected.commit)
       ?? (p.changes.filter((c) => c.change === selected.change).length === 1 ? p.changes.find((c) => c.change === selected.change) : undefined);
-  const all = useDiff(task, p.project, p.conflicted ? null : "all", diffVersion(p, "all"));
-  const one = useDiff(task, p.project, current?.commit ?? null, diffVersion(p, current?.commit ?? "all"));
+  // The whole line: from where it leaves its start to its newest change; nothing when it has none.
+  const newest = p.changes[0]?.commit;
+  const all = useDiff(task, p.project, p.from === null || newest === undefined ? null : { change: newest, from: p.from });
+  const one = useDiff(task, p.project, current === undefined ? null : { change: current.commit });
   const shown = current === undefined ? all : one;
   const sum = all.patches === null ? null : totals(all.patches);
   return (
@@ -84,11 +84,11 @@ function ProjectView({ task, p, base, picker }: { task: TaskRef; p: ProjectChang
         {!p.conflicted && <>
           {shown.error !== null && <p class="error">{shown.error}</p>}
           {shown.patches?.map((patch) => {
-            // The old side: the change's parent, or for the whole line its start.
-            const rev = current === undefined ? base : `${current.commit}-`;
+            // The old side: the change's parent, or for the whole line where it leaves its start.
+            const rev = current === undefined ? p.from ?? undefined : `${current.commit}-`;
             // A file whose patch is unchanged by a read again keeps what was opened in it.
             return (
-              <FileDiff key={`${current?.commit ?? "all"}\0${patch.path}\0${patchHash(patch)}`} task={task} project={p.project} patch={patch}
+              <FileDiff key={`${current?.commit ?? `all ${p.from}`}\0${patch.path}\0${patchHash(patch)}`} task={task} project={p.project} patch={patch}
                 rev={patch.status === "added" ? undefined : rev} />
             );
           })}
@@ -170,27 +170,27 @@ function FileDiff({ task, project, patch, rev }: { task: TaskRef; project: strin
 type Read = { patches: FilePatch[] | null; error: string | null };
 
 /**
- * `change`'s diff in `project` (`"all"` for the whole line, null for none), read again whenever `version` changes. A
- * new `change` drops what was shown; a read again keeps it until the new one lands, and a failed one keeps it beside
- * its refusal.
+ * A diff in `project`: `request.change`'s against its parent, or from `request.from` (null for none). Both are commit
+ * ids, so a diff is read once; a new request drops what was shown, and a failed read shows its refusal.
  */
-function useDiff(task: TaskRef, project: string, change: string | null, version: string): Read {
+function useDiff(task: TaskRef, project: string, request: { change: string; from?: string } | null): Read {
+  const change = request === null ? null : `${request.from ?? ""}..${request.change}`;
   const [read, setRead] = useState<Read & { change: string | null }>({ patches: null, error: null, change });
   const latest = useRef(0);
   useEffect(() => {
     const n = ++latest.current;
-    if (change === null) {
+    if (request === null) {
       setRead((r) => r.change === null && r.patches === null && r.error === null ? r : { patches: null, error: null, change });
       return;
     }
     setRead((r) => r.change === change ? r : { patches: null, error: null, change });
-    task.changeDiff({ project, change }).then(
+    task.changeDiff({ project, ...request }).then(
       (text) => { if (n === latest.current) setRead({ patches: parseGitDiff(text), error: null, change }); },
       (err: unknown) => {
         if (n === latest.current) setRead((r) => ({ patches: r.change === change ? r.patches : null, error: remoteReason(err), change }));
       },
     );
-  }, [task, project, change, version]);
+  }, [task, project, change]);
   // Until the effect has run for a new change, what is held is another change's.
   return read.change === change ? read : { patches: null, error: null };
 }

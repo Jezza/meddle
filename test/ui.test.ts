@@ -9,7 +9,7 @@ import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
-import { changeCount, changeLabel, diffVersion, patchHash, summary, totals } from "../src/dashboard/ui/changes-model";
+import { changeCount, changeLabel, patchHash, summary, totals } from "../src/dashboard/ui/changes-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 
@@ -351,7 +351,7 @@ const change = (over: Partial<TaskChange>): TaskChange => ({
   change: "kpmxqwrtzzzzzzzz", commit: "c".repeat(40), description: "", files: 1, added: 1, removed: 0,
   empty: false, conflicted: false, workingCopy: false, ...over,
 });
-const project = (over: Partial<ProjectChanges>): ProjectChanges => ({ project: "p1", name: "meddle", start: "main", conflicted: false, changes: [], ...over });
+const project = (over: Partial<ProjectChanges>): ProjectChanges => ({ project: "p1", name: "meddle", start: "main", conflicted: false, from: null, changes: [], ...over });
 
 test("changeCount counts the non-empty changes of every project", () => {
   expect(changeCount([])).toBe(0);
@@ -365,13 +365,6 @@ test("summary counts the non-empty changes", () => {
   expect(summary(project({ changes: [change({ workingCopy: true, empty: true }), change({}), change({})] }))).toBe("2 changes");
   expect(summary(project({ start: "xqttoluq", changes: [change({})] }))).toBe("1 change");
   expect(summary(project({}))).toBe("0 changes");
-});
-
-test("diffVersion moves for the whole line with its commits, never for one commit", () => {
-  const p = project({ changes: [change({ commit: "a" }), change({ commit: "b" })] });
-  expect(diffVersion(p, "all")).toBe("a,b");
-  expect(diffVersion(project({ changes: [change({ commit: "a2" }), change({ commit: "b" })] }), "all")).not.toBe(diffVersion(p, "all"));
-  expect(diffVersion(p, "b")).toBe(diffVersion(project({}), "b"));
 });
 
 test("patchHash is the same for the same patch and moves with its hunks", () => {

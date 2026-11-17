@@ -342,6 +342,8 @@ export const ProjectChangesSchema = Type.Object({
   start: Type.String(),
   /** Whether the line's bookmark is conflicted; its changes are then not listed. */
   conflicted: Type.Boolean(),
+  /** The commit the line leaves its start at, which `All changes` is diffed from; null without the line. */
+  from: Nullable(Type.String()),
   /** The line's changes since its start, newest first. */
   changes: Type.Array(TaskChangeSchema),
 });
@@ -439,9 +441,9 @@ export const TaskObject = remote("meddle.task", {
         delete: method(Type.Object({})),
         // The reads of the task's changes: not held while an update awaits confirmation. Refused `moved: …` or
         // `archived: …` while the task is not live here, `project: …` for a project not of the task, and with the code
-        // of a `ChangesError` (`bad-id: …`, `conflicted: …`, `outside: …`, `not-a-file: …`, `too-large: …`).
-        /** Change `change`'s diff against its parent, in git's format; for `"all"`, the line's whole diff from its start. */
-        changeDiff: method(Type.Object({ project: Type.String(), change: Type.String() }), Type.String()),
+        // of a `ChangesError` (`bad-id: …`, `outside: …`, `not-a-file: …`, `too-large: …`).
+        /** Change `change`'s diff in git's format: against its parent, or from `from` (a project's `from`, for the whole line). */
+        changeDiff: method(Type.Object({ project: Type.String(), change: Type.String(), from: Type.Optional(Type.String()) }), Type.String()),
         /** The file `path` (from the repo's root) at `rev` (a change or commit id, or `<id>-` its parent); null when absent there. */
         changeFile: method(Type.Object({ project: Type.String(), rev: Type.String(), path: Type.String() }), Nullable(Type.String())),
         /** The file at `path` (absolute, in one of the task's workspaces) as it is on disk now; null when absent. */
