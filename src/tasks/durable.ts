@@ -876,10 +876,15 @@ export class TaskRunner {
       // Decided and dropped in one go: of two tasks ending together, the second then sees the first gone and syncs.
       // A task that syncs stays live for others until its sync is done, so a turn starting meanwhile defers its own.
       if (live) this.#primaries.delete(taskId);
-      await syncMemoryAfter(deps, primary, live, this.#log);
+      await syncMemoryAfter(deps, primary, live, this.#log, taskId);
     } finally {
       this.#primaries.delete(taskId);
     }
+  }
+
+  /** Whether any task whose primary project is `projectId` has a turn live (or syncing) here. */
+  projectLive(projectId: string): boolean {
+    return [...this.#primaries.values()].includes(projectId);
   }
 
   /** Whether a task other than `taskId` whose primary project is `projectId` has a turn live (or syncing) here. */

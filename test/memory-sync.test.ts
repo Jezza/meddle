@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
-import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
+import { memoryChanges, syncMemoryAfter, syncMemoryBefore, writeMemory } from "../src/projects/memory-sync";
 import { ensureServiceRepo, type ReplicaDeps } from "../src/projects/replicas";
 import { createTask, setupNode } from "./helpers";
 import { peerReady, startPoolNode, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
@@ -212,7 +213,11 @@ test("two tasks of one project whose turns start and end together sync memory on
     const atMemory = await jj(["file", "show", "-r", "memory", "MEMORY.md"], mem, A.cfg);
     // Each task's first prompt is what the stand-in writes to memory.
     for (const line of ["line 0.0", "line 0.1"]) expect(atMemory).toContain(line);
-    expect(await jj(["log", "-r", "memory", "--no-graph", "-T", "description"], mem, A.cfg)).toBe(`memory from ${shortId(A.id)}\n`);
+    // The last turn end names its task.
+    const ids = tasks.map((m) => m.id);
+    const last = /^memory from (\S+): task (\S+)\n$/.exec(await jj(["log", "-r", "memory", "--no-graph", "-T", "description"], mem, A.cfg));
+    expect(last?.[1]).toBe(shortId(A.id));
+    expect(ids).toContain(last?.[2] ?? "");
   } finally {
     await A.close();
     A.db.close();
@@ -298,5 +303,142 @@ test("overlapping memory syncs of one project run one at a time: one line of his
   } finally {
     await A.close();
     A.db.close();
+  }
+}, 15_000);
+
+test("the turn end names its task", async () => {
+  const { A, id, memA, logs, log, close } = await replicated();
+  const heard: string[] = [];
+  const off = memoryChanges.subscribe((p) => { heard.push(p); });
+  try {
+    await writeFile(`${memA}/MEMORY.md`, "- from t1\n");
+    await syncMemoryAfter(depsOf(A), id, false, log, "t1");
+    expect(await jj(["log", "-r", "@-", "--no-graph", "-T", "description"], memA, A.cfg)).toBe(`memory from ${shortId(A.id)}: task t1\n`);
+    expect(await changeOf(A, memA, "memory")).toBe(await changeOf(A, memA, "@-"));
+    expect(heard).toEqual([id]);
+    // A sync that moves nothing tells no one.
+    await syncMemoryAfter(depsOf(A), id, false, log, "t1");
+    await syncMemoryBefore(depsOf(A), id, false, log);
+    expect(heard).toEqual([id]);
+    expect(logs).toEqual([]);
+  } finally {
+    off();
+    await close();
+  }
+}, 15_000);
+
+const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** The files the commit at `rev` touches. */
+async function touched(node: GitPoolNode, repo: string, rev: string): Promise<string[]> {
+  const out = await jj(["log", "-r", rev, "--no-graph", "-T", 'self.diff().files().map(|f| f.path()).join("\\n")'], repo, node.cfg);
+  return out.split("\n").filter(Boolean);
+}
+
+test("writeMemory commits only its own path", async () => {
+  const { A, id, memA, close } = await replicated();
+  const heard: string[] = [];
+  const off = memoryChanges.subscribe((p) => { heard.push(p); });
+  try {
+    await writeFile(`${memA}/other.md`, "- not yet\n");
+    const { change } = await writeMemory(depsOf(A), id, "a.md", "x\n", null, false);
+    expect(await changeOf(A, memA, "memory")).toBe(change);
+    expect(await jj(["log", "-r", "memory", "--no-graph", "-T", "description"], memA, A.cfg)).toBe("memory: dashboard\n");
+    expect(await touched(A, memA, "memory")).toEqual(["a.md"]);
+    expect(await read(`${memA}/a.md`)).toBe("x\n");
+    expect(await read(`${memA}/other.md`)).toBe("- not yet\n");
+    expect(await touched(A, memA, "@")).toEqual(["other.md"]);
+    expect(heard).toEqual([id]);
+  } finally {
+    off();
+    await close();
+  }
+}, 15_000);
+
+test("writeMemory refuses when the file changed since it was opened", async () => {
+  const { A, id, memA, close } = await replicated();
+  try {
+    await writeMemory(depsOf(A), id, "a.md", "x\n", null, false);
+    const at = await changeOf(A, memA, "memory");
+    await writeFile(`${memA}/a.md`, "y\n");
+    await expect(writeMemory(depsOf(A), id, "a.md", "z\n", sha("x\n"), false)).rejects.toMatchObject({ code: "changed" });
+    expect(await read(`${memA}/a.md`)).toBe("y\n");
+    expect(await changeOf(A, memA, "memory")).toBe(at);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("writeMemory deletes with text null, and a null base on a file that exists has changed", async () => {
+  const { A, id, memA, close } = await replicated();
+  try {
+    await writeMemory(depsOf(A), id, "a.md", "x\n", null, false);
+    const { change } = await writeMemory(depsOf(A), id, "a.md", null, sha("x\n"), false);
+    expect(await read(`${memA}/a.md`)).toBeNull();
+    expect(await changeOf(A, memA, "memory")).toBe(change);
+    expect(await touched(A, memA, "memory")).toEqual(["a.md"]);
+    expect(await jj(["file", "list", "-r", "memory"], memA, A.cfg)).not.toContain("a.md");
+
+    await writeFile(`${memA}/b.md`, "on disk\n");
+    await expect(writeMemory(depsOf(A), id, "b.md", "z\n", null, false)).rejects.toMatchObject({ code: "changed" });
+    expect(await read(`${memA}/b.md`)).toBe("on disk\n");
+    expect(await changeOf(A, memA, "memory")).toBe(change);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("writeMemory refuses while live when the working copy is behind memory", async () => {
+  const { A, B, id, memA, memB, logs, log, close } = await replicated();
+  try {
+    await writeFile(`${memA}/MEMORY.md`, "- base\n");
+    await syncMemoryAfter(depsOf(A), id, false, log);
+    await syncMemoryBefore(depsOf(B), id, false, log);
+    await writeFile(`${memB}/NOTES.md`, "- from b\n");
+    await syncMemoryAfter(depsOf(B), id, false, log);
+    const fromB = await changeOf(B, memB, "@-");
+    expect(await changeOf(A, memA, "memory")).toBe(fromB);
+    const parent = await changeOf(A, memA, "@-");
+
+    await expect(writeMemory(depsOf(A), id, "a.md", "x\n", null, true)).rejects.toMatchObject({ code: "busy" });
+    expect(await changeOf(A, memA, "@-")).toBe(parent);
+    expect(await read(`${memA}/NOTES.md`)).toBeNull();
+    expect(await read(`${memA}/a.md`)).toBeNull();
+    expect(await changeOf(A, memA, "memory")).toBe(fromB);
+
+    const { change } = await writeMemory(depsOf(A), id, "a.md", "x\n", null, false);
+    expect(await changeOf(A, memA, "memory")).toBe(change);
+    expect(await changeOf(A, memA, `${fromB} & ::@`)).toBe(fromB);
+    expect(await read(`${memA}/NOTES.md`)).toBe("- from b\n");
+    expect(await read(`${memA}/a.md`)).toBe("x\n");
+    expect(logs).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("memory paths are confined", async () => {
+  const { A, id, memA, close } = await replicated();
+  try {
+    const at = await jj(["op", "log", "--ignore-working-copy", "-n", "1", "--no-graph", "-T", "id"], memA, A.cfg);
+    for (const path of ["../x.md", "a/b.md", "/a.md", "a.txt", ".hidden.md", ""]) {
+      await expect(writeMemory(depsOf(A), id, path, "x\n", null, false)).rejects.toMatchObject({ code: "path" });
+    }
+    expect(await read(`${memA}/../x.md`)).toBeNull();
+    expect(await read(`${memA}/a.txt`)).toBeNull();
+    expect(await read(`${memA}/.hidden.md`)).toBeNull();
+    expect(await jj(["op", "log", "--ignore-working-copy", "-n", "1", "--no-graph", "-T", "id"], memA, A.cfg)).toBe(at);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("writeMemory refuses off the home", async () => {
+  const { B, id, memB, close } = await replicated();
+  try {
+    await expect(writeMemory(depsOf(B), id, "a.md", "x\n", null, false)).rejects.toMatchObject({ code: "not-home" });
+    expect(await read(`${memB}/a.md`)).toBeNull();
+  } finally {
+    await close();
   }
 }, 15_000);

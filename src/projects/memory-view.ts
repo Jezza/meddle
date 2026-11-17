@@ -128,7 +128,7 @@ export async function memoryFile(cfg: NodeConfig, repo: string, path: string, ch
 }
 
 /** The bytes of `path` in `repo` when it is a regular file there; null when absent, a symlink (never followed) or not a file. */
-async function readRegular(repo: string, path: string): Promise<Buffer | null> {
+export async function readRegular(repo: string, path: string): Promise<Buffer | null> {
   let file;
   try {
     file = await open(join(repo, path), constants.O_RDONLY | constants.O_NOFOLLOW);
