@@ -50,7 +50,7 @@ async function filesUnder(root: string, rel = ""): Promise<Map<string, Buffer>> 
 }
 
 function eventRows(db: Database, taskId: string) {
-  return db.query("SELECT task_id, seq, type, subtype, uuid, json FROM events WHERE task_id = ? ORDER BY seq").all(taskId);
+  return db.query("SELECT task_id, seq, type, subtype, uuid, at, json FROM events WHERE task_id = ? ORDER BY seq").all(taskId);
 }
 
 function transcriptRows(db: Database, sessionId: string) {
@@ -86,6 +86,8 @@ test("a task's rows and files round-trip, receipts match", async () => {
     await store.append({ projectKey, sessionId: m.sessionId, subpath: "subagents/agent-x" }, [{ type: "user", uuid: "sub-1" }]);
     await store.append({ projectKey, sessionId: "another" }, [{ type: "user", uuid: "o-1" }]);
     await mkdir(paths(R.cfg).taskConfig(m.id), { recursive: true });
+    // Logged well before the move: the receiver keeps those times, not its own now.
+    S.db.query("UPDATE events SET at = '2026-10-31T00:00:00.000Z' WHERE task_id = ?").run(m.id);
 
     const { a, b } = await pair.connect(ALPN_POOL);
     const out = await a.openBi();

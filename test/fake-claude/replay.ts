@@ -4,6 +4,8 @@
 // and the stand-in exits),
 // MEDDLE_FIXTURE_RESULTS_MS=<ms> (wait that long before every `result`: slow turns),
 // MEDDLE_FIXTURE_LATER_RESULTS_MS=<ms> (wait that long before each `result` after the first: a slow later turn),
+// MEDDLE_FIXTURE_BACKGROUND_MS=<ms> (wait that long before each `task_notification`: background work that outlasts its
+// turn's `result`),
 // MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`),
 // MEDDLE_FIXTURE_BY_TOKEN=<token>=<path>,<token>=<path> (the recording of the entry whose token is the
 // CLAUDE_CODE_OAUTH_TOKEN this run got; MEDDLE_FIXTURE when none is),
@@ -39,6 +41,7 @@ if (!fixture) { process.stderr.write("replay.ts: MEDDLE_FIXTURE is not set\n"); 
 const stall = process.env.MEDDLE_FIXTURE_STALL === "1";
 const memory = process.env.MEDDLE_FIXTURE_MEMORY === "1";
 const laterResultsMs = Number(process.env.MEDDLE_FIXTURE_LATER_RESULTS_MS ?? 0);
+const backgroundMs = Number(process.env.MEDDLE_FIXTURE_BACKGROUND_MS ?? 0);
 const resultsMs = Number(process.env.MEDDLE_FIXTURE_RESULTS_MS ?? 0);
 const toolUse = process.env.MEDDLE_FIXTURE_TOOL_USE;
 const exitAfterToolUse = process.env.MEDDLE_FIXTURE_TOOL_USE_EXIT === "1";
@@ -248,6 +251,7 @@ for (const step of steps.slice(0, lastEmit + 1)) {
     }
   }
   if (step.frame.type === "result" && resultsMs > 0) await sleep(resultsMs);
+  if (step.frame.subtype === "task_notification" && backgroundMs > 0) await sleep(backgroundMs);
   if (step.frame.type === "result" && resultsEmitted++ > 0 && laterResultsMs > 0) await sleep(laterResultsMs);
   const line = withLiveUuids(step.emit);
   if (step.frame.type === "result" && stall) {

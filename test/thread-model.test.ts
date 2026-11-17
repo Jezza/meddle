@@ -42,6 +42,17 @@ test("a prompt meddle recorded becomes a user item", () => {
   expect(items).toEqual([{ kind: "user", text: "Run: echo hi" }]);
 });
 
+test("a turn's end carries when it was logged", () => {
+  const items = buildThread([
+    { seq: 1, at: "2026-11-17T10:00:00.000Z", message: { type: "result", subtype: "success", num_turns: 2, duration_ms: 1500, total_cost_usd: 0.01 } },
+    { seq: 2, message: { type: "result", subtype: "error_during_execution" } },
+  ]);
+  expect(items).toEqual([
+    { kind: "status", text: "Turn finished · 2 turns · 1.5 s · $0.0100", at: "2026-11-17T10:00:00.000Z" },
+    { kind: "status", text: "Turn ended: error_during_execution" },
+  ]);
+});
+
 test("a token fault renders as a status line", () => {
   const fault = (fault: unknown, rerun: boolean, label: string | null = "a") =>
     ({ type: "meddle", subtype: "token_fault", at: "", tokenId: label === null ? null : "0123456789abcdef", label, fault, rerun });
@@ -89,9 +100,10 @@ test("foldSteps folds runs of calls that only look, with their thinking, and lea
   expect(foldSteps(items, true).map((i) => i.kind)).toEqual(["user", "explored", "unknown", "explored", "tool", "tool", "explored"]);
   // Thinking with no look after it stays on its own.
   expect(foldSteps([thinking, edit])).toEqual([thinking, edit]);
-  // Prose between two looks splits them; a message the thread does not know shows, unless it only keeps the books.
+  // Prose between two looks splits them; a message the thread does not know shows only with Raw.
   const odd: ThreadItem = { kind: "unknown", type: "system:api_retry", raw: {} };
-  expect(foldSteps([read, { kind: "assistant", text: "so" }, grep, odd]).map((i) => i.kind)).toEqual(["explored", "assistant", "explored", "unknown"]);
+  expect(foldSteps([read, { kind: "assistant", text: "so" }, grep, odd]).map((i) => i.kind)).toEqual(["explored", "assistant", "explored"]);
+  expect(foldSteps([read, { kind: "assistant", text: "so" }, grep, odd], true).map((i) => i.kind)).toEqual(["explored", "assistant", "explored", "unknown"]);
   expect(keyOf(foldSteps([read, grep])[0]!)).toBe(read.toolUseId);
   expect(keyOf(edit)).toBe(edit.toolUseId);
   expect(keyOf({ kind: "user", text: "x" })).toBeUndefined();
@@ -219,6 +231,21 @@ test("a rate limit event says something only when the limit is not plainly allow
     { seq: 2, message: { type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour" } } },
   ]);
   expect(items).toEqual([{ kind: "status", text: "Rate limit allowed_warning (five_hour)" }]);
+});
+
+test("a task notification shows its summary, with how the task ended when the summary does not say", () => {
+  const note = (seq: number, status: string, summary: string) =>
+    ({ seq, message: { type: "system", subtype: "task_notification", task_id: "b1", status, summary } });
+  const items = buildThread([
+    note(1, "completed", "Sleep 3 seconds then echo first"),
+    note(2, "failed", 'Background command "make" failed with exit code 2'),
+    note(3, "stopped", ""),
+  ]);
+  expect(items).toEqual([
+    { kind: "status", text: "Sleep 3 seconds then echo first (completed)" },
+    { kind: "status", text: 'Background command "make" failed with exit code 2' },
+    { kind: "status", text: "Task stopped" },
+  ]);
 });
 
 test("progress frames and bare request statuses leave no item", () => {

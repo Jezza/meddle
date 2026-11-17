@@ -19,7 +19,8 @@ export type TaskArchive = {
   archivedAt: string;
   row: Record<string, unknown>;
   manifest: unknown;
-  events: Array<{ seq: number; json: string }>;
+  /** `at`: when the event was logged; absent from an archive from before it was kept. */
+  events: Array<{ seq: number; json: string; at?: string }>;
   transcript: Array<{ project_key: string; session_id: string; subpath: string; seq: number; uuid: string | null; ts: number; json: string }>;
   /** The regular files under `<taskConfig>/projects/`, relative to it, forward slashes; their bytes in base64. */
   files: Array<{ path: string; base64: string }>;
@@ -52,7 +53,7 @@ export async function writeArchive(cfg: NodeConfig, db: Database, taskId: string
     archivedAt: new Date().toISOString(),
     row: { ...row },
     manifest: JSON.parse(row.manifest),
-    events: db.query<{ seq: number; json: string }, [string]>("SELECT seq, json FROM events WHERE task_id = ? ORDER BY seq").all(taskId),
+    events: db.query<{ seq: number; json: string; at: string }, [string]>("SELECT seq, json, at FROM events WHERE task_id = ? ORDER BY seq").all(taskId),
     transcript: db
       .query<TaskArchive["transcript"][number], [string]>(
         "SELECT project_key, session_id, subpath, seq, uuid, ts, json FROM transcript WHERE session_id = ? ORDER BY project_key, subpath, seq",
