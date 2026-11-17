@@ -1,10 +1,10 @@
 // test/memory-view.test.ts
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { ensureDataDirs, loadConfig } from "../src/config";
 import { bookmarkSet, initColocated, jj } from "../src/jj";
-import { memoryDiff, memoryEntries, memoryFile, memoryHistory, parseFrontmatter } from "../src/projects/memory-view";
+import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory, parseFrontmatter } from "../src/projects/memory-view";
 
 /** A memory repo in a temp home, and a `commit` that commits what is on disk and points `memory` at it as `importMemory` does. */
 async function memoryRepo() {
@@ -31,6 +31,11 @@ test("parseFrontmatter reads name, description and metadata.type", () => {
   expect(parseFrontmatter("---\nname: p\ntype: project\n---\n")).toEqual({ name: "p", description: null, type: "project" });
 });
 
+test("isMemoryPath accepts only the names the dashboard can write, in the top folder", () => {
+  for (const path of ["../x.md", "a/b.md", "/a.md", "a.txt", ".hidden.md", ""]) expect(isMemoryPath(path)).toBe(false);
+  for (const path of ["a.md", "MEMORY.md", "my_note-1.md"]) expect(isMemoryPath(path)).toBe(true);
+});
+
 test("memoryEntries lists MEMORY.md first and reads what is on disk", async () => {
   const { cfg, repo, commit, close } = await memoryRepo();
   try {
@@ -42,6 +47,8 @@ test("memoryEntries lists MEMORY.md first and reads what is on disk", async () =
     await writeFile(`${repo}/notes.txt`, "not memory\n");
     await mkdir(`${repo}/sub`);
     await writeFile(`${repo}/sub/c.md`, entry("c-entry", "nested", "user"));
+    await writeFile(`${repo}/.x.md`, entry("hidden", "dotfile", "user"));
+    await writeFile(`${repo}/my notes.md`, entry("spaced", "a space", "user"));
 
     const entries = await memoryEntries(cfg, repo);
     expect(entries.map((e) => e.path)).toEqual(["MEMORY.md", "a.md", "b.md"]);
@@ -101,11 +108,27 @@ test("memoryFile and memoryDiff read a change", async () => {
     expect(await memoryFile(cfg, repo, "nope.md", first)).toBeNull();
     // Only the repo's top folder is memory.
     expect(await memoryFile(cfg, repo, "../mem/b.md")).toBeNull();
+    // A history diff's old side: the change's parent; the first change's parent is the root, which has no b.md.
+    expect(await memoryFile(cfg, repo, "b.md", `${second}-`)).toBe("first\n");
+    expect(await memoryFile(cfg, repo, "b.md", `${first}-`)).toBeNull();
 
     const diff = await memoryDiff(cfg, repo, second);
     expect(diff).toContain("diff --git a/b.md b/b.md");
     expect(diff).toContain("-first");
     expect(diff).toContain("+second");
+  } finally {
+    await close();
+  }
+});
+
+test("a symlink in the memory repo is never followed", async () => {
+  const { cfg, home, repo, close } = await memoryRepo();
+  try {
+    await writeFile(`${home}/secret`, "not memory\n");
+    await writeFile(`${repo}/MEMORY.md`, "- index\n");
+    await symlink(`${home}/secret`, `${repo}/s.md`);
+    expect((await memoryEntries(cfg, repo)).map((e) => e.path)).toEqual(["MEMORY.md"]);
+    expect(await memoryFile(cfg, repo, "s.md")).toBeNull();
   } finally {
     await close();
   }

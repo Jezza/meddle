@@ -2,7 +2,8 @@
 // under `memory`, a file at a change and a change's diff. Read-only, and no jj call here snapshots the working copy
 // (`--ignore-working-copy`): an agent may be mid-turn writing there, and its writes belong to that turn's sync.
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { NodeConfig } from "../config";
 import { jj, JjError } from "../jj";
@@ -87,12 +88,16 @@ function unquote(raw: string): string | null {
   return value === "" ? null : value;
 }
 
-/** Every `*.md` file in the repo's top folder on disk, `MEMORY.md` first, then by `name ?? path`. */
+/**
+ * Every memory file (`isMemoryPath`) in the repo's top folder on disk that is a regular file (never a symlink: peers
+ * push to a memory repo), `MEMORY.md` first, then by `name ?? path`.
+ */
 export async function memoryEntries(cfg: NodeConfig, repo: string): Promise<MemoryEntry[]> {
-  const files = (await readdir(repo, { withFileTypes: true })).filter((d) => d.isFile() && d.name.endsWith(".md")).map((d) => d.name);
+  const files = (await readdir(repo, { withFileTypes: true })).filter((d) => d.isFile() && isMemoryPath(d.name)).map((d) => d.name);
   const entries = await Promise.all(
-    files.map(async (path): Promise<MemoryEntry> => {
-      const bytes = await readFile(join(repo, path));
+    files.map(async (path): Promise<MemoryEntry | null> => {
+      const bytes = await readRegular(repo, path);
+      if (bytes === null) return null;
       const [last] = await changes(cfg, repo, `(${HISTORY}) & files(${fileset(path)})`, 1);
       return {
         path,
@@ -104,26 +109,38 @@ export async function memoryEntries(cfg: NodeConfig, repo: string): Promise<Memo
     }),
   );
   const key = (e: MemoryEntry) => e.name ?? e.path;
-  return entries.sort((a, b) => Number(b.path === INDEX) - Number(a.path === INDEX) || key(a).localeCompare(key(b)));
+  return entries.filter((e) => e !== null).sort((a, b) => Number(b.path === INDEX) - Number(a.path === INDEX) || key(a).localeCompare(key(b)));
 }
 
-/** The file on disk, or at `change`; null when it is absent there. Only a file in the repo's top folder is memory. */
+/**
+ * The file on disk, or at `change` (a change id, or its parent as `<change>-`); null when it is absent there, when
+ * `path` is not a memory path (`isMemoryPath`), or when on disk it is not a regular file (a symlink is never followed).
+ */
 export async function memoryFile(cfg: NodeConfig, repo: string, path: string, change?: string): Promise<string | null> {
-  if (!topLevel(path)) return null;
-  if (change === undefined) {
-    try {
-      return await readFile(join(repo, path), "utf8");
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "EISDIR") return null;
-      throw err;
-    }
-  }
+  if (!isMemoryPath(path)) return null;
+  if (change === undefined) return (await readRegular(repo, path))?.toString("utf8") ?? null;
   try {
     return await jj(["--ignore-working-copy", "file", "show", "-r", revision(change), fileset(path)], repo, cfg);
   } catch (err) {
     if (err instanceof JjError && err.stderr.includes("No such path")) return null;
     throw err;
+  }
+}
+
+/** The bytes of `path` in `repo` when it is a regular file there; null when absent, a symlink (never followed) or not a file. */
+async function readRegular(repo: string, path: string): Promise<Buffer | null> {
+  let file;
+  try {
+    file = await open(join(repo, path), constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ELOOP") return null;
+    throw err;
+  }
+  try {
+    return (await file.stat()).isFile() ? await file.readFile() : null;
+  } finally {
+    await file.close();
   }
 }
 
@@ -134,7 +151,7 @@ export async function memoryHistory(
   let revset = `(${HISTORY})`;
   if (opts.before !== undefined) revset += ` & ::(${revision(opts.before)}-)`;
   if (opts.path !== undefined) {
-    if (!topLevel(opts.path)) return [];
+    if (!isMemoryPath(opts.path)) return [];
     revset += ` & files(${fileset(opts.path)})`;
   }
   return changes(cfg, repo, revset, opts.limit);
@@ -175,9 +192,9 @@ function author(description: string): Pick<MemoryChange, "kind" | "node" | "task
   return { kind: "other", node: null, task: null };
 }
 
-/** A plain name in the repo's top folder. */
-function topLevel(path: string): boolean {
-  return /^[^/\\\0]+$/.test(path) && path !== "." && path !== "..";
+/** A memory file's name: a `*.md` file in the repo's top folder, named as the dashboard can write it. */
+export function isMemoryPath(path: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*\.md$/.test(path);
 }
 
 /** Exactly the file `path` at the repo's root, as a jj fileset. */
@@ -185,8 +202,8 @@ function fileset(path: string): string {
   return `root-file:${JSON.stringify(path)}`;
 }
 
-/** A change or commit id (or a bookmark name), never a wider revset. */
+/** A change or commit id (or a bookmark name), or its parent as `<id>-`; never a wider revset. */
 function revision(id: string): string {
-  if (!/^[0-9a-z]+$/.test(id)) throw new Error(`not a change id: ${id}`);
+  if (!/^[0-9a-z]+-?$/.test(id)) throw new Error(`not a change id: ${id}`);
   return id;
 }
