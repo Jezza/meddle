@@ -40,7 +40,8 @@ test("a bookmark behind elsewhere is labelled behind", () => {
     { nodeId: "B", graph: [c("c2", ["c1"], 2, [main]), c("c1", [], 1)] },
   ]);
   expect(rows.map((r) => r.commit.commit)).toEqual(["c3", "c2", "c1"]);
-  expect(rows[0]!.labels).toMatchObject([{ bookmark: main, nodes: ["A"], behind: null }]);
+  // B has main, only behind: A's position is not unpushed.
+  expect(rows[0]!.labels).toEqual([{ bookmark: main, nodes: ["A"], behind: null, notPushed: false }]);
   expect(rows[1]!.labels).toEqual([{ bookmark: main, nodes: ["B"], behind: 1, notPushed: false }]);
   expect(rows[2]!.labels).toEqual([]);
 });
@@ -70,6 +71,8 @@ test("a commit only one node has is not pushed", () => {
   expect(mergeGraphs([a, b])[0]!.labels[0]).toMatchObject({ nodes: ["B"], notPushed: true });
   expect(mergeGraphs([a, b])[1]!.labels[0]).toMatchObject({ nodes: ["A", "B"], notPushed: false });
   expect(mergeGraphs([b])[0]!.labels[0]).toMatchObject({ notPushed: false });
+  // A node whose graph is not read yet counts for nothing.
+  expect(mergeGraphs([b, { nodeId: "C", graph: [] }])[0]!.labels[0]).toMatchObject({ notPushed: false });
 });
 
 test("the at text names the nodes, then behind or not pushed", () => {
@@ -91,8 +94,8 @@ test("the default branch is lane 0", () => {
   expect(segs(rows, "t1")).toContainEqual({ kind: "up", lane: 1 });
   expect(segs(rows, "c3")).toContainEqual({ kind: "through", lane: 1 });
   expect(layoutLanes(rows, "main").lanes).toBe(2);
-  // Without a default branch, the newest child continues.
-  expect(lanes(rows, null)).toEqual({ c1: 0, c2: 0, c3: 1, t1: 0, t2: 0 });
+  // Without a default branch, the oldest child continues: c3 here too.
+  expect(lanes(rows, null)).toEqual({ c1: 0, c2: 0, c3: 0, t1: 1, t2: 1 });
 });
 
 test("a merge draws out to its second parent", () => {
@@ -107,6 +110,37 @@ test("a merge draws out to its second parent", () => {
   expect(segs(rows, "m")).toContainEqual({ kind: "out", lane: 1 });
   expect(segs(rows, "c3")).toContainEqual({ kind: "through", lane: 1 });
   expect(segs(rows, "t2")).toContainEqual({ kind: "up", lane: 1 });
+});
+
+test("a merge whose parent's lane has a newer commit in the way takes a lane of its own", () => {
+  // t2 merges c2, but c3 sits on c2's lane between them.
+  const a = mergeGraphs([{
+    nodeId: "A",
+    graph: [c("t2", ["t1", "c2"], 9, [task("t")]), c("c3", ["c2"], 8, [main]), c("t1", ["c1"], 7), c("c2", ["c1"], 5), c("c1", ["c0"], 1)],
+  }]);
+  expect(lanes(a)).toEqual({ t2: 1, c3: 0, t1: 1, c2: 0, c1: 0 });
+  expect(segs(a, "t2")).toContainEqual({ kind: "out", lane: 2 });
+  expect(segs(a, "c3")).not.toContainEqual({ kind: "through", lane: 0 });
+  expect(segs(a, "t1")).toContainEqual({ kind: "through", lane: 2 });
+  expect(segs(a, "c2")).toContainEqual({ kind: "in", lane: 2 });
+  expect(layoutLanes(a, "main").lanes).toBe(3);
+  // m merges x1, but x2 sits on x1's lane between them.
+  const b = mergeGraphs([{
+    nodeId: "A",
+    graph: [c("m", ["c2", "x1"], 9, [main]), c("x2", ["x1"], 8), c("x1", ["c1"], 7), c("c2", ["c1"], 5), c("c1", ["c0"], 1)],
+  }]);
+  expect(lanes(b)).toMatchObject({ m: 0, x2: 1, x1: 1 });
+  expect(segs(b, "m")).toEqual([{ kind: "down", lane: 0 }, { kind: "out", lane: 2 }]);
+  expect(segs(b, "x2")).not.toContainEqual({ kind: "through", lane: 1 });
+  expect(segs(b, "x1")).toContainEqual({ kind: "in", lane: 2 });
+});
+
+test("a new child off a line leaves the line in place", () => {
+  const base = [c("a2", ["a1"], 7, [task("a")]), c("a1", ["c1"], 6), c("c2", ["c1"], 5, [main]), c("c1", [], 1)];
+  const before = lanes(mergeGraphs([{ nodeId: "A", graph: base }]));
+  expect(before).toEqual({ a2: 1, a1: 1, c2: 0, c1: 0 });
+  const after = lanes(mergeGraphs([{ nodeId: "A", graph: [c("b1", ["a1"], 9, [task("b")]), ...base] }]));
+  expect(after).toEqual({ ...before, b1: 2 });
 });
 
 test("lanes are stable as rows are added at the top", () => {
