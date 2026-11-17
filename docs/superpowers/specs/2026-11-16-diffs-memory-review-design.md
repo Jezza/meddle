@@ -19,7 +19,7 @@ Four pieces, built in this order. Each is its own plan; each later piece reuses 
    the 20 lines nearest the change; a second click opens the rest. The lines come from the call's own result
    (`originalFile`, which Claude Code's Edit and Write results carry; the thread model keeps only `structuredPatch`
    today, `thread-model.ts:123`, and has to carry `originalFile` through too), so no request is made. Without
-   `originalFile` (a new file, a file too large) the bars are plain text, not buttons. The view moves to its own
+   `originalFile` (a new file, a file too large) the bars are plain text, not buttons, until piece 3 (below). The view moves to its own
    module so 2–4 use it.
 2. **Memory** on the Project page: entries, edit, history.
 3. **Changes**: a task's jj changes, reviewed in the task pane.
@@ -125,6 +125,15 @@ without a default branch still works.
 - `changeDiff({ project, change | "all" })`: `jj diff --git` of one change against its parent, or for "all" from the
   start (`base`) to the line.
 - `changeFile({ project, change, path })`: a file's lines at a change (for gap bars and `Expand`).
+- `workspaceFile({ path })`: a file's lines as they are now in the task's workspace (`path` absolute, confined to the
+  task's workspaces). For the thread: Claude Code leaves `originalFile` out of Edit/Write results for files over
+  about 10 KB (64% of 841 real results checked), so their bars could not open. With this call, a thread diff
+  without `originalFile` reads the file as it is now and opens its bars from it, read as the new side (a revealed old
+  line `o` is `file[o + offset - 1]`; the `↓` gap ends at `file.length - offset`), only when every new-side line of
+  its hunks (`+` and context) matches the file at its new number; otherwise the bars stay plain. The file is fetched
+  once, when the diff is first shown open. The diff model gains this new-side reading (`side: "old" | "new"`), which
+  pieces 2 and 3 can use too. Chosen over turning on Claude Code's file checkpointing (exact old files, but per-turn
+  backups to replay patches on, and copies of every edited file in the task's config folder).
 
 **UI** (board 3): the task header gets a `Thread | Changes n` switch (n = the count of non-empty changes; hidden for a
 task without a project). Changes: a summary line (`n changes on <start>`, where `<start>` is a bookmark on the base
