@@ -164,6 +164,11 @@
   .mem-body .md { margin-bottom: 10px; }
   .mem-body .diff { margin: 6px 0 10px; }
   .mem-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  /* An opened entry: its text and its actions in one card, the actions in a strip along the bottom. */
+  .mem-card { background: var(--raised); border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; }
+  .mem-text-view { padding: 12px 14px; }
+  .mem-card .md { margin: 0; }
+  .mem-card .mem-foot { padding: 5px 8px 5px 14px; border-top: 1px solid var(--line-strong); background: var(--side); }
   .mem-file { display: block; margin-bottom: 4px; font-size: 12px; color: var(--muted); }
   input.mem-file { color: var(--fg); font: 12.5px ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }
   .mem-text { display: block; width: 100%; min-height: 176px; margin-bottom: 8px; padding: 8px 10px; resize: vertical; font: 12.5px/1.55 ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }

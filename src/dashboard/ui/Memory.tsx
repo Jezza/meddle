@@ -183,13 +183,15 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
         )
         : (
           <div class="mem-body">
-            {text !== null && <Markdown text={stripFrontmatter(text)} />}
-            <div class="mem-foot">
-              {entry.last !== null && <span>{ago(Date.now() - Date.parse(entry.last.at))} ago<Who change={entry.last} context={context} sep /></span>}
-              <span class="bar-gap" />
-              {editable && <button type="button" disabled={current === null} onClick={() => current !== null && setEditing(current)}>Edit</button>}
-              <button type="button" class="quiet" onClick={onHistory}>History</button>
-              {editable && <button type="button" class="quiet danger" disabled={deleting || current === null} onClick={() => void remove()}>Delete</button>}
+            <div class="mem-card">
+              {text !== null && <div class="mem-text-view"><Markdown text={stripFrontmatter(text)} /></div>}
+              <div class="mem-foot">
+                {entry.last !== null && <span>{ago(Date.now() - Date.parse(entry.last.at))} ago<Who change={entry.last} context={context} sep /></span>}
+                <span class="bar-gap" />
+                {editable && <button type="button" disabled={current === null} onClick={() => current !== null && setEditing(current)}>Edit</button>}
+                <button type="button" class="quiet" onClick={onHistory}>History</button>
+                {editable && <button type="button" class="quiet danger" disabled={deleting || current === null} onClick={() => void remove()}>Delete</button>}
+              </div>
             </div>
             {error !== null && <p class="error">{error}</p>}
           </div>
