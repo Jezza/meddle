@@ -8,6 +8,8 @@ import {
   type SDKResultMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import type { Attachment, Prompt } from "../blobs/attachment";
+import type { UserContent } from "../blobs/content";
 import { appendEvent } from "../store/events";
 import type { Approvals } from "./approvals";
 import { InputQueue } from "./input";
@@ -99,10 +101,18 @@ function moreTelling(a: TokenFault | null, b: TokenFault): TokenFault {
 
 /**
  * The event meddle records for a prompt or steer it sends, with the `uuid` it was sent with when it has one: Claude
- * Code does not echo the user's text back, so the log would otherwise hold none.
+ * Code does not echo the user's text back, so the log would otherwise hold none. Its content is the prompt's text as
+ * written, whatever Claude Code was sent in its place; the prompt's attachments go beside it as refs, when it has any,
+ * and never as bytes.
  */
-export function promptEvent(text: string, uuid?: string): SDKUserMessage {
-  return { type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, ...(uuid !== undefined ? { uuid: uuid as SDKUserMessage["uuid"] } : {}) };
+export function promptEvent(prompt: Prompt, uuid?: string): SDKUserMessage & { attachments?: Attachment[] } {
+  return {
+    type: "user",
+    message: { role: "user", content: prompt.text },
+    parent_tool_use_id: null,
+    ...(uuid !== undefined ? { uuid: uuid as SDKUserMessage["uuid"] } : {}),
+    ...(prompt.attachments.length > 0 ? { attachments: prompt.attachments } : {}),
+  };
 }
 
 /**
@@ -123,7 +133,9 @@ const EXIT_GRACE_MS = 5_000;
 
 export type RunTurnArgs = {
   input: Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">;
-  prompt: string;
+  prompt: Prompt;
+  /** What Claude Code is sent for `prompt`; its text when not given. */
+  content?: UserContent;
   db: Database;
   approvals: Approvals;
   queue?: InputQueue;
@@ -139,9 +151,10 @@ export type RunTurnArgs = {
 
 /**
  * Starts one Claude Code turn and returns its handle at once. `done` records every message, and
- * resolves with the `result` once the child has gone (so a later `resume` never races it).
+ * resolves with the `result` once the child has gone (so a later `resume` never races it). The turn's own prompt is
+ * logged as written, with its attachments' refs, and Claude Code is sent `content` for it.
  *
- * Texts pushed into `queue` while the turn runs steer it: each is logged (`promptEvent`, with its uuid) when Claude
+ * Prompts pushed into `queue` while the turn runs steer it: each is logged (`promptEvent`, with its uuid) when Claude
  * Code takes it, which it does into the running turn or, after that turn's `result`, as a turn of its own (an `init`,
  * then its own `result`). That is still this turn: it ends at a `result` once no steer is left untaken. A steer Claude
  * Code has not taken `EXIT_GRACE_MS` after a `result` stays untaken in `queue` when the turn ends, unlogged.
@@ -162,10 +175,10 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
   const taskId = input.manifest.id;
   const record = recorder(args);
   const queue = args.queue ?? new InputQueue();
-  const prompt = queue.push(args.prompt);
-  queue.take(prompt);
+  const uuid = queue.push(args.prompt, "next", args.content);
+  queue.take(uuid);
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
-  record(promptEvent(args.prompt, prompt));
+  record(promptEvent(args.prompt, uuid));
 
   const canUseTool: CanUseTool = (toolName, toolInput, options) => args.approvals.ask({
     requestId: options.requestId,
@@ -203,7 +216,7 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
       console.error(`meddle: the token fault of task ${taskId}'s turn could not be handled:`, err);
     }
   };
-  const done = drive(q, queue, prompt, args.signal, record, watch).then(
+  const done = drive(q, queue, uuid, args.signal, record, watch).then(
     (result) => { tell(); return result; },
     (err: unknown) => {
       if (!(err instanceof DOMException && err.name === "AbortError")) tell();
@@ -309,9 +322,9 @@ async function drive(
       // A steer is logged as Claude Code takes it, ahead of the message that says so.
       for (const uuid of takenBy(m)) {
         if (uuid === prompt) promptQueued = false;
-        const text = queue.take(uuid);
-        if (text === null) continue;
-        record(promptEvent(text, uuid));
+        const taken = queue.take(uuid);
+        if (taken === null) continue;
+        record(promptEvent(taken, uuid));
         goOn();
       }
       record(m);

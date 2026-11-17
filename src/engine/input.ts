@@ -1,48 +1,54 @@
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Prompt } from "../blobs/attachment";
+import type { UserContent } from "../blobs/content";
 
-/** A text sent into a turn's input that Claude Code has not taken yet, by the uuid it was sent with. */
-export type Untaken = { uuid: string; text: string };
+/** A prompt sent into a turn's input that Claude Code has not taken yet, by the uuid it was sent with. */
+export type Untaken = { uuid: string; prompt: Prompt };
 
 /**
- * The streaming prompt of one turn: pushed texts become user messages, each with a uuid of its own. `"next"` is taken
+ * The streaming prompt of one turn: pushed prompts become user messages, each with a uuid of its own. `"next"` is taken
  * into the running turn at its next chance (or starts the next turn); `"now"` interrupts the running turn for it.
- * Ending the queue closes the child's stdin. Every text pushed is `untaken` until `take` says Claude Code took it.
+ * Ending the queue closes the child's stdin. Every prompt pushed is `untaken` until `take` says Claude Code took it.
  */
 export class InputQueue implements AsyncIterable<SDKUserMessage> {
   #items: SDKUserMessage[] = [];
   #ended = false;
-  #untaken = new Map<string, string>();
+  #untaken = new Map<string, Prompt>();
   #wake: (() => void) | undefined;
   /** The reader has an item and has not come back for the next one yet. */
   #reading = false;
   #writtenWaiters: (() => void)[] = [];
 
-  /** Queues `text`; answers the uuid it is sent with. */
-  push(text: string, priority: "now" | "next" = "next"): string {
+  /**
+   * Queues `prompt`; answers the uuid it is sent with. Claude Code is sent `content` (the prompt's text unless given
+   * another, say with its images inline); the prompt itself, with its attachments' refs, is what `take` and `untaken`
+   * hand back for the log.
+   */
+  push(prompt: Prompt, priority: "now" | "next" = "next", content: UserContent = prompt.text): string {
     if (this.#ended) throw new Error("input queue ended");
     const uuid = crypto.randomUUID();
-    this.#untaken.set(uuid, text);
-    this.#items.push({ type: "user", message: { role: "user", content: text }, parent_tool_use_id: null, session_id: "", priority, uuid });
+    this.#untaken.set(uuid, prompt);
+    this.#items.push({ type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "", priority, uuid });
     this.#notify();
     return uuid;
   }
 
-  /** Marks the text sent as `uuid` taken; answers it, or null when it was taken already or never sent here. */
-  take(uuid: string): string | null {
-    const text = this.#untaken.get(uuid);
-    if (text === undefined) return null;
+  /** Marks the prompt sent as `uuid` taken; answers it, or null when it was taken already or never sent here. */
+  take(uuid: string): Prompt | null {
+    const prompt = this.#untaken.get(uuid);
+    if (prompt === undefined) return null;
     this.#untaken.delete(uuid);
-    return text;
+    return prompt;
   }
 
-  /** The texts pushed and not taken, oldest first. */
+  /** The prompts pushed and not taken, oldest first. */
   untaken(): Untaken[] {
-    return [...this.#untaken].map(([uuid, text]) => ({ uuid, text }));
+    return [...this.#untaken].map(([uuid, prompt]) => ({ uuid, prompt }));
   }
 
   /**
-   * Resolves once every text pushed so far is written to Claude Code, or there is no more input. The SDK writes a
-   * message before it reads the next, so a text is written once the reader has come back past it.
+   * Resolves once every prompt pushed so far is written to Claude Code, or there is no more input. The SDK writes a
+   * message before it reads the next, so a prompt is written once the reader has come back past it.
    */
   written(): Promise<void> {
     if (this.#isWritten()) return Promise.resolve();

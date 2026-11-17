@@ -557,7 +557,7 @@ export class TaskRunner {
 
   /** What the task has been sent and not started on, oldest first: its live turn's untaken steers, then its queue. */
   queued(taskId: string): string[] {
-    const live = this.#live.get(taskId)?.queue.untaken().map((u) => u.text) ?? [];
+    const live = this.#live.get(taskId)?.queue.untaken().map((u) => u.prompt.text) ?? [];
     return [...live, ...queuedOf(this.#row(taskId))];
   }
 
@@ -601,7 +601,7 @@ export class TaskRunner {
 
   /** Sends `text` into a live turn's input, for Claude Code to take at its next chance; it is logged when taken. */
   #send(taskId: string, queue: InputQueue, text: string): void {
-    queue.push(text, "next");
+    queue.push({ text, attachments: [] }, "next");
     this.#emitQueued(taskId);
   }
 
@@ -815,7 +815,7 @@ export class TaskRunner {
       const { query, done, sendNow } = runTurn({
         input: await this.#engineInput(taskId, manifest, resume, picked.value),
         // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
-        prompt: resume && cutOff === "token" ? TOKEN_RETRY_PROMPT : resume && cutOff === "restart" ? CARRY_ON_PROMPT : input.prompt,
+        prompt: { text: resume && cutOff === "token" ? TOKEN_RETRY_PROMPT : resume && cutOff === "restart" ? CARRY_ON_PROMPT : input.prompt, attachments: [] },
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -838,7 +838,7 @@ export class TaskRunner {
       } finally {
         // Steers Claude Code did not take wait for the next turn. The task stays in `#primaries` until `finish` has
         // synced its memory.
-        this.#requeueFront(taskId, queue.untaken().map((u) => u.text));
+        this.#requeueFront(taskId, queue.untaken().map((u) => u.prompt.text));
         this.#live.delete(taskId);
         this.#emitQueued(taskId);
       }

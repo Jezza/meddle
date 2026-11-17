@@ -7,10 +7,12 @@ import { listEvents } from "../src/store/events";
 import { SqliteSessionStore } from "../src/store/session-store";
 import { Approvals, } from "../src/engine/approvals";
 import { InputQueue } from "../src/engine/input";
-import { runTurn, tokenFaultOf, type TokenFault } from "../src/engine/session";
+import { promptEvent, runTurn, tokenFaultOf, type TokenFault } from "../src/engine/session";
+import type { Attachment, Prompt } from "../src/blobs/attachment";
 import { loadConfig, ensureDataDirs } from "../src/config";
 import { DEFAULT_CONTEXT } from "../src/projects/context";
 const replay = `${import.meta.dir}/fake-claude/replay.ts`;
+const att: Attachment = { hash: "a".repeat(64), name: "a.png", type: "image/png", size: 3 };
 async function setup() {
   const home = await mkdtemp("/tmp/meddle-eng-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
@@ -22,7 +24,7 @@ async function setup() {
 }
 test("hello: every message is recorded, the result returns, the child exits", async () => {
   const { db, input, fixture } = await setup();
-  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: "Reply with the single word ok.", db, approvals: new Approvals() });
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals() });
   const result = await done;
   expect(result.type).toBe("result");
   const types = listEvents(db, "abc").map(e => (e.message as any).type);
@@ -34,7 +36,7 @@ test("approval: the dashboard's answer unblocks the tool", async () => {
   const { db, input, fixture } = await setup();
   const approvals = new Approvals();
   approvals.onChange(() => { for (const p of approvals.pending("abc")) approvals.answer(p.requestId, { behavior: "allow", updatedInput: p.input }); });
-  const { done } = runTurn({ input: { ...input, extraEnv: fixture("approval") }, prompt: "Run: echo hi", db, approvals });
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("approval") }, prompt: { text: "Run: echo hi", attachments: [] }, db, approvals });
   expect((await done).type).toBe("result");
   expect(listEvents(db, "abc").some(e => (e.message as any).type === "user")).toBe(true);
   const recorded = listEvents(db, "abc").map(e => e.message as any);
@@ -44,7 +46,7 @@ test("approval: the dashboard's answer unblocks the tool", async () => {
 test("abort closes the query", async () => {
   const { db, input, fixture } = await setup();
   const ac = new AbortController();
-  const { done } = runTurn({ input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: "x", db, approvals: new Approvals(), signal: ac.signal });
+  const { done } = runTurn({ input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: { text: "x", attachments: [] }, db, approvals: new Approvals(), signal: ac.signal });
   setTimeout(() => ac.abort(), 300);
   await expect(done).rejects.toMatchObject({ name: "AbortError" });
 });
@@ -61,7 +63,7 @@ test("a turn that fails to record closes the child and logs turn_failed", async 
   const boom = new Error("broadcast failed");
   const { done } = runTurn({
     input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1", MEDDLE_TEST_MARK: mark.split("=")[1]! } },
-    prompt: "x", db, approvals: new Approvals(),
+    prompt: { text: "x", attachments: [] }, db, approvals: new Approvals(),
     onMessage: (m) => { if (m.type !== "meddle" && m.type !== "user") { childSeen = processesWith(mark).length > 0; throw boom; } },
   });
   await expect(done).rejects.toBe(boom);
@@ -75,19 +77,19 @@ test("a turn that fails to record closes the child and logs turn_failed", async 
 test("an abort after the result resolves with the result", async () => {
   const { db, input, fixture } = await setup();
   const ac = new AbortController();
-  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: "x", db, approvals: new Approvals(), signal: ac.signal, onMessage: (m) => { if (m.type === "result") ac.abort(); } });
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "x", attachments: [] }, db, approvals: new Approvals(), signal: ac.signal, onMessage: (m) => { if (m.type === "result") ac.abort(); } });
   expect((await done).type).toBe("result");
   expect(listEvents(db, "abc").map(e => (e.message as any).subtype)).not.toContain("turn_aborted");
 });
 test("a synchronous failure to start still closes the turn in the log", async () => {
   const { db, input } = await setup();
-  expect(() => runTurn({ input: { ...input, cfg: undefined as any }, prompt: "x", db, approvals: new Approvals() })).toThrow();
+  expect(() => runTurn({ input: { ...input, cfg: undefined as any }, prompt: { text: "x", attachments: [] }, db, approvals: new Approvals() })).toThrow();
   expect(listEvents(db, "abc").map(e => (e.message as any).subtype ?? (e.message as any).type)).toEqual(["turn_started", "user", "turn_failed"]);
 });
 test("onMessage streams every recorded event, meddle's own included, in seq order", async () => {
   const { db, input, fixture } = await setup();
   const streamed: [number, unknown][] = [];
-  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: "x", db, approvals: new Approvals(), onMessage: (m, seq) => streamed.push([seq, m]) });
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "x", attachments: [] }, db, approvals: new Approvals(), onMessage: (m, seq) => streamed.push([seq, m]) });
   expect(streamed).toHaveLength(2); // turn_started and the prompt, both before the child says anything
   await done;
   expect(streamed).toEqual(listEvents(db, "abc").map(e => [e.seq, e.message]));
@@ -121,13 +123,13 @@ test("tokenFaultOf reads a rejected rate limit and the login-class assistant err
 test("onTokenFault is called once, before done resolves, for a turn whose login hit a limit", async () => {
   const { db, input, fixture } = await setup();
   const faults: TokenFault[] = [];
-  const { done } = runTurn({ input: { ...input, extraEnv: fixture("rate-limited") }, prompt: "x", db, approvals: new Approvals(), onTokenFault: (f) => faults.push(f) });
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("rate-limited") }, prompt: { text: "x", attachments: [] }, db, approvals: new Approvals(), onTokenFault: (f) => faults.push(f) });
   const result = await done;
   expect(result).toMatchObject({ subtype: "error_during_execution", is_error: true });
   expect(faults).toEqual([{ kind: "exhausted", until: new Date(4102444800 * 1000).toISOString(), type: "five_hour" }]);
   // a turn without one never calls it
   const none: TokenFault[] = [];
-  await runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: "x", db, approvals: new Approvals(), onTokenFault: (f) => none.push(f) }).done;
+  await runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "x", attachments: [] }, db, approvals: new Approvals(), onTokenFault: (f) => none.push(f) }).done;
   expect(none).toEqual([]);
 });
 const STEER = "Also: end your reply with the word PINEAPPLE.";
@@ -135,15 +137,15 @@ const STEER = "Also: end your reply with the word PINEAPPLE.";
  * Runs a turn of recording `name` whose first assistant message is answered with a steer into its input, as the
  * runner steers a live turn; `extraEnv` goes to the stand-in.
  */
-async function steeredTurn(name: string, extraEnv: Record<string, string> = {}) {
+async function steeredTurn(name: string, extraEnv: Record<string, string> = {}, steerPrompt: Prompt = { text: STEER, attachments: [] }) {
   const { db, input, fixture } = await setup();
   const queue = new InputQueue();
   let steer: string | undefined;
   let steerableAfterFirstResult: boolean | undefined;
   const { done } = runTurn({
-    input: { ...input, extraEnv: { ...fixture(name), ...extraEnv } }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(), queue,
+    input: { ...input, extraEnv: { ...fixture(name), ...extraEnv } }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(), queue,
     onMessage: (m) => {
-      if (m.type === "assistant" && steer === undefined) steer = queue.push(STEER);
+      if (m.type === "assistant" && steer === undefined) steer = queue.push(steerPrompt);
       if (m.type === "result") steerableAfterFirstResult ??= !queue.ended;
     },
   });
@@ -164,6 +166,15 @@ test("a steer Claude Code folds into the running turn is logged where it took it
   expect(s.slice(s.indexOf(`user: ${STEER}`) - 1, s.indexOf(`user: ${STEER}`) + 3)).toEqual(["user", `user: ${STEER}`, "command_lifecycle", "assistant"]);
   expect(s.filter(x => x === "result/success")).toHaveLength(1);
 });
+test("a prompt's and a steer's attachments are logged as refs beside their text, never as content", async () => {
+  const { db, input, fixture } = await setup();
+  const prompt = { text: "Reply with the single word ok.", attachments: [att] };
+  await runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt, content: [{ type: "text", text: "sent to Claude Code" }], db, approvals: new Approvals() }).done;
+  expect(listEvents(db, "abc").map(e => e.message as any).filter(m => m.type === "user")).toEqual([{ type: "user", message: { role: "user", content: prompt.text }, parent_tool_use_id: null, uuid: expect.any(String), attachments: [att] }]);
+  const steer = { text: STEER, attachments: [att] };
+  const { recorded, steer: uuid } = await steeredTurn("steer-fold", {}, steer);
+  expect(recorded.filter(m => m.type === "user" && m.message.content === STEER)).toEqual([{ type: "user", message: { role: "user", content: STEER }, parent_tool_use_id: null, uuid, attachments: [att] }]);
+});
 test("a steer that gets a turn of its own keeps the turn going past the exit grace, open to more steers, to its own result", async () => {
   const { result, recorded, queue, steerableAfterFirstResult } = await steeredTurn("steer-turn", { MEDDLE_FIXTURE_LATER_RESULTS_MS: "5500" });
   expect(result).toMatchObject({ subtype: "success", result: "ok PINEAPPLE" });
@@ -180,11 +191,11 @@ test("a steer Claude Code never takes ends the turn after the exit grace, unlogg
   const queue = new InputQueue();
   let steer: string | undefined;
   const { done } = runTurn({
-    input: { ...input, extraEnv: fixture("hello") }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(), queue,
-    onMessage: (m) => { if (m.type === "assistant") steer = queue.push(STEER); },
+    input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(), queue,
+    onMessage: (m) => { if (m.type === "assistant") steer = queue.push({ text: STEER, attachments: [] }); },
   });
   expect(await done).toMatchObject({ result: "ok" });
-  expect(queue.untaken()).toEqual([{ uuid: steer!, text: STEER }]);
+  expect(queue.untaken()).toEqual([{ uuid: steer!, prompt: { text: STEER, attachments: [] } }]);
   expect(listEvents(db, "abc").map(e => e.message as any).filter(m => m.type === "user").map(m => m.message.content)).toEqual(["Reply with the single word ok."]);
 }, 15_000);
 test("background work live at a result keeps the child past the exit grace, and the turn ends with the result of Claude Code's wake for it", async () => {
@@ -192,7 +203,7 @@ test("background work live at a result keeps the child past the exit grace, and 
   const queue = new InputQueue();
   let openAfterFirstResult: boolean | undefined;
   const { done } = runTurn({
-    input: { ...input, extraEnv: { ...fixture("background-wake"), MEDDLE_FIXTURE_BACKGROUND_MS: "6000" } }, prompt: "Run the suite.", db, approvals: new Approvals(), queue,
+    input: { ...input, extraEnv: { ...fixture("background-wake"), MEDDLE_FIXTURE_BACKGROUND_MS: "6000" } }, prompt: { text: "Run the suite.", attachments: [] }, db, approvals: new Approvals(), queue,
     onMessage: (m) => { if (m.type === "result") openAfterFirstResult ??= !queue.ended; },
   });
   expect(await done).toMatchObject({ subtype: "success", result: "The suite passed." });
@@ -208,7 +219,7 @@ test("a result Claude Code gives before it starts the prompt (a resumed session'
   const queue = new InputQueue();
   const openAtResults: boolean[] = [];
   const { done } = runTurn({
-    input: { ...input, extraEnv: { ...fixture("background-resume"), MEDDLE_FIXTURE_BACKGROUND_MS: "3000" } }, prompt: "Run the suite.", db, approvals: new Approvals(), queue,
+    input: { ...input, extraEnv: { ...fixture("background-resume"), MEDDLE_FIXTURE_BACKGROUND_MS: "3000" } }, prompt: { text: "Run the suite.", attachments: [] }, db, approvals: new Approvals(), queue,
     onMessage: (m) => { if (m.type === "result") openAtResults.push(!queue.ended); },
   });
   expect(await done).toMatchObject({ subtype: "success", result: "The suite passed." });
@@ -222,19 +233,19 @@ test("send now gets a text pushed just before it to Claude Code first, and Claud
   let steer: string | undefined;
   let sent: Promise<unknown> | undefined;
   const turn = runTurn({
-    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(), queue,
-    onMessage: (m) => { if (m.type === "assistant" && sent === undefined) { steer = queue.push(STEER); sent = turn.sendNow(); } },
+    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(), queue,
+    onMessage: (m) => { if (m.type === "assistant" && sent === undefined) { steer = queue.push({ text: STEER, attachments: [] }); sent = turn.sendNow(); } },
   });
   expect(await turn.done).toMatchObject({ subtype: "error_during_execution" });
   expect(await sent).toBe("stopped");
   // the stand-in ends rather than run it: it is handed back untaken, for the task's next turn
-  expect(queue.untaken()).toEqual([{ uuid: steer!, text: STEER }]);
+  expect(queue.untaken()).toEqual([{ uuid: steer!, prompt: { text: STEER, attachments: [] } }]);
 }, 15_000);
 test("send now with nothing waiting leaves the turn running", async () => {
   const { db, input, fixture } = await setup();
   let sent: Promise<unknown> | undefined;
   const turn = runTurn({
-    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(),
+    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(),
     onMessage: (m) => { if (m.type === "assistant" && sent === undefined) sent = turn.sendNow(); },
   });
   while (sent === undefined) await Bun.sleep(10);
@@ -251,36 +262,50 @@ test("send now is refused by a Claude Code that does not offer it", async () => 
   await Bun.write(older, recording.replace('\\"interrupt_send_now_v1\\",', ""));
   let sent: Promise<unknown> | undefined;
   const turn = runTurn({
-    input: { ...input, extraEnv: { MEDDLE_FIXTURE: older } }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(),
+    input: { ...input, extraEnv: { MEDDLE_FIXTURE: older } }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(),
     onMessage: (m) => { if (m.type === "assistant" && sent === undefined) sent = turn.sendNow().catch((err: Error) => err.message); },
   });
   await turn.done;
   expect(await sent).toBe("this Claude Code cannot send now");
 }, 15_000);
-test("input queue: every text pushed is untaken, in order, until taken by its uuid; taken ones are told once", () => {
+test("input queue: every prompt pushed is untaken, in order, until taken by its uuid; taken ones are told once", () => {
   const q = new InputQueue();
-  const a = q.push("a"), b = q.push("b"), c = q.push("c", "now");
+  const p = (text: string): Prompt => ({ text, attachments: [] });
+  const a = q.push(p("a")), b = q.push(p("b")), c = q.push(p("c"), "now");
   expect(new Set([a, b, c]).size).toBe(3);
-  expect(q.untaken()).toEqual([{ uuid: a, text: "a" }, { uuid: b, text: "b" }, { uuid: c, text: "c" }]);
-  expect(q.take(b)).toBe("b");
+  expect(q.untaken()).toEqual([{ uuid: a, prompt: p("a") }, { uuid: b, prompt: p("b") }, { uuid: c, prompt: p("c") }]);
+  expect(q.take(b)).toEqual(p("b"));
   expect(q.take(b)).toBeNull(); // taken already
   expect(q.take("unknown")).toBeNull();
-  expect(q.untaken()).toEqual([{ uuid: a, text: "a" }, { uuid: c, text: "c" }]);
+  expect(q.untaken()).toEqual([{ uuid: a, prompt: p("a") }, { uuid: c, prompt: p("c") }]);
+});
+test("a pushed prompt is sent as its content and logged as its text and refs", async () => {
+  const q = new InputQueue();
+  const content = [{ type: "text" as const, text: "look\n\nAttached files:\n- a.png: /x" }];
+  const uuid = q.push({ text: "look", attachments: [att] }, "next", content);
+  const sent = (await q[Symbol.asyncIterator]().next()).value;
+  expect(sent.message.content).toEqual(content);
+  expect(q.untaken()).toEqual([{ uuid, prompt: { text: "look", attachments: [att] } }]);
+  expect(q.take(uuid)).toEqual({ text: "look", attachments: [att] });
+});
+test("promptEvent keeps the text as content and adds the refs", () => {
+  expect(promptEvent({ text: "look", attachments: [att] }, "u1")).toMatchObject({ message: { content: "look" }, attachments: [att], uuid: "u1" });
+  expect("attachments" in promptEvent({ text: "hi", attachments: [] })).toBe(false);
 });
 test("input queue: yields pushed items in order, waits while empty, finishes after end", async () => {
   const q = new InputQueue();
   const it = q[Symbol.asyncIterator]();
-  const one = q.push("one"); q.push("two", "now");
+  const one = q.push({ text: "one", attachments: [] }); q.push({ text: "two", attachments: [] }, "now");
   expect((await it.next()).value).toEqual({ type: "user", message: { role: "user", content: "one" }, parent_tool_use_id: null, session_id: "", priority: "next", uuid: one });
   expect((await it.next()).value).toMatchObject({ message: { content: "two" }, priority: "now" });
   let settled = false;
   const waiting = it.next().then(r => { settled = true; return r; });
   await Bun.sleep(20);
   expect(settled).toBe(false);
-  q.push("three");
+  q.push({ text: "three", attachments: [] });
   expect((await waiting).value).toMatchObject({ message: { content: "three" }, priority: "next" });
-  q.push("four"); q.end(); q.end();
-  expect(() => q.push("five")).toThrow("input queue ended");
+  q.push({ text: "four", attachments: [] }); q.end(); q.end();
+  expect(() => q.push({ text: "five", attachments: [] })).toThrow("input queue ended");
   expect((await it.next()).value).toMatchObject({ message: { content: "four" } });
   expect((await it.next()).done).toBe(true);
 });
@@ -288,11 +313,11 @@ test("input queue: yields pushed items in order, waits while empty, finishes aft
 async function settles(p: Promise<unknown>): Promise<boolean> {
   return Promise.race([p.then(() => true), Bun.sleep(20).then(() => false)]);
 }
-test("input queue: written waits until the reader has come back past every text pushed so far", async () => {
+test("input queue: written waits until the reader has come back past every prompt pushed so far", async () => {
   const q = new InputQueue();
   const it = q[Symbol.asyncIterator]();
   expect(await settles(q.written())).toBe(true); // nothing pushed
-  q.push("one"); q.push("two");
+  q.push({ text: "one", attachments: [] }); q.push({ text: "two", attachments: [] });
   const written = q.written();
   await it.next(); // the reader has "one" and is writing it
   expect(await settles(written)).toBe(false);
@@ -306,7 +331,7 @@ test("input queue: written waits until the reader has come back past every text 
 test("input queue: written does not wait once there is no more input", async () => {
   const q = new InputQueue();
   const it = q[Symbol.asyncIterator]();
-  q.push("one");
+  q.push({ text: "one", attachments: [] });
   const written = q.written();
   await it.next();
   q.end(); // the turn is over while the reader still has "one"
