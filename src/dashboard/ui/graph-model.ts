@@ -141,6 +141,11 @@ export function layoutLanes(rows: readonly Row[], defaultBranch: string | null):
   // made oldest bottom first, after the default branch's.
   const continued = chainOf.map((k) => k === 0);
   for (let i = rows.length - 1; i >= 0; i--) {
+    // A line ends where it is merged, if that is its oldest child: a later child starts a chain of its own.
+    for (const id of rows[i]!.commit.parents.slice(1)) {
+      const q = index.get(id);
+      if (q !== undefined) continued[q] = true;
+    }
     if (chainOf[i] !== -1) continue;
     const p = firstParent(i);
     if (p !== undefined && !continued[p]) {

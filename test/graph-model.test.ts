@@ -143,6 +143,16 @@ test("a new child off a line leaves the line in place", () => {
   expect(after).toEqual({ ...before, b1: 2 });
 });
 
+test("a line ends where it is merged", () => {
+  const base = [
+    c("y1", ["m2"], 6), c("m2", ["m"], 5, [main]), c("m", ["c2", "x2"], 4), c("x2", ["x1"], 3), c("x1", ["c2"], 2), c("c2", [], 1),
+  ];
+  const before = lanes(mergeGraphs([{ nodeId: "A", graph: base }]));
+  // x2's oldest child is the merge, so a new child of x2 starts a chain of its own.
+  const after = lanes(mergeGraphs([{ nodeId: "A", graph: [c("x3", ["x2"], 7), ...base] }]));
+  expect(after).toMatchObject(before);
+});
+
 test("lanes are stable as rows are added at the top", () => {
   const base = [
     c("b2", ["b1"], 8, [task("b")]), c("c4", ["c3"], 7, [main]), c("b1", ["c3"], 6), c("a2", ["a1"], 5, [task("a")]),
