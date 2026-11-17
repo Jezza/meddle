@@ -47,8 +47,10 @@ test("a node started awaiting confirmation is held until its updater starts, the
 test("gated refuses an implementation's methods while held and leaves its other members alone", async () => {
   let held: string | null = HELD;
   const cell = { value: 1 };
-  const impl = gated({ cell, add: async (n: number) => n + 1, sync: () => "done" }, () => held);
+  const impl = gated({ cell, add: async (n: number) => n + 1, sync: () => "done", look: async () => "seen" }, () => held, ["look"]);
   expect(impl.cell).toBe(cell);
+  // A method named a read is not held.
+  expect(await impl.look()).toBe("seen");
   expect(await refusal(impl.add(1))).toBe(HELD);
   expect(await refusal(impl.sync() as unknown as Promise<unknown>)).toBe(HELD);
   held = null;
@@ -123,7 +125,13 @@ test("while an update awaits confirmation, every method of NodeObject, TaskObjec
       },
     };
     expect(Object.keys(calls.node!).sort()).toEqual(Object.keys(NodeObject.def.variants.default.methods).sort());
-    expect(Object.keys(calls.task!).sort()).toEqual(Object.keys(TaskObject.def.variants.default.methods).sort());
+    // The task's reads, which are not held.
+    const taskReads: Record<string, () => Promise<unknown>> = {
+      changeDiff: () => task.changeDiff({ project: A.project.id, change: "all" }),
+      changeFile: () => task.changeFile({ project: A.project.id, rev: m.projects[0]!.base[0]!, path: "README" }),
+      workspaceFile: () => task.workspaceFile({ path: `${A.cfg.taskRoot}/${m.id}/a/README` }),
+    };
+    expect([...Object.keys(calls.task!), ...Object.keys(taskReads)].sort()).toEqual(Object.keys(TaskObject.def.variants.default.methods).sort());
     expect(Object.keys(calls.pool!).sort()).toEqual(Object.keys(PoolObject.def.variants.default.methods).sort());
     expect(Object.keys(calls.update!).sort()).toEqual(Object.keys(UpdateObject.def.variants.default.methods).sort());
     for (const [object, methods] of Object.entries(calls)) {
@@ -132,6 +140,7 @@ test("while an update awaits confirmation, every method of NodeObject, TaskObjec
         if (!why.includes(HELD)) throw new Error(`${object}.${name} was not refused for the update: ${why}`);
       }
     }
+    expect(await Promise.all(Object.values(taskReads).map((call) => call()))).toEqual(["", "a\n", "a\n"]);
     // Nothing changed, and what dashboards read still reads.
     expect(getTask(A.db, m.id)?.title).toBe("before");
     expect(A.pool.settings.get("jj.user")).toBeNull();

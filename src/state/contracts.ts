@@ -318,6 +318,34 @@ export const ProjectObject = remote("meddle.project", {
 /** A local bookmark under a task's namespace (`meddle/task/<id>/`) in one project's replica; "" when conflicted. */
 export const TaskBookmarkSchema = Type.Object({ project: Type.String(), name: Type.String(), changeId: Type.String() });
 
+/** A change of a task's line in one project (`TaskChange`). */
+export const TaskChangeSchema = Type.Object({
+  change: Type.String(),
+  commit: Type.String(),
+  /** The description's first line. */
+  description: Type.String(),
+  files: Type.Number(),
+  added: Type.Number(),
+  removed: Type.Number(),
+  empty: Type.Boolean(),
+  conflicted: Type.Boolean(),
+  /** The line bookmark's commit: the workspace's working copy as of its last snapshot (a turn's end). */
+  workingCopy: Type.Boolean(),
+});
+
+/** A task's changes in one of its projects (`ProjectChanges`). */
+export const ProjectChangesSchema = Type.Object({
+  /** The project's id. */
+  project: Type.String(),
+  name: Type.String(),
+  /** A local bookmark on the task's base commit (the project's default branch first), else its short change id. */
+  start: Type.String(),
+  /** Whether the line's bookmark is conflicted; its changes are then not listed. */
+  conflicted: Type.Boolean(),
+  /** The line's changes since its start, newest first. */
+  changes: Type.Array(TaskChangeSchema),
+});
+
 export const TaskObject = remote("meddle.task", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
@@ -357,6 +385,11 @@ export const TaskObject = remote("meddle.task", {
          * state, and every 60 s.
          */
         bookmarks: Type.Array(TaskBookmarkSchema),
+        /**
+         * The task's changes in each of its projects, in the manifest's order (a project jj cannot read left out); re-read
+         * like `bookmarks`. [] while the task is not live here (moved, archived).
+         */
+        changes: Type.Array(ProjectChangesSchema),
         /** When the task's row last changed (ISO): its state, settings or title; what the dashboard sorts by. */
         activityAt: Type.String(),
       },
@@ -404,6 +437,15 @@ export const TaskObject = remote("meddle.task", {
         restore: method(Type.Object({ node: Nullable(Type.String()) }), Type.Object({ nodeId: Type.String() })),
         /** Deletes an archived or moved task's rows and archive from its node; refused for any other. */
         delete: method(Type.Object({})),
+        // The reads of the task's changes: not held while an update awaits confirmation. Refused `moved: …` or
+        // `archived: …` while the task is not live here, `project: …` for a project not of the task, and with the code
+        // of a `ChangesError` (`bad-id: …`, `conflicted: …`, `outside: …`, `not-a-file: …`, `too-large: …`).
+        /** Change `change`'s diff against its parent, in git's format; for `"all"`, the line's whole diff from its start. */
+        changeDiff: method(Type.Object({ project: Type.String(), change: Type.String() }), Type.String()),
+        /** The file `path` (from the repo's root) at `rev` (a change or commit id, or `<id>-` its parent); null when absent there. */
+        changeFile: method(Type.Object({ project: Type.String(), rev: Type.String(), path: Type.String() }), Nullable(Type.String())),
+        /** The file at `path` (absolute, in one of the task's workspaces) as it is on disk now; null when absent. */
+        workspaceFile: method(Type.Object({ path: Type.String() }), Nullable(Type.String())),
       },
     },
   },

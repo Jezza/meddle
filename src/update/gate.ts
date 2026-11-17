@@ -31,13 +31,14 @@ export function nodeInputHold(
 
 /**
  * The methods of a served object's implementation, each refused while `hold` gives a reason (the reason is the
- * error); everything else in `impl` (its cells) as it is. Every method is gated, so one added later is too.
+ * error); everything else in `impl` (its cells, and the methods named in `reads`) as it is. Every other method is
+ * gated, so one added later is too.
  */
-export function gated<T extends object>(impl: T, hold: (() => string | null) | undefined): T {
+export function gated<T extends object>(impl: T, hold: (() => string | null) | undefined, reads: ReadonlyArray<keyof T & string> = []): T {
   if (hold === undefined) return impl;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(impl)) {
-    if (typeof value !== "function") {
+    if (typeof value !== "function" || reads.includes(key as keyof T & string)) {
       out[key] = value;
       continue;
     }

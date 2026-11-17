@@ -29,7 +29,8 @@ import {
 import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
-import { taskNamespace, type Start, type TaskManifest } from "../tasks/manifest";
+import { ChangesError, changeDiff, changeFile, taskChanges, workspaceFile, type ProjectChanges } from "../tasks/changes";
+import { taskNamespace, type ManifestProject, type Start, type TaskManifest } from "../tasks/manifest";
 import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
@@ -664,6 +665,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const queued = self.state("queued", members.queued, { init: () => runner.queued(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
+    const changes = self.state("changes", members.changes, { init: () => taskChangesNow(id) });
     const activityAt = self.state("activityAt", members.activityAt, { init: () => getTask(db, id)?.updated_at ?? "" });
     /** Brings the manifest and the activity time up to the row (a rename, a restore). */
     const refreshRow = (ctx: Ctx) => {
@@ -673,6 +675,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (row.updated_at !== activityAt.value) activityAt.replace(ctx, row.updated_at);
     };
     const refreshBookmarks = latest(() => taskBookmarksNow(id), bookmarks);
+    const refreshChanges = latest(() => taskChangesNow(id), changes);
+    /** Both read off the task's lines, so re-read on the same triggers. */
+    const refreshLines = async (ctx: Ctx) => {
+      await Promise.all([refreshBookmarks(ctx), refreshChanges(ctx)]);
+    };
 
     /** Brings the cells up to the runner, the approvals and the event log. */
     const catchUpLog = (ctx: Ctx) => {
@@ -689,12 +696,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (on !== archivedOn.value) archivedOn.replace(ctx, on);
       refreshRow(ctx);
       // A turn's end set (and pushed) them; a move fetched or forgot them.
-      return refreshBookmarks(ctx);
+      return refreshLines(ctx);
     });
     self.on("manifests", manifests, (event, ctx) => { if (event.taskId === id) refreshRow(ctx); });
-    self.on("projects", projectChanges, (_event, ctx) => refreshBookmarks(ctx));
+    self.on("projects", projectChanges, (_event, ctx) => refreshLines(ctx));
     // What the agent bookmarks during a turn, or the user by hand, tells nothing: a slow re-read catches it.
-    self.on("ticks", headTicks, (_event, ctx) => refreshBookmarks(ctx));
+    self.on("ticks", headTicks, (_event, ctx) => refreshLines(ctx));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
@@ -718,6 +725,29 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       approvals.answer(requestId, result(req));
     };
 
+    /** Task `id`'s projects for a read of its changes; refused while it is not live here. */
+    const here = (): ManifestProject[] => {
+      const row = getTask(db, id);
+      if (row === null) throw new ChordError("unavailable", `unknown: no task ${id}`);
+      if (row.state === "moved") throw new ChordError("unavailable", `moved: the task is on ${row.moved_to ?? "another node"}`);
+      if (row.state === "archived") throw new ChordError("unavailable", `archived: the task is archived on ${row.archived_on ?? "a node"}`);
+      return (JSON.parse(row.manifest) as TaskManifest).projects;
+    };
+    const projectOf = (projectId: string): ManifestProject => {
+      const p = here().find((q) => q.id === projectId);
+      if (p === undefined) throw new ChordError("invalid", `project: not a project of the task: ${JSON.stringify(projectId)}`);
+      return p;
+    };
+    /** A read of the task's changes, its refusals (`ChangesError`) with their code first; any other failure as it is. */
+    const read = async <T>(run: () => Promise<T>): Promise<T> => {
+      try {
+        return await run();
+      } catch (err) {
+        if (err instanceof ChangesError) throw new ChordError("invalid", err.message);
+        throw err;
+      }
+    };
+
     return gated({
       variant: "default",
       manifest,
@@ -734,6 +764,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       archivedOn,
       acceptance,
       bookmarks,
+      changes,
       activityAt,
       prompt: async ({ text }) => ({ queued: (await runner.prompt(id, text)) === "queued" }),
       rename: async ({ title }) => { await runner.rename(id, title); },
@@ -758,7 +789,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       // Here (`"here"`, this node's id), on another node through a move from the archive, or (null) where placement says.
       restore: ({ node }) => runner.restore(id, node),
       delete: () => runner.deleteTask(id),
-    }, deps.inputHold);
+      // Reads: not held while an update awaits confirmation.
+      changeDiff: ({ project, change }) => read(() => changeDiff(cfg, projectOf(project), id, change)),
+      changeFile: ({ project, rev, path }) => read(() => changeFile(cfg, projectOf(project), rev, path)),
+      workspaceFile: ({ path }) => read(() => workspaceFile(cfg, here(), id, path)),
+    }, deps.inputHold, ["changeDiff", "changeFile", "workspaceFile"]);
   });
 
   host.serve(SessionObject, ({ taskId }, _principal, self) => {
@@ -819,6 +854,20 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       }
     }
     return found;
+  }
+
+  /**
+   * Task `taskId`'s changes in each of its projects (the manifest's order); [] while it is not live here (moved,
+   * archived). A project jj cannot read is left out, and read again on the next trigger. Without the repo lock, like
+   * `taskBookmarksNow`: `taskChanges` never snapshots.
+   */
+  async function taskChangesNow(taskId: string): Promise<ProjectChanges[]> {
+    const row = getTask(db, taskId);
+    if (row === null || row.state === "moved" || row.state === "archived") return [];
+    const projects = (JSON.parse(row.manifest) as TaskManifest).projects;
+    const read = await Promise.all(projects.map((p) =>
+      taskChanges(cfg, p, taskId, { defaultBranch: getProject(db, p.id)?.defaultBranch ?? null }).catch(() => null)));
+    return read.filter((c) => c !== null);
   }
 
   function manifestOf(taskId: string): TaskManifest {

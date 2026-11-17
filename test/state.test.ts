@@ -387,6 +387,59 @@ test("a task's bookmarks are listed without waiting for a push holding its repli
   }
 }, 15_000);
 
+test("changes come back over the object and follow a turn", async () => {
+  const { client, project, cfg, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    expect(task.changes.value).toEqual([
+      { project: project.id, name: project.name, start: "main", conflicted: false, changes: [expect.objectContaining({ workingCopy: true, files: 0, empty: true })] },
+    ]);
+    // What the agent writes in its workspace shows once its turn's end snapshots it and moves the line.
+    const workspace = `${paths(cfg).task(manifest.id)}/${manifest.projects[0]!.workspace}`;
+    await writeFile(`${workspace}/notes.txt`, "one\ntwo\n");
+    await task.prompt({ text: "Reply with the single word ok." });
+    const changes = await until(task.changes, (list) => list[0]?.changes[0]?.files === 1);
+    expect(changes[0]!.changes).toEqual([expect.objectContaining({ workingCopy: true, files: 1, added: 2, removed: 0, empty: false })]);
+
+    const change = changes[0]!.changes[0]!.change;
+    expect(await task.changeDiff({ project: project.id, change })).toContain("+two");
+    expect(await task.changeDiff({ project: project.id, change: "all" })).toContain("notes.txt");
+    expect(await task.changeFile({ project: project.id, rev: change, path: "notes.txt" })).toBe("one\ntwo\n");
+    expect(await task.changeFile({ project: project.id, rev: `${change}-`, path: "notes.txt" })).toBeNull();
+    expect(await task.workspaceFile({ path: `${workspace}/notes.txt` })).toBe("one\ntwo\n");
+    // A malformed id reaches the caller with its code.
+    expect(await task.changeFile({ project: project.id, rev: "x|y", path: "notes.txt" }).then(() => "", remoteReason)).toStartWith("bad-id:");
+    expect(await task.changeDiff({ project: "nope", change }).then(() => "", remoteReason)).toStartWith("project:");
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("workspaceFile refuses outside the workspace", async () => {
+  const { client, project, home, cfg, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    expect(await task.workspaceFile({ path: `${home}/a/README` }).then(() => "", remoteReason)).toStartWith("outside:");
+    // An archived task's changes are not here.
+    const inside = `${paths(cfg).task(manifest.id)}/a/README`;
+    expect(await task.workspaceFile({ path: inside })).toBe("a\n");
+    await task.archive({});
+    await until(task.changes, (list) => list.length === 0);
+    expect(await task.workspaceFile({ path: inside }).then(() => "", remoteReason)).toStartWith("archived:");
+    expect(await task.changeDiff({ project: project.id, change: "all" }).then(() => "", remoteReason)).toStartWith("archived:");
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
 /** `memoryHead` once `memory` and the memory working copy's parent are both on `change` (`memoryPlacing`'s line). */
