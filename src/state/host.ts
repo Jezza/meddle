@@ -14,12 +14,11 @@ import type { PoolRuntime } from "../pool/runtime";
 import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
 import { listBranchRows, listLineRows, rowChanges } from "../pool/rows";
-import { bookmarkList, isJjRepo, jj } from "../jj";
-import { MEMORY_BOOKMARK } from "../memory";
+import { bookmarkList, isJjRepo } from "../jj";
 import { paths } from "../paths";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
-import { memoryChanges, MemoryWriteError, writeMemory } from "../projects/memory-sync";
+import { memoryChanges, memoryPlacing, MemoryWriteError, syncMemoryBefore, writeMemory } from "../projects/memory-sync";
 import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory } from "../projects/memory-view";
 import { releaseLineRows } from "../projects/lines";
 import { resolveStarts } from "../projects/starts";
@@ -68,7 +67,8 @@ export type NodeHostDeps = {
   /**
    * Why this node accepts no input now (its new build awaits confirmation: `Updater.inputHold`), or null. While it
    * says, every method of `NodeObject`, `TaskObject` and `PoolObject`'s default variant is refused with it, and
-   * `ProjectObject`'s writes of memory.
+   * `ProjectObject`'s writes of memory. Those would survive a rollback (it restores the database, not the memory repo);
+   * they are refused all the same, so a node awaiting confirmation takes no input at all.
    */
   inputHold?(): string | null;
 };
@@ -573,18 +573,37 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("branchTicks", headTicks, (_event, ctx) => refreshBranches(ctx));
 
     const memoryRepo = paths(cfg).memory(id);
-    /** The change `memory` is on, read without a snapshot (an agent may be writing there); null without one. */
+    /** Where `memory` and the memory working copy's parent are (`memoryPlacing`, read without a snapshot); null without a repo. */
     const memoryHeadNow = async () => {
       try {
-        const out = await jj(["--ignore-working-copy", "log", "-r", `present(${MEMORY_BOOKMARK})`, "-n", "1", "--no-graph", "-T", "change_id"], memoryRepo, cfg);
-        return out.trim() === "" ? null : out.trim();
+        return (await memoryPlacing(cfg, memoryRepo)).trim();
       } catch {
         return null;
       }
     };
     const memoryHead = self.state("memoryHead", ProjectObject.def.variants.default.state.memoryHead, { init: memoryHeadNow });
     const refreshMemoryHead = latest(memoryHeadNow, memoryHead);
-    self.on("memory", memoryChanges, (projectId, ctx) => { if (projectId === id) return refreshMemoryHead(ctx); });
+    /**
+     * On the project's home, with no task of it live here, brings the memory working copy onto `memory`: a peer's push
+     * moves only the bookmark, and the entries are read from disk. With one live its turn end does it. What this moves
+     * tells `memoryChanges` again, and that second run finds nothing to move.
+     */
+    const followHome = async () => {
+      if (getProject(db, id)?.home !== pool.identity.id || !(await isJjRepo(memoryRepo))) return;
+      // Asked just before the sync queues for its lock: a turn starting later queues its own sync behind this one.
+      if (!runner.projectLive(id)) await syncMemoryBefore({ cfg, db, pool }, id, false);
+    };
+    self.on("memory", memoryChanges, async (projectId, ctx) => {
+      if (projectId !== id) return;
+      await followHome();
+      await refreshMemoryHead(ctx);
+    });
+    // A push that landed while no one here listened left the working copy behind: caught up once the object is live.
+    self.task(async (ctx) => {
+      await followHome();
+      await refreshMemoryHead(ctx);
+    });
+    self.on("memoryTicks", headTicks, (_event, ctx) => refreshMemoryHead(ctx));
     /** The memory repo, for a read; refused without one. */
     const readable = async () => {
       if (!(await isJjRepo(memoryRepo))) throw memoryRefusal("no-repo", "no memory replica here");

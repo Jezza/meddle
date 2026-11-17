@@ -14,6 +14,9 @@ import { allBranchRows, listLineRows } from "./rows";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore, WireRosterRow } from "./store";
 
+/** A peer's error as it said it (`memory-names.ts`, where the dashboard reads it too). */
+export { remoteReason } from "../projects/memory-names";
+
 export type PoolObjectDeps = {
   store: PoolStore;
   /** The node's database: the token, line and branch rows are read from it. */
@@ -63,14 +66,6 @@ const defaultState = PoolObject.def.variants.default.state;
 const LiveSchema = Type.Object({ summary: NodeSummarySchema, at: Type.String() });
 export type Live = Type.Static<typeof LiveSchema>;
 type PoolNode = Type.Static<typeof defaultState.nodes>[number];
-
-/** A peer's error as it said it: without the `<code>: ` (or `<code>/<reason>: `) a chord error's message starts with. */
-export function remoteReason(err: unknown): string {
-  if (!(err instanceof Error)) return String(err);
-  const code = (err as { code?: unknown }).code;
-  if (typeof code === "string" && err.message.startsWith(code)) return err.message.replace(/^[^:]*: /, "");
-  return err.message;
-}
 
 /**
  * One roster row as a dashboard sees it; this node's own row shows its live summary. A summary from an older meddle

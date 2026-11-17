@@ -418,6 +418,34 @@ test("writeMemory refuses while live when the working copy is behind memory", as
   }
 }, 15_000);
 
+test("a write refused changed after it brought the working copy onto memory still tells memoryChanges", async () => {
+  const { A, B, id, memA, memB, logs, log, close } = await replicated();
+  try {
+    await writeFile(`${memA}/MEMORY.md`, "- base\n");
+    await syncMemoryAfter(depsOf(A), id, false, log);
+    await syncMemoryBefore(depsOf(B), id, false, log);
+    await writeFile(`${memB}/NOTES.md`, "- from b\n");
+    await syncMemoryAfter(depsOf(B), id, false, log);
+    const fromB = await changeOf(B, memB, "@-");
+    expect(await read(`${memA}/NOTES.md`)).toBeNull();
+
+    const heard: string[] = [];
+    const off = memoryChanges.subscribe((p) => { heard.push(p); });
+    try {
+      // The follow puts B's NOTES.md on disk, which a write of it as new (base null) then finds there.
+      await expect(writeMemory(depsOf(A), id, "NOTES.md", "x\n", null, () => false)).rejects.toMatchObject({ code: "changed" });
+      expect(await changeOf(A, memA, `${fromB} & ::@`)).toBe(fromB);
+      expect(await read(`${memA}/NOTES.md`)).toBe("- from b\n");
+      expect(heard).toEqual([id]);
+    } finally {
+      off();
+    }
+    expect(logs).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
 test("memory paths are confined", async () => {
   const { A, id, memA, close } = await replicated();
   try {

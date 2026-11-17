@@ -4,12 +4,17 @@ import { NodeObject, ProjectObject, TaskObject, SessionObject } from "../src/sta
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent } from "../src/store/events";
 import { errorResultFixture } from "./helpers";
-import { linkClient, startPoolNode } from "./pool-helpers";
+import { linkClient, peerReady, startPoolNode, twoPoolNodes } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
 import { getTask } from "../src/store/records";
 import { readManifest } from "../src/tasks/manifest";
 import { createHash } from "node:crypto";
 import { remoteReason } from "../src/pool/object";
+import { writeFile } from "node:fs/promises";
+import { paths, type NodeConfig } from "../src/config";
+import { jj } from "../src/jj";
+import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
+import { ensureServiceRepo } from "../src/projects/replicas";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -384,14 +389,21 @@ test("a task's bookmarks are listed without waiting for a push holding its repli
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
+/** `memoryHead` once `memory` and the memory working copy's parent are both on `change` (`memoryPlacing`'s line). */
+async function headAt(cfg: NodeConfig, projectId: string, change: string): Promise<string> {
+  const commit = await jj(["--ignore-working-copy", "log", "-r", change, "--no-graph", "-T", "commit_id"], paths(cfg).memory(projectId), cfg);
+  return `${commit.trim()} true true`;
+}
+
 test("memoryHead follows a dashboard write", async () => {
-  const { client, project, close } = await connect();
+  const { client, project, cfg, close } = await connect();
   try {
     const view = await client.get(ProjectObject, { id: project.id });
     const before = view.memoryHead.value;
     const { change } = await view.writeMemory({ path: "a.md", text: "x\n", base: null });
-    expect(change).not.toBe(before);
-    expect(await until(view.memoryHead, (head) => head === change)).toBe(change);
+    const at = await headAt(cfg, project.id, change);
+    expect(at).not.toBe(before);
+    expect(await until(view.memoryHead, (head) => head === at)).toBe(at);
     view.release();
   } finally {
     await close();
@@ -436,7 +448,7 @@ test("memoryEntries and memoryHistory come back over the object", async () => {
 }, 15_000);
 
 test("a changed base reaches the caller as changed:, and a delete takes the file out", async () => {
-  const { client, project, close } = await connect();
+  const { client, project, cfg, close } = await connect();
   try {
     const view = await client.get(ProjectObject, { id: project.id });
     await view.writeMemory({ path: "a.md", text: "x\n", base: null });
@@ -448,12 +460,43 @@ test("a changed base reaches the caller as changed:, and a delete takes the file
     const { change } = await view.deleteMemory({ path: "a.md", base: sha256("x\n") });
     expect(await view.memoryFile({ path: "a.md" })).toBeNull();
     expect((await view.memoryEntries({})).map((e) => e.path)).not.toContain("a.md");
-    expect(await until(view.memoryHead, (head) => head === change)).toBe(change);
+    const at = await headAt(cfg, project.id, change);
+    expect(await until(view.memoryHead, (head) => head === at)).toBe(at);
     view.release();
   } finally {
     await close();
   }
 }, 15_000);
+
+test("the home follows a peer's push of memory onto disk while no task of the project is live there", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const { client, close: closeClient } = linkClient(A.host);
+  try {
+    await peerReady(B, A);
+    const id = A.project.id;
+    await ensureServiceRepo({ cfg: B.cfg, db: B.db, pool: B.pool }, id);
+    const memA = paths(A.cfg).memory(id);
+    const memB = paths(B.cfg).memory(id);
+    const view = await client.get(ProjectObject, { id });
+    await view.writeMemory({ path: "MEMORY.md", text: "- base\n", base: null });
+    await syncMemoryBefore({ cfg: B.cfg, db: B.db, pool: B.pool }, id, false);
+    const before = view.memoryHead.value;
+
+    await writeFile(`${memB}/NOTES.md`, "- from b\n");
+    await syncMemoryAfter({ cfg: B.cfg, db: B.db, pool: B.pool }, id, false);
+    const fromB = (await jj(["--ignore-working-copy", "log", "-r", "@-", "--no-graph", "-T", "change_id"], memB, B.cfg)).trim();
+    // The push moved A's `memory`; A's working copy follows it, and `memoryHead` says where both are.
+    const at = await headAt(A.cfg, id, fromB);
+    expect(await until(view.memoryHead, (head) => head === at)).toBe(at);
+    expect(at).not.toBe(before);
+    expect(await Bun.file(`${memA}/NOTES.md`).text()).toBe("- from b\n");
+    expect((await view.memoryEntries({})).map((e) => e.path)).toEqual(["MEMORY.md", "NOTES.md"]);
+    view.release();
+  } finally {
+    await closeClient();
+    await close();
+  }
+}, 20_000);
 
 test("while an update awaits confirmation, a project's memory is not written, and still reads", async () => {
   let held: string | null = null;

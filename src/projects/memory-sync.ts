@@ -16,11 +16,10 @@ import { MEMORY_BOOKMARK } from "../memory";
 import { paths } from "../paths";
 import { shortId } from "../pool/ids";
 import { repoKey, serialised } from "../serial";
-import { isMemoryPath, readRegular } from "./memory-view";
+import { isMemoryPath, memoryFileset } from "./memory-names";
+import { readRegular } from "./memory-view";
 import { getProject } from "./project";
 import { pushBookmark, type ReplicaDeps } from "./replicas";
-
-export { isMemoryPath };
 
 type Log = (line: string) => void;
 
@@ -67,21 +66,27 @@ async function descends(cfg: NodeConfig, repo: string, rev: string, base: string
 }
 
 /**
- * Where `memory` and the working copy's parents are, read without a snapshot: what a sync moved when it differs
- * after it.
+ * Where `memory` and the working copy's parents are (a line per commit: its id, whether `memory` is on it, whether it
+ * is a parent of `@`), read without a snapshot: what a sync moved when it differs after it.
  */
-async function placing(cfg: NodeConfig, repo: string): Promise<string> {
+export async function memoryPlacing(cfg: NodeConfig, repo: string): Promise<string> {
   const template = `commit_id ++ " " ++ self.contained_in('bookmarks(exact:"${MEMORY_BOOKMARK}")') ++ " " ++ self.contained_in("@-") ++ "\\n"`;
   return jj(["--ignore-working-copy", "log", "-r", `bookmarks(exact:"${MEMORY_BOOKMARK}") | @-`, "--no-graph", "-T", template], repo, cfg);
 }
 
-/** Runs `fn` on the memory repo of `projectId` and tells `memoryChanges` when it moved `memory` or the working copy. */
+/**
+ * Runs `fn` on the memory repo of `projectId` and tells `memoryChanges` when it moved `memory` or the working copy,
+ * also when it then failed (a write refused after it brought the working copy onto `memory`).
+ */
 async function noting(deps: ReplicaDeps, projectId: string, fn: () => Promise<void>): Promise<void> {
   const repo = paths(deps.cfg).memory(projectId);
-  const where = () => placing(deps.cfg, repo).catch(() => null);
+  const where = () => memoryPlacing(deps.cfg, repo).catch(() => null);
   const before = await where();
-  await fn();
-  if (before !== (await where())) memoryChanged(projectId);
+  try {
+    await fn();
+  } finally {
+    if (before !== (await where())) memoryChanged(projectId);
+  }
 }
 
 /**
@@ -270,7 +275,7 @@ async function write(
 
   if (text === null) await rm(file, { force: true });
   else await replaceFile(repo, file, text);
-  const fileset = `root-file:${JSON.stringify(path)}`;
+  const fileset = memoryFileset(path);
   if ((await jj(["diff", "--name-only", fileset], repo, cfg)).trim() === "") {
     // The file is as `@-` has it: nothing to commit, and `memory` stays where it is (`@-` before there is one).
     const [change] = [...(await changes(cfg, repo, `present(${MEMORY_BOOKMARK})`)), ...(await changes(cfg, repo, "@-"))];

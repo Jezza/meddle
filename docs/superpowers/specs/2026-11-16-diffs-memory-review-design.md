@@ -64,10 +64,13 @@ read-only, with `offline` beside the heading and no Edit/Delete/New.
 
 **ProjectObject gains:**
 
-- state `memoryHead`: the change id the `memory` bookmark points at (null without a memory repo), re-read after every
-  memory sync, every dashboard write on this node, and every peer push into the memory repo (`src/git/serve.ts`,
-  where it already runs `gitImport`): on the home that is how `memory` mostly moves. The dashboard re-fetches what it
-  shows when it changes.
+- state `memoryHead`: where the `memory` bookmark and the memory working copy's parent are, as one opaque string
+  (their commit ids; null without a memory repo), so it changes when either moves. Re-read after every memory sync,
+  every dashboard write on this node, every peer push into the memory repo (`src/git/serve.ts`, where it already runs
+  `gitImport`): on the home that is how `memory` mostly moves; and every 60 s. On the home, a push (or opening the
+  object) with no task of the project live there first brings the working copy onto `memory` as `syncMemoryBefore`
+  does, so the entries read from disk are what `memory` holds; with one live, its turn end does. The dashboard
+  re-fetches what it shows when it changes.
 - `memoryEntries()`: every file in the memory repo's working copy on this node, i.e. what agents here read and write,
   uncommitted writes of a turn in progress included (path, size, a hash of its content, and for a `.md` file with
   frontmatter its `name`, `description`, `metadata.type`), plus for each the change that last touched it (when, which
@@ -79,7 +82,8 @@ read-only, with `offline` beside the heading and no Edit/Delete/New.
 - `writeMemory({ path, text, base })` and `deleteMemory({ path, base })`, home only. `base` is the content hash the
   entry had when you opened it (null for a new file). Refused when the file on disk no longer hashes to `base`: an
   agent or a peer changed it while you edited. The dashboard then shows `Changed` and reloads the entry from disk,
-  keeping your text in the box to copy from. Paths are confined to the memory repo (no `..`, no absolute).
+  keeping your text in the box to copy from; `Save` keeps answering `Changed` until you cancel and edit the reloaded
+  entry, so it never saves over text you did not see. Paths are confined to the memory repo (no `..`, no absolute).
 
 **How a write happens.** Under both the turn syncs' lock (`serialised("memory-sync\0<path>")` in `memory-sync.ts`)
 and the lock a peer's push into the repo takes (`serialised(repoKey(repo))` in `src/git/serve.ts`), so neither a sync

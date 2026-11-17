@@ -8,6 +8,9 @@ import { join } from "node:path";
 import type { NodeConfig } from "../config";
 import { jj, JjError } from "../jj";
 import { MEMORY_BOOKMARK } from "../memory";
+import { isMemoryPath, memoryFileset as fileset } from "./memory-names";
+
+export { isMemoryPath };
 
 export type MemoryChange = {
   change: string;
@@ -94,22 +97,36 @@ function unquote(raw: string): string | null {
  */
 export async function memoryEntries(cfg: NodeConfig, repo: string): Promise<MemoryEntry[]> {
   const files = (await readdir(repo, { withFileTypes: true })).filter((d) => d.isFile() && isMemoryPath(d.name)).map((d) => d.name);
+  const last = await lastChanges(cfg, repo, files);
   const entries = await Promise.all(
     files.map(async (path): Promise<MemoryEntry | null> => {
       const bytes = await readRegular(repo, path);
       if (bytes === null) return null;
-      const [last] = await changes(cfg, repo, `(${HISTORY}) & files(${fileset(path)})`, 1);
       return {
         path,
         size: bytes.length,
         hash: createHash("sha256").update(bytes).digest("hex"),
         ...parseFrontmatter(bytes.toString("utf8")),
-        last: last ?? null,
+        last: last.get(path) ?? null,
       };
     }),
   );
   const key = (e: MemoryEntry) => e.name ?? e.path;
   return entries.filter((e) => e !== null).sort((a, b) => Number(b.path === INDEX) - Number(a.path === INDEX) || key(a).localeCompare(key(b)));
+}
+
+/** The newest change of the history touching each of `files`, in one walk of it; a file it never touched is absent. */
+async function lastChanges(cfg: NodeConfig, repo: string, files: readonly string[]): Promise<Map<string, MemoryChange>> {
+  const last = new Map<string, MemoryChange>();
+  if (files.length === 0) return last;
+  const out = await jj(
+    ["--ignore-working-copy", "log", "--no-graph", "-r", `(${HISTORY}) & files(${files.map(fileset).join(" | ")})`, "-T", CHANGE_TEMPLATE],
+    repo, cfg,
+  );
+  for (const change of out.split("\n").filter(Boolean).map(parseChange)) {
+    for (const path of change.files) if (!last.has(path)) last.set(path, change);
+  }
+  return last;
 }
 
 /**
@@ -190,16 +207,6 @@ function author(description: string): Pick<MemoryChange, "kind" | "node" | "task
   if (description === "memory: dashboard") return { kind: "dashboard", node: null, task: null };
   if (description.startsWith("import memory from ")) return { kind: "import", node: null, task: null };
   return { kind: "other", node: null, task: null };
-}
-
-/** A memory file's name: a `*.md` file in the repo's top folder, named as the dashboard can write it. */
-export function isMemoryPath(path: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*\.md$/.test(path);
-}
-
-/** Exactly the file `path` at the repo's root, as a jj fileset. */
-function fileset(path: string): string {
-  return `root-file:${JSON.stringify(path)}`;
 }
 
 /** A change or commit id (or a bookmark name), or its parent as `<id>-`; never a wider revset. */

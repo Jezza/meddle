@@ -279,8 +279,11 @@ export const ProjectObject = remote("meddle.project", {
         /** The project's branches, by name: re-computed when its branch rows change, and every 60 s. */
         branches: Type.Array(BranchSchema),
         /**
-         * The change `memory` is on in this node's memory repo of the project, null without one (or without `memory`):
-         * re-read whenever a memory sync, a dashboard write or a peer's push here moves it.
+         * Where `memory` and the memory working copy's parent are in this node's memory repo of the project, as one
+         * opaque string (their commit ids), null without a repo: it changes whenever either moves. Re-read whenever a
+         * memory sync, a dashboard write or a peer's push here moves one (on the home, a push is followed by bringing
+         * the working copy onto `memory` when no task of the project is live here), and every 60 s. A signal to read
+         * memory again, not a change id.
          */
         memoryHead: Nullable(Type.String()),
       },

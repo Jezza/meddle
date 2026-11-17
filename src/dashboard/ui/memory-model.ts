@@ -1,5 +1,6 @@
 // What the Project page's Memory and History sections decide without a DOM: which node to read memory from, who a
 // change of the history was, why a write was refused, and an entry's text without its frontmatter.
+import { isMemoryPath, remoteReason } from "../../projects/memory-names";
 import type { MemoryChange } from "../../projects/memory-view";
 
 /**
@@ -20,17 +21,9 @@ export function changeWho(c: MemoryChange, taskTitle: (id: string) => string | n
   return { label: "", taskId: null };
 }
 
-/** A refused memory write's reason, the error's message without chord's leading `<code>: ` (or `<code>/<reason>: `). */
-function reasonOf(err: unknown): string {
-  if (!(err instanceof Error)) return String(err);
-  const code = (err as { code?: unknown }).code;
-  if (typeof code === "string" && err.message.startsWith(code)) return err.message.replace(/^[^:]*: /, "");
-  return err.message;
-}
-
 /** The word a refused write shows beside `Save`: the file changed since it was opened, or a live turn is behind memory. */
 export function writeError(err: unknown): "Changed" | "Busy" | null {
-  const reason = reasonOf(err);
+  const reason = remoteReason(err);
   if (reason.startsWith("changed:")) return "Changed";
   if (reason.startsWith("busy:")) return "Busy";
   return null;
@@ -38,12 +31,7 @@ export function writeError(err: unknown): "Changed" | "Busy" | null {
 
 /** Whether a read failed because the node holds no memory repo of the project (nothing to show). */
 export function noMemoryRepo(err: unknown): boolean {
-  return reasonOf(err).startsWith("no-repo:");
-}
-
-/** A memory file's name as the dashboard can write it (the pattern `isMemoryPath` checks on the node). */
-export function isMemoryName(path: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*\.md$/.test(path);
+  return remoteReason(err).startsWith("no-repo:");
 }
 
 /** `text` without the `---` block at its top (a block never closed is kept). */
@@ -54,7 +42,7 @@ export function stripFrontmatter(text: string): string {
 
 /** Whether `New` may save as `name`: a memory file's name that no listed entry has (a listed one is edited instead). */
 export function canSaveNew(name: string, listed: readonly string[]): boolean {
-  return isMemoryName(name) && !listed.includes(name);
+  return isMemoryPath(name) && !listed.includes(name);
 }
 
 /** History rows as loaded: newest first, and whether `Older` has more below them. */

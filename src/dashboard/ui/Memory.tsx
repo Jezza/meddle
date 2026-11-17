@@ -3,11 +3,12 @@
 import type { Host, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { ProjectObject } from "../../state/contracts";
+import { isMemoryPath } from "../../projects/memory-names";
 import type { MemoryChange, MemoryEntry } from "../../projects/memory-view";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
 import { errorText, type Hosts, useObject, useValue } from "./hooks";
-import { canSaveNew, changeWho, type HistoryRows, isMemoryName, mergeFirstPage, noMemoryRepo, stripFrontmatter, writeError } from "./memory-model";
+import { canSaveNew, changeWho, type HistoryRows, mergeFirstPage, noMemoryRepo, stripFrontmatter, writeError } from "./memory-model";
 import { hashOf } from "./routes";
 import { ago } from "./sidebar-model";
 import type { ListedTask } from "./sources";
@@ -80,7 +81,7 @@ function MemoryLoaded({ project, editable, context }: { project: ProjectRef; edi
   const follow = (e: MouseEvent) => {
     const link = (e.target as Element | null)?.closest?.("a");
     const href = link?.getAttribute("href") ?? "";
-    if (isMemoryName(href) && entries?.some((x) => x.path === href)) {
+    if (isMemoryPath(href) && entries?.some((x) => x.path === href)) {
       e.preventDefault();
       toggle(href, true);
     }
@@ -199,16 +200,16 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
 
 /**
  * The raw file in a box, `Save` and `Cancel`; with `path` null, a name for a new file first (one not `listed`). A
- * refused save keeps the text and says `Changed` or `Busy`. Editing an entry, `Changed` reads it again so the next Save
- * is against what is there now; a new file never takes another's hash, so it never saves over a file it did not show.
+ * refused save keeps the text and says `Changed` or `Busy`. `Changed` reloads the entries, but the editor keeps the
+ * `base` it opened with: Save answers `Changed` until the user cancels and edits the reloaded entry, so it never saves
+ * over text the user has not seen.
  */
-function Editor({ project, path, initial, base: opened, listed, reload, onSaved, onCancel }: {
+function Editor({ project, path, initial, base, listed, reload, onSaved, onCancel }: {
   project: ProjectRef; path: string | null; initial: string; base: string | null; listed: readonly string[];
   reload(): Promise<MemoryEntry[] | null>; onSaved(path: string): void; onCancel(): void;
 }) {
   const [name, setName] = useState("");
   const [text, setText] = useState(initial);
-  const [base, setBase] = useState(opened);
   const [busy, setBusy] = useState(false);
   const [refused, setRefused] = useState<"Changed" | "Busy" | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -229,10 +230,7 @@ function Editor({ project, path, initial, base: opened, listed, reload, onSaved,
       const word = writeError(err);
       if (word === null) setError(errorText(err));
       else setRefused(word);
-      if (word === "Changed" && path !== null) {
-        const fresh = await reload();
-        if (fresh !== null) setBase(fresh.find((e) => e.path === target)?.hash ?? null);
-      }
+      if (word === "Changed") await reload();
     } finally {
       setBusy(false);
     }
