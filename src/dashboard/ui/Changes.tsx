@@ -170,27 +170,30 @@ function FileDiff({ task, project, patch, rev }: { task: TaskRef; project: strin
 type Read = { patches: FilePatch[] | null; error: string | null };
 
 /**
- * A diff in `project`: `request.change`'s against its parent, or from `request.from` (null for none). Both are commit
- * ids, so a diff is read once; a new request drops what was shown, and a failed read shows its refusal.
+ * A diff in `project`: `request.change`'s against its parent, or from `request.from` (null for none). Its slot is the
+ * change, or the whole line's (`"all"`) while it has a `from`: a new slot drops what was shown; a new request in the
+ * same slot (the line moved) is a read again, which keeps it until the new one lands, and a failed read keeps it beside
+ * its refusal. A newer request's read supersedes an older one's late answer.
  */
 function useDiff(task: TaskRef, project: string, request: { change: string; from?: string } | null): Read {
-  const change = request === null ? null : `${request.from ?? ""}..${request.change}`;
-  const [read, setRead] = useState<Read & { change: string | null }>({ patches: null, error: null, change });
+  const slot = request === null ? null : request.from !== undefined ? "all" : request.change;
+  const key = request === null ? null : `${request.from ?? ""}..${request.change}`;
+  const [read, setRead] = useState<Read & { slot: string | null }>({ patches: null, error: null, slot });
   const latest = useRef(0);
   useEffect(() => {
     const n = ++latest.current;
     if (request === null) {
-      setRead((r) => r.change === null && r.patches === null && r.error === null ? r : { patches: null, error: null, change });
+      setRead((r) => r.slot === null && r.patches === null && r.error === null ? r : { patches: null, error: null, slot });
       return;
     }
-    setRead((r) => r.change === change ? r : { patches: null, error: null, change });
+    setRead((r) => r.slot === slot ? r : { patches: null, error: null, slot });
     task.changeDiff({ project, ...request }).then(
-      (text) => { if (n === latest.current) setRead({ patches: parseGitDiff(text), error: null, change }); },
+      (text) => { if (n === latest.current) setRead({ patches: parseGitDiff(text), error: null, slot }); },
       (err: unknown) => {
-        if (n === latest.current) setRead((r) => ({ patches: r.change === change ? r.patches : null, error: remoteReason(err), change }));
+        if (n === latest.current) setRead((r) => ({ patches: r.slot === slot ? r.patches : null, error: remoteReason(err), slot }));
       },
     );
-  }, [task, project, change]);
-  // Until the effect has run for a new change, what is held is another change's.
-  return read.change === change ? read : { patches: null, error: null };
+  }, [task, project, key]);
+  // Until the effect has run for a new slot, what is held is another's.
+  return read.slot === slot ? read : { patches: null, error: null };
 }
