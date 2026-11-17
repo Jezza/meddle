@@ -3,11 +3,12 @@
 // wrote is committed, `memory` moves onto it, and other nodes push it to the home. Conflicts stay as jj's markers
 // for the next session to tidy. The syncs never throw: failures are logged and the next turn tries again. The syncs of
 // one memory repo run one at a time (`serialised`): overlapping ones would leave stray commits beside the history.
+// What they do in the repo also runs under the repo's own lock (`repoKey`), which a peer's push into it takes too.
 // The dashboard writes a memory file on the home (`writeMemory`) in that same line, and refuses rather than guess.
 import type { Subscribable } from "@earendil-works/chord";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, rm } from "node:fs/promises";
+import { lstat, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { NodeConfig } from "../config";
 import { bookmarkList, bookmarkSet, fetch, isJjRepo, jj, track } from "../jj";
@@ -28,8 +29,8 @@ const defaultLog: Log = (line) => console.error(line);
 const listeners = new Set<(projectId: string) => void>();
 
 /**
- * Fires with a project's id after a memory sync here moved its `memory` bookmark or its memory working copy, and after
- * every write of its memory from the dashboard.
+ * Fires with a project's id after a memory sync or a dashboard write here moved its `memory` bookmark or its memory
+ * working copy, and after a peer's push into its memory repo here (`git/serve.ts`).
  */
 export const memoryChanges: Subscribable<string> = {
   subscribe(cb) {
@@ -152,13 +153,13 @@ async function before(deps: ReplicaDeps, projectId: string, log: Log): Promise<v
   try {
     const { cfg, pool } = deps;
     const { home, repo } = await memoryOf(deps, projectId);
-    let remote: string | null = null;
-    if (home !== pool.identity.id) {
-      remote = shortId(home);
-      if (!pool.net.isOnline(home)) throw new Error(`home ${remote} is offline`);
-      await fetchMemory(cfg, repo, remote);
-    }
-    if (await settleMemory(cfg, repo, remote, resolved(projectId, log))) await followMemory(cfg, repo);
+    const remote = home === pool.identity.id ? null : shortId(home);
+    if (remote !== null && !pool.net.isOnline(home)) throw new Error(`home ${remote} is offline`);
+    // Fetched, settled and followed in one go, under the lock a peer's push into the repo takes too.
+    await serialised(repoKey(repo), async () => {
+      if (remote !== null) await fetchMemory(cfg, repo, remote);
+      if (await settleMemory(cfg, repo, remote, resolved(projectId, log))) await followMemory(cfg, repo);
+    });
   } catch (err) {
     log(`meddle: git: memory of ${shortId(projectId)} was not synced before the turn: ${oneLine(err)}`);
   }
@@ -184,17 +185,17 @@ async function after(deps: ReplicaDeps, projectId: string, log: Log, taskId: str
     const { cfg, pool } = deps;
     const self = pool.identity.id;
     const { home, repo } = await memoryOf(deps, projectId);
-    if ((await jj(["log", "-r", "@", "--no-graph", "-T", "empty"], repo, cfg)).trim() !== "true") {
-      // A commit with conflicts is never pushed: what a session wrote on top of one (tidying the markers up) goes into
-      // it instead of above it, so the tidied commit replaces the conflicted one and pushes again.
-      if ((await changes(cfg, repo, "@- & conflicts()")).length > 0) await jj(["squash", "--use-destination-message"], repo, cfg);
-      else await jj(["commit", "-m", `memory from ${shortId(self)}${taskId === null ? "" : `: task ${taskId}`}`], repo, cfg);
-    }
     const remote = home === self ? null : shortId(home);
     const online = remote !== null && pool.net.isOnline(home);
-    if (online) await fetchMemory(cfg, repo, remote);
-    // Settled, rebased onto and moved in one go: a peer's push to the home's `memory` cannot land in between.
+    // Committed, settled, rebased onto and moved in one go: a peer's push to the home's `memory` cannot land in between.
     const parent = await serialised(repoKey(repo), async () => {
+      if ((await jj(["log", "-r", "@", "--no-graph", "-T", "empty"], repo, cfg)).trim() !== "true") {
+        // A commit with conflicts is never pushed: what a session wrote on top of one (tidying the markers up) goes
+        // into it instead of above it, so the tidied commit replaces the conflicted one and pushes again.
+        if ((await changes(cfg, repo, "@- & conflicts()")).length > 0) await jj(["squash", "--use-destination-message"], repo, cfg);
+        else await jj(["commit", "-m", `memory from ${shortId(self)}${taskId === null ? "" : `: task ${taskId}`}`], repo, cfg);
+      }
+      if (online) await fetchMemory(cfg, repo, remote);
       const exists = await settleMemory(cfg, repo, remote, resolved(projectId, log));
       if (exists && !(await descends(cfg, repo, "@-", MEMORY_BOOKMARK))) {
         await jj(["rebase", "-b", "@", "-d", MEMORY_BOOKMARK], repo, cfg);
@@ -205,6 +206,7 @@ async function after(deps: ReplicaDeps, projectId: string, log: Log, taskId: str
     });
     if (parent === undefined || remote === null) return;
     if (!online) throw new Error(`home ${remote} is offline`);
+    // Outside the repo's lock: `pushBookmark` takes it itself.
     const pushed = (await bookmarkList(repo, cfg)).find((b) => b.name === MEMORY_BOOKMARK && b.remote === remote);
     if (pushed?.changeId === parent) return;
     await pushBookmark(cfg, repo, home, MEMORY_BOOKMARK, parent);
@@ -225,23 +227,26 @@ export class MemoryWriteError extends Error {
 
 /**
  * Writes the memory file `path` of `projectId` on its home (deletes it when `text` is null), commits just that file
- * (`memory: dashboard`) and moves `memory` onto it. `base` is the sha256 hex of the file as it was read (null: there
- * was none); when the file on disk is not that any more nothing is written. A working copy behind `memory` (a peer
- * pushed) is brought onto it first, unless a task of the project is `live` here, whose turn owns the working copy.
- * Rejects with a `MemoryWriteError`; resolves with the new change on `memory`.
+ * (`memory: dashboard`) and moves `memory` onto it; when that leaves the file as it was, nothing is committed. `base`
+ * is the sha256 hex of the file as it was read (null: there was none); when the file on disk is not that any more
+ * nothing is written. A working copy behind `memory` (a peer pushed) is brought onto it first, unless a task of the
+ * project is `live()` here (asked once the locks are held), whose turn owns the working copy. Rejects with a
+ * `MemoryWriteError`; resolves with the change `memory` is on after it.
  */
 export async function writeMemory(
-  deps: ReplicaDeps, projectId: string, path: string, text: string | null, base: string | null, live: boolean,
+  deps: ReplicaDeps, projectId: string, path: string, text: string | null, base: string | null, live: () => boolean,
 ): Promise<{ change: string }> {
   const repo = paths(deps.cfg).memory(projectId);
   // The memory sync's lock first, then the repo's (as a turn end takes them), so a peer's push waits for the write.
-  const written = await oneAtATime(deps, projectId, () => serialised(repoKey(repo), () => write(deps, projectId, repo, path, text, base, live)));
-  memoryChanged(projectId);
-  return written;
+  let written: { change: string } | undefined;
+  await oneAtATime(deps, projectId, () => noting(deps, projectId, async () => {
+    written = await serialised(repoKey(repo), () => write(deps, projectId, repo, path, text, base, live));
+  }));
+  return written!;
 }
 
 async function write(
-  deps: ReplicaDeps, projectId: string, repo: string, path: string, text: string | null, base: string | null, live: boolean,
+  deps: ReplicaDeps, projectId: string, repo: string, path: string, text: string | null, base: string | null, live: () => boolean,
 ): Promise<{ change: string }> {
   const { cfg } = deps;
   const project = getProject(deps.db, projectId);
@@ -252,7 +257,7 @@ async function write(
 
   if (await settleMemory(cfg, repo, null, resolved(projectId, defaultLog))) {
     if (!(await descends(cfg, repo, "@", MEMORY_BOOKMARK))) {
-      if (live) throw new MemoryWriteError("busy", "a turn of the project is live here and its memory is behind");
+      if (live()) throw new MemoryWriteError("busy", "a turn of the project is live here and its memory is behind");
       await followMemory(cfg, repo);
     }
   }
@@ -263,19 +268,36 @@ async function write(
   const now = bytes === null ? null : createHash("sha256").update(bytes).digest("hex");
   if (now !== base) throw new MemoryWriteError("changed", `${path} changed since it was read`);
 
-  if (text === null) {
-    await rm(file, { force: true });
-  } else {
-    // Never through a symlink: one put here since the check would send the write outside the repo.
-    const handle = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o644);
+  if (text === null) await rm(file, { force: true });
+  else await replaceFile(repo, file, text);
+  const fileset = `root-file:${JSON.stringify(path)}`;
+  if ((await jj(["diff", "--name-only", fileset], repo, cfg)).trim() === "") {
+    // The file is as `@-` has it: nothing to commit, and `memory` stays where it is (`@-` before there is one).
+    const [change] = [...(await changes(cfg, repo, `present(${MEMORY_BOOKMARK})`)), ...(await changes(cfg, repo, "@-"))];
+    return { change: change! };
+  }
+  await jj(["commit", "-m", "memory: dashboard", fileset], repo, cfg);
+  const [change] = await changes(cfg, repo, "@-");
+  await bookmarkSet(repo, MEMORY_BOOKMARK, change!, cfg);
+  return { change: change! };
+}
+
+/**
+ * Puts `text` at `file` in `repo` whole: written to a file under `.jj` (on the same filesystem, never snapshotted), then
+ * renamed over it, so a reader never sees half of it and a symlink put at `file` is replaced, never followed.
+ */
+async function replaceFile(repo: string, file: string, text: string): Promise<void> {
+  const temp = join(repo, ".jj", `meddle-write-${randomUUID()}`);
+  try {
+    const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
     try {
       await handle.writeFile(text);
     } finally {
       await handle.close();
     }
+    await rename(temp, file);
+  } catch (err) {
+    await rm(temp, { force: true });
+    throw err;
   }
-  await jj(["commit", "-m", "memory: dashboard", `root-file:${JSON.stringify(path)}`], repo, cfg);
-  const [change] = await changes(cfg, repo, "@-");
-  await bookmarkSet(repo, MEMORY_BOOKMARK, change!, cfg);
-  return { change: change! };
 }

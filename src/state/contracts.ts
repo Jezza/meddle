@@ -234,6 +234,34 @@ export const BranchSchema = Type.Object({
   waiting: Type.Array(Type.String()),
 });
 
+/** A change of a project's memory history (`MemoryChange`). */
+export const MemoryChangeSchema = Type.Object({
+  change: Type.String(),
+  /** The author timestamp, ISO 8601 in UTC. */
+  at: Type.String(),
+  node: Nullable(Type.String()),
+  task: Nullable(Type.String()),
+  kind: Type.Union([Type.Literal("task"), Type.Literal("dashboard"), Type.Literal("import"), Type.Literal("node"), Type.Literal("other")]),
+  /** The description's first line. */
+  description: Type.String(),
+  files: Type.Array(Type.String()),
+  added: Type.Number(),
+  removed: Type.Number(),
+});
+
+/** A memory file of a project on disk (`MemoryEntry`). */
+export const MemoryEntrySchema = Type.Object({
+  path: Type.String(),
+  size: Type.Number(),
+  /** sha256 hex of the bytes on disk: the `base` a write of it gives. */
+  hash: Type.String(),
+  name: Nullable(Type.String()),
+  description: Nullable(Type.String()),
+  type: Nullable(Type.String()),
+  /** The newest change under `memory` touching the path; null when the file is not in it yet. */
+  last: Nullable(MemoryChangeSchema),
+});
+
 export const ProjectObject = remote("meddle.project", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
@@ -250,6 +278,35 @@ export const ProjectObject = remote("meddle.project", {
         heads: Type.Array(HeadSchema),
         /** The project's branches, by name: re-computed when its branch rows change, and every 60 s. */
         branches: Type.Array(BranchSchema),
+        /**
+         * The change `memory` is on in this node's memory repo of the project, null without one (or without `memory`):
+         * re-read whenever a memory sync, a dashboard write or a peer's push here moves it.
+         */
+        memoryHead: Nullable(Type.String()),
+      },
+      methods: {
+        // The reads of the project's memory work on any node holding its memory repo (refused without one); a path
+        // that is not a memory file (a `*.md` in the repo's top folder) is refused (`path: …`).
+        /** Every memory file on disk, `MEMORY.md` first. */
+        memoryEntries: method(Type.Object({}), Type.Array(MemoryEntrySchema)),
+        /** The file on disk, or at `change` (or its parent, `<change>-`); null where it is absent. */
+        memoryFile: method(Type.Object({ path: Type.String(), change: Type.Optional(Type.String()) }), Nullable(Type.String())),
+        /** The history under `memory`, newest first: below `before`, touching `path`, at most `limit` (1..200). */
+        memoryHistory: method(
+          Type.Object({ before: Type.Optional(Type.String()), limit: Type.Number(), path: Type.Optional(Type.String()) }),
+          Type.Array(MemoryChangeSchema),
+        ),
+        /** `change`'s diff, in git's format. */
+        memoryDiff: method(Type.Object({ change: Type.String() }), Type.String()),
+        /**
+         * Writes (`deleteMemory`: deletes) a memory file on the project's home and commits just it to `memory`; `base`
+         * is the `hash` it was read with (null: it was absent). Answers the change `memory` is on after it (where it
+         * was when that left the file as it was). Refused with a reason (as `remoteReason` reads it) starting with why:
+         * `changed:` (the file is not `base` any more), `busy:` (a turn of the project is live and its memory is
+         * behind), `path:`, `not-home:` or `no-repo:`; any other failure as it is.
+         */
+        writeMemory: method(Type.Object({ path: Type.String(), text: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
+        deleteMemory: method(Type.Object({ path: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
       },
     },
   },

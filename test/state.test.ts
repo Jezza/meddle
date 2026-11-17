@@ -8,6 +8,8 @@ import { linkClient, startPoolNode } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
 import { getTask } from "../src/store/records";
 import { readManifest } from "../src/tasks/manifest";
+import { createHash } from "node:crypto";
+import { remoteReason } from "../src/pool/object";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -377,5 +379,99 @@ test("a task's bookmarks are listed without waiting for a push holding its repli
     node.release();
   } finally {
     await close();
+  }
+}, 15_000);
+
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+test("memoryHead follows a dashboard write", async () => {
+  const { client, project, close } = await connect();
+  try {
+    const view = await client.get(ProjectObject, { id: project.id });
+    const before = view.memoryHead.value;
+    const { change } = await view.writeMemory({ path: "a.md", text: "x\n", base: null });
+    expect(change).not.toBe(before);
+    expect(await until(view.memoryHead, (head) => head === change)).toBe(change);
+    view.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("memoryEntries and memoryHistory come back over the object", async () => {
+  const { client, project, close } = await connect();
+  try {
+    const view = await client.get(ProjectObject, { id: project.id });
+    const text = "---\nname: Tides\ndescription: when the tide turns\ntype: user\n---\nbody\n";
+    const first = await view.writeMemory({ path: "tides.md", text, base: null });
+    const second = await view.writeMemory({ path: "MEMORY.md", text: "- [Tides](tides.md)\n", base: null });
+
+    const entries = await view.memoryEntries({});
+    expect(entries.map((e) => e.path)).toEqual(["MEMORY.md", "tides.md"]);
+    expect(entries[1]).toMatchObject({
+      path: "tides.md", size: text.length, hash: sha256(text), name: "Tides", description: "when the tide turns", type: "user",
+      last: { change: first.change, kind: "dashboard", node: null, task: null, description: "memory: dashboard", files: ["tides.md"], removed: 0 },
+    });
+
+    const history = await view.memoryHistory({ limit: 10 });
+    expect(history.slice(0, 2).map((c) => c.change)).toEqual([second.change, first.change]);
+    expect(history[0]).toMatchObject({ kind: "dashboard", files: ["MEMORY.md"], added: 1, removed: 0 });
+    expect(history[0]!.at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    // The limit is clamped to 1..200.
+    expect(await view.memoryHistory({ limit: 0 })).toHaveLength(1);
+    expect((await view.memoryHistory({ limit: 1, before: second.change })).map((c) => c.change)).toEqual([first.change]);
+    expect((await view.memoryHistory({ limit: 10, path: "tides.md" })).map((c) => c.change)).toEqual([first.change]);
+
+    expect(await view.memoryFile({ path: "tides.md" })).toBe(text);
+    expect(await view.memoryFile({ path: "tides.md", change: first.change })).toBe(text);
+    expect(await view.memoryFile({ path: "tides.md", change: `${first.change}-` })).toBeNull();
+    expect(await view.memoryDiff({ change: first.change })).toContain("+name: Tides");
+    // A read refuses a path that is not a memory file.
+    const refused = await view.memoryFile({ path: "../x.md" }).then(() => "", remoteReason);
+    expect(refused).toStartWith("path:");
+    view.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a changed base reaches the caller as changed:, and a delete takes the file out", async () => {
+  const { client, project, close } = await connect();
+  try {
+    const view = await client.get(ProjectObject, { id: project.id });
+    await view.writeMemory({ path: "a.md", text: "x\n", base: null });
+    // As the dashboard reads it: the reason, without chord's own code.
+    const refused = await view.writeMemory({ path: "a.md", text: "z\n", base: sha256("y\n") }).then(() => "", remoteReason);
+    expect(refused).toStartWith("changed:");
+    expect(await view.memoryFile({ path: "a.md" })).toBe("x\n");
+
+    const { change } = await view.deleteMemory({ path: "a.md", base: sha256("x\n") });
+    expect(await view.memoryFile({ path: "a.md" })).toBeNull();
+    expect((await view.memoryEntries({})).map((e) => e.path)).not.toContain("a.md");
+    expect(await until(view.memoryHead, (head) => head === change)).toBe(change);
+    view.release();
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("while an update awaits confirmation, a project's memory is not written, and still reads", async () => {
+  let held: string | null = null;
+  const node = await startPoolNode(undefined, {}, { inputHold: () => held });
+  const { client, close } = linkClient(node.host);
+  try {
+    const view = await client.get(ProjectObject, { id: node.project.id });
+    held = "update in progress";
+    const refusal = (p: Promise<unknown>) => p.then(() => "", (err: unknown) => (err as Error).message);
+    expect(await refusal(view.writeMemory({ path: "a.md", text: "x\n", base: null }))).toContain("update in progress");
+    expect(await refusal(view.deleteMemory({ path: "a.md", base: null }))).toContain("update in progress");
+    expect(await view.memoryEntries({})).toEqual([]);
+    held = null;
+    await view.writeMemory({ path: "a.md", text: "x\n", base: null });
+    expect((await view.memoryEntries({})).map((e) => e.path)).toEqual(["a.md"]);
+    view.release();
+  } finally {
+    await close();
+    await node.close();
   }
 }, 15_000);

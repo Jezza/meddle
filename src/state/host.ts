@@ -3,7 +3,7 @@
 import { hostname } from "node:os";
 import Type from "typebox";
 import type { Database } from "bun:sqlite";
-import { createHost, forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
+import { ChordError, createHost, forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { checkTaskRoot, type NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
@@ -14,9 +14,13 @@ import type { PoolRuntime } from "../pool/runtime";
 import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
 import { listBranchRows, listLineRows, rowChanges } from "../pool/rows";
-import { bookmarkList } from "../jj";
+import { bookmarkList, isJjRepo, jj } from "../jj";
+import { MEMORY_BOOKMARK } from "../memory";
+import { paths } from "../paths";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
+import { memoryChanges, MemoryWriteError, writeMemory } from "../projects/memory-sync";
+import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory } from "../projects/memory-view";
 import { releaseLineRows } from "../projects/lines";
 import { resolveStarts } from "../projects/starts";
 import {
@@ -63,7 +67,8 @@ export type NodeHostDeps = {
   pool: PoolRuntime;
   /**
    * Why this node accepts no input now (its new build awaits confirmation: `Updater.inputHold`), or null. While it
-   * says, every method of `NodeObject`, `TaskObject` and `PoolObject`'s default variant is refused with it.
+   * says, every method of `NodeObject`, `TaskObject` and `PoolObject`'s default variant is refused with it, and
+   * `ProjectObject`'s writes of memory.
    */
   inputHold?(): string | null;
 };
@@ -75,6 +80,16 @@ const NOTIFICATIONS_KEPT = 50;
 /** How often a `ProjectObject` re-reads its replica's bookmarks when nothing told it they changed (pushes from peers). */
 const HEADS_REFRESH_MS = 60_000;
 const WINDOW_SIZE = 200;
+/** The most changes of a project's memory history one `memoryHistory` call answers. */
+const MEMORY_HISTORY_MAX = 200;
+
+/**
+ * A refusal of a memory call whose reason starts with `code` (`changed: …`) as the caller reads it (`remoteReason`).
+ * A chord error, as chord takes a plain error's leading `<word>: ` for its own code and drops it on the way.
+ */
+function memoryRefusal(code: string, message: string): ChordError {
+  return new ChordError("unavailable", `${code}: ${message}`);
+}
 
 export type PeerObjectDeps = {
   cfg: NodeConfig;
@@ -556,6 +571,39 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     // Any row change, a push of another node's that waits for its commit included (still fetching until admitted).
     self.on("rows", rowChanges, (projectId, ctx) => { if (projectId === id) return refreshBranches(ctx); });
     self.on("branchTicks", headTicks, (_event, ctx) => refreshBranches(ctx));
+
+    const memoryRepo = paths(cfg).memory(id);
+    /** The change `memory` is on, read without a snapshot (an agent may be writing there); null without one. */
+    const memoryHeadNow = async () => {
+      try {
+        const out = await jj(["--ignore-working-copy", "log", "-r", `present(${MEMORY_BOOKMARK})`, "-n", "1", "--no-graph", "-T", "change_id"], memoryRepo, cfg);
+        return out.trim() === "" ? null : out.trim();
+      } catch {
+        return null;
+      }
+    };
+    const memoryHead = self.state("memoryHead", ProjectObject.def.variants.default.state.memoryHead, { init: memoryHeadNow });
+    const refreshMemoryHead = latest(memoryHeadNow, memoryHead);
+    self.on("memory", memoryChanges, (projectId, ctx) => { if (projectId === id) return refreshMemoryHead(ctx); });
+    /** The memory repo, for a read; refused without one. */
+    const readable = async () => {
+      if (!(await isJjRepo(memoryRepo))) throw memoryRefusal("no-repo", "no memory replica here");
+      return memoryRepo;
+    };
+    const memoryPath = (path: string) => {
+      if (!isMemoryPath(path)) throw memoryRefusal("path", `not a memory file: ${JSON.stringify(path)}`);
+      return path;
+    };
+    /** A write of memory, its refusals (`MemoryWriteError`) with their code first; any other failure as it is. */
+    const write = async (path: string, text: string | null, base: string | null) => {
+      try {
+        return await writeMemory({ cfg, db, pool }, id, path, text, base, () => runner.projectLive(id));
+      } catch (err) {
+        if (err instanceof MemoryWriteError) throw memoryRefusal(err.code, err.message);
+        throw err;
+      }
+    };
+
     return {
       variant: "default",
       id: self.derive([project], (p) => p.id),
@@ -567,6 +615,19 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       contextLoaded: self.derive([project], (p) => p.contextLoaded),
       heads,
       branches,
+      memoryHead,
+      memoryEntries: async () => memoryEntries(cfg, await readable()),
+      memoryFile: async ({ path, change }) => memoryFile(cfg, await readable(), memoryPath(path), change),
+      memoryHistory: async ({ before, limit, path }) => memoryHistory(cfg, await readable(), {
+        ...(before === undefined ? {} : { before }),
+        limit: Math.min(MEMORY_HISTORY_MAX, Math.max(1, Math.trunc(limit))),
+        ...(path === undefined ? {} : { path: memoryPath(path) }),
+      }),
+      memoryDiff: async ({ change }) => memoryDiff(cfg, await readable(), change),
+      ...gated({
+        writeMemory: ({ path, text, base }: { path: string; text: string; base: string | null }) => write(path, text, base),
+        deleteMemory: ({ path, base }: { path: string; base: string | null }) => write(path, null, base),
+      }, deps.inputHold),
     };
   });
 

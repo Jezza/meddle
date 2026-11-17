@@ -18,6 +18,7 @@ import { listBranchRows, writeBranchRow, type BranchRow } from "../pool/rows";
 import type { PoolRuntime } from "../pool/runtime";
 import { applyProject, catchUp, gitGraph, holdView, releaseView } from "../projects/applier";
 import { computeBranch, planPush, type BranchHeads, type PushedRef } from "../projects/branches";
+import { memoryChanged } from "../projects/memory-sync";
 import { getProject } from "../projects/project";
 import { rosterProjectIds } from "../projects/replicas";
 import { repoKey, serialised } from "../serial";
@@ -361,7 +362,24 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
   });
 
   let served: Served;
-  if (project === null) {
+  if (project === null && request.service === "receive-pack") {
+    // A peer's push into a memory repo (a project repo takes none from a peer). It lands and jj imports it, without a
+    // snapshot, under the repo's lock, so it never lands between a memory sync's steps here (or a dashboard write's),
+    // and the bookmark is there when its push returns. (A checkout's push lands in the view, which jj never imports.)
+    const memory = request.repo.id;
+    let imported = false;
+    served = await serialised(repoKey(repo), async () => {
+      const done = await pipe(s, spawn(command(deps.cfg, request.service, gitDir), {}));
+      if (done.code === 0) {
+        imported = await gitImport(repo, deps.cfg).then(() => true, (err: unknown) => {
+          deps.log?.(`meddle: git: what ${shortId(s.peerId)} pushed to ${repoName(request.repo)} was not imported: ${oneLine(err)}`);
+          return false;
+        });
+      }
+      return done;
+    });
+    if (imported) memoryChanged(memory);
+  } else if (project === null) {
     served = await pipe(s, spawn(command(deps.cfg, request.service, gitDir), {}));
   } else if (request.service === "upload-pack") {
     served = await pipe(s, spawn(viewCommand(deps.cfg, request.service, gitDir), {}));
@@ -399,14 +417,7 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
       });
     }
   }
-  const { code, delivered, input } = served;
-  // A peer's push landed in the memory repo: jj imports it now, so the bookmark is there when its push returns.
-  // Without a snapshot. (A checkout's push lands in the view, which jj never imports.)
-  if (code === 0 && request.service === "receive-pack" && project === null) {
-    await gitImport(repo, deps.cfg).catch((err: unknown) => {
-      deps.log?.(`meddle: git: what ${shortId(s.peerId)} pushed to ${repoName(request.repo)} was not imported: ${oneLine(err)}`);
-    });
-  }
+  const { delivered, input } = served;
   if (delivered) await s.stream.send.finish().catch(() => {});
   else await s.stream.send.reset(0n).catch(() => {});
   // The process is gone: nothing more the peer sends has anywhere to go.
