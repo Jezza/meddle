@@ -3,7 +3,8 @@
 export type View =
   /** Nothing chosen: the first task waiting on you, else a new task. */
   | { name: "home" }
-  | { name: "task"; nodeId: string; id: string }
+  /** A task: its thread, or with `tab`, its changes. */
+  | { name: "task"; nodeId: string; id: string; tab?: "changes" }
   /** A new task: in one project, or (null) with none chosen yet. */
   | { name: "new"; projectId: string | null }
   | { name: "project"; id: string }
@@ -12,7 +13,7 @@ export type View =
   | { name: "settings" };
 
 /**
- * The view a location hash names (`#/task/<nodeId>/<taskId>`, `#/new[/<projectId>]`, `#/project/<id>`,
+ * The view a location hash names (`#/task/<nodeId>/<taskId>[/changes]`, `#/new[/<projectId>]`, `#/project/<id>`,
  * `#/projects/add`, `#/node/<nodeId>`, `#/settings`), home otherwise (a malformed escape included).
  */
 export function viewOf(hash: string): View {
@@ -25,6 +26,7 @@ export function viewOf(hash: string): View {
   const [, name, a, b] = parts;
   const given = (s: string | undefined): s is string => s !== undefined && s !== "";
   if (name === "task" && parts.length === 4 && given(a) && given(b)) return { name: "task", nodeId: a, id: b };
+  if (name === "task" && parts.length === 5 && given(a) && given(b) && parts[4] === "changes") return { name: "task", nodeId: a, id: b, tab: "changes" };
   if (name === "new" && parts.length === 2) return { name: "new", projectId: null };
   if (name === "new" && parts.length === 3 && given(a)) return { name: "new", projectId: a };
   if (name === "project" && parts.length === 3 && given(a)) return { name: "project", id: a };
@@ -41,7 +43,7 @@ export function hashOf(view: View): string {
   const e = encodeURIComponent;
   switch (view.name) {
     case "home": return "#/";
-    case "task": return `#/task/${e(view.nodeId)}/${e(view.id)}`;
+    case "task": return `#/task/${e(view.nodeId)}/${e(view.id)}${view.tab === "changes" ? "/changes" : ""}`;
     case "new": return view.projectId === null ? "#/new" : `#/new/${e(view.projectId)}`;
     case "project": return `#/project/${e(view.id)}`;
     case "add-project": return "#/projects/add";

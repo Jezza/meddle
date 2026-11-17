@@ -7,6 +7,8 @@ import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffec
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useObject, useValue } from "./hooks";
+import { Changes } from "./Changes";
+import { changeCount } from "./changes-model";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Iconoir } from "./icons";
@@ -37,8 +39,11 @@ DOMPurify.addHook("afterSanitizeAttributes", (el) => {
   }
 });
 
+/** Which of a task's views shows: its thread, or its changes. */
+type Tab = "changes" | undefined;
+
 /** A task on any member: through that node's host while it is online. */
-export function TaskView({ hosts, pool, nodeId, taskId }: { hosts: Hosts; pool: PoolRef; nodeId: string; taskId: string }) {
+export function TaskView({ hosts, pool, nodeId, taskId, tab }: { hosts: Hosts; pool: PoolRef; nodeId: string; taskId: string; tab: Tab }) {
   const row = useValue(pool.nodes).find((n) => n.nodeId === nodeId);
   const message = (text: string, cls = "muted") => <><PaneHead><span class="muted">Task</span></PaneHead><p class={`pane-note ${cls}`}>{text}</p></>;
   // This node's own tasks are always reachable over /ws.
@@ -49,10 +54,10 @@ export function TaskView({ hosts, pool, nodeId, taskId }: { hosts: Hosts; pool: 
   }
   const host = hosts.for(nodeId);
   if (host === undefined) return <><PaneHead><span class="muted">Task</span></PaneHead><div class="pane-note"><Unavailable status={hosts.status(nodeId)} /></div></>;
-  return <TaskOnline host={host} pool={pool} taskId={taskId} />;
+  return <TaskOnline host={host} pool={pool} taskId={taskId} tab={tab} />;
 }
 
-function TaskOnline({ host, pool, taskId }: { host: Host; pool: PoolRef; taskId: string }) {
+function TaskOnline({ host, pool, taskId, tab }: { host: Host; pool: PoolRef; taskId: string; tab: Tab }) {
   const node = useObject(host, NodeObject, {});
   const task = useObject(host, TaskObject, { id: taskId });
   const session = useObject(host, SessionObject, { taskId });
@@ -61,10 +66,10 @@ function TaskOnline({ host, pool, taskId }: { host: Host; pool: PoolRef; taskId:
   if (node.ref === undefined || task.ref === undefined || session.ref === undefined) {
     return <><PaneHead><span class="muted">Loading task…</span></PaneHead></>;
   }
-  return <TaskLoaded node={node.ref} pool={pool} task={task.ref} session={session.ref} />;
+  return <TaskLoaded node={node.ref} pool={pool} task={task.ref} session={session.ref} tab={tab} />;
 }
 
-function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRef; task: TaskRef; session: SessionRef }) {
+function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: PoolRef; task: TaskRef; session: SessionRef; tab: Tab }) {
   const manifest = useValue(task.manifest);
   const state = useValue(task.state);
   const pending = useValue(task.pending);
@@ -73,6 +78,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const movedTo = useValue(task.movedTo);
   const archivedOn = useValue(task.archivedOn);
   const acceptance = useValue(task.acceptance);
+  const changes = useValue(task.changes);
   const nodeId = useValue(node.nodeId);
   const nodes = useValue(pool.nodes);
   const nameOf = (id: string) => nodes.find((n) => n.nodeId === id)?.hostname ?? shortId(id);
@@ -86,6 +92,9 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   const archived = state === "archived";
   const moving = state === "moving" || move !== null;
   const live = state === "running" || state === "waiting";
+  // The changes show only for a task with a project, live here: `changes` is [] otherwise.
+  const switchable = manifest.projects.length > 0 && changes.length > 0;
+  const showChanges = switchable && tab === "changes";
   /** Shows every event in the thread, the ones it otherwise leaves out included. */
   const [raw, setRaw] = useState(false);
   // What the composer holds, here so that a failed text's Edit can put it back.
@@ -103,9 +112,10 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
   return (
     <div class="task">
       <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving}
-        partly={acceptance === "partly" && !archived && state !== "moved"} raw={raw} onRaw={() => setRaw(!raw)} />
+        partly={acceptance === "partly" && !archived && state !== "moved"} raw={raw} onRaw={() => setRaw(!raw)}
+        changes={switchable ? { count: changeCount(changes), on: showChanges } : null} />
       {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
-      {state === "moved" ? (
+      {showChanges ? <Changes task={task} /> : state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
       ) : (
         <Thread task={task} session={session} readOnly={archived} working={state === "running"} raw={raw} after={<>
@@ -116,7 +126,7 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
           ))}
         </>} />
       )}
-      {!archived && state !== "moved" && (
+      {!archived && state !== "moved" && !showChanges && (
         <Composer task={task} running={live} disabled={moving} text={draft} setText={setDraft} box={box}
           onFailed={(text, error) => setFailed((all) => [...all, { id: ++failedId.current, text, error }])} />
       )}
@@ -127,11 +137,13 @@ function TaskLoaded({ node, pool, task, session }: { node: NodeRef; pool: PoolRe
 
 // ─── the head ───
 
-function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, raw, onRaw }: {
+function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, raw, onRaw, changes }: {
   task: TaskRef; nodes: PoolRef["nodes"]["value"]; nodeId: string; title: string; state: string; pendingCount: number; moving: boolean;
   /** A pushed branch contains the task's line for some of its projects, not all: nothing is archived yet. */
   partly: boolean;
   raw: boolean; onRaw: () => void;
+  /** The `Thread` / `Changes n` switch: the non-empty changes, and whether they show; null hides it. */
+  changes: { count: number; on: boolean } | null;
 }) {
   const [renaming, setRenaming] = useState(false);
   const [restoreAt, setRestoreAt] = useState<Anchor | null>(null);
@@ -163,6 +175,14 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
       </div>
       <div class="head-actions">
         {action.error !== null && <span class="error" title={action.error}>{action.error}</span>}
+        {changes !== null && (
+          <nav class="task-tabs" aria-label="Task view">
+            <a class={changes.on ? "" : "on"} aria-current={changes.on ? undefined : "page"}
+              href={hashOf({ name: "task", nodeId, id: task.manifest.value.id })}>Thread</a>
+            <a class={changes.on ? "on" : ""} aria-current={changes.on ? "page" : undefined}
+              href={hashOf({ name: "task", nodeId, id: task.manifest.value.id, tab: "changes" })}>Changes {changes.count}</a>
+          </nav>
+        )}
         <button class={raw ? "on" : ""} aria-pressed={raw} title="Show every event, bookkeeping included" onClick={onRaw}>Raw</button>
         {live && <button disabled={moving || action.busy} onClick={() => action.run(() => task.interrupt({}))}>■ Interrupt</button>}
         {/* Retry runs a parked turn (one that crashed the node too often) again, or carries on an idle task's last turn (interrupted or failed). */}
@@ -252,7 +272,8 @@ function Thread({ task, session, readOnly, working, raw, after }: {
   const events = useMemo(() => [...merged(seen, window).values()].sort((a, b) => a.seq - b.seq), [seen, window]);
   const items = useMemo(() => buildThread(events), [events]);
   const blocks = useMemo(() => blocksOf(foldSteps(items, raw)), [items, raw]);
-  const view = useMemo(() => ({ cwd: cwdOf(events), raw, task }), [events, raw, task]);
+  // A read-only thread has no task to open a large file's diff from: its workspace is gone, and the read refused.
+  const view = useMemo(() => ({ cwd: cwdOf(events), raw, task: readOnly ? null : task }), [events, raw, task, readOnly]);
   const oldest = events[0]?.seq;
 
   // Kept at the bottom while you are there; left alone while you read further up.

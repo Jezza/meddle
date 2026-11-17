@@ -9,6 +9,9 @@ import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
+import { changeCount, changeLabel, summary, totals } from "../src/dashboard/ui/changes-model";
+import type { FilePatch } from "../src/dashboard/ui/git-diff";
+import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 
 test("the dashboard bundle builds", async () => {
   const build = await Bun.build({ entrypoints: ["src/dashboard/ui/main.tsx"], target: "browser", format: "esm" });
@@ -19,6 +22,7 @@ test("viewOf and hashOf round-trip every route", () => {
   const views = [
     { name: "home" },
     { name: "task", nodeId: "abc", id: "t1" },
+    { name: "task", nodeId: "abc", id: "t1", tab: "changes" },
     { name: "new", projectId: null },
     { name: "new", projectId: "p/1" },
     { name: "project", id: "p1" },
@@ -28,6 +32,9 @@ test("viewOf and hashOf round-trip every route", () => {
   ] as const;
   for (const view of views) expect(viewOf(hashOf(view))).toEqual(view);
   expect(hashOf({ name: "task", nodeId: "abc", id: "t1" })).toBe("#/task/abc/t1");
+  expect(hashOf({ name: "task", nodeId: "abc", id: "t1", tab: "changes" })).toBe("#/task/abc/t1/changes");
+  expect(viewOf("#/task/abc/t1")).not.toHaveProperty("tab");
+  expect(viewOf("#/task/abc/t1/other")).toEqual({ name: "home" });
   expect(viewOf("")).toEqual({ name: "home" });
   expect(viewOf("#/task/t1")).toEqual({ name: "home" });          // the Plan 1 shape no longer resolves
   expect(viewOf("#/pool")).toEqual({ name: "home" });             // the old pool and projects pages
@@ -338,4 +345,36 @@ test("mergeFirstPage puts new changes on top and keeps the pages loaded below", 
   expect(mergeFirstPage(loaded, ["e", "d"].map(c), 3)).toEqual({ list: ["e", "d"].map(c), more: false });
   // Nothing loaded yet: the page as it is.
   expect(mergeFirstPage(null, ["b", "a"].map(c), 2)).toEqual({ list: ["b", "a"].map(c), more: true });
+});
+
+const change = (over: Partial<TaskChange>): TaskChange => ({
+  change: "kpmxqwrtzzzzzzzz", commit: "c".repeat(40), description: "", files: 1, added: 1, removed: 0,
+  empty: false, conflicted: false, workingCopy: false, ...over,
+});
+const project = (over: Partial<ProjectChanges>): ProjectChanges => ({ project: "p1", name: "meddle", start: "main", conflicted: false, changes: [], ...over });
+
+test("changeCount counts the non-empty changes of every project", () => {
+  expect(changeCount([])).toBe(0);
+  expect(changeCount([
+    project({ changes: [change({ workingCopy: true, empty: true, files: 0, added: 0 }), change({}), change({})] }),
+    project({ project: "p2", changes: [change({ empty: true, files: 0, added: 0 }), change({})] }),
+  ])).toBe(3);
+});
+
+test("summary says how many changes since the start", () => {
+  expect(summary(project({ changes: [change({ workingCopy: true, empty: true }), change({}), change({})] }))).toBe("2 changes on main");
+  expect(summary(project({ start: "xqttoluq", changes: [change({})] }))).toBe("1 change on xqttoluq");
+  expect(summary(project({}))).toBe("0 changes on main");
+});
+
+test("totals sums a diff's files and lines", () => {
+  const patch = (added: number, removed: number): FilePatch => ({ path: "a", status: "modified", binary: false, hunks: [], added, removed });
+  expect(totals([patch(5, 2), patch(8, 0), patch(48, 0)])).toEqual({ files: 3, added: 61, removed: 2 });
+  expect(totals([])).toEqual({ files: 0, added: 0, removed: 0 });
+});
+
+test("changeLabel names the working copy, else the description, else the short id", () => {
+  expect(changeLabel(change({ workingCopy: true, description: "Wip" }))).toBe("Working copy");
+  expect(changeLabel(change({ description: "Add DiffView" }))).toBe("Add DiffView");
+  expect(changeLabel(change({ description: "" }))).toBe("kpmxqwrt");
 });
