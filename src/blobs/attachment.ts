@@ -89,12 +89,12 @@ export function queueEntry(p: Prompt): string | Prompt {
 /**
  * Per attachment, whether it goes to Claude as an image block. In order, a supported image within the per-image limit
  * and what is left of the budget goes inline and uses that much up; one that does not fit goes as a file, and a later,
- * smaller one may still go inline.
+ * smaller one may still go inline. An empty image never does: an empty image block would likely fail the turn.
  */
 export function inlined(attachments: readonly Attachment[]): boolean[] {
   let left = IMAGE_BUDGET_BASE64;
   return attachments.map((a) => {
-    if (!INLINE_IMAGE_TYPES.includes(a.type)) return false;
+    if (!INLINE_IMAGE_TYPES.includes(a.type) || a.size <= 0) return false;
     const base64 = base64Length(a.size);
     if (base64 > MAX_IMAGE_BASE64 || base64 > left) return false;
     left -= base64;

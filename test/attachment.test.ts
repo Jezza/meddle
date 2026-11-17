@@ -99,3 +99,7 @@ test("inlined skips what does not fit and goes on, so a later smaller image can 
   expect(inlined([att({ size: 4_000_000 }), att({ size: small })])).toEqual([false, true]);
   expect(inlined([])).toEqual([]);
 });
+test("inlined never inlines an empty image: an empty image block would likely fail the turn", () => {
+  expect(inlined([att({ size: 0 })])).toEqual([false]);
+  expect(inlined([att({ size: 0 }), att({ size: 1 })])).toEqual([false, true]);
+});
