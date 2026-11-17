@@ -183,6 +183,36 @@ test("exitCode reads a failed command's code; paths show relative to the session
   expect(cwdOf([])).toBe("");
 });
 
+test("a skill's text goes with its Skill call, not into the thread as a message from you", () => {
+  const call = (seq: number, id: string, skill: string) =>
+    ({ seq, message: { type: "assistant", message: { id: `m${seq}`, content: [{ type: "tool_use", id, name: "Skill", input: { skill } }] }, parent_tool_use_id: null } });
+  const launched = (seq: number, id: string, skill: string) => ({
+    seq,
+    message: {
+      type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: `Launching skill: ${skill}` }] },
+      parent_tool_use_id: null, tool_use_result: { success: true, commandName: skill },
+    },
+  });
+  const synthetic = (seq: number, text: string) =>
+    ({ seq, message: { type: "user", message: { role: "user", content: [{ type: "text", text }] }, parent_tool_use_id: null, isSynthetic: true } });
+  const items = buildThread([
+    call(1, "tu1", "brainstorming"),
+    launched(2, "tu1", "brainstorming"),
+    synthetic(3, "Base directory for this skill: /s\n\n# Brainstorming"),
+    { seq: 4, message: { type: "assistant", message: { id: "m4", content: [{ type: "text", text: "Using it" }] }, parent_tool_use_id: null } },
+    // A skill that ran in a subagent sends no text: a later synthetic message is not its.
+    call(5, "tu2", "forked"),
+    launched(6, "tu2", "forked"),
+    { seq: 7, message: { type: "assistant", message: { id: "m7", content: [{ type: "text", text: "Done" }] }, parent_tool_use_id: null } },
+    synthetic(8, "something else"),
+  ]);
+  expect(items.map((i) => i.kind)).toEqual(["tool", "assistant", "tool", "assistant", "user"]);
+  expect(items[0]).toMatchObject({ name: "Skill", result: { text: "Launching skill: brainstorming" }, skill: "Base directory for this skill: /s\n\n# Brainstorming" });
+  expect((items[2] as ToolItem).skill).toBeUndefined();
+  expect(items[4]).toEqual({ kind: "user", text: "something else" });
+  expect(toolTarget(items[0] as ToolItem, "/w")).toBe("brainstorming");
+});
+
 test("a rate limit event says something only when the limit is not plainly allowed", () => {
   const items = buildThread([
     { seq: 1, message: { type: "rate_limit_event", rate_limit_info: { status: "allowed" } } },

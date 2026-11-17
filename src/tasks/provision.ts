@@ -60,8 +60,10 @@ export function cwdFor(
  * What a task's workspace takes as `immutable_heads()` (Decision 2): each commit of `base` and everything below it;
  * every local bookmark but task `taskId`'s own (`meddle/task/<id>/*`): the branches and this node's other tasks'
  * lines; and every line held elsewhere (`task/<t>/*@meddle`) but the task's own, which it has before provisioning and
- * on a receiver before activation. Its agent may rewrite its own line and anything else. The remote term picks lines by
- * bookmark name, so a commit another node's line also holds stays immutable to it. The local term is a difference of
+ * on a receiver before activation. A service repo that is also its project's checkout (a folder project added before
+ * service repos were kept apart) holds every line its fetch brought back too, as `meddle/task/<t>/*@meddle`: the
+ * task's own among them is its own as well. Its agent may rewrite its own line and anything else. The remote term picks
+ * lines by bookmark name, so a commit another node's line also holds stays immutable to it. The local term is a difference of
  * commit sets: a branch's commit (or another local line's) is protected only while the task's own bookmark is not on it
  * too. A branch the agent drags along that way is put back at turn end (`applyProject`), and checkouts only ever see
  * branches as their rows say, never the service repo's bookmarks.
@@ -70,7 +72,7 @@ export function workspaceImmutableHeads(taskId: string, base: string[]): string 
   return [
     ...base.map((commit) => `present(${commit})`),
     `(bookmarks() ~ bookmarks(glob:"meddle/task/${taskId}/*"))`,
-    `untracked_remote_bookmarks(~glob:"task/${taskId}/*", remote=exact:"meddle")`,
+    `untracked_remote_bookmarks(~(glob:"task/${taskId}/*" | glob:"meddle/task/${taskId}/*"), remote=exact:"meddle")`,
   ].join(" | ");
 }
 
