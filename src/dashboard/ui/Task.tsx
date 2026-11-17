@@ -553,6 +553,7 @@ function ToolRow({ tool }: { tool: ToolItem }) {
           </div>
         )}
         {result !== undefined && result.text !== "" && !(edit && !failed) && <pre class={failed ? "out error" : "out"}>{result.text}</pre>}
+        {tool.skill !== undefined && <pre class="out">{tool.skill}</pre>}
       </div>
     </details>
   );
