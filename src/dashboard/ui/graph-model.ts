@@ -22,7 +22,10 @@ export function mergeGraphs(nodes: readonly NodeGraph[]): Row[] {
   const marks = new Map<string, { bookmark: GraphBookmark; at: Map<string, string[]> }>();
   for (const { nodeId, graph } of nodes) {
     for (const c of graph) {
-      if (!byId.has(c.commit)) byId.set(c.commit, c);
+      // A line is mutable on its holder and immutable elsewhere (a remote bookmark there): mutable anywhere wins.
+      const known = byId.get(c.commit);
+      if (known === undefined) byId.set(c.commit, c);
+      else if (known.immutable && !c.immutable) byId.set(c.commit, { ...known, immutable: false });
       holders.set(c.commit, (holders.get(c.commit) ?? 0) + 1);
       for (const bookmark of c.bookmarks) {
         const key = JSON.stringify(bookmark);
@@ -97,11 +100,6 @@ function ancestry(byId: ReadonlyMap<string, GraphCommit>): (commit: string) => R
     memo.set(commit, seen);
     return seen;
   };
-}
-
-/** `⌂ a · b`, the nodes with a bookmark here, then `atTail`. */
-export function atText(label: Label, nodeName: (nodeId: string) => string): string {
-  return `⌂ ${label.nodes.map(nodeName).join(" · ")}${atTail(label)}`;
 }
 
 /** What follows a label's nodes: ` · n behind`, ` · not pushed`, or nothing. */

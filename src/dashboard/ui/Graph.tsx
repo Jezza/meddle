@@ -98,14 +98,14 @@ function Pill({ label, taskOf }: { label: Label; taskOf: GraphProps["taskOf"] })
     : <a class={`bm line${behind}`} href={task.href}>{task.title}</a>;
 }
 
-/** `⌂ a · b` and its tail (as `atText`), a failed node's name followed by its note; it wraps between names. */
+/** `⌂ a · b` and its tail (`atTail`), a failed node's name followed by its note; it wraps between names. */
 function At({ label, nodeName, contextFailed }: { label: Label; nodeName: GraphProps["nodeName"]; contextFailed: ReadonlySet<string> }) {
   return (
     <span class="at">
       ⌂ {label.nodes.map((n, i) => (
         <Fragment key={n}>
           {i > 0 && " · "}
-          <span class="at-node">{nodeName(n)}{contextFailed.has(n) && <> <span class="error">context failed to load</span></>}</span>
+          <span class="at-node">{nodeName(n)}</span>{contextFailed.has(n) && <> <span class="error">context failed to load</span></>}
         </Fragment>
       ))}{atTail(label)}
     </span>

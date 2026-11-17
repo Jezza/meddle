@@ -1,7 +1,7 @@
 // A project across the pool (its home, its graph as its online nodes read it, a conflicted or fetching branch, its
 // tasks), and adding a project on this node from a folder or an upstream URL.
 import type { Host, Ref } from "@earendil-works/chord";
-import { useCallback, useEffect, useState } from "preact/hooks";
+import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { NodeObject, ProjectObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import type { GraphCommit } from "../../projects/graph";
@@ -29,8 +29,10 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
   const nodes = useValue(pool.nodes);
   const online = nodes.filter((n) => n.nodeId === hosts.selfId || (n.status === "member" && n.online));
   const [held, setHeld] = useState<ReadonlyMap<string, Held>>(() => new Map());
-  // The home's read with no lower bound once `Older` is clicked, and how many commits it asked for.
+  // How many commits `Older` asked for; and the home's read of them (no lower bound), re-read as its graph changes.
+  const [limit, setLimit] = useState<number | null>(null);
   const [older, setOlder] = useState<{ graph: readonly GraphCommit[]; limit: number } | null>(null);
+  const asked = useRef(0);
   const report = useCallback<Report>((key, copy) => setHeld((prev) => {
     const next = new Map(prev);
     if (copy === null) next.delete(key);
@@ -48,11 +50,22 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
   const holders = project?.holders ?? [];
   const rows = graphRows(holders, project?.home ?? "", older?.graph ?? []);
   const home = project === undefined ? undefined : held.get(`${project.home}/${id}`);
+  // Only the newest request's answer is kept: a late one for an older request is dropped.
+  const read = async (ref: Ref<typeof ProjectObject>, limit: number) => {
+    const n = ++asked.current;
+    const graph = await ref.olderGraph({ limit });
+    if (n === asked.current) setOlder({ graph, limit });
+  };
+  useEffect(() => {
+    // A failed re-read keeps the last one.
+    if (limit !== null && home !== undefined) read(home.ref, limit).catch(() => {});
+  }, [home?.graph, home?.ref]);
   // The last read had all there is, or as much as one read lists.
   const ended = older !== null && (older.graph.length < older.limit || older.limit >= OLDER_CAP);
   const readOlder = home === undefined || !onlineIds.includes(home.nodeId) || ended ? null : async () => {
-    const limit = Math.min(rows.length + OLDER_MORE, OLDER_CAP);
-    setOlder({ graph: await home.ref.olderGraph({ limit }), limit });
+    const next = Math.min(rows.length + OLDER_MORE, OLDER_CAP);
+    setLimit(next);
+    await read(home.ref, next);
   };
   const labelled = new Set(rows.flatMap((r) => r.labels.flatMap((l) => l.nodes)));
   const failed = holders.filter((h) => !h.contextLoaded);

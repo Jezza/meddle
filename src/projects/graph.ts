@@ -88,15 +88,17 @@ function revset(commits: Iterable<string>): string {
 
 /**
  * The commits under the probe's heads (`B`), newest first, at most `limit`, each with the probe's bookmarks on it: from
- * the parent of `defaultBranch`'s commit up (`::B ~ ::(<default>--)`), or all of them (`::B`) when the probe has no
- * such branch; never the root, which is no commit to draw. None when it has no heads.
+ * the parent of `defaultBranch`'s commit up, and every head's own commit however old (`(::B ~ ::(<default>--)) | B`),
+ * or all of them (`::B`) when the probe has no such branch; never the root, which is no commit to draw. None when it
+ * has no heads.
  */
 export async function projectGraph(
   cfg: NodeConfig, replica: string, probe: GraphProbe, defaultBranch: string | null, limit = GRAPH_MAX,
 ): Promise<GraphCommit[]> {
   if (probe.heads.length === 0) return [];
   const main = probe.heads.filter((h) => h.bookmark.kind === "branch" && h.bookmark.name === defaultBranch).map((h) => h.commit);
-  const range = `::(${revset(probe.heads.map((h) => h.commit))})${main.length === 0 ? "" : ` ~ ::((${revset(main)})--)`} ~ root()`;
+  const heads = revset(probe.heads.map((h) => h.commit));
+  const range = `(${main.length === 0 ? `::(${heads})` : `(::(${heads}) ~ ::((${revset(main)})--)) | ${heads}`}) ~ root()`;
   const out = await jj(
     ["--ignore-working-copy", "log", "--no-graph", "--limit", String(limit), "-r", range, "-T", COMMIT_TEMPLATE],
     replica, cfg,

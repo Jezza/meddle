@@ -12,7 +12,6 @@ import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, patchHash, summary, totals } from "../src/dashboard/ui/changes-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
-import { atText } from "../src/dashboard/ui/graph-model";
 
 test("the dashboard bundle builds", async () => {
   const build = await Bun.build({ entrypoints: ["src/dashboard/ui/main.tsx"], target: "browser", format: "esm" });
@@ -389,11 +388,4 @@ test("changeLabel names the working copy, else the description, else the short i
   expect(changeLabel(change({ workingCopy: true, description: "Wip" }))).toBe("Working copy");
   expect(changeLabel(change({ description: "Add DiffView" }))).toBe("Add DiffView");
   expect(changeLabel(change({ description: "" }))).toBe("kpmxqwrt");
-});
-
-test("a graph label's at text: its nodes, then behind or not pushed", () => {
-  const label = { bookmark: { kind: "branch", name: "main" } as const, nodes: ["a", "b"], behind: null, notPushed: false };
-  expect(atText(label, (id) => id)).toBe("⌂ a · b");
-  expect(atText({ ...label, nodes: ["a"], behind: 1 }, (id) => id)).toBe("⌂ a · 1 behind");
-  expect(atText({ ...label, nodes: ["a"], notPushed: true }, (id) => id)).toBe("⌂ a · not pushed");
 });

@@ -103,10 +103,25 @@ test("projectGraph reads from the default branch's parent up", async () => {
     expect(two[0]!.bookmarks).not.toEqual([]);
     expect(await projectGraph(cfg, replica, { key: "", heads: [] }, "main")).toEqual([]);
 
-    // A bookmark named like `main`'s commit id is not that commit.
-    await bookmarkSet(replica, c3, c1, cfg, { ignoreWorkingCopy: true });
+    // A bookmark named like `main`'s commit id is not that commit: read as one, `main--` would be the root, and c1 in.
+    await bookmarkSet(replica, c3, c2, cfg, { ignoreWorkingCopy: true });
     const named = await graphProbe(cfg, replica, "a", archived);
     expect(ids(await projectGraph(cfg, replica, named, "main")).toSorted()).toEqual(ids(graph).toSorted());
+  } finally {
+    await close();
+  }
+});
+
+test("projectGraph reads a branch below the default branch's parent, with its bookmark", async () => {
+  const { cfg, replica, archived, c1, c2, close } = await graphRepo();
+  try {
+    await bookmarkSet(replica, "release", c1, cfg, { ignoreWorkingCopy: true });
+    const probe = await graphProbe(cfg, replica, "a", archived);
+    const graph = await projectGraph(cfg, replica, probe, "main");
+    expect(graph.find((c) => c.commit === c1)).toMatchObject({ parents: [], bookmarks: [{ kind: "branch", name: "release" }] });
+    // Only its own commit: what lies between it and the range is for Older.
+    expect(ids(graph)).toContain(c2);
+    expect(newestFirst(graph)).toBe(true);
   } finally {
     await close();
   }

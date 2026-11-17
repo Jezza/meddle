@@ -290,11 +290,11 @@ export const ProjectObject = remote("meddle.project", {
         contextLoaded: Type.Boolean(),
         /**
          * The commits of this node's replica from the default branch's parent up to its branches and the project's
-         * task lines not archived (`projectGraph`), newest first, at most 200: re-read when projects change, when a
-         * task of the project changes state, when the project's rows change, and every 60 s; the read is skipped
-         * while the bookmarks and the default branch are as they were, and a failed one keeps the last value. So the
-         * `immutable` flags follow the counted bookmarks' moves: a fetch that moves only a remote bookmark (`main@origin`)
-         * shows on the next counted move.
+         * task lines not archived, and those bookmarks' own commits (`projectGraph`), newest first, at most 200:
+         * re-read when projects change, when a task of the project changes state, when the project's rows change, and
+         * every 60 s; the read is skipped while the bookmarks and the default branch are as they were, and a failed
+         * one keeps the last value. So the `immutable` flags follow the counted bookmarks' moves: a fetch that moves
+         * only a remote bookmark (`main@origin`) shows on the next counted move.
          */
         graph: Type.Array(GraphCommitSchema),
         /** The project's branches, by name: re-computed when its branch rows change, and every 60 s. */

@@ -1,6 +1,6 @@
 // test/graph-model.test.ts
 import { test, expect } from "bun:test";
-import { atText, graphRows, hasOlder, layoutLanes, mergeGraphs, segPath, type Row } from "../src/dashboard/ui/graph-model";
+import { atTail, graphRows, hasOlder, layoutLanes, mergeGraphs, segPath, type Row } from "../src/dashboard/ui/graph-model";
 import type { GraphBookmark, GraphCommit } from "../src/projects/graph";
 
 const main: GraphBookmark = { kind: "branch", name: "main" };
@@ -75,11 +75,20 @@ test("a commit only one node has is not pushed", () => {
   expect(mergeGraphs([b, { nodeId: "C", graph: [] }])[0]!.labels[0]).toMatchObject({ notPushed: false });
 });
 
-test("the at text names the nodes, then behind or not pushed", () => {
-  const name = (id: string) => id.toLowerCase();
-  expect(atText({ bookmark: main, nodes: ["A", "B"], behind: null, notPushed: false }, name)).toBe("⌂ a · b");
-  expect(atText({ bookmark: main, nodes: ["A"], behind: 1, notPushed: false }, name)).toBe("⌂ a · 1 behind");
-  expect(atText({ bookmark: main, nodes: ["A"], behind: null, notPushed: true }, name)).toBe("⌂ a · not pushed");
+test("a commit mutable on any node is mutable", () => {
+  // A line is immutable everywhere but on its holder: the holder, second here, wins.
+  const fixed = (x: GraphCommit) => ({ ...x, immutable: true });
+  const elsewhere = { nodeId: "A", graph: [fixed(c("t1", ["c1"], 2, [task("t")])), fixed(c("c1", [], 1, [main]))] };
+  const holder = { nodeId: "B", graph: [c("t1", ["c1"], 2, [task("t")]), fixed(c("c1", [], 1, [main]))] };
+  for (const nodes of [[elsewhere, holder], [holder, elsewhere]]) {
+    expect(mergeGraphs(nodes).map((r) => [r.commit.commit, r.commit.immutable])).toEqual([["t1", false], ["c1", true]]);
+  }
+});
+
+test("the at tail says behind or not pushed, else nothing", () => {
+  expect(atTail({ bookmark: main, nodes: ["A", "B"], behind: null, notPushed: false })).toBe("");
+  expect(atTail({ bookmark: main, nodes: ["A"], behind: 1, notPushed: false })).toBe(" · 1 behind");
+  expect(atTail({ bookmark: main, nodes: ["A"], behind: null, notPushed: true })).toBe(" · not pushed");
 });
 
 test("the default branch is lane 0", () => {
