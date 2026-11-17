@@ -130,8 +130,10 @@ without a default branch still works.
   about 10 KB (64% of 841 real results checked), so their bars could not open. With this call, a thread diff
   without `originalFile` reads the file as it is now and opens its bars from it, read as the new side (a revealed old
   line `o` is `file[o + offset - 1]`; the `↓` gap ends at `file.length - offset`), only when every new-side line of
-  its hunks (`+` and context) matches the file at its new number; otherwise the bars stay plain. The file is fetched
-  once, when the diff is first shown open. The diff model gains this new-side reading (`side: "old" | "new"`), which
+  its hunks (`+` and context) matches the file at its new number; otherwise the bars go plain. Nothing is fetched
+  until you click a bar: until then `↑` and `↕` show their counts (the patch gives them) and `↓` shows without one
+  (`↓ lines`), since the file's length is not known; the first click fetches the file once, opens the lines if the
+  edit still matches it, and drops `↓` if nothing is below. The diff model gains this new-side reading (`side: "old" | "new"`), which
   pieces 2 and 3 can use too. Chosen over turning on Claude Code's file checkpointing (exact old files, but per-turn
   backups to replay patches on, and copies of every edited file in the task's config folder).
 
