@@ -3,7 +3,7 @@
 import type { Ref } from "@earendil-works/chord";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { NodeObject } from "../../state/contracts";
-import { type Hosts, useAction, useObject, useValue } from "./hooks";
+import { type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
 import { type Anchor, MenuItem, ModelPicker, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
 import { projectChoices } from "./pool-model";
 import type { Open } from "./routes";
@@ -27,7 +27,8 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
   const projects = projectChoices(nodes);
   const canHost = nodes.filter((n) => n.status === "member" && n.online && n.hostsTasks);
   const [chosen, setChosen] = useState<string[]>(() => (projectId === null ? [] : [projectId]));
-  const [prompt, setPrompt] = useState("");
+  // A prompt left unstarted is there again on coming back to a new task under the same project (or none).
+  const [prompt, setPrompt] = useDraft(`new.${projectId ?? ""}`);
   const models = useValue(node.models);
   const defaults = useValue(pool.defaults);
   /** The model and effort picked; null while they are the pool's defaults. */
@@ -53,7 +54,10 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
       const { manifest, nodeId } = await node.createTask({ projects: chosen.map((id) => ({ id })), node: where?.nodeId ?? null, prompt, model, effort });
       created = { taskId: manifest.id, nodeId };
     });
-    if (ok && created !== undefined) open(created.nodeId, created.taskId);
+    if (ok && created !== undefined) {
+      setPrompt("");
+      open(created.nodeId, created.taskId);
+    }
   };
 
   return (

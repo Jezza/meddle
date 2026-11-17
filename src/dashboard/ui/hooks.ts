@@ -1,5 +1,5 @@
 // chord references and state members as Preact hooks.
-import { useEffect, useRef, useState } from "preact/hooks";
+import { type Dispatch, type StateUpdater, useEffect, useRef, useState } from "preact/hooks";
 import { createHost, webSocketLink, type AnyContract, type Host, type InputOf, type Readable, type Ref } from "@earendil-works/chord";
 
 /** A socket to the node the page came from at `path` (`/ws`, `/ws/node/<nodeId>`). */
@@ -193,6 +193,35 @@ export function useAction() {
     }
   };
   return { busy, error, run };
+}
+
+/**
+ * Text being written, kept in localStorage under `meddle.draft.<key>` as it is typed: it outlives the view it is typed
+ * in (another task opened meanwhile, a reload) until it is set to nothing, as a sent text is. The setter writes through
+ * at once rather than from an effect, so a draft cleared just before the view goes away is cleared all the same.
+ */
+export function useDraft(key: string): [string, Dispatch<StateUpdater<string>>] {
+  const name = `meddle.draft.${key}`;
+  const [text, setText] = useState(() => {
+    try {
+      return localStorage.getItem(name) ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const now = useRef(text);
+  const set = (next: StateUpdater<string>) => {
+    const value = typeof next === "function" ? next(now.current) : next;
+    now.current = value;
+    try {
+      if (value === "") localStorage.removeItem(name);
+      else localStorage.setItem(name, value);
+    } catch {
+      // a private window, or storage full: the draft lasts as long as the view
+    }
+    setText(value);
+  };
+  return [text, set];
 }
 
 export function errorText(err: unknown): string {

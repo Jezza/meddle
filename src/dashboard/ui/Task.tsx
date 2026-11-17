@@ -6,7 +6,7 @@ import { createContext, type RefObject } from "preact";
 import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
-import { errorText, type Hosts, useAction, useObject, useValue } from "./hooks";
+import { errorText, type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
@@ -97,8 +97,9 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   const showChanges = switchable && tab === "changes";
   /** Shows every event in the thread, the ones it otherwise leaves out included. */
   const [raw, setRaw] = useState(false);
-  // What the composer holds, here so that a failed text's Edit can put it back.
-  const [draft, setDraft] = useState("");
+  // What the composer holds, here so that a failed text's Edit can put it back; kept by task id, so that it is still
+  // there after another task (or a reload), and follows the task when it moves to another node.
+  const [draft, setDraft] = useDraft(`task.${manifest.id}`);
   const box = useRef<HTMLTextAreaElement>(null);
   /** Texts the task could not be sent: this page's own, so they go with it. */
   const [failed, setFailed] = useState<Failed[]>([]);
