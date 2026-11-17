@@ -112,8 +112,9 @@ export const MeddleMove = defineTask<MoveInput, MoveCheckpoint, null, MeddleHook
       runner.requireMoving(taskId);
       runner.enterMove(taskId, to, "handoff");
       const fromArchive = task.input.fromArchive ?? false;
-      const manifest = JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest;
-      // A restore-move's task has no workspace: its lines' rows are as its archive left them.
+      // A restore-move's task has no workspace: its lines' rows are as its archive left them, but for one its
+      // acceptance released, opened again on its branch.
+      const manifest = fromArchive ? await runner.reopenReleasedLines(taskId) : JSON.parse(taskRow(runner, taskId).manifest) as TaskManifest;
       if (!fromArchive) {
         // Nothing is written or sent under a turn: one that is running here ends first.
         await runner.awaitTurnEnd(taskId, false, context, async () => {});

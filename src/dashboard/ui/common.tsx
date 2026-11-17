@@ -177,20 +177,20 @@ export function MoveMenu({ task, nodes, from, anchor, onClose }: {
 
 /**
  * Where to restore an archived task held by `holder`: where placement says, on the holder, or on another node that
- * can take it. Answers through `onRestored` with the node it is on (or on its way to).
+ * can take it. Calls `onRestored` once the restore is done here, or once its move to another node has started: the
+ * task is not there yet (and may never be, if the move fails), so the holder's view of it, which follows it once it
+ * has moved, is the one to stay on.
  */
 export function RestoreMenu({ task, nodes, holder, anchor, onClose, onRestored }: {
-  task: TaskRef; nodes: readonly PoolNode[]; holder: string; anchor: Anchor; onClose(): void; onRestored?(nodeId: string): void;
+  task: TaskRef; nodes: readonly PoolNode[]; holder: string; anchor: Anchor; onClose(): void; onRestored?(): void;
 }) {
   const self = nodes.find((n) => n.nodeId === holder);
   const choices = moveChoices(nodes, holder, self?.claudeCodeVersion ?? "");
   const action = useAction();
   const restore = async (node: string | null) => {
-    let to: string | undefined;
-    const ok = await action.run(async () => { ({ nodeId: to } = await task.restore({ node })); });
-    if (ok) {
+    if (await action.run(() => task.restore({ node }))) {
       onClose();
-      if (to !== undefined) onRestored?.(to);
+      onRestored?.();
     }
   };
   return (

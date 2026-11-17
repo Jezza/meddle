@@ -411,3 +411,68 @@ test("a line rebased onto a moved main, or squashed into its own commit, keeps n
     await close();
   }
 }, 60_000);
+
+test("a task whose work was accepted restores here on main, where its work is now: its line starts again there with no work of its own, and is accepted again once more of it is pushed", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const P = A.project;
+    const m = await createTask(A, { title: "t", projectIds: [P.id] });
+    await writeFile(join(paths(A.cfg).task(m.id), "a", "work"), "work\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await pushMain(A, P, lineHead(A, P.id, m.id, "a")!);
+    await until("the task's state", () => getTask(A.db, m.id)?.state, "archived");
+    await until("A's line rows", () => heldOf(A, m.id), ["a null here true"]);
+    // main moves on before you take the task up again.
+    const main = await userCommit(A, P);
+
+    expect(await A.runner.restore(m.id, "here")).toEqual({ nodeId: A.id });
+    expect(getTask(A.db, m.id)?.state).toBe("idle");
+    const workspace = join(paths(A.cfg).task(m.id), "a");
+    expect(await read(A.cfg, workspace, "@-")).toBe(main);
+    expect(await Bun.file(join(workspace, "work")).text()).toBe("work\n");
+    expect(heldOf(A, m.id)).toEqual([`a ${main} here false`]);
+    expect(listLineRows(A.db, P.id, m.id)[0]!.base).toEqual([main]);
+    expect((JSON.parse(getTask(A.db, m.id)!.manifest) as { projects: Array<{ base: string[] }> }).projects[0]!.base).toEqual([main]);
+    expect(A.logs).toContain(`meddle: restore: ${m.id}'s line ${shortId(P.id)}/a, released as its work was accepted, starts again on main at ${main.slice(0, 12)}`);
+
+    // A turn on main holds no work of the task's own: nothing is accepted, and it stays.
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    expect(A.runner.acceptance(m.id)).toBe("no");
+    expect(getTask(A.db, m.id)?.state).toBe("idle");
+    // Its next work, pushed, is accepted as any task's is.
+    await writeFile(join(workspace, "more"), "more\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await pushMain(A, P, lineHead(A, P.id, m.id, "a")!);
+    await until("the task's state", () => getTask(A.db, m.id)?.state, "archived");
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("a task whose work was accepted restores on another node through a move: its line, opened again on main by the node it is archived on, is taken there one epoch up", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const P = A.project;
+    const m = await createTask(A, { title: "t", projectIds: [P.id] });
+    await writeFile(join(paths(A.cfg).task(m.id), "a", "work"), "work\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await pushMain(A, P, lineHead(A, P.id, m.id, "a")!);
+    await until("the task's state", () => getTask(A.db, m.id)?.state, "archived");
+    await until("A's line rows", () => heldOf(A, m.id), ["a null here true"]);
+    const main = await userCommit(A, P);
+
+    expect(await A.runner.restore(m.id, B.id)).toEqual({ nodeId: B.id });
+    await until("the task's state on A", () => getTask(A.db, m.id)?.state, "moved");
+    expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", receiving_from: null });
+    const workspace = join(paths(B.cfg).task(m.id), "a");
+    expect(await read(B.cfg, workspace, "@-")).toBe(main);
+    expect(await Bun.file(join(workspace, "work")).text()).toBe("work\n");
+    const [row] = listLineRows(B.db, P.id, m.id);
+    expect(row).toMatchObject({ holder: B.id, epoch: 2, commit: main, base: [main], archived: false });
+  } finally {
+    await close();
+  }
+}, 60_000);

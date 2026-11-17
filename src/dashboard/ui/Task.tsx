@@ -204,8 +204,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
         </>}
       </div>
       {restoreAt !== null && (
-        <RestoreMenu task={task} nodes={nodes} holder={nodeId} anchor={restoreAt} onClose={() => setRestoreAt(null)}
-          onRestored={(to) => { location.hash = hashOf({ name: "task", nodeId: to, id: task.manifest.value.id }); }} />
+        <RestoreMenu task={task} nodes={nodes} holder={nodeId} anchor={restoreAt} onClose={() => setRestoreAt(null)} />
       )}
     </PaneHead>
   );

@@ -168,8 +168,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
       )}
       {menu?.kind === "move" && <MoveMenu task={task.ref} nodes={nodes} from={task.nodeId} anchor={menu.anchor} onClose={close} />}
       {menu?.kind === "restore" && (
-        <RestoreMenu task={task.ref} nodes={nodes} holder={task.nodeId} anchor={menu.anchor} onClose={close}
-          onRestored={(nodeId) => { if (selected) location.hash = hashOf({ name: "task", nodeId, id: task.id }); onNavigate(); }} />
+        <RestoreMenu task={task.ref} nodes={nodes} holder={task.nodeId} anchor={menu.anchor} onClose={close} onRestored={onNavigate} />
       )}
     </>
   );

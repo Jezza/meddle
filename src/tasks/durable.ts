@@ -23,6 +23,7 @@ import { loadProjectSettings, parseContext, withTaskRules } from "../projects/co
 import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
 import type { StreamReader } from "../pool/frames";
 import { getProject, listProjects, type Project } from "../projects/project";
+import { defaultBranchCommit } from "../projects/starts";
 import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRows } from "../projects/lines";
 import { branchChanges, lineChanges, listLineRows, mergeLineRows, writeLineRow, type LineRow } from "../pool/rows";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
@@ -1367,7 +1368,7 @@ export class TaskRunner {
       if (this.#moving.has(taskId)) throw new Error("task is moving");
       if (row.state !== "archived") throw new Error(`task is ${row.state}`);
       if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
-      const manifest = JSON.parse(row.manifest) as TaskManifest;
+      const manifest = await this.reopenReleasedLines(taskId);
       const file = paths(this.#cfg).archiveFile(taskId);
       const archive = await readArchive(file);
       // What a node that stopped while archiving it left.
@@ -1395,6 +1396,48 @@ export class TaskRunner {
       this.#emitState(taskId, "idle");
       return restored;
     });
+  }
+
+  /**
+   * Opens again each project's own line of task `taskId`, archived here, that its acceptance released (its row held
+   * here, with no commit), so that a restore, here or through a move, takes it as it takes any line: at the project's
+   * default branch as its rows compute it, which holds the accepted work, as its base too, archived as the task is, at
+   * the line's epoch. The manifest's `base` for the project becomes that commit: the restored task's work is measured
+   * from there (none yet, so it is not accepted again at once), and its workspace cannot rewrite the branch. Returns
+   * the manifest, written to the task's row when a line was opened. Rejects, opening none, when a branch cannot be
+   * read (`defaultBranchCommit`'s reason).
+   */
+  async reopenReleasedLines(taskId: string): Promise<TaskManifest> {
+    const deps = this.#replicaDeps();
+    const manifest = JSON.parse(this.#row(taskId).manifest) as TaskManifest;
+    if (deps === null) return manifest;
+    const self = deps.pool.identity.id;
+    const opened: Array<{ project: Project; name: string; epoch: number; commit: string }> = [];
+    for (const p of manifest.projects) {
+      const line = listLineRows(this.#db, p.id, taskId).find((r) => r.name === p.name);
+      if (line === undefined || line.commit !== null || line.holder !== self) continue;
+      const project = getProject(this.#db, p.id);
+      if (project === null) throw new Error(`unknown project: ${p.id}`);
+      try {
+        opened.push({ project, name: p.name, epoch: line.epoch, commit: await defaultBranchCommit({ ...deps, selfId: self }, project) });
+      } catch (err) {
+        throw new Error(`${p.name}: its work was accepted, and its line cannot start again on its default branch: ${messageOf(err)}`);
+      }
+    }
+    if (opened.length === 0) return manifest;
+    for (const { project, name, epoch, commit } of opened) {
+      writeLineRow(this.#db, { project: project.id, task: taskId, name, holder: self, epoch, commit, base: [commit], archived: true });
+      this.#log(`meddle: restore: ${taskId}'s line ${shortId(project.id)}/${name}, released as its work was accepted, starts again on ${project.defaultBranch} at ${commit.slice(0, 12)}`);
+    }
+    const reopened: TaskManifest = {
+      ...manifest,
+      projects: manifest.projects.map((p) => {
+        const o = opened.find((x) => x.project.id === p.id);
+        return o === undefined ? p : { ...p, base: [o.commit] };
+      }),
+    };
+    updateTask(this.#db, taskId, { manifest: JSON.stringify(reopened) });
+    return reopened;
   }
 
   /**

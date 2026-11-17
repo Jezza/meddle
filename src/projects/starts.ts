@@ -151,7 +151,7 @@ const CATCH_UP_MS = 5000;
  * rows, then the commits); refused `<b> is not here yet; try again shortly` when it still has no row and a push of it
  * still waits. A push still waiting after that is not counted (as on every node that lacks its commit).
  */
-async function defaultBranchCommit(deps: StartDeps, project: Project): Promise<string> {
+export async function defaultBranchCommit(deps: StartDeps, project: Project): Promise<string> {
   const { cfg, db, pool } = deps;
   const branch = project.defaultBranch;
   if (branch === null) throw new Error(`${project.name} has no default branch; name a revision`);
