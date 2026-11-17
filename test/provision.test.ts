@@ -183,11 +183,11 @@ test("provision scopes each workspace to its task's line, from its start's base;
   const immutableHeads = 'revset-aliases."immutable_heads()"';
   const scoped = workspaceImmutableHeads(m.id, [main]);
   expect(scoped).toBe(
-    `present(${main}) | (bookmarks() ~ bookmarks(glob:"meddle/task/${m.id}/*")) | untracked_remote_bookmarks(~glob:"task/${m.id}/*", remote=exact:"meddle")`,
+    `present(${main}) | (bookmarks() ~ bookmarks(glob:"meddle/task/${m.id}/*")) | untracked_remote_bookmarks(~(glob:"task/${m.id}/*" | glob:"meddle/task/${m.id}/*"), remote=exact:"meddle")`,
   );
   // One `present` for each base commit.
   expect(workspaceImmutableHeads("t", ["b1", "b2"])).toBe(
-    `present(b1) | present(b2) | (bookmarks() ~ bookmarks(glob:"meddle/task/t/*")) | untracked_remote_bookmarks(~glob:"task/t/*", remote=exact:"meddle")`,
+    `present(b1) | present(b2) | (bookmarks() ~ bookmarks(glob:"meddle/task/t/*")) | untracked_remote_bookmarks(~(glob:"task/t/*" | glob:"meddle/task/t/*"), remote=exact:"meddle")`,
   );
   expect((await jj(["config", "get", immutableHeads], workspace, cfg)).trim()).toBe(scoped);
   // The service repo's own workspace keeps jj's default.
@@ -264,6 +264,25 @@ test("a task's workspace may not rewrite a commit another task's line also holds
   await forgetLines(cfg, a, "othertask");
   await describe();
   expect((await jj(["log", "-r", "@", "--no-graph", "-T", "description"], workspace, cfg)).trim()).toBe("by the agent");
+});
+
+test("in a service repo that is also its checkout, the task's line its fetch brings back stays the task's; another task's does not", async () => {
+  const { cfg, db, a, pa } = await projectWithMain();
+  const m = await provision(cfg, db, "t", [pa]);
+  const workspace = `${paths(cfg).task(m.id)}/a`;
+  await (await import("node:fs/promises")).writeFile(`${workspace}/work`, "work\n");
+  const commitAt = async (rev: string) => (await jj(["log", "-r", rev, "--no-graph", "-T", "commit_id"], workspace, cfg)).trim();
+  // What the checkout's `jj git fetch --remote meddle` keeps of task `taskId`'s line: `meddle/task/<id>/a@meddle`.
+  const fetched = async (taskId: string, commit: string) => {
+    await git(["update-ref", `refs/remotes/meddle/meddle/task/${taskId}/a`, commit], a, cfg);
+    await gitImport(a, cfg);
+  };
+  const head = await commitAt("@");
+  await fetched(m.id, head);
+  await jj(["describe", "-r", head, "-m", "by the agent"], workspace, cfg);
+  const described = await commitAt("@");
+  await fetched("othertask", described);
+  await expect(jj(["describe", "-r", described, "-m", "again"], workspace, cfg)).rejects.toThrow(`Commit ${described.slice(0, 12)} is immutable`);
 });
 
 test("a task's workspace may not rewrite a branch nor another local task's line; its own line's head it may, by its bookmark or its remote ref alone", async () => {

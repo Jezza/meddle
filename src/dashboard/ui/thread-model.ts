@@ -14,6 +14,8 @@ export type ThreadItem =
     result?: { text: string; isError: boolean; patch?: Hunk[]; original?: string[] };
     children: ThreadItem[];
     agentId?: string;
+    /** A Skill call's skill: the text the session sends after the call's result, as a message of its own. */
+    skill?: string;
   }
   | { kind: "question"; toolUseId: string; questions: unknown }
   | { kind: "denied"; toolName: string; reason?: string; reasonType?: string }
@@ -29,7 +31,7 @@ type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
 /**
  * Builds the thread from events in seq order. Progress frames (`PROGRESS_KINDS`) are left out (the session's
  * `live` cell covers `stream_event`s), and so is a status that only says a request went out or the session went idle; an assistant message streamed as several events with one id becomes one item; a `tool_result` attaches
- * to its `tool_use`; a message with a `parent_tool_use_id` nests under that call.
+ * to its `tool_use`, and a skill's text to its Skill call; a message with a `parent_tool_use_id` nests under that call.
  */
 export function buildThread(events: Array<{ seq: number; message: unknown }>): ThreadItem[] {
   const top: ThreadItem[] = [];
@@ -38,6 +40,8 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
   const questions = new Set<string>();
   const assistants = new Map<string, AssistantItem>();
   const denials = new Map<string, DeniedItem>();
+  /** By the list they are in, Skill calls whose result has landed and whose skill's text has not, in call order. */
+  const unsent = new Map<ThreadItem[], ToolItem[]>();
 
   /** Where a message with this parent goes: under its call when the call is known, else at the top. */
   const listFor = (parent: unknown): ThreadItem[] =>
@@ -78,6 +82,8 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
   return top;
 
   function addAssistant(m: Message, list: ThreadItem[]) {
+    // A skill's text comes before Claude goes on: a call still without one (a skill run in a subagent) gets none.
+    unsent.delete(list);
     const inner = (m.message ?? {}) as { id?: unknown; content?: unknown };
     const id = typeof inner.id === "string" ? inner.id : undefined;
     for (const block of blocks(inner.content)) {
@@ -108,11 +114,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
 
   function addUser(m: Message, list: ThreadItem[]) {
     const content = (m.message as { content?: unknown } | undefined)?.content;
-    if (typeof content === "string") {
-      list.push({ kind: "user", text: content });
-      return;
-    }
-    const texts: string[] = [];
+    const texts: string[] = typeof content === "string" ? [content] : [];
     for (const block of blocks(content)) {
       if (block.type === "tool_result") {
         const id = str(block.tool_use_id);
@@ -124,6 +126,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
           if (patch.length > 0) tool.result.patch = patch;
           if (typeof result.originalFile === "string") tool.result.original = textLines(result.originalFile);
           if (typeof result.agentId === "string") tool.agentId = result.agentId;
+          if (tool.name === "Skill" && !tool.result.isError) unsent.set(list, [...(unsent.get(list) ?? []), tool]);
         } else if (!questions.has(id)) {
           list.push({ kind: "unknown", type: "tool_result", raw: block });
         }
@@ -133,7 +136,11 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         texts.push(`[${String(block.type)}]`);
       }
     }
-    if (texts.length > 0) list.push({ kind: "user", text: texts.join("\n") });
+    if (texts.length === 0) return;
+    // The session sends a skill's text as though you had, marked synthetic.
+    const skill = m.isSynthetic === true ? unsent.get(list)?.shift() : undefined;
+    if (skill !== undefined) skill.skill = texts.join("\n");
+    else list.push({ kind: "user", text: texts.join("\n") });
   }
 
   function addSystem(m: Message) {
@@ -336,13 +343,17 @@ export function toolSummary(input: unknown, max = 120): string {
   return "";
 }
 
-/** What a row says a call acted on: a path relative to the session's directory, a pattern and where, a subagent's task. */
+/**
+ * What a row says a call acted on: a path relative to the session's directory, a pattern and where, a subagent's task,
+ * a skill.
+ */
 export function toolTarget(tool: ToolItem, cwd: string): string {
   const input = (tool.input ?? {}) as Record<string, unknown>;
   const field = (key: string) => typeof input[key] === "string" ? input[key] as string : undefined;
   const file = field("file_path") ?? field("notebook_path");
   if (file !== undefined) return relativePath(file, cwd);
   if (tool.name === "Agent" || tool.name === "Task") return field("description") ?? "";
+  if (tool.name === "Skill") return field("skill") ?? "";
   const pattern = field("pattern");
   const path = field("path");
   if (pattern !== undefined) return path === undefined ? pattern : `${pattern} in ${relativePath(path, cwd)}`;
