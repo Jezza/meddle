@@ -32,7 +32,7 @@ export type TaskRow = {
   updated_at: string;
   /** `TaskSettings` as JSON, or NULL for none. */
   settings: string | null;
-  /** Prompts waiting for a turn, as a JSON array of each one's `queueEntry` (a text alone, or a prompt); NULL for none. */
+  /** Prompts waiting for a turn, as a JSON array of their `queueEntry`s (a text alone, or a prompt); NULL for none. */
   queued: string | null;
   /** The node a `moved` task went to. */
   moved_to: string | null;

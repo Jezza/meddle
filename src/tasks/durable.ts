@@ -460,20 +460,30 @@ export class TaskRunner {
   }
 
   /**
-   * Steers the live turn with the prompt of `text` and `attachments`, or starts a new durable turn with it when the task
-   * is idle; a busy task is never refused a prompt. First every attachment must be valid (else `bad attachment: <why>`),
-   * its file here, fetched from the pool when it is not (else `attachment <name> is not on any online node`), and the
-   * size it says (else `bad attachment: size does not match its file`): a prompt refused for one queues nothing.
+   * Steers the live turn with the prompt of `text` and `attachments`, or starts a new durable turn with it when the
+   * task is idle; a busy task is never refused a prompt. A task's prompts are taken one at a time, in the order they
+   * were sent: one waits for any earlier one's files to be fetched or written, so a prompt never overtakes another.
+   * First every attachment must be valid (else `bad attachment: <why>`), its file here, fetched from the pool when it
+   * is not (else `attachment <name> is not on any online node`), and the size it says (else `bad attachment: size does
+   * not match its file`): a prompt refused for one queues nothing, and the next is taken as usual. Only an
+   * attachment's `hash`, `name`, `type` and `size` are kept.
    * A steer goes into the turn's input, for Claude Code to take into the running turn at its next chance (or as a
    * turn of its own once that one ends), and is `queued` until it does. A prompt the live turn can no longer take (its
    * input closed with its `result`), or for a turn that is being created, resumed by the Harness or retried after it
    * was parked (which this retries), is queued for the task's next turn. A task left `running` with no turn here or in
-   * the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the prompt started a turn, `"queued"`
-   * when it waits to be taken (a steer, or a prompt for a later turn).
+   * the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the prompt started a turn,
+   * `"queued"` when it waits to be taken (a steer, or a prompt for a later turn).
    */
-  async prompt(taskId: string, text: string, attachments: Attachment[] = []): Promise<"turn" | "queued"> {
+  prompt(taskId: string, text: string, attachments: Attachment[] = []): Promise<"turn" | "queued"> {
+    // A chain of its own: never behind the task's receive, import or activation (`taskKey`).
+    return serialised(`prompt\0${taskId}`, () => this.#prompt(taskId, text, attachments));
+  }
+
+  async #prompt(taskId: string, text: string, attachments: Attachment[]): Promise<"turn" | "queued"> {
     await this.#ensureAttachments(attachments);
-    const p: Prompt = { text, attachments };
+    // Whatever else a caller put on an attachment never reaches meddle's records (the queue, a turn's input, the log).
+    const refs = attachments.map(({ hash, name, type, size }) => ({ hash, name, type, size }));
+    const p: Prompt = { text, attachments: refs };
     const row = this.#row(taskId);
     if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
     if (this.#archiving.has(taskId)) throw new Error("task is being archived");
@@ -503,7 +513,8 @@ export class TaskRunner {
       if (stale) this.#setState(taskId, "idle");
       return this.#enqueueNext(taskId, p);
     }
-    // Reserved before the next await, so a concurrent prompt cannot create a second turn: it waits for the next.
+    // Reserved before the next await and until the turn runs, so neither a later prompt nor `startQueued` creates a
+    // second turn meanwhile: a prompt waits for the next.
     if (this.#pending.has(taskId)) return this.#enqueueNext(taskId, p);
     // A pool update holds new turns: the prompt queues, and runs once the hold lifts.
     if (this.#holds.turns !== null) {
@@ -513,7 +524,7 @@ export class TaskRunner {
     this.#pending.add(taskId);
     try {
       if (stale) this.#setState(taskId, "idle");
-      await this.#createTurn({ taskId, prompt: text, attachments });
+      await this.#createTurn({ taskId, prompt: text, attachments: refs });
     } catch (err) {
       this.#pending.delete(taskId);
       throw err;
@@ -534,7 +545,8 @@ export class TaskRunner {
       if (!(await this.blobs.ensure(a.hash))) throw new Error(`attachment ${a.name} is not on any online node`);
     }
     for (const a of attachments) {
-      if ((await stat(this.blobs.store.path(a.hash))).size !== a.size) throw new Error("bad attachment: size does not match its file");
+      const { size } = await stat(this.blobs.store.path(a.hash));
+      if (size !== a.size) throw new Error("bad attachment: size does not match its file");
     }
   }
 
@@ -569,10 +581,9 @@ export class TaskRunner {
     }
     // This is the one taker, kept single by `#pending`; meanwhile a prompt may join the tail, or the steers a turn
     // ended without the front, so the first prompt equal to it (text and attachments) goes.
-    const started = JSON.stringify(head);
     this.#db.transaction(() => {
       const queued = queuedOf(this.#row(taskId));
-      const at = queued.findIndex((q) => JSON.stringify(q) === started);
+      const at = queued.findIndex((q) => Bun.deepEquals(q, head));
       const rest = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
       updateTask(this.#db, taskId, { queued: queuedColumn(rest) });
     })();
@@ -807,9 +818,9 @@ export class TaskRunner {
   /**
    * The `run` phase of `meddle.turn`: drives the turn to its end with the first usable token. A rerun that resumes the
    * session sends `CARRY_ON_PROMPT` (the turn was cut off) or `TOKEN_RETRY_PROMPT` (its token failed it) instead of the
-   * prompt; otherwise Claude Code is sent the prompt with its images inline and its files' paths (`promptContent`). Steers
-   * the turn ends without taking are queued, with their attachments, ahead of the task's queued prompts. When the
-   * turn's token hit a limit or was refused, the token is marked for the pool. When the turn also ended
+   * prompt; otherwise Claude Code is sent the prompt with its images inline and its files' paths (`promptContent`).
+   * Steers the turn ends without taking are queued, with their attachments, ahead of the task's queued prompts. When
+   * the turn's token hit a limit or was refused, the token is marked for the pool. When the turn also ended
    * with an error, a `token_fault` is logged, and `"rerun"` is returned when this was the turn's first try
    * (`tokenRetries` 0, and this run is not already the rerun) and another token is usable now, so the phase enters
    * itself again. A turn that succeeded all the same is done.

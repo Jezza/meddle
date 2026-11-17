@@ -693,3 +693,73 @@ test("a steer with an image that the turn ends without keeps its image for the n
     await node.harness.close();
   }
 });
+
+test("a prompt sent while an earlier one with an attachment is still being taken runs after it", async () => {
+  const node = await setupNode();
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const shot = await storedShot(node);
+    let results = 0;
+    node.runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "result") results++; });
+    // the first prompt's file is checked on disk; the second has nothing to wait for, yet it waits its turn
+    const first = node.runner.prompt(m.id, "first, with image", [shot]);
+    const second = node.runner.prompt(m.id, "second, text");
+    expect(await Promise.all([first, second])).toEqual(["turn", "queued"]);
+    await eventually(() => results === 2 && node.runner.state(m.id) === "idle", () => `${results} results, ${node.runner.state(m.id)}`);
+    expect(userEvents(node.db, m.id).map((u) => u.message.content)).toEqual(["first, with image", "second, text"]);
+  } finally {
+    await node.harness.close();
+  }
+});
+
+test("steers reach the live turn in the order they were sent, a refused one between them breaking nothing", async () => {
+  const node = await setupNode("hello.jsonl", { MEDDLE_FIXTURE_STALL: "1" });
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const shot = await storedShot(node);
+    const initialised = nextInit(node.runner, m.id);
+    await node.runner.prompt(m.id, "look");
+    await initialised;
+    // the first steer's files are written before it is sent; the third, text alone, is sent after it all the same
+    const sent = [
+      node.runner.prompt(m.id, "S1", [shot]),
+      node.runner.prompt(m.id, "refused", [{ ...shot, hash: "0".repeat(64) }]),
+      node.runner.prompt(m.id, "S2"),
+    ];
+    expect((await Promise.allSettled(sent)).map((r) => r.status === "fulfilled" ? r.value : (r.reason as Error).message)).toEqual([
+      "queued", "attachment shot.png is not on any online node", "queued",
+    ]);
+    expect(node.runner.queued(m.id)).toEqual([{ text: "S1", attachments: [shot] }, { text: "S2", attachments: [] }]);
+    // held, so the interrupted turn leaves both queued, still in order
+    node.runner.setHolds({ turns: "held", work: null, hosting: null });
+    const end = turnEnd(node.runner, m.id);
+    await node.runner.interrupt(m.id);
+    await end.idle;
+    expect(JSON.parse(getTask(node.db, m.id)!.queued!)).toEqual([{ text: "S1", attachments: [shot] }, "S2"]);
+  } finally {
+    await node.harness.close();
+  }
+});
+
+test("an attachment keeps only its hash, name, type and size: nothing else a caller put on it is stored or logged", async () => {
+  const node = await setupNode();
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const shot = await storedShot(node);
+    const carrying = { ...shot, data: Buffer.from(PNG_BYTES).toString("base64") } as Attachment;
+    // queued (turns held): the stored queue
+    node.runner.setHolds({ turns: "held", work: null, hosting: null });
+    expect(await node.runner.prompt(m.id, "held", [carrying])).toBe("queued");
+    expect(JSON.parse(getTask(node.db, m.id)!.queued!)).toEqual([{ text: "held", attachments: [shot] }]);
+    const queuedTurn = turnEnd(node.runner, m.id);
+    node.runner.setHolds({ turns: null, work: null, hosting: null });
+    await queuedTurn.idle;
+    // a turn of its own: the turn's input, which is what the log records
+    const ownTurn = turnEnd(node.runner, m.id);
+    expect(await node.runner.prompt(m.id, "direct", [carrying])).toBe("turn");
+    await ownTurn.idle;
+    expect(userEvents(node.db, m.id).map((u) => [u.message.content, u.attachments])).toEqual([["held", [shot]], ["direct", [shot]]]);
+  } finally {
+    await node.harness.close();
+  }
+});
