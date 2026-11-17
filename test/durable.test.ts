@@ -1,6 +1,7 @@
 // test/durable.test.ts
 import { test, expect, spyOn } from "bun:test";
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { loadConfig, ensureDataDirs, paths, type NodeConfig } from "../src/config";
 import { openDb } from "../src/store/db";
 import { addProjectFromFolder } from "../src/projects/project";
@@ -13,7 +14,8 @@ import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import { jj } from "../src/jj";
 import { listLineRows, writeBranchRow } from "../src/pool/rows";
-import { readManifest, writeManifest } from "../src/tasks/manifest";
+import { readManifest, transcriptPath, writeManifest, type TaskManifest } from "../src/tasks/manifest";
+import type { Attachment, Prompt } from "../src/blobs/attachment";
 import { createTask, setupNode } from "./helpers";
 import { peerReady, twoPoolNodes } from "./pool-helpers";
 
@@ -84,17 +86,17 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   await initialised;
   expect(runner.state(m.id)).toBe("running");
   // a steer into the live turn is sent, and queued (told to listeners) until Claude Code takes it: not logged yet
-  const told: string[][] = [];
+  const told: Prompt[][] = [];
   runner.onQueued((tid) => { if (tid === m.id) told.push(runner.queued(m.id)); });
   await runner.prompt(m.id, "Also say why.");
-  expect(runner.queued(m.id)).toEqual(["Also say why."]);
-  expect(told).toEqual([["Also say why."]]);
+  expect(runner.queued(m.id)).toEqual([{ text: "Also say why.", attachments: [] }]);
+  expect(told).toEqual([[{ text: "Also say why.", attachments: [] }]]);
   expect(listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content)).toEqual(["Reply with the single word ok."]);
   await h.close();
   expect(runner.liveQuery(m.id)).toBeNull();
   expect(turnsStarted()).toEqual([false]);
   // the turn was killed before Claude Code took the steer: it waits as the task's next prompt
-  expect(queuedOf(getTask(db, m.id)!)).toEqual(["Also say why."]);
+  expect(queuedOf(getTask(db, m.id)!)).toEqual([{ text: "Also say why.", attachments: [] }]);
   // 2. a fresh process reruns the parked phase, which resumes the session and finishes the turn; the steer runs next
   const again = await open();
   let results = 0;
@@ -287,7 +289,7 @@ test("a project id in task.json that the task's row lacks fails the turn", async
 test("a prompt sent once the turn's input has closed waits, queued, and runs as the next turn", async () => {
   const { db, h, runner, m, turnsStarted } = await setup();
   let late: Promise<unknown> | undefined;
-  let queuedThen: string[] | undefined;
+  let queuedThen: Prompt[] | undefined;
   let results = 0;
   // a microtask after the result's listeners: the turn's input is closed, its child not gone yet
   runner.onEvent((tid, _s, msg: any) => {
@@ -297,7 +299,7 @@ test("a prompt sent once the turn's input has closed waits, queued, and runs as 
   await runner.prompt(m.id, "Reply with the single word ok.");
   await eventually(() => results === 2 && runner.state(m.id) === "idle", () => `${results} results, ${runner.state(m.id)}`);
   await late;
-  expect(queuedThen).toEqual(["too late"]);
+  expect(queuedThen).toEqual([{ text: "too late", attachments: [] }]);
   expect(turnsStarted()).toEqual([false, true]);
   const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
   expect(prompts).toEqual(["Reply with the single word ok.", "too late"]);
@@ -309,7 +311,7 @@ test("a steer Claude Code folds into the running turn is queued until it takes i
   await h.close();
   const steering = await open({ MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/steer-fold.jsonl` });
   const STEER = "Also: end your reply with the word PINEAPPLE.";
-  const told: string[][] = [];
+  const told: Prompt[][] = [];
   steering.runner.onQueued((tid) => { if (tid === m.id) told.push(steering.runner.queued(m.id)); });
   let sent: Promise<unknown> | undefined;
   steering.runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "assistant" && sent === undefined) sent = steering.runner.prompt(m.id, STEER); });
@@ -320,7 +322,7 @@ test("a steer Claude Code folds into the running turn is queued until it takes i
   expect((await end.result).result).toBe("done\n\nPINEAPPLE");
   await end.idle;
   await sent;
-  expect(told).toEqual([[STEER], []]);
+  expect(told).toEqual([[{ text: STEER, attachments: [] }], []]);
   const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user" && typeof (e.message as any).message.content === "string").map(e => (e.message as any).message.content);
   expect(prompts).toEqual(["Run the bash command `sleep 3; echo first`, then say done.", STEER]);
   expect(listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started")).toHaveLength(1);
@@ -363,7 +365,7 @@ test("a prompt to a task whose turn is parked retries the turn and queues the me
   // the prompt waits, queued, for the retried turn to end
   await runner.prompt("t1", "hello");
   expect(retried).toEqual(["turn-1"]);
-  expect(runner.queued("t1")).toEqual(["hello"]);
+  expect(runner.queued("t1")).toEqual([{ text: "hello", attachments: [] }]);
   await runner.retry("t1");
   expect(retried).toEqual(["turn-1", "turn-1"]);
   expect(listEvents(db, "t1")).toEqual([]);
@@ -541,4 +543,153 @@ test("a task created with a made-up title is named from its prompt, unless it wa
   // A task that cannot be renamed keeps its title, and naming it does not reject.
   await runner.nameFromPrompt("nonexistent", "t", "Say hello");
   await h.close();
+});
+
+// ─── prompts with attachments ───
+
+async function* chunks(...parts: Uint8Array[]) { for (const p of parts) yield p; }
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]); // a few bytes are enough; nothing decodes them
+
+/** Puts a small PNG into the node's blob store; answers it as an attachment named `shot.png`. */
+async function storedShot(node: { runner: TaskRunner }): Promise<Attachment> {
+  const { hash, size } = await node.runner.blobs.store.write(chunks(PNG_BYTES));
+  return { hash, name: "shot.png", type: "image/png", size };
+}
+
+/** The user messages the stand-in Claude Code wrote to the task's session transcript, one per run, in order. */
+async function transcriptPrompts(cfg: NodeConfig, m: TaskManifest): Promise<any[]> {
+  return (await readFile(transcriptPath(cfg, m), "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
+/** Resolves on the task's next `init`: Claude Code has read its first prompt and written it to the transcript. */
+function nextInit(runner: TaskRunner, taskId: string): Promise<void> {
+  return new Promise<void>((res) => runner.onEvent((tid, _s, msg: any) => { if (tid === taskId && msg.type === "system" && msg.subtype === "init") res(); }));
+}
+
+const userEvents = (db: Parameters<typeof listEvents>[0], taskId: string) =>
+  listEvents(db, taskId).map((e) => e.message as any).filter((msg) => msg.type === "user");
+
+test("a prompt's image reaches Claude Code inline and its file as a path", async () => {
+  const node = await setupNode();
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const shot = await storedShot(node);
+    const end = turnEnd(node.runner, m.id);
+    expect(await node.runner.prompt(m.id, "look", [shot])).toBe("turn");
+    await end.idle;
+    const [first] = await transcriptPrompts(node.cfg, m);
+    const dir = paths(node.cfg).taskAttachments(m.id);
+    expect(first.message.content[0]).toMatchObject({ type: "image", source: { media_type: "image/png" } });
+    expect(first.message.content.at(-1).text).toBe(`look\n\nAttached files:\n- shot.png: ${dir}/${shot.hash}/shot.png`);
+    expect(new Uint8Array(await readFile(`${dir}/${shot.hash}/shot.png`))).toEqual(PNG_BYTES);
+    // meddle's own log holds the text and the refs, never the bytes
+    expect(userEvents(node.db, m.id)).toMatchObject([{ message: { content: "look" }, attachments: [shot] }]);
+  } finally {
+    await node.harness.close();
+  }
+});
+
+test("a turn without attachments still finds the attachments folder Claude Code is given", async () => {
+  const node = await setupNode();
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const dir = paths(node.cfg).taskAttachments(m.id);
+    expect(existsSync(dir)).toBe(false);
+    const end = turnEnd(node.runner, m.id);
+    await node.runner.prompt(m.id, "Reply with the single word ok.");
+    await end.idle;
+    expect(existsSync(dir)).toBe(true);
+    const [first] = await transcriptPrompts(node.cfg, m);
+    expect(first.message.content).toBe("Reply with the single word ok.");
+  } finally {
+    await node.harness.close();
+  }
+});
+
+test("a prompt naming a blob no node has, a bad name or a wrong size is refused, and nothing is queued or logged", async () => {
+  const node = await setupNode();
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const shot = await storedShot(node);
+    await expect(node.runner.prompt(m.id, "look", [{ ...shot, hash: "0".repeat(64) }])).rejects.toThrow("attachment shot.png is not on any online node");
+    await expect(node.runner.prompt(m.id, "look", [{ ...shot, name: "../x" }])).rejects.toThrow("bad attachment:");
+    // every attachment is checked before any is fetched: a bad one after a missing one is what is refused
+    await expect(node.runner.prompt(m.id, "look", [{ ...shot, hash: "0".repeat(64) }, { ...shot, name: "" }])).rejects.toThrow("bad attachment:");
+    await expect(node.runner.prompt(m.id, "look", [{ ...shot, size: shot.size + 1 }])).rejects.toThrow("bad attachment: size does not match its file");
+    expect(node.runner.queued(m.id)).toEqual([]);
+    expect(getTask(node.db, m.id)!.queued).toBeNull();
+    expect(node.runner.state(m.id)).toBe("idle");
+    expect(userEvents(node.db, m.id)).toEqual([]);
+  } finally {
+    await node.harness.close();
+  }
+});
+
+test("a queue an older meddle wrote still reads, attachments stay with their prompt, and each runs once, in order", async () => {
+  const node = await setupNode();
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const shot = await storedShot(node);
+    updateTask(node.db, m.id, { queued: JSON.stringify(["old", { text: "new", attachments: [shot] }]) });
+    expect(node.runner.queued(m.id)).toEqual([{ text: "old", attachments: [] }, { text: "new", attachments: [shot] }]);
+    // held turns: both prompts queue behind them; a text alone is written as an older meddle wrote it
+    node.runner.setHolds({ turns: "held", work: null, hosting: null });
+    expect(await node.runner.prompt(m.id, "plain")).toBe("queued");
+    expect(await node.runner.prompt(m.id, "again", [shot])).toBe("queued");
+    expect(JSON.parse(getTask(node.db, m.id)!.queued!)).toEqual([
+      "old", { text: "new", attachments: [shot] }, "plain", { text: "again", attachments: [shot] },
+    ]);
+    let results = 0;
+    node.runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "result") results++; });
+    node.runner.setHolds({ turns: null, work: null, hosting: null });
+    await eventually(() => results === 4 && node.runner.state(m.id) === "idle", () => `${results} results, ${node.runner.state(m.id)}`, 30_000);
+    expect(userEvents(node.db, m.id).map((u) => [u.message.content, u.attachments ?? []])).toEqual([
+      ["old", []], ["new", [shot]], ["plain", []], ["again", [shot]],
+    ]);
+    expect(node.runner.queued(m.id)).toEqual([]);
+    expect(getTask(node.db, m.id)!.queued).toBeNull();
+    // each turn's Claude Code was sent its own prompt's image
+    const dir = paths(node.cfg).taskAttachments(m.id);
+    const sent = (await transcriptPrompts(node.cfg, m)).map((u) => typeof u.message.content === "string" ? u.message.content : u.message.content.at(-1).text);
+    expect(sent).toEqual(["old", `new\n\nAttached files:\n- shot.png: ${dir}/${shot.hash}/shot.png`, "plain", `again\n\nAttached files:\n- shot.png: ${dir}/${shot.hash}/shot.png`]);
+  } finally {
+    await node.harness.close();
+  }
+}, 60_000);
+
+test("a steer with an image that the turn ends without keeps its image for the next turn", async () => {
+  const node = await setupNode("hello.jsonl", { MEDDLE_FIXTURE_STALL: "1" });
+  try {
+    const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
+    const shot = await storedShot(node);
+    const initialised = nextInit(node.runner, m.id);
+    await node.runner.prompt(m.id, "look");
+    await initialised;
+    // the stand-in, stalled before its result, never takes the steer
+    expect(await node.runner.prompt(m.id, "and this", [shot])).toBe("queued");
+    expect(node.runner.queued(m.id)).toEqual([{ text: "and this", attachments: [shot] }]);
+    // turns held, so the steer waits once the interrupted turn ends without it
+    node.runner.setHolds({ turns: "held", work: null, hosting: null });
+    const end = turnEnd(node.runner, m.id);
+    await node.runner.interrupt(m.id);
+    await end.idle;
+    expect(node.runner.queued(m.id)).toEqual([{ text: "and this", attachments: [shot] }]);
+    expect(JSON.parse(getTask(node.db, m.id)!.queued!)).toEqual([{ text: "and this", attachments: [shot] }]);
+    expect(userEvents(node.db, m.id).map((u) => u.message.content)).toEqual(["look"]);
+    // the next turn sends it, its image inline
+    const next = nextInit(node.runner, m.id);
+    node.runner.setHolds({ turns: null, work: null, hosting: null });
+    await next;
+    const sent = (await transcriptPrompts(node.cfg, m))[1];
+    const dir = paths(node.cfg).taskAttachments(m.id);
+    expect(sent.message.content[0]).toMatchObject({ type: "image", source: { media_type: "image/png" } });
+    expect(sent.message.content.at(-1).text).toBe(`and this\n\nAttached files:\n- shot.png: ${dir}/${shot.hash}/shot.png`);
+    expect(userEvents(node.db, m.id).at(-1)).toMatchObject({ message: { content: "and this" }, attachments: [shot] });
+    expect(node.runner.queued(m.id)).toEqual([]);
+    const ended = turnEnd(node.runner, m.id);
+    await node.runner.interrupt(m.id);
+    await ended.idle;
+  } finally {
+    await node.harness.close();
+  }
 });

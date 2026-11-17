@@ -698,7 +698,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const archivedOn = self.state("archivedOn", members.archivedOn, { init: () => archivedOnNow(id) });
     const acceptance = self.state("acceptance", members.acceptance, { init: () => runner.acceptance(id) });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
-    const queued = self.state("queued", members.queued, { init: () => runner.queued(id) });
+    const queued = self.state("queued", members.queued, { init: () => runner.queued(id).map((p) => p.text) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
     // Read once the object is up (`self.task` below), not before: a dashboard opens one per task it lists.
@@ -755,7 +755,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
-    self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) queued.replace(ctx, runner.queued(id)); });
+    self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) queued.replace(ctx, runner.queued(id).map((p) => p.text)); });
     // What changed between the cells' init and the listeners starting.
     self.task(async (ctx) => {
       state.replace(ctx, runner.state(id));
@@ -764,7 +764,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       archivedOn.replace(ctx, archivedOnNow(id));
       acceptance.replace(ctx, runner.acceptance(id));
       pending.replace(ctx, approvals.pending(id));
-      queued.replace(ctx, runner.queued(id));
+      queued.replace(ctx, runner.queued(id).map((p) => p.text));
       refreshRow(ctx);
       catchUpLog(ctx);
       await refreshChanges(ctx);
