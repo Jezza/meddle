@@ -316,6 +316,13 @@ test("a project's graph shows a task's line and follows a turn's end", async () 
     expect(graph.flatMap((c) => c.bookmarks)).toContainEqual({ kind: "task", task: manifest.id });
     expect(graph.flatMap((c) => c.bookmarks)).toContainEqual({ kind: "branch", name: "main" });
     expect(await view.olderGraph({ limit: 1 })).toHaveLength(1);
+    // Clamped to 1..2000.
+    expect(await view.olderGraph({ limit: 0 })).toHaveLength(1);
+
+    // Archiving flips the line's row: its line leaves the graph.
+    await until(task.state, (s) => s === "idle");
+    await task.archive({});
+    await until(view.graph, (list) => !list.some((c) => c.bookmarks.some((b) => b.kind === "task")));
   } finally {
     await close();
   }

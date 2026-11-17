@@ -292,7 +292,9 @@ export const ProjectObject = remote("meddle.project", {
          * The commits of this node's replica from the default branch's parent up to its branches and the project's
          * task lines not archived (`projectGraph`), newest first, at most 200: re-read when projects change, when a
          * task of the project changes state, when the project's rows change, and every 60 s; the read is skipped
-         * while the bookmarks and the default branch are as they were, and a failed one keeps the last value.
+         * while the bookmarks and the default branch are as they were, and a failed one keeps the last value. So the
+         * `immutable` flags follow the counted bookmarks' moves: a fetch that moves only a remote bookmark (`main@origin`)
+         * shows on the next counted move.
          */
         graph: Type.Array(GraphCommitSchema),
         /** The project's branches, by name: re-computed when its branch rows change, and every 60 s. */
@@ -320,7 +322,10 @@ export const ProjectObject = remote("meddle.project", {
         ),
         /** `change`'s diff, in git's format. */
         memoryDiff: method(Type.Object({ change: Type.String() }), Type.String()),
-        /** The commits under the same bookmarks as `graph`'s with no lower bound, newest first, at most `limit` (1..2000). */
+        /**
+         * The commits under the same bookmarks as `graph`'s (probed now before its first read) with no lower bound,
+         * newest first, at most `limit` (1..2000).
+         */
         olderGraph: method(Type.Object({ limit: Type.Number() }), Type.Array(GraphCommitSchema)),
         /**
          * Writes (`deleteMemory`: deletes) a memory file on the project's home and commits just it to `memory`; `base`

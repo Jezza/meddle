@@ -18,7 +18,7 @@ import { bookmarkList, gitImport, isJjRepo, JjError } from "../jj";
 import { paths } from "../paths";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
-import { graphProbe, olderGraph, projectGraph, type GraphCommit } from "../projects/graph";
+import { graphProbe, olderGraph, projectGraph, type GraphCommit, type GraphProbe } from "../projects/graph";
 import { memoryChanges, memoryPlacing, MemoryWriteError, syncMemoryBefore, writeMemory } from "../projects/memory-sync";
 import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory } from "../projects/memory-view";
 import { releaseLineRows } from "../projects/lines";
@@ -85,8 +85,11 @@ type ChangesProbes = {
 };
 
 const NOTIFICATIONS_KEPT = 50;
-/** How often a `ProjectObject` re-reads its replica's bookmarks when nothing told it they changed (pushes from peers). */
-const HEADS_REFRESH_MS = 60_000;
+/**
+ * How often an object re-reads what can change without an event telling it (a peer's push, the user's git or jj): a
+ * project's graph, branches and memory, a task's lines.
+ */
+const SLOW_REFRESH_MS = 60_000;
 const WINDOW_SIZE = 200;
 /** The most changes of a project's memory history one `memoryHistory` call answers. */
 const MEMORY_HISTORY_MAX = 200;
@@ -244,9 +247,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const approvalChanges: Subscribable<null> = { subscribe: (cb) => approvals.onChange(() => cb(null)) };
   const samples: Subscribable<NodeMetrics> = { subscribe: (cb) => metrics.onSample(cb) };
   const poolChanges: Subscribable<null> = { subscribe: (cb) => pool.onChange(() => cb(null)) };
-  const headTicks: Subscribable<null> = {
+  const slowTicks: Subscribable<null> = {
     subscribe: (cb) => {
-      const timer = setInterval(() => cb(null), HEADS_REFRESH_MS);
+      const timer = setInterval(() => cb(null), SLOW_REFRESH_MS);
       timer.unref();
       return () => clearInterval(timer);
     },
@@ -548,29 +551,31 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         return { ...found, contextLoaded };
       },
     });
-    /** The probe key and default branch `graph` was last read in full at; null before the first read. */
-    let graphAt: string | null = null;
     /**
-     * The replica's graph (`projectGraph`), or `last` while the counted bookmarks and the default branch are as the last
-     * full read had them, or whenever jj cannot read it. The git refs are imported first: a peer's push lands in `.git`.
+     * The last full read of the graph: what it read, the probe it read under (`olderGraph` reads under it too) and that
+     * probe's key with the default branch. Kept apart from the cell, which a dropped refresh leaves behind.
      */
-    const graphNow = async (last: GraphCommit[]) => {
+    let read: { at: string; probe: GraphProbe; value: GraphCommit[] } | null = null;
+    /**
+     * The replica's graph (`projectGraph`), or the last full read's while the counted bookmarks and the default branch
+     * are as it had them, or whenever jj cannot read it. The git refs are imported first: a peer's push lands in `.git`.
+     */
+    const graphNow = async (): Promise<GraphCommit[]> => {
       const found = getProject(db, id);
-      if (found === null) return last;
+      if (found === null) return read?.value ?? [];
       try {
         await gitImport(found.replica, cfg);
         const probe = await graphProbe(cfg, found.replica, found.name, archivedOf(id));
         const at = JSON.stringify([probe.key, found.defaultBranch]);
-        if (at === graphAt) return last;
-        const read = await projectGraph(cfg, found.replica, probe, found.defaultBranch);
-        graphAt = at;
-        return read;
+        if (read !== null && at === read.at) return read.value;
+        read = { at, probe, value: await projectGraph(cfg, found.replica, probe, found.defaultBranch) };
+        return read.value;
       } catch {
-        return last;
+        return read?.value ?? [];
       }
     };
-    const graph = self.state("graph", ProjectObject.def.variants.default.state.graph, { init: () => graphNow([]) });
-    const refreshGraph = latest(() => graphNow(graph.value), graph);
+    const graph = self.state("graph", ProjectObject.def.variants.default.state.graph, { init: graphNow });
+    const refreshGraph = latest(graphNow, graph);
     self.on("projects", projectChanges, (_event, ctx) => refreshGraph(ctx));
     // A task of this project changed state: a turn's end moved (and pushed) its line, or a move fetched or forgot one.
     self.on("taskStates", states, ({ taskId }, ctx) => {
@@ -578,7 +583,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     });
     // Bookmarks a peer pushes into the replica's `.git`, or the user's git, tell nothing: a slow re-read (which imports
     // the git refs first) catches them.
-    self.on("ticks", headTicks, (_event, ctx) => refreshGraph(ctx));
+    self.on("ticks", slowTicks, (_event, ctx) => refreshGraph(ctx));
     /** The project's branches as this node computes them; [] while (or whenever) they cannot be read. */
     const branchesNow = async () => {
       try {
@@ -596,7 +601,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       await refreshBranches(ctx);
       await refreshGraph(ctx);
     });
-    self.on("branchTicks", headTicks, (_event, ctx) => refreshBranches(ctx));
+    self.on("branchTicks", slowTicks, (_event, ctx) => refreshBranches(ctx));
 
     const memoryRepo = paths(cfg).memory(id);
     /** Where `memory` and the memory working copy's parent are (`memoryPlacing`, read without a snapshot); null without a repo. */
@@ -629,7 +634,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       await followHome();
       await refreshMemoryHead(ctx);
     });
-    self.on("memoryTicks", headTicks, (_event, ctx) => refreshMemoryHead(ctx));
+    self.on("memoryTicks", slowTicks, (_event, ctx) => refreshMemoryHead(ctx));
     /** The memory repo, for a read; refused without one. */
     const readable = async () => {
       if (!(await isJjRepo(memoryRepo))) throw memoryRefusal("no-repo", "no memory replica here");
@@ -672,7 +677,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       olderGraph: async ({ limit }) => {
         const found = getProject(db, id);
         if (found === null) throw new ChordError("unavailable", `unknown: no project ${id}`);
-        const probe = await graphProbe(cfg, found.replica, found.name, archivedOf(id));
+        const probe = read?.probe ?? await graphProbe(cfg, found.replica, found.name, archivedOf(id));
         return olderGraph(cfg, found.replica, probe, Math.min(OLDER_GRAPH_MAX, Math.max(1, Math.trunc(limit))));
       },
       ...gated({
@@ -746,7 +751,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("manifests", manifests, (event, ctx) => { if (event.taskId === id) refreshRow(ctx); });
     self.on("projects", projectChanges, (_event, ctx) => refreshLines(ctx));
     // What the agent bookmarks during a turn, or the user by hand, tells nothing: a slow re-read catches it.
-    self.on("ticks", headTicks, (_event, ctx) => refreshLines(ctx));
+    self.on("ticks", slowTicks, (_event, ctx) => refreshLines(ctx));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
