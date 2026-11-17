@@ -1,5 +1,5 @@
-// A project across the pool (its home, its branches, a conflicted one with its siblings, the nodes holding a copy and
-// their bookmarks, its tasks), and adding a project on this node from a folder or an upstream URL.
+// A project across the pool (its home, its branches, a conflicted one with its siblings, the nodes holding a copy, its
+// tasks), and adding a project on this node from a folder or an upstream URL.
 import type { Host, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
 import { NodeObject, ProjectObject } from "../../state/contracts";
@@ -8,7 +8,7 @@ import { type Hosts, useAction, useObject, useValue } from "./hooks";
 import { Memory } from "./Memory";
 import { memorySource } from "./memory-model";
 import { PaneHead, type PoolRef, StateDot } from "./common";
-import { branchLines, headText, mergeProjects, type HeldProject } from "./pool-model";
+import { branchLines, mergeProjects, type HeldProject } from "./pool-model";
 import { hashOf } from "./routes";
 import { waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
@@ -70,16 +70,11 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
             )}
             <h3>Copies</h3>
             <table>
-              <thead><tr><th>Node</th><th>Bookmarks</th></tr></thead>
+              <thead><tr><th>Node</th></tr></thead>
               <tbody>
                 {project.holders.map((h) => (
                   <tr key={h.nodeId}>
                     <td title={h.nodeId}>{nameOf(h.nodeId)}{!h.contextLoaded && <div class="error">context failed to load</div>}</td>
-                    <td>
-                      {h.heads.length === 0 ? <span class="muted">no bookmarks</span> : h.heads.map((b, i) => (
-                        <div key={i} class={b.conflicted ? "flag" : ""}><code>{headText(b)}</code></div>
-                      ))}
-                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -127,14 +122,13 @@ function HeldSourceLoaded({ project, nodeId, report }: { project: Ref<typeof Pro
   const name = useValue(project.name);
   const home = useValue(project.home);
   const defaultBranch = useValue(project.defaultBranch);
-  const heads = useValue(project.heads);
   const branches = useValue(project.branches);
   const contextLoaded = useValue(project.contextLoaded);
   useEffect(() => {
     const key = `${nodeId}/${id}`;
-    report(key, { nodeId, id, name, home, defaultBranch: defaultBranch ?? null, heads, branches, contextLoaded });
+    report(key, { nodeId, id, name, home, defaultBranch: defaultBranch ?? null, branches, contextLoaded });
     return () => report(key, null);
-  }, [nodeId, id, name, home, defaultBranch, heads, branches, contextLoaded, report]);
+  }, [nodeId, id, name, home, defaultBranch, branches, contextLoaded, report]);
   return null;
 }
 

@@ -14,10 +14,11 @@ import type { PoolRuntime } from "../pool/runtime";
 import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
 import { listBranchRows, listLineRows, rowChanges } from "../pool/rows";
-import { bookmarkList, isJjRepo, JjError } from "../jj";
+import { bookmarkList, gitImport, isJjRepo, JjError } from "../jj";
 import { paths } from "../paths";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
+import { graphProbe, olderGraph, projectGraph, type GraphCommit } from "../projects/graph";
 import { memoryChanges, memoryPlacing, MemoryWriteError, syncMemoryBefore, writeMemory } from "../projects/memory-sync";
 import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory } from "../projects/memory-view";
 import { releaseLineRows } from "../projects/lines";
@@ -40,7 +41,6 @@ import { gated } from "../update/gate";
 import { VERSION } from "../version";
 import {
   BranchSchema,
-  HeadSchema,
   isProgress,
   NodeObject,
   NodeStore,
@@ -90,6 +90,8 @@ const HEADS_REFRESH_MS = 60_000;
 const WINDOW_SIZE = 200;
 /** The most changes of a project's memory history one `memoryHistory` call answers. */
 const MEMORY_HISTORY_MAX = 200;
+/** The most commits `ProjectObject.olderGraph` lists. */
+const OLDER_GRAPH_MAX = 2000;
 
 /**
  * A refusal of a memory call whose reason starts with `code` (`changed: …`) as the caller reads it (`remoteReason`).
@@ -546,26 +548,37 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         return { ...found, contextLoaded };
       },
     });
-    /** The replica's bookmarks; [] while (or whenever) jj cannot list them. */
-    const headsNow = async () => {
+    /** The probe key and default branch `graph` was last read in full at; null before the first read. */
+    let graphAt: string | null = null;
+    /**
+     * The replica's graph (`projectGraph`), or `last` while the counted bookmarks and the default branch are as the last
+     * full read had them, or whenever jj cannot read it. The git refs are imported first: a peer's push lands in `.git`.
+     */
+    const graphNow = async (last: GraphCommit[]) => {
       const found = getProject(db, id);
-      if (found === null) return [];
+      if (found === null) return last;
       try {
-        return await bookmarkList(found.replica, cfg);
+        await gitImport(found.replica, cfg);
+        const probe = await graphProbe(cfg, found.replica, found.name, archivedOf(id));
+        const at = JSON.stringify([probe.key, found.defaultBranch]);
+        if (at === graphAt) return last;
+        const read = await projectGraph(cfg, found.replica, probe, found.defaultBranch);
+        graphAt = at;
+        return read;
       } catch {
-        return [];
+        return last;
       }
     };
-    const heads = self.state("heads", Type.Array(HeadSchema), { init: headsNow });
-    const refreshHeads = latest(headsNow, heads);
-    self.on("projects", projectChanges, (_event, ctx) => refreshHeads(ctx));
-    // A task of this project changed state: a turn's end moved (and pushed) its bookmark, or a move fetched or forgot one.
+    const graph = self.state("graph", ProjectObject.def.variants.default.state.graph, { init: () => graphNow([]) });
+    const refreshGraph = latest(() => graphNow(graph.value), graph);
+    self.on("projects", projectChanges, (_event, ctx) => refreshGraph(ctx));
+    // A task of this project changed state: a turn's end moved (and pushed) its line, or a move fetched or forgot one.
     self.on("taskStates", states, ({ taskId }, ctx) => {
-      if (taskHasProject(taskId, id)) return refreshHeads(ctx);
+      if (taskHasProject(taskId, id)) return refreshGraph(ctx);
     });
     // Bookmarks a peer pushes into the replica's `.git`, or the user's git, tell nothing: a slow re-read (which imports
     // the git refs first) catches them.
-    self.on("ticks", headTicks, (_event, ctx) => refreshHeads(ctx));
+    self.on("ticks", headTicks, (_event, ctx) => refreshGraph(ctx));
     /** The project's branches as this node computes them; [] while (or whenever) they cannot be read. */
     const branchesNow = async () => {
       try {
@@ -577,7 +590,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const branches = self.state("branches", Type.Array(BranchSchema), { init: branchesNow });
     const refreshBranches = latest(branchesNow, branches);
     // Any row change, a push of another node's that waits for its commit included (still fetching until admitted).
-    self.on("rows", rowChanges, (projectId, ctx) => { if (projectId === id) return refreshBranches(ctx); });
+    // An archive flips a line row: its line leaves the graph.
+    self.on("rows", rowChanges, async (projectId, ctx) => {
+      if (projectId !== id) return;
+      await refreshBranches(ctx);
+      await refreshGraph(ctx);
+    });
     self.on("branchTicks", headTicks, (_event, ctx) => refreshBranches(ctx));
 
     const memoryRepo = paths(cfg).memory(id);
@@ -640,7 +658,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       home: self.derive([project], (p) => p.home),
       defaultBranch: self.derive([project], (p) => p.defaultBranch ?? null),
       contextLoaded: self.derive([project], (p) => p.contextLoaded),
-      heads,
+      graph,
       branches,
       memoryHead,
       memoryEntries: async () => memoryEntries(cfg, await readable()),
@@ -651,6 +669,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         ...(path === undefined ? {} : { path: memoryPath(path) }),
       }),
       memoryDiff: async ({ change }) => memoryDiff(cfg, await readable(), change),
+      olderGraph: async ({ limit }) => {
+        const found = getProject(db, id);
+        if (found === null) throw new ChordError("unavailable", `unknown: no project ${id}`);
+        const probe = await graphProbe(cfg, found.replica, found.name, archivedOf(id));
+        return olderGraph(cfg, found.replica, probe, Math.min(OLDER_GRAPH_MAX, Math.max(1, Math.trunc(limit))));
+      },
       ...gated({
         writeMemory: ({ path, text, base }: { path: string; text: string; base: string | null }) => write(path, text, base),
         deleteMemory: ({ path, base }: { path: string; base: string | null }) => write(path, null, base),
@@ -873,7 +897,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const replica = getProject(db, p.id)?.replica;
       if (replica === undefined) continue;
       try {
-        // Not under the repo lock (held across a push's network round trips), like `heads`: the listing never
+        // Not under the repo lock (held across a push's network round trips), like `graph`: the listing never
         // snapshots, and what it catches mid-push the next trigger corrects.
         for (const b of await bookmarkList(replica, cfg)) {
           if (b.remote === null && b.name.startsWith(ns)) found.push({ project: p.id, name: b.name, changeId: b.changeId });
@@ -929,6 +953,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const row = getTask(db, taskId);
     if (row === null) throw new Error(`unknown task: ${taskId}`);
     return JSON.parse(row.manifest) as TaskManifest;
+  }
+
+  /** The tasks whose lines in project `projectId` are archived. */
+  function archivedOf(projectId: string): Set<string> {
+    return new Set(listLineRows(db, projectId).filter((r) => r.archived).map((r) => r.task));
   }
 
   /** Whether task `taskId` (its row's manifest) works in project `projectId`. */

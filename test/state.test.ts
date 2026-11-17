@@ -303,20 +303,19 @@ test("a task's activation reads its log summary from the newest events, and its 
   }
 });
 
-test("a project's heads list its replica's bookmarks and follow a turn's end of a task of it, without a metrics sample", async () => {
+test("a project's graph shows a task's line and follows a turn's end", async () => {
   const { client, project, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
     const view = await client.get(ProjectObject, { id: project.id });
-    expect(view.heads.value.some((h) => h.name.startsWith("meddle/task/"))).toBe(false);
+    expect(view.graph.value.some((c) => c.bookmarks.some((b) => b.kind === "task"))).toBe(false);
     const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
     const task = await client.get(TaskObject, { id: manifest.id });
     await task.prompt({ text: "Reply with the single word ok." });
-    const bookmark = `meddle/task/${manifest.id}/${project.name}`;
-    const heads = await until(view.heads, (list) => list.some((h) => h.name === bookmark));
-    const head = heads.find((h) => h.name === bookmark)!;
-    expect(head).toMatchObject({ remote: null, conflicted: false });
-    expect(head.changeId).toMatch(/^[k-z]+$/);
+    const graph = await until(view.graph, (list) => list.some((c) => c.bookmarks.some((b) => b.kind === "task")));
+    expect(graph.flatMap((c) => c.bookmarks)).toContainEqual({ kind: "task", task: manifest.id });
+    expect(graph.flatMap((c) => c.bookmarks)).toContainEqual({ kind: "branch", name: "main" });
+    expect(await view.olderGraph({ limit: 1 })).toHaveLength(1);
   } finally {
     await close();
   }

@@ -119,6 +119,8 @@ test("olderGraph reads past the default branch's parent", async () => {
     const older = await olderGraph(cfg, replica, probe, 400);
     expect(ids(older)).toContain(c1);
     expect(ids(older)).not.toContain(ROOT);
+    // Nor is it c1's parent.
+    expect(older.find((c) => c.commit === c1)!.parents).toEqual([]);
     expect(newestFirst(older)).toBe(true);
     expect(await olderGraph(cfg, replica, probe, 3)).toHaveLength(3);
   } finally {

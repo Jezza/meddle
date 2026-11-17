@@ -48,16 +48,13 @@ export function projectChoices(nodes: readonly ProjectLister[]): ListedProject[]
   return [...byId.values()].map((e) => e.project).sort((x, y) => x.name.localeCompare(y.name) || x.id.localeCompare(y.id));
 }
 
-/** A bookmark of a project's replica, as `ProjectObject.heads` carries it. */
-export type Head = { name: string; remote: string | null; changeId: string; conflicted: boolean };
-
 /** One node's copy of a project, with its branches as that node computes them (`ProjectObject.branches`). */
 export type HeldProject = {
   nodeId: string; id: string; name: string; home: string; defaultBranch: string | null;
-  heads: readonly Head[]; branches: readonly ProjectBranch[]; contextLoaded: boolean;
+  branches: readonly ProjectBranch[]; contextLoaded: boolean;
 };
 
-export type Holder = { nodeId: string; heads: readonly Head[]; contextLoaded: boolean };
+export type Holder = { nodeId: string; contextLoaded: boolean };
 
 /** A project across the pool: the nodes holding a copy of it, and its branches as one of them computes them. */
 export type PoolProject = {
@@ -86,16 +83,10 @@ export function mergeProjects(held: readonly HeldProject[], nodeOrder: readonly 
       home: named.home,
       defaultBranch: named.defaultBranch,
       branches: named.branches,
-      holders: copies.map((c) => ({ nodeId: c.nodeId, heads: c.heads, contextLoaded: c.contextLoaded })),
+      holders: copies.map((c) => ({ nodeId: c.nodeId, contextLoaded: c.contextLoaded })),
     });
   }
   return rows.sort((x, y) => x.name.localeCompare(y.name) || x.id.localeCompare(y.id));
-}
-
-/** `name` (local) or `name@remote`, then the change's short id or `(conflicted)`. */
-export function headText(head: Head): string {
-  const where = head.remote === null ? head.name : `${head.name}@${head.remote}`;
-  return `${where} ${head.conflicted ? "(conflicted)" : head.changeId.slice(0, 8)}`;
 }
 
 /** A branch as the project page lists it: `text` says where it is; a conflicted one names its `siblings`. */

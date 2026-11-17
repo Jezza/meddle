@@ -1,6 +1,6 @@
 // test/ui.test.ts
 import { test, expect } from "bun:test";
-import { branchLines, headText, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
+import { branchLines, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
@@ -67,22 +67,19 @@ test("a task moves only to another online member that hosts tasks and runs the s
 
 test("the projects view merges each project's holders by id, home's name first, holders in pool order", () => {
   const [a, b, c] = ["a", "b", "c"].map((x) => x.repeat(64)) as [string, string, string];
-  const heads = [{ name: "trunk", remote: null, changeId: "kkkkkkkkkkkk", conflicted: false }];
   const branches = [{ name: "main", state: "single" as const, commit: "1".repeat(40), siblings: [], waiting: [] }];
   const rows = mergeProjects([
-    { nodeId: c, id: "p1", name: "one", home: a, defaultBranch: "main", heads: [], branches: [], contextLoaded: true },
-    { nodeId: a, id: "p1", name: "one", home: a, defaultBranch: "main", heads, branches, contextLoaded: true },
-    { nodeId: b, id: "p2", name: "two", home: b, defaultBranch: null, heads: [], branches: [], contextLoaded: false },
+    { nodeId: c, id: "p1", name: "one", home: a, defaultBranch: "main", branches: [], contextLoaded: true },
+    { nodeId: a, id: "p1", name: "one", home: a, defaultBranch: "main", branches, contextLoaded: true },
+    { nodeId: b, id: "p2", name: "two", home: b, defaultBranch: null, branches: [], contextLoaded: false },
   ], [a, b, c]);
   expect(rows).toEqual([
     {
       id: "p1", name: "one", home: a, defaultBranch: "main", branches,
-      holders: [{ nodeId: a, heads, contextLoaded: true }, { nodeId: c, heads: [], contextLoaded: true }],
+      holders: [{ nodeId: a, contextLoaded: true }, { nodeId: c, contextLoaded: true }],
     },
-    { id: "p2", name: "two", home: b, defaultBranch: null, branches: [], holders: [{ nodeId: b, heads: [], contextLoaded: false }] },
+    { id: "p2", name: "two", home: b, defaultBranch: null, branches: [], holders: [{ nodeId: b, contextLoaded: false }] },
   ]);
-  expect(headText(heads[0]!)).toBe("trunk kkkkkkkk");
-  expect(headText({ name: "meddle/task/t1/one", remote: "0123456789", changeId: "", conflicted: true })).toBe("meddle/task/t1/one@0123456789 (conflicted)");
 });
 
 test("the project page marks a conflicted branch, names its siblings as a checkout fetches them, and says what it is still fetching", () => {

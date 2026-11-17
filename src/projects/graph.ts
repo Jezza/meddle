@@ -12,7 +12,7 @@ export type GraphBookmark = { kind: "branch"; name: string } | { kind: "task"; t
 export type GraphCommit = {
   commit: string;
   change: string;
-  /** Every parent's commit id, whether or not it is in the same read. */
+  /** Every parent's commit id, whether or not it is in the same read; never the root's. */
   parents: string[];
   /** The description's first line. */
   description: string;
@@ -106,7 +106,8 @@ export async function projectGraph(
     return {
       commit,
       change,
-      parents: parents === "" ? [] : parents.split(","),
+      // The root is never read: a parent naming it would look like one cut off.
+      parents: parents.split(",").filter((p) => p !== "" && !/^0+$/.test(p)),
       description: rest.join(FIELD),
       immutable: immutable === "true",
       time: Date.parse(time),

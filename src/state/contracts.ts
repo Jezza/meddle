@@ -217,8 +217,25 @@ export const NodeStore = local("meddle.node-store", {
   },
 });
 
-/** A bookmark of a project's replica: local (`remote` null) or a remote's; a conflicted one has `changeId` "". */
-export const HeadSchema = Type.Object({ name: Type.String(), remote: Nullable(Type.String()), changeId: Type.String(), conflicted: Type.Boolean() });
+/** A branch, or a task's line in the project (`GraphBookmark`). */
+export const GraphBookmarkSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("branch"), name: Type.String() }),
+  Type.Object({ kind: Type.Literal("task"), task: Type.String() }),
+]);
+
+/** A commit of a project's graph (`GraphCommit`). */
+export const GraphCommitSchema = Type.Object({
+  commit: Type.String(),
+  change: Type.String(),
+  /** Every parent's commit id, whether or not it is in the same read; never the root's. */
+  parents: Type.Array(Type.String()),
+  /** The description's first line. */
+  description: Type.String(),
+  immutable: Type.Boolean(),
+  /** The committer's timestamp, in ms. */
+  time: Type.Number(),
+  bookmarks: Type.Array(GraphBookmarkSchema),
+});
 
 /**
  * A shared branch of a project as its node computes it from every node's rows (`ProjectBranch`): `single` at `commit`;
@@ -272,10 +289,12 @@ export const ProjectObject = remote("meddle.project", {
         ...ProjectSchema.properties,
         contextLoaded: Type.Boolean(),
         /**
-         * This node's replica's bookmarks, local and remote: re-read when projects change, when a task of the project
-         * changes state, and every 60 s.
+         * The commits of this node's replica from the default branch's parent up to its branches and the project's
+         * task lines not archived (`projectGraph`), newest first, at most 200: re-read when projects change, when a
+         * task of the project changes state, when the project's rows change, and every 60 s; the read is skipped
+         * while the bookmarks and the default branch are as they were, and a failed one keeps the last value.
          */
-        heads: Type.Array(HeadSchema),
+        graph: Type.Array(GraphCommitSchema),
         /** The project's branches, by name: re-computed when its branch rows change, and every 60 s. */
         branches: Type.Array(BranchSchema),
         /**
@@ -301,6 +320,8 @@ export const ProjectObject = remote("meddle.project", {
         ),
         /** `change`'s diff, in git's format. */
         memoryDiff: method(Type.Object({ change: Type.String() }), Type.String()),
+        /** The commits under the same bookmarks as `graph`'s with no lower bound, newest first, at most `limit` (1..2000). */
+        olderGraph: method(Type.Object({ limit: Type.Number() }), Type.Array(GraphCommitSchema)),
         /**
          * Writes (`deleteMemory`: deletes) a memory file on the project's home and commits just it to `memory`; `base`
          * is the `hash` it was read with (null: it was absent). Answers the change `memory` is on after it (where it
@@ -383,8 +404,7 @@ export const TaskObject = remote("meddle.task", {
         acceptance: Type.Union([Type.Literal("accepted"), Type.Literal("partly"), Type.Literal("no")]),
         /**
          * Every local bookmark under the task's namespace, per project (its id) in the manifest's order: the project's
-         * own and the side bookmarks. Re-read like `ProjectObject.heads`: when projects change, when the task changes
-         * state, and every 60 s.
+         * own and the side bookmarks. Re-read when projects change, when the task changes state, and every 60 s.
          */
         bookmarks: Type.Array(TaskBookmarkSchema),
         /**
