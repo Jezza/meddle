@@ -5,6 +5,8 @@ import { useCallback, useEffect, useState } from "preact/hooks";
 import { NodeObject, ProjectObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
+import { Memory } from "./Memory";
+import { memorySource } from "./memory-model";
 import { PaneHead, type PoolRef, StateDot } from "./common";
 import { branchLines, headText, mergeProjects, type HeldProject } from "./pool-model";
 import { hashOf } from "./routes";
@@ -28,6 +30,8 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
   const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
   const tasks = index.tasks.filter((t) => !t.archived && t.projects.some((p) => p.id === id));
   const listed = nodes.flatMap((n) => n.projects).find((p) => p.id === id);
+  const memory = project === undefined ? null : memorySource(project.home, project.holders.map((h) => h.nodeId), onlineIds);
+  const nodeName = (short: string) => nodes.find((n) => shortId(n.nodeId) === short)?.hostname ?? short;
   return (
     <>
       {online.map((row) => {
@@ -80,6 +84,9 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
                 ))}
               </tbody>
             </table>
+            {memory !== null && (
+              <Memory key={memory.nodeId} hosts={hosts} nodeId={memory.nodeId} editable={memory.editable} id={id} tasks={index.tasks} nodeName={nodeName} />
+            )}
           </>
         )}
         <h3>Tasks</h3>

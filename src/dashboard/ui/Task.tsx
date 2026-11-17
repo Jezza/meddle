@@ -363,7 +363,7 @@ function useSince(key: string): number {
   return last.current.at;
 }
 
-function Markdown({ text }: { text: string }) {
+export function Markdown({ text }: { text: string }) {
   const html = useMemo(() => DOMPurify.sanitize(renderMarkdown(text)), [text]);
   return <div class="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }

@@ -6,6 +6,8 @@ import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usa
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
+import { changeWho, memorySource, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
+import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 
 test("the dashboard bundle builds", async () => {
@@ -277,4 +279,39 @@ test("the last failure names its build, node and reason; a node behind the pool'
   expect([...buildAlerts({ poolBuild: "n3w", nodes: [node({}), node({ node: "a", build: "n3w", mismatched: false })] }).keys()]).toEqual(["b"]);
   expect(nodeDot({ online: true, running: 2 }, "Update failed: x")).toBe("dot bad");
   expect(nodeDot({ online: true, running: 2 })).toBe("dot busy");
+});
+
+test("memorySource picks the home, else a holder, read-only", () => {
+  expect(memorySource("h", ["h", "a", "b"], ["a", "h", "b"])).toEqual({ nodeId: "h", editable: true });
+  expect(memorySource("h", ["h", "a", "b"], ["b", "a"])).toEqual({ nodeId: "a", editable: false });
+  expect(memorySource("h", ["h", "a"], ["c"])).toBeNull();
+  expect(memorySource("h", [], [])).toBeNull();
+});
+
+test("changeWho names the task, the dashboard or the import", () => {
+  const change = (kind: MemoryChange["kind"], task: string | null = null): MemoryChange =>
+    ({ change: "c", at: "2026-11-17T00:00:00.000Z", node: null, task, kind, description: "", files: [], added: 0, removed: 0 });
+  const title = (id: string) => (id === "t1" ? "Render patches" : null);
+  expect(changeWho(change("task", "t1"), title)).toEqual({ label: "Render patches", taskId: "t1" });
+  expect(changeWho(change("task", "t9"), title)).toEqual({ label: "t9", taskId: "t9" });
+  expect(changeWho(change("dashboard"), title)).toEqual({ label: "Dashboard", taskId: null });
+  expect(changeWho(change("import"), title)).toEqual({ label: "Imported", taskId: null });
+  expect(changeWho(change("node"), title)).toEqual({ label: "", taskId: null });
+  expect(changeWho(change("other"), title)).toEqual({ label: "", taskId: null });
+});
+
+test("writeError reads changed and busy", () => {
+  const refused = (message: string) => Object.assign(new Error(message), { code: "unavailable" });
+  expect(writeError(refused("unavailable: changed: x"))).toBe("Changed");
+  expect(writeError(refused("unavailable: busy: y"))).toBe("Busy");
+  expect(writeError(refused("unavailable: path: z"))).toBeNull();
+  expect(writeError(refused("unavailable: other"))).toBeNull();
+  expect(writeError(new Error("network down"))).toBeNull();
+});
+
+test("stripFrontmatter leaves the body", () => {
+  expect(stripFrontmatter("---\nname: a\ntype: b\n---\n\nBody\n")).toBe("\nBody\n");
+  expect(stripFrontmatter("---\r\nname: a\r\n---\r\nBody")).toBe("Body");
+  expect(stripFrontmatter("# No frontmatter\n")).toBe("# No frontmatter\n");
+  expect(stripFrontmatter("---\nunclosed\n")).toBe("---\nunclosed\n");
 });

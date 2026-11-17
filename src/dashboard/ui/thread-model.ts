@@ -412,7 +412,7 @@ export function editDiff(tool: ToolItem): { hunks: Hunk[]; fallback: DiffRow[]; 
 }
 
 /** A text's lines, a final newline not counted as one more empty line. */
-function textLines(text: unknown): string[] {
+export function textLines(text: unknown): string[] {
   if (typeof text !== "string" || text === "") return [];
   const lines = text.split("\n");
   if (lines.at(-1) === "") lines.pop();
