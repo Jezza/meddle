@@ -11,7 +11,7 @@ import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
-import { Iconoir } from "./icons";
+import { Chevron, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { type ProjectLine, projectLines, usageShort } from "./sidebar-model";
@@ -471,10 +471,6 @@ function Icon({ name }: { name: keyof typeof ICONS }) {
   );
 }
 
-function Chevron() {
-  return <svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>;
-}
-
 /** A row's state, for screen readers: its icon says it only by shape. */
 function StateText({ running, failed }: { running: boolean; failed: boolean }) {
   return running ? <span class="sr">running</span> : failed ? <span class="sr">failed</span> : null;
@@ -543,7 +539,7 @@ function ToolRow({ tool }: { tool: ToolItem }) {
         {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
         {diff !== null && (diff.hunks.length > 0
           ? <DiffView hunks={diff.hunks} file={result?.original ?? null} {...fromWorkspace} />
-          : diff.fallback.length > 0 && <div class="diff"><DiffRows rows={diff.fallback} /></div>)}
+          : diff.fallback.length > 0 && <div class="diff"><div class="diff-body"><DiffRows rows={diff.fallback} /></div></div>)}
         {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
         {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}
         {(children.length > 0 || tool.agentId !== undefined) && (

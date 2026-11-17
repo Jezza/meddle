@@ -1,20 +1,22 @@
 // A task's changes in one of its projects: the changes since its start as a small graph on the left, `All changes`
-// first, and the selection's files as diffs on the right, whose hidden lines load from the node on a click.
+// first; the selection's files as a tree beside it; and their diffs on the right, whose hidden lines load from the
+// node on a click.
 import type { Ref } from "@earendil-works/chord";
-import type { ComponentChildren } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import type { ComponentChildren, JSX } from "preact";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { TaskObject } from "../../state/contracts";
 import { remoteReason } from "../../projects/memory-names";
 import type { ProjectChanges, TaskChange } from "../../tasks/changes";
-import { changeLabel, patchHash, summary, totals } from "./changes-model";
+import { changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "./changes-model";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
 import { useValue } from "./hooks";
+import { Chevron } from "./icons";
 import { textLines } from "./thread-model";
 
 type TaskRef = Ref<typeof TaskObject>;
 
-/** Changed lines, at most, for a file's diff to start open. */
+/** Changed lines, at most, for a file's diff to start shown. */
 const OPEN_LINES = 200;
 
 /** The task's changes: one project at a time, picked above the list when it has several. */
@@ -35,6 +37,12 @@ export function Changes({ task }: { task: TaskRef }) {
 /** What is selected: the whole line, or one change (its commit, and its change id to follow it once rewritten). */
 type Selection = "all" | { change: string; commit: string };
 
+/**
+ * A file of the selection's diff and its key: the selection, its path and its patch's hash, so that a file whose patch
+ * is unchanged by a read again keeps what was opened in it.
+ */
+type Shown = { patch: FilePatch; key: string };
+
 function ProjectView({ task, p, picker }: { task: TaskRef; p: ProjectChanges; picker: ComponentChildren }) {
   const [selected, setSelected] = useState<Selection>("all");
   // The selected change as listed now: the same commit, else the one change with its change id; else the whole line.
@@ -47,6 +55,20 @@ function ProjectView({ task, p, picker }: { task: TaskRef; p: ProjectChanges; pi
   const one = useDiff(task, p.project, current === undefined ? null : { change: current.commit });
   const shown = current === undefined ? all : one;
   const sum = all.patches === null ? null : totals(all.patches);
+  const tree = useMemo(() => shown.patches === null ? null : fileTree(shown.patches), [shown.patches]);
+  const at = current?.commit ?? `all ${p.from}`;
+  const diffs = useMemo((): Shown[] => tree === null ? [] : treeFiles(tree).map((patch) => ({ patch, key: `${at}\0${patch.path}\0${patchHash(patch)}` })), [tree, at]);
+  // The files shown or hidden by hand, by key; the rest are hidden when they are long.
+  const [shut, setShut] = useState<ReadonlyMap<string, boolean>>(new Map());
+  const closed = (d: Shown) => shut.get(d.key) ?? d.patch.added + d.patch.removed > OPEN_LINES;
+  const boxes = useRef(new Map<string, HTMLElement>());
+  // A file picked in the tree: its diff shown, at the top of the view.
+  const reveal = (patch: FilePatch) => {
+    const d = diffs.find((d) => d.patch === patch);
+    if (d === undefined) return;
+    if (closed(d)) setShut((m) => new Map(m).set(d.key, false));
+    boxes.current.get(d.key)?.scrollIntoView({ block: "start" });
+  };
   return (
     <div class="changes">
       <nav class="chg-list" aria-label="Changes">
@@ -70,6 +92,7 @@ function ProjectView({ task, p, picker }: { task: TaskRef; p: ProjectChanges; pi
           </div>
         </>}
       </nav>
+      {!p.conflicted && <FileTree nodes={tree ?? []} onReveal={reveal} />}
       <div class="chg-main">
         <div class="chg-sum">
           {p.conflicted ? <span class="flag">conflicted</span> : <>
@@ -83,13 +106,13 @@ function ProjectView({ task, p, picker }: { task: TaskRef; p: ProjectChanges; pi
         </div>
         {!p.conflicted && <>
           {shown.error !== null && <p class="error">{shown.error}</p>}
-          {shown.patches?.map((patch) => {
+          {diffs.map((d) => {
             // The old side: the change's parent, or for the whole line where it leaves its start.
             const rev = current === undefined ? p.from ?? undefined : `${current.commit}-`;
-            // A file whose patch is unchanged by a read again keeps what was opened in it.
             return (
-              <FileDiff key={`${current?.commit ?? `all ${p.from}`}\0${patch.path}\0${patchHash(patch)}`} task={task} project={p.project} patch={patch}
-                rev={patch.status === "added" ? undefined : rev} />
+              <FileDiff key={d.key} task={task} project={p.project} patch={d.patch} rev={d.patch.status === "added" ? undefined : rev}
+                closed={closed(d)} onToggle={() => setShut((m) => new Map(m).set(d.key, !closed(d)))}
+                box={(el) => { if (el === null) boxes.current.delete(d.key); else boxes.current.set(d.key, el); }} />
             );
           })}
         </>}
@@ -113,6 +136,44 @@ function ChangeRow({ c, first, selected, onSelect }: { c: TaskChange; first: boo
       </span>
     </button>
   );
+}
+
+/**
+ * The selection's files as a tree, in the order of their diffs: a file's row brings its diff to the top of the view,
+ * shown; a folder's folds it.
+ */
+function FileTree({ nodes, onReveal }: { nodes: readonly FileNode[]; onReveal(patch: FilePatch): void }) {
+  const [folded, setFolded] = useState<ReadonlySet<string>>(new Set());
+  const fold = (path: string) => setFolded((f) => {
+    const next = new Set(f);
+    if (!next.delete(path)) next.add(path);
+    return next;
+  });
+  const rows: JSX.Element[] = [];
+  const walk = (list: readonly FileNode[], depth: number) => {
+    for (const n of list) {
+      const indent = { paddingLeft: `${4 + depth * 12}px` };
+      if (n.kind === "dir") {
+        const open = !folded.has(n.path);
+        rows.push(
+          <button key={`d${n.path}`} type="button" class="tree-row" style={indent} aria-expanded={open} title={n.path} onClick={() => fold(n.path)}>
+            <Chevron /><span class="tree-name">{n.name}</span>
+          </button>,
+        );
+        if (open) walk(n.children, depth + 1);
+        continue;
+      }
+      const { patch } = n;
+      rows.push(
+        <button key={`f${patch.path}`} type="button" class={`tree-row ${patch.status}`} style={indent}
+          title={patch.oldPath === undefined ? patch.path : `${patch.oldPath} → ${patch.path}`} onClick={() => onReveal(patch)}>
+          <span class="chev" /><span class="tree-name">{n.name}</span>
+        </button>,
+      );
+    }
+  };
+  walk(nodes, 0);
+  return <nav class="chg-tree" aria-label="Files">{rows}</nav>;
 }
 
 /**
@@ -142,10 +203,18 @@ function Lines({ added, removed }: { added: number; removed: number }) {
 const files = (n: number) => `${n} ${n === 1 ? "file" : "files"}`;
 
 /**
- * One file's diff, open when it has at most `OPEN_LINES` changed lines; its hidden lines read from `rev` (none for an
- * added file) on the first click, a read's refusal shown beneath.
+ * One file's diff, its rows hidden while `closed`; its hidden lines read from `rev` (none for an added file) on the
+ * first click, a read's refusal shown beneath. `box` is given the file's element.
  */
-function FileDiff({ task, project, patch, rev }: { task: TaskRef; project: string; patch: FilePatch; rev: string | undefined }) {
+function FileDiff({ task, project, patch, rev, closed, onToggle, box }: {
+  task: TaskRef;
+  project: string;
+  patch: FilePatch;
+  rev: string | undefined;
+  closed: boolean;
+  onToggle(): void;
+  box(el: HTMLElement | null): void;
+}) {
   const [error, setError] = useState<string | null>(null);
   const load = rev === undefined ? undefined : async () => {
     try {
@@ -158,8 +227,8 @@ function FileDiff({ task, project, patch, rev }: { task: TaskRef; project: strin
     }
   };
   return (
-    <div class="chg-file">
-      <DiffView hunks={patch.hunks} file={null} load={load} closed={patch.added + patch.removed > OPEN_LINES}
+    <div ref={box} class="chg-file">
+      <DiffView hunks={patch.hunks} file={null} load={load} closed={closed} onToggle={onToggle}
         head={{ path: patch.path, status: patch.status, added: patch.added, removed: patch.removed, binary: patch.binary }} />
       {error !== null && <p class="error">{error}</p>}
     </div>
