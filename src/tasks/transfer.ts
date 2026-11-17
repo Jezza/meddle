@@ -3,6 +3,7 @@ import { cp, lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle 
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { SendStream } from "@number0/iroh";
+import { promptOf, queueEntry, type Prompt } from "../blobs/attachment";
 import type { NodeConfig } from "../config";
 import { paths } from "../paths";
 import { MAX_FRAME, writeFrame, type StreamReader } from "../pool/frames";
@@ -14,11 +15,13 @@ import { transcriptSlot, type TaskManifest } from "./manifest";
  * A task's move, as frames on one `blob` stream: JSON header frames (kind 0) in the order manifest, events, transcript
  * rows, files, done; each `file` frame is followed by its bytes as kind-1 frames (one, for a file of at most
  * `MAX_FRAME` bytes). `done` carries the sender's counts and a SHA-256 over every frame before it (kind, length and
- * payload, as sent); the receiver computes its own and answers with its receipt.
+ * payload, as sent); the receiver computes its own and answers with its receipt. The manifest's `queued` holds the
+ * task's `tasks.queued` entries as they are: a string is a text-only prompt (all an older meddle sends), a prompt
+ * carries its attachments' refs, never their bytes.
  */
 
 export type TransferFrame =
-  | { t: "manifest"; manifest: TaskManifest; settings: TaskSettings | null; queued: string[]; turns: number }
+  | { t: "manifest"; manifest: TaskManifest; settings: TaskSettings | null; queued: (string | Prompt)[]; turns: number }
   /** `at`: when the sender logged it; absent from a sender from before it was sent, and the receiver's now then. */
   | { t: "event"; seq: number; json: string; at?: string }
   | { t: "transcript"; projectKey: string; sessionId: string; subpath: string; seq: number; uuid: string | null; ts: number; json: string }
@@ -144,7 +147,7 @@ function manifestFrame(row: { manifest: string; settings: string | null; queued:
     t: "manifest",
     manifest: JSON.parse(row.manifest) as TaskManifest,
     settings: row.settings === null ? null : (JSON.parse(row.settings) as TaskSettings),
-    queued: row.queued === null ? [] : (JSON.parse(row.queued) as string[]),
+    queued: row.queued === null ? [] : (JSON.parse(row.queued) as (string | Prompt)[]),
     turns: row.turns,
   };
 }
@@ -242,14 +245,16 @@ function stringField(json: string, name: string): string | null {
 /**
  * Receives a task `exportTask` sent: files are written under this node's `<taskConfig>/projects/` as they arrive; the
  * event and transcript rows are written in one transaction once `done` arrives, so a stream that ends first ("transfer
- * ended early") leaves no rows. The manifest must be task `expect.taskId`'s. The caller inserts the task row.
+ * ended early") leaves no rows. The manifest must be task `expect.taskId`'s, and each of its queued entries a prompt
+ * (`promptOf`), else `bad queued prompt in transfer`; they come back as `queueEntry` has them, each attachment its four
+ * fields alone. The caller inserts the task row.
  */
 export async function importTask(
   cfg: NodeConfig,
   db: Database,
   reader: StreamReader,
   expect: { taskId: string },
-): Promise<{ manifest: TaskManifest; settings: TaskSettings | null; queued: string[]; turns: number; receipt: Receipt }> {
+): Promise<{ manifest: TaskManifest; settings: TaskSettings | null; queued: (string | Prompt)[]; turns: number; receipt: Receipt }> {
   const hash = new FrameHash();
   const next = async () => {
     const frame = await reader.readFrame();
@@ -262,6 +267,13 @@ export async function importTask(
   const head = first.kind === HEADER ? parseFrame(first.data) : null;
   if (head?.t !== "manifest") throw new Error("transfer does not begin with a manifest");
   if (head.manifest?.id !== expect.taskId) throw new Error("manifest is for another task");
+  const queued = (Array.isArray(head.queued) ? head.queued : []).map((entry) => {
+    try {
+      return queueEntry(promptOf(entry));
+    } catch {
+      throw new Error("bad queued prompt in transfer");
+    }
+  });
 
   const root = join(paths(cfg).taskConfig(expect.taskId), "projects");
   await mkdir(root, { recursive: true });
@@ -326,7 +338,7 @@ export async function importTask(
   return {
     manifest: head.manifest,
     settings: head.settings ?? null,
-    queued: Array.isArray(head.queued) ? head.queued : [],
+    queued,
     turns: head.turns,
     receipt: {
       events: events.length, transcript: transcript.length, files, bytes, lastEventSeq: events.at(-1)?.seq ?? 0, sha256: hash.digest(),

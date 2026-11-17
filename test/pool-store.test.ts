@@ -18,7 +18,7 @@ function row(nodeId: string, status: RosterRow["status"], updatedAt: string, ext
 }
 
 function summary(hostname: string, taskCount: number): NodeSummary {
-  return { hostname, version: "0.1.0", claudeCodeVersion: "2.1.0", hostsTasks: true, taskCount, running: 0, limit: 0, projects: [] };
+  return { hostname, version: "0.1.0", claudeCodeVersion: "2.1.0", hostsTasks: true, taskCount, running: 0, limit: 0, projects: [], attachments: true };
 }
 
 test("ensurePool makes an empty pool (no secret) with this node alone, and is idempotent", () => {

@@ -125,7 +125,7 @@ async function poolNode(
   const store = new PoolStore(db);
   const identity = freshIdentity();
   const id = identity.id;
-  const summary: NodeSummary = { hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [] };
+  const summary: NodeSummary = { hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [], attachments: true };
   store.setSecret({ nodeId: id, hostname: summary.hostname }, DEFAULT_POOL_NAME, POOL_SECRET);
   const endpoint = await openEndpoint(cfg, identity);
   const errors: unknown[] = [];

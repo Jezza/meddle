@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { attachmentProblem, type Attachment } from "../blobs/attachment";
 
 /** `at`: when this node logged the event (a moved task's events keep the times they were logged with). */
 export type EventRecord = { seq: number; message: unknown; at: string };
@@ -97,4 +98,21 @@ export function latestEventWithField(db: Database, taskId: string, type: string,
     "SELECT seq, at, json FROM events WHERE task_id = ? AND type = ? AND subtype = ? AND json_extract(json, ?) IS NOT NULL ORDER BY seq DESC LIMIT 1",
   ).get(taskId, type, subtype, `$.${field}`);
   return row === null ? null : { seq: row.seq, message: JSON.parse(row.json), at: row.at };
+}
+
+/**
+ * Every valid attachment of the task's logged prompts (`user` events with `attachments`), oldest first, each as its
+ * `hash`, `name`, `type` and `size` alone; anything else on an event's `attachments` is left out.
+ */
+export function listPromptAttachments(db: Database, taskId: string): Attachment[] {
+  const rows = db.query<{ json: string }, [string]>(
+    "SELECT json FROM events WHERE task_id = ? AND type = 'user' AND json_extract(json, '$.attachments') IS NOT NULL ORDER BY seq",
+  ).all(taskId);
+  return rows.flatMap((row) => {
+    const attachments = (JSON.parse(row.json) as { attachments?: unknown }).attachments;
+    if (!Array.isArray(attachments)) return [];
+    return (attachments as unknown[])
+      .filter((a): a is Attachment => attachmentProblem(a) === null)
+      .map(({ hash, name, type, size }) => ({ hash, name, type, size }));
+  });
 }

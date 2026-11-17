@@ -565,8 +565,9 @@ export type SessionView = Type.Static<typeof SessionViewSchema>;
 export const WireAddrSchema = Type.Object({ id: Type.String(), relay: Nullable(Type.String()), direct: Type.Array(Type.String()) });
 
 /**
- * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit` and `projects` are
- * optional: an older meddle sends none of them, and they read as 0, 0 and [] (`withSummaryDefaults`).
+ * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit`, `projects` and
+ * `attachments` are optional: an older meddle sends none of them, and they read as 0, 0, [] and false
+ * (`withSummaryDefaults`).
  */
 export const NodeSummarySchema = Type.Object({
   hostname: Type.String(),
@@ -580,6 +581,8 @@ export const NodeSummarySchema = Type.Object({
   limit: Type.Optional(Type.Number()),
   /** Every project the node holds, its own and its replicas of others'. */
   projects: Type.Optional(Type.Array(ProjectInfoSchema)),
+  /** Whether the node takes prompts with attachments. */
+  attachments: Type.Optional(Type.Boolean()),
 });
 
 /** One node of the pool's roster (`RosterRow`). */

@@ -79,6 +79,11 @@ test("a queue entry is a string for text alone, and either shape reads back", ()
   expect(promptOf(queueEntry(p))).toEqual(p);
   expect(() => promptOf({ text: 1 })).toThrow("bad queued prompt");
 });
+test("a queued prompt reads back with each attachment as its four fields only", () => {
+  const entry = { text: "x", attachments: [{ ...att(), data: "AAAA", note: { deep: true } }], extra: 1 };
+  expect(promptOf(entry)).toEqual({ text: "x", attachments: [att()] });
+  expect(Object.keys(promptOf(entry).attachments[0]!)).toEqual(["hash", "name", "type", "size"]);
+});
 test("a queued prompt that would write somewhere it must not is refused", () => {
   expect(() => promptOf({ text: "x", attachments: [att({ name: "../x" })] })).toThrow("bad queued prompt");
   expect(() => promptOf({ text: "x", attachments: "none" })).toThrow("bad queued prompt");

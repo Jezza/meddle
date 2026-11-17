@@ -7,8 +7,8 @@ import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
-import { attachmentProblem, queueEntry, type Attachment, type Prompt } from "../blobs/attachment";
-import { promptContent } from "../blobs/content";
+import { attachmentProblem, promptOf, queueEntry, type Attachment, type Prompt } from "../blobs/attachment";
+import { materialize, promptContent } from "../blobs/content";
 import { BlobFetcher } from "../blobs/pool";
 import { BlobStore } from "../blobs/store";
 import { Approvals } from "../engine/approvals";
@@ -32,7 +32,7 @@ import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRow
 import { branchChanges, lineChanges, listLineRows, mergeLineRows, writeLineRow, type LineRow } from "../pool/rows";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
-import { appendEvent, latestEventOfType, listEventsTail, type EventRecord } from "../store/events";
+import { appendEvent, latestEventOfType, listEventsTail, listPromptAttachments, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
   clearTaskLog,
@@ -1124,19 +1124,24 @@ export class TaskRunner {
 
   /**
    * Imports the task `from` sends over a `blob` stream into its `receiving` row (what an earlier attempt imported is
-   * replaced), keeping its settings, queued prompts and turn count. Refused `forbidden` unless the task is being
-   * received from `from`.
+   * replaced), keeping its settings, queued prompts and turn count. Every file its queued prompts name is fetched (from
+   * `from` first) before it answers: one no member gives fails the import (`attachment <name> could not be fetched
+   * from <short id>`). Refused `forbidden` unless the task is being received from `from`.
    */
   async importIncoming(taskId: string, from: string, reader: StreamReader): Promise<Receipt> {
     return serialised(taskKey(taskId), async () => {
       const row = this.#receivingFrom(taskId, from);
       clearTaskLog(this.#db, taskId, row.session_id);
       const got = await importTask(this.#cfg, this.#db, reader, { taskId });
+      const queued = got.queued.map(promptOf);
+      for (const a of queued.flatMap((p) => p.attachments)) {
+        if (!(await this.blobs.ensure(a.hash, from))) throw new Error(`attachment ${a.name} could not be fetched from ${shortId(from)}`);
+      }
       // The manifest checked as the task was received, not the stream's copy.
       await adoptTranscriptSlot(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest);
       updateTask(this.#db, taskId, {
         settings: got.settings === null ? null : JSON.stringify(got.settings),
-        queued: got.queued.length === 0 ? null : JSON.stringify(got.queued),
+        queued: queuedColumn(queued),
         turns: got.turns,
       });
       notify(this.#settingsListeners, (cb) => cb(taskId));
@@ -1147,11 +1152,12 @@ export class TaskRunner {
   /**
    * Makes a task received from `from` live here (`idle`); a follow-up joins the front of its queued prompts, which
    * then run one turn each, in order (`startQueued`), and its lines' rows are this node's, one epoch up
-   * (`holdLineRows`, in the same transaction as the row's state: a failure to hold them is no activation). A task
-   * already activated is a no-op: the sender's commit ran again, also when this node has moved the task on since. Refused `forbidden` when this node has no copy of the
-   * task or is receiving it from another node. Every answer is definite, so the sender can tell it from a lost one:
-   * `ok: true` when this node activated the task, `ok: false` when activating it failed and it did not (its received
-   * copy stays, for the sender to abandon).
+   * (`holdLineRows`, in the same transaction as the row's state: a failure to hold them is no activation). The files of
+   * its earlier prompts are then written under the task again, without waiting (`#rewriteAttachments`, from `from`
+   * first). A task already activated is a no-op: the sender's commit ran again, also when this node has moved the
+   * task on since. Refused `forbidden` when this node has no copy of the task or is receiving it from another node.
+   * Every answer is definite, so the sender can tell it from a lost one: `ok: true` when this node activated the task,
+   * `ok: false` when activating it failed and it did not (its received copy stays, for the sender to abandon).
    */
   async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: boolean }> {
     return serialised(taskKey(taskId), async () => {
@@ -1187,9 +1193,47 @@ export class TaskRunner {
         // The task is here now; its prompts stay queued, and the next prompt starts them.
         this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
       }
+      void this.#rewriteAttachments(taskId, from);
       await this.#deps.hooks?.afterActivate?.(taskId);
       return { ok: true };
     });
+  }
+
+  /**
+   * Writes the files of the task's logged prompts under it again (`materialize`), so that the paths Claude Code was
+   * given in earlier turns still work after a move or a restore. Best effort: each file is fetched when it is not here
+   * (from `prefer` first); one no online node has is logged (`meddle: task <id>: attachment <name> is not on any online
+   * node`) and left out, as is one that cannot be written. Stops once the task leaves (moving, archived, moved), so
+   * that nothing is written into a folder taken off this node. Never rejects.
+   */
+  async #rewriteAttachments(taskId: string, prefer?: string): Promise<void> {
+    const here = () => {
+      const row = getTask(this.#db, taskId);
+      return row !== null && (row.state === "idle" || row.state === "running" || row.state === "waiting")
+        && !this.#isMoving(row) && !this.#archiving.has(taskId);
+    };
+    try {
+      const dir = paths(this.#cfg).taskAttachments(taskId);
+      const done = new Set<string>();
+      for (const a of listPromptAttachments(this.#db, taskId)) {
+        // A file sent with several prompts is fetched, or found missing, once.
+        if (done.has(`${a.hash}/${a.name}`)) continue;
+        done.add(`${a.hash}/${a.name}`);
+        if (!here()) return;
+        try {
+          if (!(await this.blobs.ensure(a.hash, prefer))) {
+            this.#log(`meddle: task ${taskId}: attachment ${a.name} is not on any online node`);
+            continue;
+          }
+          if (!here()) return;
+          await materialize(this.blobs.store, dir, a);
+        } catch (err) {
+          this.#log(`meddle: task ${taskId}: attachment ${a.name} was not written again: ${messageOf(err)}`);
+        }
+      }
+    } catch (err) {
+      this.#log(`meddle: task ${taskId}: the files of its prompts were not written again: ${messageOf(err)}`);
+    }
   }
 
   /**
@@ -1411,7 +1455,8 @@ export class TaskRunner {
    * (`#takeLines`), and each project's workspace starts on its project's line; the folder is provisioned from the
    * manifest and the archive's files are unpacked into it (a task without a project's transcript into this node's
    * slot). The row is `idle` again, no longer archived, its lines' rows live again (`holdLineRows`, then applied here),
-   * and the archive is deleted. No other node is asked anything. On failure, what it made is taken off again and the
+   * and the archive is deleted. No other node is asked anything but for the files of its prompts, which are written
+   * under the task again without waiting (`#rewriteAttachments`). On failure, what it made is taken off again and the
    * task stays archived. While it runs, another restore of the task is refused (`task is being restored`).
    */
   async restoreHere(taskId: string): Promise<TaskManifest> {
@@ -1465,6 +1510,7 @@ export class TaskRunner {
       await this.#applyProjects(deps, this.#row(taskId), "was restored");
       await rm(file, { force: true });
       this.#emitState(taskId, "idle");
+      void this.#rewriteAttachments(taskId);
       return restored;
     });
   }
@@ -1854,7 +1900,8 @@ export class TaskRunner {
   /**
    * Throws why task `row` cannot move to `to` (decision 16): it is not live here (received, moved, archived) or is
    * already moving (unless `own`: the move's own steps check again), there is no pool, `to` is this node, not a
-   * member, offline or hosts no tasks, or the two report different or unknown Claude Code versions. With
+   * member, offline or hosts no tasks, the two report different or unknown Claude Code versions, or the task has a
+   * prompt with attachments queued and `to` does not say it takes them (an older meddle would drop them). With
    * `fromArchive` (a restore-move) it is the other way round: the task must be archived here, or (`own`, a rerun of
    * `prepare`) moving with its row still naming this node as where it is archived.
    */
@@ -1892,6 +1939,9 @@ export class TaskRunner {
     const ours = claudeCodeVersion();
     const theirs = summary.claudeCodeVersion;
     if (ours !== theirs || ours === "unknown" || theirs === "unknown") throw new Error(`claude code ${ours} here, ${theirs} there`);
+    if (!summary.attachments && this.queued(row.id).some((p) => p.attachments.length > 0)) {
+      throw new Error(`${summary.hostname} runs a meddle that takes no attachments`);
+    }
   }
 
   onMove(cb: (taskId: string, move: MoveState | null) => void): () => void {

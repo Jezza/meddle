@@ -126,6 +126,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     running: summary.running(),
     limit: settings.runningLimit(),
     projects: summary.projects(),
+    attachments: true,
   });
   let key: PoolKey | null;
   try {

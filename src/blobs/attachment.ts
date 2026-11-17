@@ -70,13 +70,19 @@ export function attachmentProblem(a: unknown): string | null {
   return null;
 }
 
-/** The prompt a queue entry holds; a string is text alone. Throws `bad queued prompt` for anything else. */
+/**
+ * The prompt a queue entry holds; a string is text alone. Throws `bad queued prompt` for anything else. Each attachment
+ * is copied as its `hash`, `name`, `type` and `size` alone: whatever else an entry carries (one another meddle wrote, or
+ * that came with a move) never reaches a turn's input or the log.
+ */
 export function promptOf(entry: unknown): Prompt {
   if (typeof entry === "string") return { text: entry, attachments: [] };
   if (typeof entry === "object" && entry !== null) {
     const { text, attachments } = entry as Record<string, unknown>;
     const valid = Array.isArray(attachments) && attachments.every((a) => attachmentProblem(a) === null);
-    if (typeof text === "string" && valid) return entry as Prompt;
+    if (typeof text === "string" && valid) {
+      return { text, attachments: (attachments as Attachment[]).map(({ hash, name, type, size }) => ({ hash, name, type, size })) };
+    }
   }
   throw new Error("bad queued prompt");
 }

@@ -1,6 +1,8 @@
 import { test, expect } from "bun:test";
+import type { Attachment } from "../src/blobs/attachment";
+import { promptEvent } from "../src/engine/session";
 import { openDb } from "../src/store/db";
-import { appendEvent, latestEventOfType, latestEventWithField, listEvents, listEventsTail } from "../src/store/events";
+import { appendEvent, latestEventOfType, latestEventWithField, listEvents, listEventsTail, listPromptAttachments } from "../src/store/events";
 test("unknown message shapes are stored verbatim with sequence numbers", () => {
   const db = openDb(":memory:");
   expect(appendEvent(db, "t", { type: "assistant", uuid: "u1" })).toBe(1);
@@ -79,4 +81,26 @@ test("listEventsTail leaves out a type:subtype entry without dropping messages m
   const db = openDb(":memory:");
   for (const m of [{ type: "system", subtype: "thinking_tokens" }, { type: "system", subtype: "init" }, { type: "system" }, { foo: 1 }, { type: "tool_progress" }]) appendEvent(db, "t", m);
   expect(listEventsTail(db, "t", { limit: 10, excludeTypes: ["system:thinking_tokens", "tool_progress"] }).map(e => e.seq)).toEqual([2, 3, 4]);
+});
+
+const shot: Attachment = { hash: "a".repeat(64), name: "shot.png", type: "image/png", size: 7 };
+const log: Attachment = { hash: "b".repeat(64), name: "server.log", type: "text/plain", size: 5 };
+
+test("listPromptAttachments finds the refs of logged prompts", () => {
+  const db = openDb(":memory:");
+  appendEvent(db, "t", promptEvent({ text: "a", attachments: [shot] }));
+  appendEvent(db, "t", promptEvent({ text: "b", attachments: [] }));
+  appendEvent(db, "t", { type: "assistant", message: { content: [] } });
+  expect(listPromptAttachments(db, "t")).toEqual([shot]);
+});
+
+test("listPromptAttachments lists the task's own prompts' valid refs oldest first, each as its four fields", () => {
+  const db = openDb(":memory:");
+  appendEvent(db, "u", promptEvent({ text: "another task", attachments: [shot] }));
+  appendEvent(db, "t", promptEvent({ text: "a", attachments: [{ ...log, data: "AAAA" } as Attachment] }));
+  appendEvent(db, "t", { type: "assistant", attachments: [shot] });
+  appendEvent(db, "t", { type: "user", message: { content: "b" }, attachments: [{ ...shot, name: "../x" }, "junk", shot] });
+  appendEvent(db, "t", { type: "user", message: { content: "c" }, attachments: "none" });
+  expect(listPromptAttachments(db, "t")).toEqual([log, shot]);
+  expect(listPromptAttachments(db, "none")).toEqual([]);
 });
