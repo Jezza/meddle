@@ -19,7 +19,8 @@ export type ThreadItem =
   }
   | { kind: "question"; toolUseId: string; questions: unknown }
   | { kind: "denied"; toolName: string; reason?: string; reasonType?: string }
-  | { kind: "status"; text: string }
+  /** `at`: when the event was logged, for a turn's end (`result`). */
+  | { kind: "status"; text: string; at?: string }
   | { kind: "unknown"; type: string; raw: unknown };
 
 export type ToolItem = Extract<ThreadItem, { kind: "tool" }>;
@@ -33,7 +34,7 @@ type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
  * `live` cell covers `stream_event`s), and so is a status that only says a request went out or the session went idle; an assistant message streamed as several events with one id becomes one item; a `tool_result` attaches
  * to its `tool_use`, and a skill's text to its Skill call; a message with a `parent_tool_use_id` nests under that call.
  */
-export function buildThread(events: Array<{ seq: number; message: unknown }>): ThreadItem[] {
+export function buildThread(events: Array<{ seq: number; message: unknown; at?: string }>): ThreadItem[] {
   const top: ThreadItem[] = [];
   const tools = new Map<string, ToolItem>();
   /** Question tool uses: their results are the answers the question item already stands for. */
@@ -47,7 +48,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
   const listFor = (parent: unknown): ThreadItem[] =>
     (typeof parent === "string" ? tools.get(parent)?.children : undefined) ?? top;
 
-  for (const { message } of events) {
+  for (const { message, at } of events) {
     const m = (message ?? {}) as Message;
     if (isProgress(m)) continue;
     switch (m.type) {
@@ -70,7 +71,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown }>): T
         addSystem(m);
         break;
       case "result":
-        top.push({ kind: "status", text: resultText(m) });
+        top.push({ kind: "status", text: resultText(m), at });
         break;
       case "meddle":
         addMeddle(m);

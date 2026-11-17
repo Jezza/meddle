@@ -15,11 +15,11 @@ test("a message without a type is stored, and seq numbering is per task", () => 
   expect(appendEvent(db, "b", { type: "system", subtype: "init" })).toBe(1);
   expect(appendEvent(db, "a", { type: "result" })).toBe(2);
   expect(listEvents(db, "a")).toEqual([
-    { seq: 1, message: { foo: 1 } },
-    { seq: 2, message: { type: "result" } },
+    { seq: 1, at: expect.any(String), message: { foo: 1 } },
+    { seq: 2, at: expect.any(String), message: { type: "result" } },
   ]);
-  expect(listEvents(db, "b")).toEqual([{ seq: 1, message: { type: "system", subtype: "init" } }]);
-  expect(listEvents(db, "a", { limit: 1 })).toEqual([{ seq: 1, message: { foo: 1 } }]);
+  expect(listEvents(db, "b")).toEqual([{ seq: 1, at: expect.any(String), message: { type: "system", subtype: "init" } }]);
+  expect(listEvents(db, "a", { limit: 1 })).toEqual([{ seq: 1, at: expect.any(String), message: { foo: 1 } }]);
 });
 
 test("listEventsTail returns the newest events oldest first, before beforeSeq, without the excluded types", () => {
@@ -28,9 +28,9 @@ test("listEventsTail returns the newest events oldest first, before beforeSeq, w
   appendEvent(db, "u", { type: "assistant" });
   expect(listEventsTail(db, "t", { limit: 2 }).map(e => e.seq)).toEqual([5, 6]);
   expect(listEventsTail(db, "t", { limit: 3, excludeTypes: ["stream_event"] })).toEqual([
-    { seq: 3, message: { type: "assistant" } },
-    { seq: 4, message: { foo: 1 } },
-    { seq: 6, message: { type: "result" } },
+    { seq: 3, at: expect.any(String), message: { type: "assistant" } },
+    { seq: 4, at: expect.any(String), message: { foo: 1 } },
+    { seq: 6, at: expect.any(String), message: { type: "result" } },
   ]);
   expect(listEventsTail(db, "t", { beforeSeq: 4, limit: 10, excludeTypes: ["stream_event"] }).map(e => e.seq)).toEqual([1, 3]);
   expect(listEventsTail(db, "t", { beforeSeq: 4, limit: 1, excludeTypes: ["stream_event", "assistant"] }).map(e => e.seq)).toEqual([1]);
@@ -45,7 +45,7 @@ test("latestEventOfType finds the task's newest event of a type, and of a subtyp
   appendEvent(db, "t", { type: "system", subtype: "init", model: "b" });
   appendEvent(db, "t", { type: "system", subtype: "status", status: null });
   appendEvent(db, "u", { type: "system", subtype: "init", model: "c" });
-  expect(latestEventOfType(db, "t", "system", "init")).toEqual({ seq: 3, message: { type: "system", subtype: "init", model: "b" } });
+  expect(latestEventOfType(db, "t", "system", "init")).toEqual({ seq: 3, at: expect.any(String), message: { type: "system", subtype: "init", model: "b" } });
   expect(latestEventOfType(db, "t", "system")?.seq).toBe(4);
   expect(latestEventOfType(db, "t", "result")).toBeNull();
 });

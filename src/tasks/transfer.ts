@@ -19,7 +19,8 @@ import { transcriptSlot, type TaskManifest } from "./manifest";
 
 export type TransferFrame =
   | { t: "manifest"; manifest: TaskManifest; settings: TaskSettings | null; queued: string[]; turns: number }
-  | { t: "event"; seq: number; json: string }
+  /** `at`: when the sender logged it; absent from a sender from before it was sent, and the receiver's now then. */
+  | { t: "event"; seq: number; json: string; at?: string }
   | { t: "transcript"; projectKey: string; sessionId: string; subpath: string; seq: number; uuid: string | null; ts: number; json: string }
   /** Relative to `<taskConfig>/projects/`, forward slashes; followed by kind-1 frames of `size` bytes in all. */
   | { t: "file"; path: string; size: number }
@@ -51,7 +52,7 @@ class FrameHash {
   }
 }
 
-type EventRow = { seq: number; json: string };
+type EventRow = { seq: number; json: string; at?: string };
 type TranscriptRow = { project_key: string; session_id: string; subpath: string; seq: number; uuid: string | null; ts: number; json: string };
 
 /** The regular files under `root`, depth first in name order, as forward-slash paths relative to it; symlinks skipped. */
@@ -84,7 +85,7 @@ export async function exportTask(cfg: NodeConfig, db: Database, taskId: string, 
     )
     .get(taskId);
   if (row === null) throw new Error(`unknown task: ${taskId}`);
-  const events = db.query<EventRow, [string]>("SELECT seq, json FROM events WHERE task_id = ? ORDER BY seq").all(taskId);
+  const events = db.query<EventRow, [string]>("SELECT seq, json, at FROM events WHERE task_id = ? ORDER BY seq").all(taskId);
   const transcript = db
     .query<TranscriptRow, [string]>(
       "SELECT project_key, session_id, subpath, seq, uuid, ts, json FROM transcript WHERE session_id = ? ORDER BY project_key, session_id, subpath, seq",
@@ -164,7 +165,7 @@ async function sendFrames(
   const sendHeader = (frame: TransferFrame) => sendFrame(HEADER, encoder.encode(JSON.stringify(frame)));
 
   await sendHeader(header);
-  for (const e of events) await sendHeader({ t: "event", seq: e.seq, json: e.json });
+  for (const e of events) await sendHeader({ t: "event", seq: e.seq, json: e.json, at: e.at });
   for (const r of transcript) {
     await sendHeader({
       t: "transcript", projectKey: r.project_key, sessionId: r.session_id, subpath: r.subpath, seq: r.seq, uuid: r.uuid, ts: r.ts, json: r.json,
@@ -264,7 +265,7 @@ export async function importTask(
 
   const root = join(paths(cfg).taskConfig(expect.taskId), "projects");
   await mkdir(root, { recursive: true });
-  const events: Array<{ seq: number; json: string }> = [];
+  const events: EventRow[] = [];
   const transcript: Array<Extract<TransferFrame, { t: "transcript" }>> = [];
   let files = 0;
   let bytes = 0;
@@ -274,7 +275,7 @@ export async function importTask(
     const parsed = parseFrame(frame.data);
     if (parsed.t === "done") break;
     hash.add(frame.kind, frame.data);
-    if (parsed.t === "event") events.push({ seq: parsed.seq, json: parsed.json });
+    if (parsed.t === "event") events.push({ seq: parsed.seq, json: parsed.json, at: typeof parsed.at === "string" ? parsed.at : undefined });
     else if (parsed.t === "transcript") transcript.push(parsed);
     else if (parsed.t === "file") {
       const segments = safeSegments(parsed.path);
@@ -312,7 +313,7 @@ export async function importTask(
     for (const e of events) {
       insertEvent.run({
         $task_id: expect.taskId, $seq: e.seq, $type: stringField(e.json, "type"), $subtype: stringField(e.json, "subtype"),
-        $uuid: stringField(e.json, "uuid"), $at: at, $json: e.json,
+        $uuid: stringField(e.json, "uuid"), $at: e.at ?? at, $json: e.json,
       });
     }
     for (const r of transcript) {

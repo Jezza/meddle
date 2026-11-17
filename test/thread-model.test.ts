@@ -42,6 +42,17 @@ test("a prompt meddle recorded becomes a user item", () => {
   expect(items).toEqual([{ kind: "user", text: "Run: echo hi" }]);
 });
 
+test("a turn's end carries when it was logged", () => {
+  const items = buildThread([
+    { seq: 1, at: "2026-11-17T10:00:00.000Z", message: { type: "result", subtype: "success", num_turns: 2, duration_ms: 1500, total_cost_usd: 0.01 } },
+    { seq: 2, message: { type: "result", subtype: "error_during_execution" } },
+  ]);
+  expect(items).toEqual([
+    { kind: "status", text: "Turn finished · 2 turns · 1.5 s · $0.0100", at: "2026-11-17T10:00:00.000Z" },
+    { kind: "status", text: "Turn ended: error_during_execution" },
+  ]);
+});
+
 test("a token fault renders as a status line", () => {
   const fault = (fault: unknown, rerun: boolean, label: string | null = "a") =>
     ({ type: "meddle", subtype: "token_fault", at: "", tokenId: label === null ? null : "0123456789abcdef", label, fault, rerun });

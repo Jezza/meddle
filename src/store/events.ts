@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 
-export type EventRecord = { seq: number; message: unknown };
+/** `at`: when this node logged the event (a moved task's events keep the times they were logged with). */
+export type EventRecord = { seq: number; message: unknown; at: string };
 
 function stringField(message: unknown, name: string): string | null {
   if (typeof message !== "object" || message === null) return null;
@@ -35,11 +36,11 @@ export function listEvents(
   opts: { fromSeq?: number; limit?: number } = {},
 ): EventRecord[] {
   const rows = db
-    .query<{ seq: number; json: string }, [string, number, number]>(
-      "SELECT seq, json FROM events WHERE task_id = ? AND seq >= ? ORDER BY seq LIMIT ?",
+    .query<{ seq: number; at: string; json: string }, [string, number, number]>(
+      "SELECT seq, at, json FROM events WHERE task_id = ? AND seq >= ? ORDER BY seq LIMIT ?",
     )
     .all(taskId, opts.fromSeq ?? 1, opts.limit ?? -1);
-  return rows.map((row) => ({ seq: row.seq, message: JSON.parse(row.json) }));
+  return rows.map((row) => ({ seq: row.seq, message: JSON.parse(row.json), at: row.at }));
 }
 
 /**
@@ -71,29 +72,29 @@ export function listEventsTail(
   }
   params.push(opts.limit);
   const rows = db
-    .query<{ seq: number; json: string }, Array<string | number>>(
-      `SELECT seq, json FROM events WHERE ${where.join(" AND ")} ORDER BY seq DESC LIMIT ?`,
+    .query<{ seq: number; at: string; json: string }, Array<string | number>>(
+      `SELECT seq, at, json FROM events WHERE ${where.join(" AND ")} ORDER BY seq DESC LIMIT ?`,
     )
     .all(...params);
-  return rows.reverse().map((row) => ({ seq: row.seq, message: JSON.parse(row.json) }));
+  return rows.reverse().map((row) => ({ seq: row.seq, message: JSON.parse(row.json), at: row.at }));
 }
 
 /** The task's newest event of `type` (and `subtype`, when given), or null. */
 export function latestEventOfType(db: Database, taskId: string, type: string, subtype?: string): EventRecord | null {
   const row = subtype === undefined
-    ? db.query<{ seq: number; json: string }, [string, string]>(
-      "SELECT seq, json FROM events WHERE task_id = ? AND type = ? ORDER BY seq DESC LIMIT 1",
+    ? db.query<{ seq: number; at: string; json: string }, [string, string]>(
+      "SELECT seq, at, json FROM events WHERE task_id = ? AND type = ? ORDER BY seq DESC LIMIT 1",
     ).get(taskId, type)
-    : db.query<{ seq: number; json: string }, [string, string, string]>(
-      "SELECT seq, json FROM events WHERE task_id = ? AND type = ? AND subtype = ? ORDER BY seq DESC LIMIT 1",
+    : db.query<{ seq: number; at: string; json: string }, [string, string, string]>(
+      "SELECT seq, at, json FROM events WHERE task_id = ? AND type = ? AND subtype = ? ORDER BY seq DESC LIMIT 1",
     ).get(taskId, type, subtype);
-  return row === null ? null : { seq: row.seq, message: JSON.parse(row.json) };
+  return row === null ? null : { seq: row.seq, message: JSON.parse(row.json), at: row.at };
 }
 
 /** The task's newest `type`/`subtype` event whose JSON has a non-null top-level `field`, or null. */
 export function latestEventWithField(db: Database, taskId: string, type: string, subtype: string, field: string): EventRecord | null {
-  const row = db.query<{ seq: number; json: string }, [string, string, string, string]>(
-    "SELECT seq, json FROM events WHERE task_id = ? AND type = ? AND subtype = ? AND json_extract(json, ?) IS NOT NULL ORDER BY seq DESC LIMIT 1",
+  const row = db.query<{ seq: number; at: string; json: string }, [string, string, string, string]>(
+    "SELECT seq, at, json FROM events WHERE task_id = ? AND type = ? AND subtype = ? AND json_extract(json, ?) IS NOT NULL ORDER BY seq DESC LIMIT 1",
   ).get(taskId, type, subtype, `$.${field}`);
-  return row === null ? null : { seq: row.seq, message: JSON.parse(row.json) };
+  return row === null ? null : { seq: row.seq, message: JSON.parse(row.json), at: row.at };
 }

@@ -110,7 +110,8 @@ export const ProjectInfoSchema = Type.Object({
   defaultBranch: Type.Optional(Nullable(Type.String())),
 });
 
-export const EventSchema = Type.Object({ seq: Type.Number(), message: Type.Unknown() });
+/** `at`: when the event was logged; absent from a node from before it was sent. */
+export const EventSchema = Type.Object({ seq: Type.Number(), message: Type.Unknown(), at: Type.Optional(Type.String()) });
 
 export const PermissionModeSchema = Type.Union([
   Type.Literal("default"),

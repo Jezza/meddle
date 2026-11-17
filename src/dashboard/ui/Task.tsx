@@ -14,7 +14,7 @@ import { DiffRows, DiffView } from "./diff";
 import { Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
-import { type ProjectLine, projectLines, usageShort } from "./sidebar-model";
+import { ago, type ProjectLine, projectLines, usageShort } from "./sidebar-model";
 import {
   activity, activityLine, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps, isLook,
   keyOf, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
@@ -432,9 +432,20 @@ function ShownView({ item }: { item: ShownItem }) {
         </div>
       );
     case "status":
-      if (/^Turn (finished|ended)/.test(item.text)) return <div class={`turn-end${item.text.startsWith("Turn ended") ? " bad" : ""}`}><i />{item.text}<i /></div>;
+      if (/^Turn (finished|ended)/.test(item.text)) return <TurnEnd text={item.text} at={item.at} />;
       return <div class={`status${/^(Turn failed|Turn aborted|Token |No usable token|Rate limit rejected)/.test(item.text) ? " bad" : ""}`}>{item.text}</div>;
   }
+}
+
+/** The line a turn ends with: how it ended, and how long ago (the time itself on hover). */
+function TurnEnd({ text, at }: { text: string; at: string | undefined }) {
+  useTick(10_000);
+  const when = at === undefined ? NaN : Date.parse(at);
+  return (
+    <div class={`turn-end${text.startsWith("Turn ended") ? " bad" : ""}`} title={Number.isNaN(when) ? undefined : new Date(when).toLocaleString()}>
+      <i /><span>{text}{!Number.isNaN(when) && ` · ${ago(Date.now() - when)} ago`}</span><i />
+    </div>
+  );
 }
 
 /** Thinking as a row: its first line, closed; open, the whole of it. */
