@@ -203,6 +203,47 @@ test("background work live at a result keeps the child past the exit grace, and 
   expect(s.lastIndexOf("system/init")).toBeGreaterThan(s.indexOf("system/task_notification"));
   expect(s).not.toContain("meddle/turn_failed");
 }, 20_000);
+test("send now gets a text pushed just before it to Claude Code first, and Claude Code cuts the turn to run it", async () => {
+  const { db, input, fixture } = await setup();
+  const queue = new InputQueue();
+  let steer: string | undefined;
+  let sent: Promise<unknown> | undefined;
+  const turn = runTurn({
+    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(), queue,
+    onMessage: (m) => { if (m.type === "assistant" && sent === undefined) { steer = queue.push(STEER); sent = turn.sendNow(); } },
+  });
+  expect(await turn.done).toMatchObject({ subtype: "error_during_execution" });
+  expect(await sent).toBe("stopped");
+  // the stand-in ends rather than run it: it is handed back untaken, for the task's next turn
+  expect(queue.untaken()).toEqual([{ uuid: steer!, text: STEER }]);
+}, 15_000);
+test("send now with nothing waiting leaves the turn running", async () => {
+  const { db, input, fixture } = await setup();
+  let sent: Promise<unknown> | undefined;
+  const turn = runTurn({
+    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(),
+    onMessage: (m) => { if (m.type === "assistant" && sent === undefined) sent = turn.sendNow(); },
+  });
+  while (sent === undefined) await Bun.sleep(10);
+  expect(await sent).toBe("nothing_waiting");
+  expect(await settles(turn.done)).toBe(false);
+  await turn.query.interrupt();
+  expect(await turn.done).toMatchObject({ subtype: "error_during_execution" });
+}, 15_000);
+test("send now is refused by a Claude Code that does not offer it", async () => {
+  const { db, input, cfg } = await setup();
+  const recording = readFileSync(`${import.meta.dir}/fixtures/hello.jsonl`, "utf8");
+  expect(recording).toContain('\\"interrupt_send_now_v1\\",');
+  const older = `${cfg.dataDir}/older.jsonl`;
+  await Bun.write(older, recording.replace('\\"interrupt_send_now_v1\\",', ""));
+  let sent: Promise<unknown> | undefined;
+  const turn = runTurn({
+    input: { ...input, extraEnv: { MEDDLE_FIXTURE: older } }, prompt: "Reply with the single word ok.", db, approvals: new Approvals(),
+    onMessage: (m) => { if (m.type === "assistant" && sent === undefined) sent = turn.sendNow().catch((err: Error) => err.message); },
+  });
+  await turn.done;
+  expect(await sent).toBe("this Claude Code cannot send now");
+}, 15_000);
 test("input queue: every text pushed is untaken, in order, until taken by its uuid; taken ones are told once", () => {
   const q = new InputQueue();
   const a = q.push("a"), b = q.push("b"), c = q.push("c", "now");
@@ -229,6 +270,34 @@ test("input queue: yields pushed items in order, waits while empty, finishes aft
   expect(() => q.push("five")).toThrow("input queue ended");
   expect((await it.next()).value).toMatchObject({ message: { content: "four" } });
   expect((await it.next()).done).toBe(true);
+});
+/** Whether `p` has settled within a few milliseconds. */
+async function settles(p: Promise<unknown>): Promise<boolean> {
+  return Promise.race([p.then(() => true), Bun.sleep(20).then(() => false)]);
+}
+test("input queue: written waits until the reader has come back past every text pushed so far", async () => {
+  const q = new InputQueue();
+  const it = q[Symbol.asyncIterator]();
+  expect(await settles(q.written())).toBe(true); // nothing pushed
+  q.push("one"); q.push("two");
+  const written = q.written();
+  await it.next(); // the reader has "one" and is writing it
+  expect(await settles(written)).toBe(false);
+  await it.next(); // past "one", the reader has "two"
+  expect(await settles(written)).toBe(false);
+  const more = it.next(); // past "two": both are written, and the reader waits for more
+  expect(await settles(written)).toBe(true);
+  q.end();
+  expect((await more).done).toBe(true);
+});
+test("input queue: written does not wait once there is no more input", async () => {
+  const q = new InputQueue();
+  const it = q[Symbol.asyncIterator]();
+  q.push("one");
+  const written = q.written();
+  await it.next();
+  q.end(); // the turn is over while the reader still has "one"
+  expect(await settles(written)).toBe(true);
 });
 test("approvals: pending until answered, unknown ids refused, listeners told", async () => {
   const approvals = new Approvals();

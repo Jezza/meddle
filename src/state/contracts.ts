@@ -432,6 +432,12 @@ export const TaskObject = remote("meddle.task", {
         /** Renames the task; refused for a blank title and while it is not live here (moving, moved, archived). */
         rename: method(Type.Object({ title: Type.String() })),
         interrupt: method(Type.Object({})),
+        /**
+         * Sends what the running turn has not taken now, as Claude Code's "send now" does: every steer, in order, into
+         * the turn when Claude Code can fit it in, or else the turn is cut short for them. Does nothing without a
+         * running turn; refused while the task is not live here.
+         */
+        sendNow: method(Type.Object({})),
         /** Runs the task's turn again after repeated crashes parked it, or, for an idle task that has had a turn, starts one that carries on from it (after an interrupt or a failure); rejects otherwise. */
         retry: method(Type.Object({})),
         approve: method(Type.Object({ requestId: Type.String(), updatedInput: Type.Optional(Type.Record(Type.String(), Type.Unknown())) })),

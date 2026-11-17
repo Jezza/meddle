@@ -96,6 +96,7 @@ test("while an update awaits confirmation, every method of NodeObject, TaskObjec
         prompt: () => task.prompt({ text: "hello" }),
         rename: () => task.rename({ title: "after" }),
         interrupt: () => task.interrupt({}),
+        sendNow: () => task.sendNow({}),
         retry: () => task.retry({}),
         approve: () => task.approve({ requestId: "r1" }),
         deny: () => task.deny({ requestId: "r1", message: "no" }),

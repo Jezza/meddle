@@ -1,7 +1,8 @@
 // Stands in for the `claude` binary: replays a recorded stream-json session (see record.ts).
 // Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause before `result` until stdin ends or,
 // as Claude Code ends an interrupted turn, an `interrupt` arrives: then the `result` comes as `error_during_execution`
-// and the stand-in exits),
+// and the stand-in exits; an `interrupt` with `send_now` does that only when a user message it has not used is waiting,
+// and is answered `nothing_waiting` otherwise, as Claude Code's is),
 // MEDDLE_FIXTURE_RESULTS_MS=<ms> (wait that long before every `result`: slow turns),
 // MEDDLE_FIXTURE_LATER_RESULTS_MS=<ms> (wait that long before each `result` after the first: a slow later turn),
 // MEDDLE_FIXTURE_BACKGROUND_MS=<ms> (wait that long before each `task_notification`: background work that outlasts its
@@ -22,7 +23,7 @@ type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t:
 type HookMatcher = { matcher?: string; hookCallbackIds?: string[] };
 type Frame = {
   type: string; subtype?: string; uuid?: string; message?: { content?: unknown }; request_id?: string;
-  request?: { subtype?: string; hooks?: Record<string, HookMatcher[]> }; response?: { request_id?: string };
+  request?: { subtype?: string; hooks?: Record<string, HookMatcher[]>; send_now?: boolean }; response?: { request_id?: string };
 };
 type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
 type Step = { need: Need; uuid?: string } | { emit: string; frame: Frame };
@@ -97,13 +98,30 @@ async function finish(): Promise<never> {
   process.exit(0);
 }
 
-function answer(f: Frame) {
+function answer(f: Frame, response: Record<string, unknown> = {}) {
   const liveId = f.request_id;
   const recorded = recordedResponse.get(f.request?.subtype ?? "");
   const reply = recorded
     ? { ...recorded, response: { ...recorded.response, request_id: liveId } }
-    : { type: "control_response", response: { subtype: "success", request_id: liveId, response: {} } };
+    : { type: "control_response", response: { subtype: "success", request_id: liveId, response } };
   write(JSON.stringify(reply));
+}
+
+/** The uuids of the user messages that arrived and that the recording has not used: those waiting to run. */
+function waitingUuids(): string[] {
+  return arrived.filter(a => !a.used && a.frame.type === "user").map(a => a.frame.uuid ?? "");
+}
+
+/**
+ * Answers an `interrupt` with `send_now` as Claude Code does: with nothing waiting, `nothing_waiting` and the turn goes
+ * on; otherwise, while stalling, the turn is cut (`stopped`). Answers whether the turn is cut. Claude Code would then
+ * run what is waiting as a turn of its own; the stand-in ends instead, so it is left untaken.
+ */
+function answerSendNow(f: Frame): boolean {
+  const waiting = waitingUuids();
+  const cut = waiting.length > 0 && stalling && heldResult !== undefined;
+  answer(f, { still_queued: waiting, send_now: waiting.length === 0 ? "nothing_waiting" : cut ? "stopped" : "delivering" });
+  return cut;
 }
 
 let buf = "";
@@ -116,8 +134,10 @@ process.stdin.on("data", (chunk: Buffer) => {
     let f: Frame;
     try { f = JSON.parse(line); } catch { continue; }
     if (f.type === "control_request" && f.request?.subtype === "initialize") hooks = f.request.hooks ?? {};
-    if (f.type === "control_request") answer(f);
-    if (f.type === "control_request" && f.request?.subtype === "interrupt" && stalling && heldResult !== undefined) {
+    let cut = false; // the turn is interrupted
+    if (f.type === "control_request" && f.request?.subtype === "interrupt" && f.request.send_now === true) cut = answerSendNow(f);
+    else if (f.type === "control_request") { answer(f); cut = f.request?.subtype === "interrupt"; }
+    if (cut && stalling && heldResult !== undefined) {
       write(JSON.stringify({ ...JSON.parse(heldResult), subtype: "error_during_execution", is_error: true, errors: [] }));
       heldResult = undefined;
       // The SDK keeps stdin open after an interrupted turn's result (meddle closes it after a grace period): the

@@ -265,8 +265,8 @@ otherwise. Nothing needs opening in a firewall for that. If you want a fixed UDP
 dashboard's sidebar (under a project, or under Tasks for none or several): the composer takes the projects, the node
 and the first prompt. Without a prompt `task new` creates a task that waits idle;
 `meddle task prompt <id> "<text>"` sends one and waits for the turn to end, so it is the command for scripts. A message
-to a busy task is queued, never refused: Claude takes it at its next step, or runs it next
-([README](../README.md#projects-and-tasks)).
+to a busy task is queued, never refused: Claude takes it at its next step, or runs it next; in the composer,
+Ctrl+Enter sends it now instead, as in Claude Code ([README](../README.md#projects-and-tasks)).
 `meddle task list` lists every task of the pool with its state and node.
 
 **Watching.** Any node's dashboard shows the whole pool: a sidebar of projects and their tasks (each with its state,

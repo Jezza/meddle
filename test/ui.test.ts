@@ -10,6 +10,7 @@ import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, 
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "../src/dashboard/ui/changes-model";
+import { composerKey } from "../src/dashboard/ui/composer-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 
@@ -414,4 +415,24 @@ test("changeLabel names the working copy, else the description, else the short i
   expect(changeLabel(change({ workingCopy: true, description: "Wip" }))).toBe("Working copy");
   expect(changeLabel(change({ description: "Add DiffView" }))).toBe("Add DiffView");
   expect(changeLabel(change({ description: "" }))).toBe("kpmxqwrt");
+});
+
+test("composerKey: Enter sends (queued while a turn runs), Ctrl or Cmd+Enter sends now, Shift+Enter and touch keyboards make a new line", () => {
+  const key = (k: Partial<Parameters<typeof composerKey>[0]>) => ({ key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, isComposing: false, keyCode: 13, ...k });
+  const desk = { running: true, touch: false };
+  expect(composerKey(key({}), desk)).toBe("send");
+  expect(composerKey(key({}), { ...desk, running: false })).toBe("send");
+  expect(composerKey(key({ ctrlKey: true }), desk)).toBe("send-now");
+  expect(composerKey(key({ metaKey: true }), desk)).toBe("send-now");
+  // with no turn running there is nothing to cut: it sends
+  expect(composerKey(key({ ctrlKey: true }), { ...desk, running: false })).toBe("send");
+  expect(composerKey(key({ shiftKey: true }), desk)).toBeNull();
+  expect(composerKey(key({ altKey: true }), desk)).toBeNull();
+  // the Enter that ends an input method's composition is the input method's
+  expect(composerKey(key({ isComposing: true }), desk)).toBeNull();
+  expect(composerKey(key({ keyCode: 229 }), desk)).toBeNull();
+  // a phone's Enter makes a new line; a keyboard attached to it still sends now
+  expect(composerKey(key({}), { ...desk, touch: true })).toBeNull();
+  expect(composerKey(key({ ctrlKey: true }), { ...desk, touch: true })).toBe("send-now");
+  expect(composerKey(key({ key: "a" }), desk)).toBeNull();
 });

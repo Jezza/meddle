@@ -10,7 +10,7 @@ import type { NodeConfig } from "../config";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
-import { resultError, runTurn, type MeddleEvent, type TokenFault } from "../engine/session";
+import { resultError, runTurn, type MeddleEvent, type SendNowOutcome, type TokenFault } from "../engine/session";
 import { askTitle } from "../engine/title";
 import { bookmarkForget, bookmarkSet, changeId } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
@@ -195,7 +195,7 @@ export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHook
   },
 });
 
-type LiveTurn = { query: Query; queue: InputQueue; state: "running" | "waiting" };
+type LiveTurn = { query: Query; queue: InputQueue; sendNow: () => Promise<SendNowOutcome | undefined>; state: "running" | "waiting" };
 
 /** How long a turn interrupted by a "move now" has to end before it is closed. */
 const INTERRUPT_GRACE_MS = 15_000;
@@ -633,6 +633,19 @@ export class TaskRunner {
     await this.#liveQueryOrThrow(taskId).interrupt();
   }
 
+  /**
+   * Sends the steers the task's running turn has not taken now, as Claude Code's own "send now" does: in order, into
+   * the turn when Claude Code can fit them in, or else it cuts the turn short and runs them next. A steer `prompt` sent
+   * just before is among them; texts queued for the task's next turn are not (they run next already). Answers what
+   * Claude Code says it did, `nothing_waiting` without a running turn.
+   */
+  async sendNow(taskId: string): Promise<SendNowOutcome | undefined> {
+    this.#refuseElsewhere(taskId);
+    const live = this.#live.get(taskId);
+    if (live === undefined) return "nothing_waiting";
+    return live.sendNow();
+  }
+
   /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
     this.#refuseElsewhere(taskId);
@@ -794,7 +807,7 @@ export class TaskRunner {
       }
       const queue = new InputQueue();
       let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
-      const { query, done } = runTurn({
+      const { query, done, sendNow } = runTurn({
         input: await this.#engineInput(taskId, manifest, resume, picked.value),
         // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
         prompt: resume && cutOff === "token" ? TOKEN_RETRY_PROMPT : resume && cutOff === "restart" ? CARRY_ON_PROMPT : input.prompt,
@@ -809,7 +822,7 @@ export class TaskRunner {
         },
         onTokenFault: (f) => { fault = f; },
       });
-      this.#live.set(taskId, { query, queue, state: "running" });
+      this.#live.set(taskId, { query, queue, sendNow, state: "running" });
       let result: Awaited<typeof done>;
       try {
         result = await done;

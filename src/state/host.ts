@@ -827,6 +827,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       prompt: async ({ text }) => ({ queued: (await runner.prompt(id, text)) === "queued" }),
       rename: async ({ title }) => { await runner.rename(id, title); },
       interrupt: () => runner.interrupt(id),
+      sendNow: async () => { await runner.sendNow(id); },
       retry: () => runner.retry(id),
       approve: async ({ requestId, updatedInput }) => {
         answer(requestId, (req) => ({ behavior: "allow", updatedInput: updatedInput ?? req.input }));
