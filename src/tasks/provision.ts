@@ -4,7 +4,7 @@ import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { checkTaskRoot, ensurePrivateDir, paths } from "../paths";
 import {
-  bookmarkForget, bookmarkList, bookmarkSet, commitOf, configSetWorkspace, editIn, isJjRepo, workspaceAdd,
+  bookmarkForget, bookmarkList, bookmarkSet, changesIn, commitOf, configSetWorkspace, editIn, isJjRepo, workspaceAdd,
   workspaceConfigPath, workspaceForget,
 } from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
@@ -305,13 +305,29 @@ export function checkReceivedManifest(m: TaskManifest): void {
 }
 
 /**
+ * Carries a task's workspace `workspace`, just added on `parent` (a commit id) and scoped, on in `parent` itself rather
+ * than in the new change on it, when `parent` is empty, has no description, is mutable to the task and is no
+ * workspace's working copy: so a task moved or restored with nothing in its working copy keeps that one, rather than
+ * leaving one more empty change on its line each time. Best effort: on a failure the new change stays.
+ */
+async function resumeEmpty(workspace: string, parent: string, cfg: NodeConfig): Promise<void> {
+  if (!COMMIT_ID.test(parent)) return;
+  const revset = `present(${parent}) & empty() & description(exact:"") & mutable() ~ working_copies()`;
+  try {
+    if ((await changesIn(workspace, revset, cfg)).length > 0) await editIn(workspace, parent, cfg);
+  } catch {
+    // The task carries on in the new change, as it would have.
+  }
+}
+
+/**
  * Provisions a task another node sent: the steps of `provisionTask`, keeping the manifest's id, title, session,
  * primary project, creation time and projects (ids, names, workspaces, bases, and the meddle contexts captured at the
  * task's start), with each project's `replica` this node's and its `parent` the revision `parents[projectId]` (fetched
  * from the sender), where the workspace starts and the task's bookmark points. Each workspace is scoped to the task's
- * line (`scopeWorkspace`). Writes `task.json` and the row (`started` 1,
- * `state`, no turns); with `keepRow` (a task restored from its archive on this node, whose row is still here), no row:
- * the caller updates it. On failure, removes what it made.
+ * line (`scopeWorkspace`), and carries on in `parent` itself when it is empty and undescribed (`resumeEmpty`).
+ * Writes `task.json` and the row (`started` 1, `state`, no turns); with `keepRow` (a task restored from its archive on
+ * this node, whose row is still here), no row: the caller updates it. On failure, removes what it made.
  */
 export async function provisionFromManifest(
   cfg: NodeConfig,
@@ -355,6 +371,7 @@ export async function provisionFromManifest(
       added.push({ replica, workspace });
       await workspaceAdd(replica, workspaceName, workspace, parent, cfg);
       await scopeWorkspace(cfg, workspace, id, base);
+      await resumeEmpty(workspace, parent, cfg);
       const bookmark = `${taskNamespace(id)}${entry.name}`;
       await serialised(repoKey(replica), async () => {
         const existed = (await bookmarkList(replica, cfg)).some((b) => b.name === bookmark && b.remote === null);

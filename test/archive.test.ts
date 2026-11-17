@@ -201,6 +201,31 @@ test("a restored task keeps the meddle context captured at its start, not one it
   }
 }, 30_000);
 
+test("a task restored with an empty, undescribed working copy carries on in it; one with a description gets a new change on it", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    const workspace = join(paths(A.cfg).task(m.id), "a");
+    const empty = await changeAt(A, workspace, "@");
+    const start = await changeAt(A, workspace, "@-");
+    await A.runner.archive(m.id);
+    await A.runner.restoreHere(m.id);
+    // The same change, on the start as before: no empty change left beneath it.
+    expect(await changeAt(A, workspace, "@")).toBe(empty);
+    expect(await changeAt(A, workspace, "@-")).toBe(start);
+    expect((await namespace(A, A.project.replica, m.id)).local).toEqual([`meddle/task/${m.id}/a ${empty}`]);
+
+    await jj(["describe", "-m", "kept"], workspace, A.cfg);
+    await A.runner.archive(m.id);
+    await A.runner.restoreHere(m.id);
+    expect(await changeAt(A, workspace, "@-")).toBe(empty);
+    expect(await changeAt(A, workspace, "@")).not.toBe(empty);
+  } finally {
+    await close();
+  }
+}, 30_000);
+
 test("deleting an archived task releases its line and its workspace config, and the commit under it is mutable and visible again", async () => {
   const { nodes, close } = await poolNodes(1);
   const A = nodes[0]!;
@@ -515,7 +540,8 @@ test("restore with no node named lands a task archived off its project's home on
 
     expect(getTask(B.db, m.id)).toMatchObject({ state: "idle", archived_on: null, receiving_from: null, turns: 1 });
     expect((await namespace(B, B.project.replica, m.id)).local).toEqual([`meddle/task/${m.id}/a ${change}`]);
-    expect(await changeAt(B, join(paths(B.cfg).task(m.id), "a"), "@-")).toBe(change);
+    // Its working copy, empty and undescribed, carries on as its working copy there.
+    expect(await changeAt(B, join(paths(B.cfg).task(m.id), "a"), "@")).toBe(change);
     await promptAndWait(B, m.id, "Carry on.");
     expect(resumes(B, m.id)).toEqual([false, true]);
   } finally {
@@ -555,6 +581,29 @@ test("restore on a named node takes the task's side lines there from their rows,
     const workspaceA = join(paths(A.cfg).task(m.id), "a");
     expect(await changeAt(A, workspaceA, "@-")).toBe(change);
     expect(await Bun.file(join(workspaceA, "note.txt")).text()).toBe("made on B\n");
+  } finally {
+    await close();
+  }
+}, 45_000);
+
+test("a task restored on another node with an empty, undescribed working copy carries on in it there", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await createTask(B, { title: "t", projectIds: [A.project.id] });
+    const workspaceB = join(paths(B.cfg).task(m.id), "a");
+    const empty = await changeAt(B, workspaceB, "@");
+    const start = await changeAt(B, workspaceB, "@-");
+    await B.runner.archive(m.id);
+    await peerReady(B, A);
+    await peerReady(A, B);
+
+    expect(await B.runner.restore(m.id, A.id)).toEqual({ nodeId: A.id });
+    await moveSettled(B);
+
+    const workspaceA = join(paths(A.cfg).task(m.id), "a");
+    expect(await changeAt(A, workspaceA, "@")).toBe(empty);
+    expect(await changeAt(A, workspaceA, "@-")).toBe(start);
+    expect((await namespace(A, A.project.replica, m.id)).local).toEqual([`meddle/task/${m.id}/a ${empty}`]);
   } finally {
     await close();
   }

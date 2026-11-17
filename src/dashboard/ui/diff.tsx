@@ -2,6 +2,7 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { type DiffRow, diffRows, fitsNewSide, gapLabel, type GapWhere, type Hunk, nextOpen, type Opened } from "./diff-model";
 import type { FilePatch } from "./git-diff";
+import { Chevron } from "./icons";
 
 /** What a diff's head shows: the file's path, what happened to it, its line counts and whether it is binary. */
 export type DiffHead = { path: string; status: FilePatch["status"]; added: number; removed: number; binary?: boolean };
@@ -13,23 +14,25 @@ type Loaded = { file: readonly string[] | null };
  * A change's hunks as rows; a click on a gap opens it from the file's lines, a step and then the rest. The file is
  * `file`, or else what `load` gives on the first click; `side` says whether it is the old side (the default) or the
  * new, which must fit the hunks to be used. With `head`, a head above the rows names the file and has `Expand`,
- * which opens every gap at once; `closed` starts with only the head, whose path then shows and hides the rows.
+ * which opens every gap at once. `closed` hides the rows; with `onToggle`, the head's path is a button that asks for
+ * them to be shown or hidden.
  */
-export function DiffView({ hunks, file: given, load, side = "old", head, closed }: {
+export function DiffView({ hunks, file: given, load, side = "old", head, closed = false, onToggle }: {
   hunks: readonly Hunk[];
   file: readonly string[] | null;
   load?: () => Promise<readonly string[] | null>;
   side?: "old" | "new";
   head?: DiffHead;
   closed?: boolean;
+  onToggle?: () => void;
 }) {
   const [opened, setOpened] = useState<Opened>(new Map());
   const [loaded, setLoaded] = useState<Loaded | null>(null);
-  const [shut, setShut] = useState(closed === true);
   const loading = useRef<Promise<Loaded> | null>(null);
   const file = given ?? loaded?.file ?? null;
   const loadable = given === null && load !== undefined && loaded === null;
   const rows = useMemo(() => diffRows(hunks, file, opened, { side, loadable }), [hunks, file, opened, side, loadable]);
+  const outer = useRef<HTMLDivElement>(null);
   const box = useRef<HTMLDivElement>(null);
   // The row below an opened `↑` gap and where it was, so the box scrolls to keep it in place once the lines show.
   const anchor = useRef<{ row: HTMLElement; top: number } | null>(null);
@@ -70,14 +73,22 @@ export function DiffView({ hunks, file: given, load, side = "old", head, closed 
       return all;
     });
   };
-  const body = !head?.binary && !shut;
+  // Hiding the rows of a file read part way down, its head held at the top of the view: the view goes back to the
+  // file's top first, so that what follows the hidden rows comes up beneath the head rather than far past it.
+  const toggle = () => {
+    const el = outer.current;
+    const top = el?.firstElementChild;
+    if (!closed && el && top && top.getBoundingClientRect().top > el.getBoundingClientRect().top + 1) el.scrollIntoView({ block: "start" });
+    onToggle!();
+  };
+  const body = !head?.binary && !closed;
   return (
-    <div ref={box} class={opened.size > 0 ? "diff open" : "diff"}>
+    <div ref={outer} class={opened.size > 0 ? "diff open" : "diff"}>
       {head && (
         <div class="diff-head">
-          {closed !== undefined && !head.binary
-            ? <button type="button" class="path" aria-expanded={!shut} onClick={() => setShut((s) => !s)}>{head.path}</button>
-            : <span class="path">{head.path}</span>}
+          {onToggle !== undefined && !head.binary
+            ? <button type="button" class="path" aria-expanded={!closed} onClick={toggle}><Chevron />{head.path}</button>
+            : <span class="path">{onToggle !== undefined && <span class="chev" />}{head.path}</span>}
           {head.status !== "modified" && <span class="tag">{head.status === "added" ? "new" : head.status}</span>}
           {head.binary
             ? <span class="tag">binary</span>
@@ -85,7 +96,7 @@ export function DiffView({ hunks, file: given, load, side = "old", head, closed 
           {body && rows.some((row) => row.kind === "gap" && row.canOpen) && <button type="button" onClick={expand}>Expand</button>}
         </div>
       )}
-      {body && <DiffRows rows={rows} onOpen={open} />}
+      {body && <div ref={box} class="diff-body"><DiffRows rows={rows} onOpen={open} /></div>}
     </div>
   );
 }

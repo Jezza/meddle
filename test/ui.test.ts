@@ -9,7 +9,7 @@ import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
-import { changeCount, changeLabel, patchHash, summary, totals } from "../src/dashboard/ui/changes-model";
+import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "../src/dashboard/ui/changes-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 
@@ -382,6 +382,32 @@ test("totals sums a diff's files and lines", () => {
   const patch = (added: number, removed: number): FilePatch => ({ path: "a", status: "modified", binary: false, hunks: [], added, removed });
   expect(totals([patch(5, 2), patch(8, 0), patch(48, 0)])).toEqual({ files: 3, added: 61, removed: 2 });
   expect(totals([])).toEqual({ files: 0, added: 0, removed: 0 });
+});
+
+test("fileTree puts folders before files, each by name, and runs on through lone folders", () => {
+  const patch = (path: string): FilePatch => ({ path, status: "modified", binary: false, hunks: [], added: 1, removed: 0 });
+  const patches = ["README.md", "src/dashboard/ui/Changes.tsx", "src/dashboard/ui/changes-model.ts", "bun.lock", "src/cli.ts", "test/ui.test.ts", "Zeta/a.ts", "docs/plans/x.md"].map(patch);
+  const shape = (nodes: readonly FileNode[]): unknown[] => nodes.map((n) => n.kind === "dir" ? { [n.path]: shape(n.children) } : n.name);
+  const tree = fileTree(patches);
+  expect(shape(tree)).toEqual([
+    { "docs/plans": ["x.md"] },
+    { src: [{ "src/dashboard/ui": ["changes-model.ts", "Changes.tsx"] }, "cli.ts"] },
+    { test: ["ui.test.ts"] },
+    { Zeta: ["a.ts"] },
+    "bun.lock",
+    "README.md",
+  ]);
+  // A folder that runs on is named for all it runs through, below it only its own part.
+  expect(tree[0]).toMatchObject({ kind: "dir", name: "docs/plans", path: "docs/plans" });
+  expect((tree[1] as Extract<FileNode, { kind: "dir" }>).children[0]).toMatchObject({ name: "dashboard/ui", path: "src/dashboard/ui" });
+  // The diffs are drawn in the tree's order.
+  expect(treeFiles(tree).map((p) => p.path)).toEqual([
+    "docs/plans/x.md", "src/dashboard/ui/changes-model.ts", "src/dashboard/ui/Changes.tsx", "src/cli.ts", "test/ui.test.ts", "Zeta/a.ts", "bun.lock", "README.md",
+  ]);
+  expect(treeFiles(tree)[0]).toBe(patches[7]!);
+  // A file and a folder of the same name (a file replaced by a folder) are both kept.
+  expect(shape(fileTree(["a", "a/b"].map(patch)))).toEqual([{ a: ["b"] }, "a"]);
+  expect(fileTree([])).toEqual([]);
 });
 
 test("changeLabel names the working copy, else the description, else the short id", () => {
