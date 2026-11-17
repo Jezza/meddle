@@ -1,6 +1,6 @@
 // test/graph-model.test.ts
 import { test, expect } from "bun:test";
-import { atText, hasOlder, layoutLanes, mergeGraphs, segPath, type Row } from "../src/dashboard/ui/graph-model";
+import { atText, graphRows, hasOlder, layoutLanes, mergeGraphs, segPath, type Row } from "../src/dashboard/ui/graph-model";
 import type { GraphBookmark, GraphCommit } from "../src/projects/graph";
 
 const main: GraphBookmark = { kind: "branch", name: "main" };
@@ -187,4 +187,18 @@ test("each line's path, for a node on lane 0 and on lane 2", () => {
   // Mirrored when the lane is left of the node.
   expect(segPath({ kind: "in", lane: 1 }, 2)).toBe("M30 0 V4 Q30 15 42 15");
   expect(segPath({ kind: "out", lane: 0 }, 2)).toBe("M12 30 V26 Q12 15 30 15 L42 15");
+});
+
+test("the home's older read carries on its graph, and what only it has never reads as not pushed", () => {
+  const spike: GraphBookmark = { kind: "branch", name: "spike" };
+  const release: GraphBookmark = { kind: "branch", name: "release" };
+  const a = { nodeId: "A", graph: [c("c3", ["c2"], 3, [main]), c("c2", ["c1"], 2)] };
+  const b = { nodeId: "B", graph: [c("s1", ["c3"], 4, [spike]), c("c3", ["c2"], 3, [main]), c("c2", ["c1"], 2)] };
+  const older = [c("c3", ["c2"], 3, [main]), c("c2", ["c1"], 2), c("c1", [], 1, [release])];
+  const rows = graphRows([a, b], "A", older);
+  expect(rows.map((r) => r.commit.commit)).toEqual(["s1", "c3", "c2", "c1"]);
+  expect(rows[3]!.labels[0]).toMatchObject({ bookmark: release, nodes: ["A"], notPushed: false });
+  // A live head only one node has still says so.
+  expect(rows[0]!.labels[0]).toMatchObject({ bookmark: spike, notPushed: true });
+  expect(graphRows([a, b], "A", [])).toEqual(mergeGraphs([a, b]));
 });

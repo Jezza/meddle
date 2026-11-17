@@ -1,7 +1,7 @@
 // A project's graph on its page: one row per commit, its lanes drawn on the left, its bookmarks (each with the nodes
 // that have it there), short change id and description on the right; `Older` at the bottom while there is more.
 import { Fragment } from "preact";
-import { atText, hasOlder, type Label, laneX, layoutLanes, type Laid, type Row, segPath } from "./graph-model";
+import { atTail, hasOlder, type Label, laneX, layoutLanes, type Laid, type Row, segPath } from "./graph-model";
 import { useAction } from "./hooks";
 
 export type GraphProps = {
@@ -94,23 +94,20 @@ function Pill({ label, taskOf }: { label: Label; taskOf: GraphProps["taskOf"] })
   if (b.kind === "branch") return <span class={`bm branch${behind}${label.notPushed ? " flag" : ""}`}>{b.name}</span>;
   const task = taskOf(b.task);
   return task === null
-    ? <span class={`bm task${behind}`}>task {b.task.slice(0, 8)}</span>
-    : <a class={`bm task${behind}`} href={task.href}>{task.title}</a>;
+    ? <span class={`bm line${behind}`}>task {b.task.slice(0, 8)}</span>
+    : <a class={`bm line${behind}`} href={task.href}>{task.title}</a>;
 }
 
-/** `atText`, with a failed node's name followed by its note. */
+/** `⌂ a · b` and its tail (as `atText`), a failed node's name followed by its note; it wraps between names. */
 function At({ label, nodeName, contextFailed }: { label: Label; nodeName: GraphProps["nodeName"]; contextFailed: ReadonlySet<string> }) {
-  const text = atText(label, nodeName);
-  if (!label.nodes.some((n) => contextFailed.has(n))) return <span class="at">{text}</span>;
-  // atText starts with `⌂ ` and the names: the rest is what follows them.
-  const rest = text.slice(`⌂ ${label.nodes.map(nodeName).join(" · ")}`.length);
   return (
     <span class="at">
       ⌂ {label.nodes.map((n, i) => (
         <Fragment key={n}>
-          {i > 0 && " · "}{nodeName(n)}{contextFailed.has(n) && <> <span class="error">context failed to load</span></>}
+          {i > 0 && " · "}
+          <span class="at-node">{nodeName(n)}{contextFailed.has(n) && <> <span class="error">context failed to load</span></>}</span>
         </Fragment>
-      ))}{rest}
+      ))}{atTail(label)}
     </span>
   );
 }

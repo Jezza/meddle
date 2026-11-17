@@ -10,7 +10,7 @@ import { Memory } from "./Memory";
 import { memorySource } from "./memory-model";
 import { PaneHead, type PoolRef, StateDot } from "./common";
 import { Graph } from "./Graph";
-import { mergeGraphs } from "./graph-model";
+import { graphRows } from "./graph-model";
 import { branchLines, mergeProjects, type HeldProject } from "./pool-model";
 import { hashOf } from "./routes";
 import { waitsOnYou } from "./sidebar-model";
@@ -22,13 +22,15 @@ type Report = (key: string, held: Held | null) => void;
 
 /** How many more commits `Older` reads than are shown: a read's most (`GRAPH_MAX`, a server module's). */
 const OLDER_MORE = 200;
+/** The most commits `olderGraph` lists (`OLDER_GRAPH_MAX`, a server module's). */
+const OLDER_CAP = 2000;
 
 export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: PoolRef; index: PoolIndex; id: string }) {
   const nodes = useValue(pool.nodes);
   const online = nodes.filter((n) => n.nodeId === hosts.selfId || (n.status === "member" && n.online));
   const [held, setHeld] = useState<ReadonlyMap<string, Held>>(() => new Map());
-  // The home's read with no lower bound, once `Older` is clicked.
-  const [older, setOlder] = useState<{ id: string; graph: readonly GraphCommit[] } | null>(null);
+  // The home's read with no lower bound once `Older` is clicked, and how many commits it asked for.
+  const [older, setOlder] = useState<{ graph: readonly GraphCommit[]; limit: number } | null>(null);
   const report = useCallback<Report>((key, copy) => setHeld((prev) => {
     const next = new Map(prev);
     if (copy === null) next.delete(key);
@@ -43,18 +45,19 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
   const memory = project === undefined ? null : memorySource(project.home, project.holders.map((h) => h.nodeId), onlineIds);
   const nodeName = (short: string) => nodes.find((n) => shortId(n.nodeId) === short)?.hostname ?? short;
   // Every online holder's graph; the home's carries on with what Older read.
-  const deeper = older?.id === id ? older.graph : [];
-  const graphs = (project?.holders ?? []).map((h) => {
-    if (h.nodeId !== project?.home || deeper.length === 0) return { nodeId: h.nodeId, graph: h.graph };
-    const shown = new Set(h.graph.map((c) => c.commit));
-    return { nodeId: h.nodeId, graph: [...h.graph, ...deeper.filter((c) => !shown.has(c.commit))] };
-  });
-  const rows = mergeGraphs(graphs);
+  const holders = project?.holders ?? [];
+  const rows = graphRows(holders, project?.home ?? "", older?.graph ?? []);
   const home = project === undefined ? undefined : held.get(`${project.home}/${id}`);
-  const readOlder = home === undefined || !onlineIds.includes(home.nodeId) ? null : async () => {
-    setOlder({ id, graph: await home.ref.olderGraph({ limit: rows.length + OLDER_MORE }) });
+  // The last read had all there is, or as much as one read lists.
+  const ended = older !== null && (older.graph.length < older.limit || older.limit >= OLDER_CAP);
+  const readOlder = home === undefined || !onlineIds.includes(home.nodeId) || ended ? null : async () => {
+    const limit = Math.min(rows.length + OLDER_MORE, OLDER_CAP);
+    setOlder({ graph: await home.ref.olderGraph({ limit }), limit });
   };
-  const branches = project === undefined ? [] : branchLines(project.branches.filter((b) => b.state !== "single"), project.defaultBranch);
+  const labelled = new Set(rows.flatMap((r) => r.labels.flatMap((l) => l.nodes)));
+  const failed = holders.filter((h) => !h.contextLoaded);
+  const branches = project === undefined ? []
+    : branchLines(project.branches.filter((b) => b.state === "conflicted" || b.state === "fetching"), project.defaultBranch);
   const taskOf = (taskId: string) => {
     const t = index.tasks.find((t) => t.id === taskId && !t.archived);
     return t === undefined ? null : { title: t.title, href: hashOf({ name: "task", nodeId: t.nodeId, id: t.id }) };
@@ -81,8 +84,11 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
             {rows.length > 0 && <>
               <h3>Graph</h3>
               <Graph rows={rows} defaultBranch={project.defaultBranch} nodeName={nameOf} taskOf={taskOf} older={readOlder}
-                contextFailed={new Set(project.holders.filter((h) => !h.contextLoaded).map((h) => h.nodeId))} />
+                contextFailed={new Set(failed.map((h) => h.nodeId))} />
             </>}
+            {failed.filter((h) => !labelled.has(h.nodeId)).map((h) => (
+              <p key={h.nodeId} class="error">{nameOf(h.nodeId)} context failed to load</p>
+            ))}
             {branches.length > 0 && <>
               <h3>Branches</h3>
               <ul class="plain">

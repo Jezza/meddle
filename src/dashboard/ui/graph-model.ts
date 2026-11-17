@@ -99,11 +99,33 @@ function ancestry(byId: ReadonlyMap<string, GraphCommit>): (commit: string) => R
   };
 }
 
-/** `⌂ a · b`, the nodes with a bookmark here, then ` · n behind` or ` · not pushed`. */
+/** `⌂ a · b`, the nodes with a bookmark here, then `atTail`. */
 export function atText(label: Label, nodeName: (nodeId: string) => string): string {
-  const at = `⌂ ${label.nodes.map(nodeName).join(" · ")}`;
-  if (label.behind !== null) return `${at} · ${label.behind} behind`;
-  return label.notPushed ? `${at} · not pushed` : at;
+  return `⌂ ${label.nodes.map(nodeName).join(" · ")}${atTail(label)}`;
+}
+
+/** What follows a label's nodes: ` · n behind`, ` · not pushed`, or nothing. */
+export function atTail(label: Label): string {
+  if (label.behind !== null) return ` · ${label.behind} behind`;
+  return label.notPushed ? " · not pushed" : "";
+}
+
+/**
+ * The rows of the nodes' graphs, the home's carried on with `older` (its read with no lower bound). A commit only that
+ * read has is in one node's graph only, but is not unpushed for that: its labels never say not pushed.
+ */
+export function graphRows(nodes: readonly NodeGraph[], home: string, older: readonly GraphCommit[]): Row[] {
+  if (older.length === 0) return mergeGraphs(nodes);
+  const read = (n: NodeGraph) => new Set(n.graph.map((c) => c.commit));
+  const live = new Set(nodes.flatMap((n) => [...read(n)]));
+  const onlyOlder = new Set(older.filter((c) => !live.has(c.commit)).map((c) => c.commit));
+  const rows = mergeGraphs(nodes.map((n) => {
+    if (n.nodeId !== home) return n;
+    const own = read(n);
+    return { nodeId: n.nodeId, graph: [...n.graph, ...older.filter((c) => !own.has(c.commit))] };
+  }));
+  return rows.map((r) => !onlyOlder.has(r.commit.commit) ? r
+    : { ...r, labels: r.labels.map((l) => ({ ...l, notPushed: false })) });
 }
 
 /**
