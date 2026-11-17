@@ -8,7 +8,7 @@ import { BlobStore } from "../src/blobs/store";
 import { writeFrame, type StreamReader } from "../src/pool/frames";
 import type { PeerStream, PoolNet } from "../src/pool/net";
 import { acceptBlobStreams } from "../src/tasks/blob";
-import { twoNodes } from "./pool-helpers";
+import { twoNodes, twoPoolNodes } from "./pool-helpers";
 
 async function* chunks(...parts: string[]) { for (const p of parts) yield new TextEncoder().encode(p); }
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
@@ -229,6 +229,18 @@ test("a peer that lacks the blob is passed over for the next, the one preferred 
     await close();
   }
 });
+
+test("a runner given its pool after it was built fetches through it", async () => {
+  // startPoolNode builds each runner without a pool and createNodeHost attaches it (`attachPool`).
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const { hash } = await A.runner.blobs.store.write(chunks("from a"));
+    expect(await B.runner.blobs.ensure(hash, A.id)).toBe(true);
+    expect(await B.runner.blobs.store.has(hash)).toBe(true);
+  } finally {
+    await close();
+  }
+}, 30_000);
 
 test("without a pool, ensure answers only from the store", async () => {
   const dir = await mkdtemp("/tmp/blob-pool-");

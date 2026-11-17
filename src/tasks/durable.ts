@@ -225,7 +225,7 @@ function messageOf(err: unknown): string {
 /** Creates tasks and drives their turns as durable `meddle.turn` tasks on one Harness. */
 export class TaskRunner {
   readonly approvals = new Approvals();
-  /** This node's files (the ones attached to prompts), and the way to fetch those it lacks from the pool. */
+  /** This node's files (the ones attached to prompts), and the way to fetch those it lacks from its pool, once it has one. */
   readonly blobs: BlobFetcher;
   #cfg: NodeConfig;
   #db: Database;
@@ -303,7 +303,7 @@ export class TaskRunner {
     this.#harness = harness;
     this.#deps = deps;
     this.#pool = deps.pool;
-    this.blobs = new BlobFetcher(new BlobStore(paths(cfg).blobs), deps.pool?.net ?? null);
+    this.blobs = new BlobFetcher(new BlobStore(paths(cfg).blobs), () => this.#pool?.net ?? null);
     const sink = deps.log ?? ((line: string) => console.error(line));
     this.#log = dedupe((line) => sink(line));
     this.#sessionStore = new SqliteSessionStore(db);

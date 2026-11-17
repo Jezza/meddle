@@ -72,12 +72,21 @@ async function* fileBytes(reader: StreamReader): AsyncGenerator<Uint8Array> {
   }
 }
 
+/** What a fetcher needs of the pool's net. */
+type FetchNet = Pick<PoolNet, "online" | "openStream">;
+
 /** Fetches the files a node lacks from the other members of its pool, into its blob store. */
 export class BlobFetcher {
   #fetching = new Map<string, Promise<boolean>>();
+  readonly #net: () => FetchNet | null;
 
-  /** `net` is null for a node without a pool: it has only what its store has. */
-  constructor(readonly store: BlobStore, private readonly net: Pick<PoolNet, "online" | "openStream"> | null) {}
+  /**
+   * `net` is null for a node without a pool: it has only what its store has. A function is asked for the net at each
+   * fetch, for a node whose pool comes after the fetcher (`TaskRunner.attachPool`).
+   */
+  constructor(readonly store: BlobStore, net: FetchNet | null | (() => FetchNet | null)) {
+    this.#net = typeof net === "function" ? net : () => net;
+  }
 
   /**
    * Makes sure the blob with this hash is in the store: true when it is, or was fetched from a member (`prefer` first,
@@ -97,11 +106,12 @@ export class BlobFetcher {
 
   async #obtain(hash: string, prefer: string | undefined): Promise<boolean> {
     if (await this.store.has(hash)) return true;
-    if (this.net === null) return false;
-    const online = this.net.online();
+    const net = this.#net();
+    if (net === null) return false;
+    const online = net.online();
     const peers = prefer !== undefined && online.includes(prefer) ? [prefer, ...online.filter((id) => id !== prefer)] : online;
     for (const peerId of peers) {
-      if (await this.#fetchFrom(this.net, peerId, hash)) return true;
+      if (await this.#fetchFrom(net, peerId, hash)) return true;
     }
     return false;
   }
