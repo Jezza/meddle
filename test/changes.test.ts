@@ -55,7 +55,7 @@ test("taskChanges lists only the task's own work", async () => {
     try {
       const listed = await taskChanges(cfg, project, TASK);
       const short = (await jj(["--ignore-working-copy", "log", "-r", base.commit, "--no-graph", "-T", "change_id.short(8)"], replica, cfg)).trim();
-      expect(listed).toMatchObject({ project: "p1", name: "a", start: main ? "feature" : short });
+      expect(listed).toMatchObject({ project: "p1", name: "a", start: main ? "feature" : short, conflicted: false });
       expect(listed.changes.map((c) => c.description)).toEqual(["", "second", "first"]);
       expect(listed.changes.map((c) => c.workingCopy)).toEqual([true, false, false]);
       const [wc, two, one] = listed.changes;
@@ -72,7 +72,15 @@ test("taskChanges lists only the task's own work", async () => {
         expect((await taskChanges(cfg, project, TASK, { defaultBranch: "zz" })).start).toBe("zz");
       }
       // No line here: no changes.
-      expect(await taskChanges(cfg, project, "t2")).toMatchObject({ start: main ? "feature" : short, changes: [] });
+      expect(await taskChanges(cfg, project, "t2")).toMatchObject({ start: main ? "feature" : short, conflicted: false, changes: [] });
+
+      // Without the default branch on the base, a bookmark that is not a task's line wins over one that is.
+      if (!main) {
+        await bookmarkSet(replica, "meddle/task/x/a", base.commit, cfg);
+        expect((await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).start).toBe("meddle/task/x/a");
+        await bookmarkSet(replica, "trunk", base.commit, cfg);
+        expect((await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).start).toBe("trunk");
+      }
     } finally {
       await close();
     }
@@ -133,6 +141,12 @@ test("workspaceFile stays inside the workspace", async () => {
     await expect(workspaceFile(cfg, [project], TASK, join(ws, "dir"))).rejects.toThrow(/^not-a-file: /);
     await writeFile(join(ws, "big"), Buffer.alloc(3 * 1024 * 1024, "x"));
     await expect(workspaceFile(cfg, [project], TASK, join(ws, "big"))).rejects.toThrow(/^too-large: /);
+
+    // A FIFO is no file, and reading it must not wait for a writer.
+    const fifo = join(ws, "fifo");
+    const made = await Bun.spawn(["mkfifo", fifo], { stdout: "ignore", stderr: "ignore" }).exited.catch(() => 1);
+    if (made === 0) await expect(workspaceFile(cfg, [project], TASK, fifo)).rejects.toThrow(/^not-a-file: /);
+    else console.warn("mkfifo unavailable: FIFO case skipped");
   } finally {
     await close();
   }
@@ -151,6 +165,32 @@ test("reads write nothing to the replica", async () => {
     await changeFile(cfg, project, first.change, "a.txt");
     await workspaceFile(cfg, [project], TASK, join(ws, "c.txt"));
     expect(await op()).toBe(before);
+  } finally {
+    await close();
+  }
+});
+
+test("a conflicted line is reported, not listed", async () => {
+  const { cfg, replica, project, first, second, close } = await taskRepo({ main: true });
+  try {
+    const line = `meddle/task/${TASK}/a`;
+    const op = (await jj(["--ignore-working-copy", "op", "log", "-n", "1", "--no-graph", "-T", "id"], replica, cfg)).trim();
+    await bookmarkSet(replica, line, first.commit, cfg, { ignoreWorkingCopy: true });
+    await jj(["--ignore-working-copy", "--at-op", op, "bookmark", "set", line, "-r", second.commit, "--allow-backwards"], replica, cfg);
+
+    expect(await taskChanges(cfg, project, TASK)).toEqual({ project: "p1", name: "a", start: "feature", conflicted: true, changes: [] });
+    await expect(changeDiff(cfg, project, TASK, "all")).rejects.toThrow(/^conflicted: /);
+  } finally {
+    await close();
+  }
+});
+
+test("a base missing from the replica fails loudly", async () => {
+  const { cfg, project, close } = await taskRepo({ main: true });
+  try {
+    const unknown = { ...project, base: ["f".repeat(40)] };
+    await expect(taskChanges(cfg, unknown, TASK)).rejects.toThrow();
+    await expect(changeDiff(cfg, unknown, TASK, "all")).rejects.toThrow();
   } finally {
     await close();
   }

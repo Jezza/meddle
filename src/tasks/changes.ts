@@ -22,7 +22,10 @@ export type TaskChange = {
   removed: number;
   empty: boolean;
   conflicted: boolean;
-  /** The line's own commit: the bookmark sits on the workspace's working-copy change. */
+  /**
+   * The line bookmark's commit: the workspace's working-copy change as of its last snapshot (`writeLineRows`), not
+   * the workspace's live `@`.
+   */
   workingCopy: boolean;
 };
 
@@ -30,16 +33,21 @@ export type ProjectChanges = {
   /** The project's id. */
   project: string;
   name: string;
-  /** A local bookmark on a base commit (the project's default branch first), else the first base's short change id. */
+  /**
+   * A local bookmark on a base commit (the project's default branch first, then any but a task's line, then a task's
+   * line), else the first base's short change id.
+   */
   start: string;
-  /** `<base>..<line>`, newest first. */
+  /** Whether the line's bookmark is conflicted; its changes are then not listed. */
+  conflicted: boolean;
+  /** `<base>..<line>`, newest first; none when the line is absent or conflicted. */
   changes: TaskChange[];
 };
 
 /** Why a read was refused; its message is `<code>: <detail>`. */
 export class ChangesError extends Error {
   constructor(
-    public code: "bad-id" | "outside" | "not-a-file" | "too-large",
+    public code: "bad-id" | "conflicted" | "outside" | "not-a-file" | "too-large",
     detail: string,
   ) {
     super(`${code}: ${detail}`);
@@ -70,6 +78,9 @@ const CHANGE_TEMPLATE = [
 const BASE_TEMPLATE = ['commit_id', "change_id.short(8)", 'local_bookmarks.map(|b| b.name()).join("\\x1e")']
   .join(' ++ "\\x1f" ++ ') + ' ++ "\\n"';
 
+/** Where every task's line bookmarks are (`taskNamespace`). */
+const TASK_BOOKMARKS = "meddle/task/";
+
 /** The task's line in `p`: its bookmark's name. */
 function lineName(p: ManifestProject, taskId: string): string {
   return `${taskNamespace(taskId)}${p.name}`;
@@ -89,7 +100,19 @@ function bases(p: ManifestProject): string[] {
 /** The task's base commits in `p` as a revset (the root when it has none). */
 function baseRevset(p: ManifestProject): string {
   const commits = bases(p);
-  return commits.length === 0 ? "root()" : commits.map((c) => `present(${c})`).join(" | ");
+  // Never `present()`: a base missing here must fail loudly, not widen the range to the whole history.
+  return commits.length === 0 ? "root()" : commits.join(" | ");
+}
+
+/** The state of the task's line in `p`: its local bookmark absent, conflicted or pointing at one commit. */
+async function lineState(cfg: NodeConfig, p: ManifestProject, taskId: string): Promise<"absent" | "conflicted" | "normal"> {
+  const out = await jj(
+    ["--ignore-working-copy", "bookmark", "list", "-T", 'if(present, remote ++ "\\t" ++ conflict ++ "\\n")', `exact:${lineSymbol(p, taskId)}`],
+    p.replica, cfg,
+  );
+  const local = out.split("\n").find((row) => row.startsWith("\t"));
+  if (local === undefined) return "absent";
+  return local === "\ttrue" ? "conflicted" : "normal";
 }
 
 /** A change or commit id, or its parent as `<id>-`; never a wider revset. */
@@ -106,11 +129,12 @@ export async function taskChanges(
   cfg: NodeConfig, p: ManifestProject, taskId: string, options: { defaultBranch?: string | null } = {},
 ): Promise<ProjectChanges> {
   const line = lineName(p, taskId);
+  const [state, start] = await Promise.all([lineState(cfg, p, taskId), startName(cfg, p, options.defaultBranch ?? null)]);
+  const conflicted = state === "conflicted";
+  if (state !== "normal") return { project: p.id, name: p.name, start, conflicted, changes: [] };
+  // `present()` on the line: it may have gone since `lineState`.
   const range = `(${baseRevset(p)})..present(${lineSymbol(p, taskId)})`;
-  const [listed, start] = await Promise.all([
-    jj(["--ignore-working-copy", "log", "--no-graph", "-r", range, "-T", CHANGE_TEMPLATE], p.replica, cfg),
-    startName(cfg, p, options.defaultBranch ?? null),
-  ]);
+  const listed = await jj(["--ignore-working-copy", "log", "--no-graph", "-r", range, "-T", CHANGE_TEMPLATE], p.replica, cfg);
   const changes = listed.split("\n").filter(Boolean).map((row): TaskChange => {
     const [change = "", commit = "", files = "0", added = "0", removed = "0", empty = "", conflict = "", bookmarks = "", ...rest] = row.split(FIELD);
     return {
@@ -125,33 +149,37 @@ export async function taskChanges(
       workingCopy: bookmarks.split(LIST).includes(line),
     };
   });
-  return { project: p.id, name: p.name, start, changes };
+  return { project: p.id, name: p.name, start, conflicted, changes };
 }
 
-/** A local bookmark on a base commit (`defaultBranch` first, then by name), else the first base's short change id. */
+/**
+ * A local bookmark on a base commit (`defaultBranch` first, then any but a task's line, then a task's line, each by
+ * name), else the first base's short change id.
+ */
 async function startName(cfg: NodeConfig, p: ManifestProject, defaultBranch: string | null): Promise<string> {
   const out = await jj(["--ignore-working-copy", "log", "--no-graph", "-r", baseRevset(p), "-T", BASE_TEMPLATE], p.replica, cfg);
   const rows = new Map(out.split("\n").filter(Boolean).map((row) => {
     const [commit = "", short = "", bookmarks = ""] = row.split(FIELD);
-    return [commit, { short, bookmarks: bookmarks === "" ? [] : bookmarks.split(LIST).sort() }] as const;
+    return [commit, { short, bookmarks: bookmarks === "" ? [] : bookmarks.split(LIST) }] as const;
   }));
   const bases = p.base.map((c) => rows.get(c)).filter((r) => r !== undefined);
-  const bookmarks = bases.flatMap((r) => r.bookmarks);
-  if (defaultBranch !== null && bookmarks.includes(defaultBranch)) return defaultBranch;
+  const rank = (name: string) => (name === defaultBranch ? 0 : name.startsWith(TASK_BOOKMARKS) ? 2 : 1);
+  const bookmarks = [...new Set(bases.flatMap((r) => r.bookmarks))].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
   return bookmarks[0] ?? bases[0]?.short ?? (p.base[0] ?? "root").slice(0, 8);
 }
 
 /**
  * A change's diff against its parent, in git's format; for `"all"`, the line's whole diff from its start, `""` when the
- * line is not there. A task with several base commits (an edit start on a merge) is diffed from the first: what
+ * line is not there; rejects `conflicted` when the line's bookmark is. A task with several base commits (an edit start on a merge) is diffed from the first: what
  * `--from` their merge would be is not well defined.
  */
 export async function changeDiff(cfg: NodeConfig, p: ManifestProject, taskId: string, change: string | "all"): Promise<string> {
   if (change !== "all") return jj(["--ignore-working-copy", "diff", "--git", "-r", revision(change)], p.replica, cfg);
   const from = bases(p)[0] ?? "root()";
   const line = lineSymbol(p, taskId);
-  const present = await jj(["--ignore-working-copy", "log", "--no-graph", "-r", `present(${line})`, "-T", '"x"'], p.replica, cfg);
-  if (present === "") return "";
+  const state = await lineState(cfg, p, taskId);
+  if (state === "absent") return "";
+  if (state === "conflicted") throw new ChangesError("conflicted", lineName(p, taskId));
   return jj(["--ignore-working-copy", "diff", "--git", "--from", from, "--to", line], p.replica, cfg);
 }
 
@@ -178,6 +206,10 @@ function inside(root: string, path: string): boolean {
  * The file at `path` (absolute) as it is now in task `taskId`'s workspace of one of `projects`, or null when it is
  * absent. Its real path must be in one of the workspaces' real paths (`..` and symlinks resolved), else `outside`; it
  * must be a regular file, else `not-a-file`, of at most `WORKSPACE_FILE_MAX` bytes, else `too-large`.
+ *
+ * The check stops a caller naming an arbitrary path. A folder on the path swapped for a symlink between the realpath
+ * and the open could still lead outside, but only the workspace's own agent could win that race, and it runs as this
+ * same user, so it can read such a file anyway.
  */
 export async function workspaceFile(cfg: NodeConfig, projects: readonly ManifestProject[], taskId: string, path: string): Promise<string | null> {
   if (!isAbsolute(path)) throw new ChangesError("outside", path);
@@ -196,8 +228,8 @@ export async function workspaceFile(cfg: NodeConfig, projects: readonly Manifest
   if (!reals.some((r) => inside(r, real))) throw new ChangesError("outside", path);
   let file;
   try {
-    // Its real path: a symlink put there since is not followed.
-    file = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
+    // Its real path: a symlink put there since is not followed. Non-blocking: a FIFO opens at once, and is no file.
+    file = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return null;
