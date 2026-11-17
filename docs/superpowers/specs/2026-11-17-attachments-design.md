@@ -91,7 +91,7 @@ and checks the bytes against the hash.
 - **Event log:** `promptEvent` logs the text as today plus `attachments` (the refs) on the event; the thread reads
   those. The bytes are not in meddle's log, its state cells or anything streamed to a dashboard. Claude Code's own
   transcript does hold them, base64, since it records what it was sent; that is accepted.
-- **Moves:** importing a task fetches, from the sender, every blob its queued prompts and pending turn input name,
+- **Moves:** importing a task fetches, from the sender, every blob its queued prompts name (a move carries no turn input),
   before the receipt; a blob that cannot be fetched fails the import like any other import error. Then, best effort
   **(my call)**, it fetches the blobs of the earlier prompts in its log and writes `.meddle/attachments` again, so the
   paths Claude was given in earlier turns still work; one no online node has is left out, and the move goes on.
@@ -138,13 +138,14 @@ and checks the bytes against the hash.
   fields it does not know (chord's `Value.Clean`), so attachments must never be sent to it.
   - Each node says in its summary that it takes attachments (an optional field, as `running` and `projects` were
     added); an older node says nothing.
-  - The dashboard offers no paperclip, drop or paste on a task whose node does not say so, and the New Task form
-    none when the node it names does not.
+  - The New Task form offers no paperclip, drop or paste when the node it names does not say so. (A task page
+    needs no such gate: a newer dashboard cannot open a task on an older node at all, as with every cell added to
+    `TaskObject` before.)
   - `createTask` with attachments places only on nodes that say so; a move of a task with attachments in its queue
-    or pending turn is refused to a node that does not.
+    is refused to a node that does not.
   - An older dashboard or CLI must still connect to an updated node's tasks: chord refuses a link whose contract
     changed a cell's type at the same version (`contract_mismatch`), so `queued` stays an array of texts and the
-    queue's attachments come in a cell of their own (or another shape chord's check allows).
+    queue's prompts, attachments included, come in a cell of their own, `queuedPrompts`.
 - The dashboard serves on `127.0.0.1` only; the browser always uploads to its own node.
 - Pool streams carry frames of at most 16 MiB (`MAX_FRAME`), so a blob goes in several.
 
