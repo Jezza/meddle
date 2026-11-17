@@ -1,6 +1,6 @@
 import { test, expect, beforeEach } from "bun:test";
-import { existsSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdtemp, readdir, readFile, stat, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BlobStore } from "../src/blobs/store";
 import { materialize, promptContent } from "../src/blobs/content";
@@ -65,24 +65,38 @@ test("an existing file at the path is kept, not replaced", async () => {
   expect(await materialize(store, dir, text)).toBe(`${dir}/${text.hash}/server.log`);
   expect(await readFile(`${dir}/${text.hash}/server.log`, "utf8")).toBe("mine");
 });
-test("a file is a hard link to the blob", async () => {
+test("a file is a copy, so editing it leaves the blob as it was", async () => {
   const p = await materialize(store, dir, text);
-  expect((await stat(p)).ino).toBe((await stat(store.path(text.hash))).ino);
+  expect((await stat(p)).ino).not.toBe((await stat(store.path(text.hash))).ino);
+  expect((await stat(p)).nlink).toBe(1);
   expect((await stat(p)).mode & 0o777).toBe(0o600);
+  await writeFile(p, "edited by the agent");
+  expect(await readFile(p, "utf8")).toBe("edited by the agent");
+  expect(await readFile(store.path(text.hash), "utf8")).toBe("line\n");
+  expect(await store.has(text.hash)).toBe(true);
 });
-// A directory on another filesystem than the blob store's, where link fails with EXDEV and a copy is written.
-const otherFs = existsSync("/dev/shm") && statSync("/dev/shm").dev !== statSync("/tmp").dev;
-test.skipIf(!otherFs)("a file is a copy where it cannot be linked", async () => {
-  const root = await mkdtemp("/dev/shm/blob-content-");
+test("a file is written whole under its own name, with no temporary file left", async () => {
+  await materialize(store, dir, text);
+  await materialize(store, dir, text);
+  expect(await readdir(`${dir}/${text.hash}`)).toEqual(["server.log"]);
+});
+test("a file that cannot be copied leaves nothing behind", async () => {
+  if (process.getuid?.() === 0) return; // root reads whatever the mode says
+  await chmod(store.path(text.hash), 0o000);
   try {
-    const q = await materialize(store, join(root, "attachments"), text);
-    expect(await readFile(q, "utf8")).toBe("line\n");
-    expect((await stat(q)).ino).not.toBe((await stat(store.path(text.hash))).ino);
-    expect((await stat(q)).mode & 0o777).toBe(0o600);
-    expect(await materialize(store, join(root, "attachments"), text)).toBe(q);
+    await expect(materialize(store, dir, text)).rejects.toThrow();
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await chmod(store.path(text.hash), 0o600);
   }
+  expect(await readdir(`${dir}/${text.hash}`)).toEqual([]);
+});
+test("an attachment that is not safe to write is refused before anything is written", async () => {
+  await expect(materialize(store, dir, { ...text, name: "../x" })).rejects.toThrow(/^bad attachment: name /);
+  await expect(materialize(store, dir, { ...text, name: ".bashrc" })).rejects.toThrow("bad attachment: name");
+  await expect(materialize(store, dir, { ...text, hash: "../" + "a".repeat(61) })).rejects.toThrow("bad attachment: hash");
+  await expect(promptContent(store, dir, { text: "x", attachments: [{ ...text, name: "a/b" }] })).rejects.toThrow("bad attachment: name");
+  await expect(readdir(dir)).rejects.toThrow("ENOENT");
+  expect(existsSync(join(dir, "x"))).toBe(false);
 });
 test("a blob not in the store fails", async () => {
   await expect(materialize(store, dir, { ...shot, hash: "0".repeat(64) })).rejects.toThrow("attachment shot.png is not here");

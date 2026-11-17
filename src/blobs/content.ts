@@ -1,34 +1,46 @@
 // What Claude Code is sent for a prompt: its images inline, and every file written under the task with its path in the text.
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import { constants } from "node:fs";
-import { copyFile, link, mkdir, readFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { inlined, type Attachment, type Prompt } from "./attachment";
+import { attachmentProblem, inlined, type Attachment, type Prompt } from "./attachment";
 import type { BlobStore } from "./store";
 
 /** What a user turn carries to Claude Code: a string, or content blocks. */
 export type UserContent = SDKUserMessage["message"]["content"];
 
-const exists = (err: unknown) => (err as NodeJS.ErrnoException).code === "EEXIST";
+async function present(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
 
 /**
- * Writes the attachment as `<dir>/<hash>/<name>` and says where: a hard link to its blob, or a copy where linking fails
- * (another filesystem). A file already there is kept. Throws `attachment <name> is not here` when the store lacks the blob.
+ * Writes the attachment as `<dir>/<hash>/<name>` and says where. Always a copy of the blob, never a link: Claude Code may
+ * edit the file, and that must not reach the blob store. The copy is made under a temporary name and renamed into place,
+ * so a crash never leaves a part of a file under its own name. A file already there is kept as it is. Throws
+ * `bad attachment: <why>` for a name or hash that is not safe to write, and `attachment <name> is not here` when the store
+ * lacks the blob.
  */
 export async function materialize(store: BlobStore, dir: string, a: Attachment): Promise<string> {
+  const problem = attachmentProblem(a);
+  if (problem !== null) throw new Error(`bad attachment: ${problem}`);
   if (!(await store.has(a.hash))) throw new Error(`attachment ${a.name} is not here`);
   const folder = join(dir, a.hash);
-  await mkdir(folder, { recursive: true });
   const target = join(folder, a.name);
+  if (await present(target)) return target;
+  await mkdir(folder, { recursive: true });
+  // A name never starts with a dot, so this can't be one.
+  const temp = join(folder, `.tmp-${crypto.randomUUID()}`);
   try {
-    await link(store.path(a.hash), target);
+    await copyFile(store.path(a.hash), temp);
+    await rename(temp, target);
   } catch (err) {
-    if (exists(err)) return target;
-    try {
-      await copyFile(store.path(a.hash), target, constants.COPYFILE_EXCL);
-    } catch (copyErr) {
-      if (!exists(copyErr)) throw copyErr;
-    }
+    await rm(temp, { force: true });
+    throw err;
   }
   return target;
 }
