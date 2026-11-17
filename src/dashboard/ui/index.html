@@ -222,6 +222,32 @@
   .chg-file .diff { max-height: none; }
   .chg-file .error { margin: 4px 0 0; font-size: 12px; }
   .chg-main > .error { margin: 0 0 12px; }
+
+  /* ─── a project's graph ─── */
+  .graph { border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px; }
+  .graph .g { display: grid; min-height: 30px; }
+  .graph .g-rail { position: relative; }
+  .graph .g-rail svg { position: absolute; top: 0; left: 0; height: 100%; display: block; overflow: visible; }
+  .graph path, .graph line { fill: none; stroke: var(--faint); stroke-width: 1.5; }
+  .graph .stub { stroke-dasharray: 2 3; }
+  .graph .pt { fill: var(--bg); stroke: var(--fg-soft); stroke-width: 1.5; }
+  .graph .pt.head { fill: var(--accent); stroke: none; }
+  .graph .pt.alone { stroke: var(--warn); }
+  .graph .diamond { fill: var(--fg-soft); }
+  .graph .tilde { fill: var(--faint); font: 12px ui-monospace, monospace; }
+  .graph .g-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; padding: 5px 4px 5px 0; font-size: 12.5px; line-height: 20px; }
+  .graph .g-row:hover { background: var(--side); }
+  /* `display` and `height` undo the task page's `.task`. */
+  .graph .bm { display: block; height: auto; font-size: 11.5px; line-height: 18px; border-radius: 4px; padding: 0 6px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .graph .bm.task { background: var(--tint-blue-bg); color: var(--tint-blue); }
+  .graph .bm.branch { background: var(--hover); color: var(--fg); }
+  .graph .bm.branch.flag { color: var(--warn); }
+  .graph .bm.behind { background: none; border: 1px dashed var(--line-strong); color: var(--muted); }
+  .graph .at { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .graph .cid { font: 11.5px ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; color: var(--muted); }
+  .graph .desc { flex: 1 1 12em; min-width: 0; color: var(--fg-soft); overflow-wrap: anywhere; }
+  .graph button.older { background: none; border: none; padding: 0; color: var(--accent); font-size: 12px; }
+  .graph button.older:hover:not(:disabled) { background: none; text-decoration: underline; }
   /* What waits on you, beneath the changes. */
   .pending-strip { flex: none; max-height: 45vh; overflow-y: auto; padding: 10px 22px 0; border-top: 1px solid var(--line); }
   .pending-strip .ask { max-width: 860px; margin: 0 auto 10px; }

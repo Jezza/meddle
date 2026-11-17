@@ -12,6 +12,7 @@ import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, patchHash, summary, totals } from "../src/dashboard/ui/changes-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
+import { atText } from "../src/dashboard/ui/graph-model";
 
 test("the dashboard bundle builds", async () => {
   const build = await Bun.build({ entrypoints: ["src/dashboard/ui/main.tsx"], target: "browser", format: "esm" });
@@ -68,17 +69,18 @@ test("a task moves only to another online member that hosts tasks and runs the s
 test("the projects view merges each project's holders by id, home's name first, holders in pool order", () => {
   const [a, b, c] = ["a", "b", "c"].map((x) => x.repeat(64)) as [string, string, string];
   const branches = [{ name: "main", state: "single" as const, commit: "1".repeat(40), siblings: [], waiting: [] }];
+  const graph = [{ commit: "1".repeat(40), change: "k".repeat(32), parents: [], description: "", immutable: true, time: 1, bookmarks: [] }];
   const rows = mergeProjects([
-    { nodeId: c, id: "p1", name: "one", home: a, defaultBranch: "main", branches: [], contextLoaded: true },
-    { nodeId: a, id: "p1", name: "one", home: a, defaultBranch: "main", branches, contextLoaded: true },
-    { nodeId: b, id: "p2", name: "two", home: b, defaultBranch: null, branches: [], contextLoaded: false },
+    { nodeId: c, id: "p1", name: "one", home: a, defaultBranch: "main", branches: [], contextLoaded: true, graph: [] },
+    { nodeId: a, id: "p1", name: "one", home: a, defaultBranch: "main", branches, contextLoaded: true, graph },
+    { nodeId: b, id: "p2", name: "two", home: b, defaultBranch: null, branches: [], contextLoaded: false, graph: [] },
   ], [a, b, c]);
   expect(rows).toEqual([
     {
       id: "p1", name: "one", home: a, defaultBranch: "main", branches,
-      holders: [{ nodeId: a, contextLoaded: true }, { nodeId: c, contextLoaded: true }],
+      holders: [{ nodeId: a, contextLoaded: true, graph }, { nodeId: c, contextLoaded: true, graph: [] }],
     },
-    { id: "p2", name: "two", home: b, defaultBranch: null, branches: [], holders: [{ nodeId: b, contextLoaded: false }] },
+    { id: "p2", name: "two", home: b, defaultBranch: null, branches: [], holders: [{ nodeId: b, contextLoaded: false, graph: [] }] },
   ]);
 });
 
@@ -387,4 +389,11 @@ test("changeLabel names the working copy, else the description, else the short i
   expect(changeLabel(change({ workingCopy: true, description: "Wip" }))).toBe("Working copy");
   expect(changeLabel(change({ description: "Add DiffView" }))).toBe("Add DiffView");
   expect(changeLabel(change({ description: "" }))).toBe("kpmxqwrt");
+});
+
+test("a graph label's at text: its nodes, then behind or not pushed", () => {
+  const label = { bookmark: { kind: "branch", name: "main" } as const, nodes: ["a", "b"], behind: null, notPushed: false };
+  expect(atText(label, (id) => id)).toBe("⌂ a · b");
+  expect(atText({ ...label, nodes: ["a"], behind: 1 }, (id) => id)).toBe("⌂ a · 1 behind");
+  expect(atText({ ...label, nodes: ["a"], notPushed: true }, (id) => id)).toBe("⌂ a · not pushed");
 });

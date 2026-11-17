@@ -1,24 +1,34 @@
-// A project across the pool (its home, its branches, a conflicted one with its siblings, the nodes holding a copy, its
+// A project across the pool (its home, its graph as its online nodes read it, a conflicted or fetching branch, its
 // tasks), and adding a project on this node from a folder or an upstream URL.
 import type { Host, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
 import { NodeObject, ProjectObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
+import type { GraphCommit } from "../../projects/graph";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
 import { Memory } from "./Memory";
 import { memorySource } from "./memory-model";
 import { PaneHead, type PoolRef, StateDot } from "./common";
+import { Graph } from "./Graph";
+import { mergeGraphs } from "./graph-model";
 import { branchLines, mergeProjects, type HeldProject } from "./pool-model";
 import { hashOf } from "./routes";
 import { waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
 
-type Report = (key: string, held: HeldProject | null) => void;
+/** A node's copy, and its object to read more of its graph from. */
+type Held = HeldProject & { ref: Ref<typeof ProjectObject> };
+type Report = (key: string, held: Held | null) => void;
+
+/** How many more commits `Older` reads than are shown: a read's most (`GRAPH_MAX`, a server module's). */
+const OLDER_MORE = 200;
 
 export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: PoolRef; index: PoolIndex; id: string }) {
   const nodes = useValue(pool.nodes);
   const online = nodes.filter((n) => n.nodeId === hosts.selfId || (n.status === "member" && n.online));
-  const [held, setHeld] = useState<ReadonlyMap<string, HeldProject>>(() => new Map());
+  const [held, setHeld] = useState<ReadonlyMap<string, Held>>(() => new Map());
+  // The home's read with no lower bound, once `Older` is clicked.
+  const [older, setOlder] = useState<{ id: string; graph: readonly GraphCommit[] } | null>(null);
   const report = useCallback<Report>((key, copy) => setHeld((prev) => {
     const next = new Map(prev);
     if (copy === null) next.delete(key);
@@ -32,6 +42,23 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
   const listed = nodes.flatMap((n) => n.projects).find((p) => p.id === id);
   const memory = project === undefined ? null : memorySource(project.home, project.holders.map((h) => h.nodeId), onlineIds);
   const nodeName = (short: string) => nodes.find((n) => shortId(n.nodeId) === short)?.hostname ?? short;
+  // Every online holder's graph; the home's carries on with what Older read.
+  const deeper = older?.id === id ? older.graph : [];
+  const graphs = (project?.holders ?? []).map((h) => {
+    if (h.nodeId !== project?.home || deeper.length === 0) return { nodeId: h.nodeId, graph: h.graph };
+    const shown = new Set(h.graph.map((c) => c.commit));
+    return { nodeId: h.nodeId, graph: [...h.graph, ...deeper.filter((c) => !shown.has(c.commit))] };
+  });
+  const rows = mergeGraphs(graphs);
+  const home = project === undefined ? undefined : held.get(`${project.home}/${id}`);
+  const readOlder = home === undefined || !onlineIds.includes(home.nodeId) ? null : async () => {
+    setOlder({ id, graph: await home.ref.olderGraph({ limit: rows.length + OLDER_MORE }) });
+  };
+  const branches = project === undefined ? [] : branchLines(project.branches.filter((b) => b.state !== "single"), project.defaultBranch);
+  const taskOf = (taskId: string) => {
+    const t = index.tasks.find((t) => t.id === taskId && !t.archived);
+    return t === undefined ? null : { title: t.title, href: hashOf({ name: "task", nodeId: t.nodeId, id: t.id }) };
+  };
   return (
     <>
       {online.map((row) => {
@@ -51,10 +78,15 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
             <dl>
               <dt>Home</dt><dd title={project.home}>{nameOf(project.home)}</dd>
             </dl>
-            <h3>Branches</h3>
-            {project.branches.length === 0 ? <p class="muted">No branches.</p> : (
+            {rows.length > 0 && <>
+              <h3>Graph</h3>
+              <Graph rows={rows} defaultBranch={project.defaultBranch} nodeName={nameOf} taskOf={taskOf} older={readOlder}
+                contextFailed={new Set(project.holders.filter((h) => !h.contextLoaded).map((h) => h.nodeId))} />
+            </>}
+            {branches.length > 0 && <>
+              <h3>Branches</h3>
               <ul class="plain">
-                {branchLines(project.branches, project.defaultBranch).map((b) => (
+                {branches.map((b) => (
                   <li key={b.name} class={b.conflicted ? "flag" : ""}>
                     <code>{b.name}</code> {b.isDefault && <span class="muted">(default) </span>}<code>{b.text}</code>
                     {b.conflicted && (
@@ -67,18 +99,7 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
                   </li>
                 ))}
               </ul>
-            )}
-            <h3>Copies</h3>
-            <table>
-              <thead><tr><th>Node</th></tr></thead>
-              <tbody>
-                {project.holders.map((h) => (
-                  <tr key={h.nodeId}>
-                    <td title={h.nodeId}>{nameOf(h.nodeId)}{!h.contextLoaded && <div class="error">context failed to load</div>}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            </>}
             {memory !== null && (
               <Memory key={memory.nodeId} hosts={hosts} nodeId={memory.nodeId} editable={memory.editable} id={id} tasks={index.tasks} nodeName={nodeName} />
             )}
@@ -124,11 +145,12 @@ function HeldSourceLoaded({ project, nodeId, report }: { project: Ref<typeof Pro
   const defaultBranch = useValue(project.defaultBranch);
   const branches = useValue(project.branches);
   const contextLoaded = useValue(project.contextLoaded);
+  const graph = useValue(project.graph);
   useEffect(() => {
     const key = `${nodeId}/${id}`;
-    report(key, { nodeId, id, name, home, defaultBranch: defaultBranch ?? null, branches, contextLoaded });
+    report(key, { nodeId, id, name, home, defaultBranch: defaultBranch ?? null, branches, contextLoaded, graph, ref: project });
     return () => report(key, null);
-  }, [nodeId, id, name, home, defaultBranch, branches, contextLoaded, report]);
+  }, [nodeId, id, name, home, defaultBranch, branches, contextLoaded, graph, project, report]);
   return null;
 }
 

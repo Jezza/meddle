@@ -1,5 +1,6 @@
 // What the pool-wide views compute from their objects' values. Pure: no Preact, no DOM.
 import { branchText, siblingRef, type ProjectBranch } from "../../projects/branches";
+import type { GraphCommit } from "../../projects/graph";
 
 /** What a move target is chosen by: a row of `PoolObject.nodes`. */
 export type MoveCandidate = {
@@ -48,13 +49,16 @@ export function projectChoices(nodes: readonly ProjectLister[]): ListedProject[]
   return [...byId.values()].map((e) => e.project).sort((x, y) => x.name.localeCompare(y.name) || x.id.localeCompare(y.id));
 }
 
-/** One node's copy of a project, with its branches as that node computes them (`ProjectObject.branches`). */
+/**
+ * One node's copy of a project, with its branches as that node computes them (`ProjectObject.branches`) and its graph
+ * as it reads it (`ProjectObject.graph`).
+ */
 export type HeldProject = {
   nodeId: string; id: string; name: string; home: string; defaultBranch: string | null;
-  branches: readonly ProjectBranch[]; contextLoaded: boolean;
+  branches: readonly ProjectBranch[]; contextLoaded: boolean; graph: readonly GraphCommit[];
 };
 
-export type Holder = { nodeId: string; contextLoaded: boolean };
+export type Holder = { nodeId: string; contextLoaded: boolean; graph: readonly GraphCommit[] };
 
 /** A project across the pool: the nodes holding a copy of it, and its branches as one of them computes them. */
 export type PoolProject = {
@@ -83,7 +87,7 @@ export function mergeProjects(held: readonly HeldProject[], nodeOrder: readonly 
       home: named.home,
       defaultBranch: named.defaultBranch,
       branches: named.branches,
-      holders: copies.map((c) => ({ nodeId: c.nodeId, contextLoaded: c.contextLoaded })),
+      holders: copies.map((c) => ({ nodeId: c.nodeId, contextLoaded: c.contextLoaded, graph: c.graph })),
     });
   }
   return rows.sort((x, y) => x.name.localeCompare(y.name) || x.id.localeCompare(y.id));

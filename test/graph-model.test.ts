@@ -1,6 +1,6 @@
 // test/graph-model.test.ts
 import { test, expect } from "bun:test";
-import { atText, hasOlder, layoutLanes, mergeGraphs, type Row } from "../src/dashboard/ui/graph-model";
+import { atText, hasOlder, layoutLanes, mergeGraphs, segPath, type Row } from "../src/dashboard/ui/graph-model";
 import type { GraphBookmark, GraphCommit } from "../src/projects/graph";
 
 const main: GraphBookmark = { kind: "branch", name: "main" };
@@ -173,4 +173,18 @@ test("a parent outside the graph ends in a stub", () => {
   const whole = mergeGraphs([{ nodeId: "A", graph: [c("c2", ["c1"], 2, [main]), c("c1", ["c0"], 1), c("c0", [], 0)] }]);
   expect(segs(whole, "c1")).not.toContainEqual({ kind: "stub", lane: 0 });
   expect(hasOlder(whole)).toBe(false);
+});
+
+test("each line's path, for a node on lane 0 and on lane 2", () => {
+  expect(segPath({ kind: "through", lane: 1 }, 0)).toBe("M30 0 V30");
+  expect(segPath({ kind: "up", lane: 0 }, 0)).toBe("M12 0 V15");
+  expect(segPath({ kind: "down", lane: 0 }, 0)).toBe("M12 15 V30");
+  expect(segPath({ kind: "stub", lane: 0 }, 0)).toBe("M12 15 V26");
+  // A curve ends at the node's edge, or at the next lane's and runs on to the node's edge.
+  expect(segPath({ kind: "in", lane: 1 }, 0)).toBe("M30 0 V4 Q30 15 18 15");
+  expect(segPath({ kind: "in", lane: 2 }, 0)).toBe("M48 0 V4 Q48 15 30 15 L18 15");
+  expect(segPath({ kind: "out", lane: 1 }, 0)).toBe("M30 30 V26 Q30 15 18 15");
+  // Mirrored when the lane is left of the node.
+  expect(segPath({ kind: "in", lane: 1 }, 2)).toBe("M30 0 V4 Q30 15 42 15");
+  expect(segPath({ kind: "out", lane: 0 }, 2)).toBe("M12 30 V26 Q12 15 30 15 L42 15");
 });

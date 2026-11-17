@@ -219,3 +219,25 @@ export function hasOlder(rows: readonly Row[]): boolean {
   const ids = new Set(rows.map((r) => r.commit.commit));
   return rows.some((r) => r.commit.parents.some((p) => !ids.has(p)));
 }
+
+/** A lane's x in a row's drawing: rows are 30 high, lanes 18 apart, the node at y 15. */
+export function laneX(lane: number): number {
+  return 12 + 18 * lane;
+}
+
+/**
+ * A seg's SVG path in a row whose node is on lane `node`. A curve between lanes ends at the node's edge if the lane is
+ * next to it, else at the next lane's x, and runs straight on to the node's edge.
+ */
+export function segPath(seg: Seg, node: number): string {
+  const x = laneX(seg.lane);
+  if (seg.kind === "through") return `M${x} 0 V30`;
+  if (seg.kind === "up") return `M${x} 0 V15`;
+  if (seg.kind === "down") return `M${x} 15 V30`;
+  if (seg.kind === "stub") return `M${x} 15 V26`;
+  const toward = Math.sign(node - seg.lane);
+  const edge = laneX(node) - 6 * toward;
+  const end = Math.abs(node - seg.lane) > 1 ? x + 18 * toward : edge;
+  const [from, bend] = seg.kind === "in" ? [0, 4] : [30, 26];
+  return `M${x} ${from} V${bend} Q${x} 15 ${end} 15${end === edge ? "" : ` L${edge} 15`}`;
+}
