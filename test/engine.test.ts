@@ -203,6 +203,19 @@ test("background work live at a result keeps the child past the exit grace, and 
   expect(s.lastIndexOf("system/init")).toBeGreaterThan(s.indexOf("system/task_notification"));
   expect(s).not.toContain("meddle/turn_failed");
 }, 20_000);
+test("a result Claude Code gives before it starts the prompt (a resumed session's, for work the last process left) is not the turn's: the input stays open for the background work that follows", async () => {
+  const { db, input, fixture } = await setup();
+  const queue = new InputQueue();
+  const openAtResults: boolean[] = [];
+  const { done } = runTurn({
+    input: { ...input, extraEnv: { ...fixture("background-resume"), MEDDLE_FIXTURE_BACKGROUND_MS: "3000" } }, prompt: "Run the suite.", db, approvals: new Approvals(), queue,
+    onMessage: (m) => { if (m.type === "result") openAtResults.push(!queue.ended); },
+  });
+  expect(await done).toMatchObject({ subtype: "success", result: "The suite passed." });
+  // the resumed session's empty result, the prompt's own (background work live), then the wake's, which ends the turn
+  expect(openAtResults).toEqual([true, true, true]);
+  expect(shape(listEvents(db, "abc").map(e => e.message as any))).not.toContain("meddle/turn_failed");
+}, 25_000);
 test("send now gets a text pushed just before it to Claude Code first, and Claude Code cuts the turn to run it", async () => {
   const { db, input, fixture } = await setup();
   const queue = new InputQueue();

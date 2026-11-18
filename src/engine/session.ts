@@ -150,6 +150,9 @@ export type RunTurnArgs = {
  * child and its input open, with no grace: when it ends Claude Code wakes for it in a turn of its own (an `init`, then
  * its own `result`), which this turn ends with. Closing the child at that `result` would kill the work unseen.
  *
+ * A `result` while Claude Code holds the prompt queued (a `command_lifecycle` that queued it and has not started it) is
+ * not the turn's: a resumed session gives one, empty, for the work its last process left before it starts the prompt.
+ *
  * `sendNow` does what Claude Code's own "send now" key does: every steer it has not taken goes now, in order, into
  * the running turn when Claude Code can fit them in, or else it cuts the turn short and runs them next. A steer pushed
  * just before is among them. Answers what Claude Code says it did; rejects for a Claude Code that does not offer it.
@@ -200,7 +203,7 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
       console.error(`meddle: the token fault of task ${taskId}'s turn could not be handled:`, err);
     }
   };
-  const done = drive(q, queue, args.signal, record, watch).then(
+  const done = drive(q, queue, prompt, args.signal, record, watch).then(
     (result) => { tell(); return result; },
     (err: unknown) => {
       if (!(err instanceof DOMException && err.name === "AbortError")) tell();
@@ -242,6 +245,7 @@ function recorder(args: RunTurnArgs): (m: SDKMessage | MeddleEvent) => void {
 async function drive(
   q: Query,
   queue: InputQueue,
+  prompt: string,
   signal: AbortSignal | undefined,
   record: (m: SDKMessage | MeddleEvent) => void,
   watch: (m: SDKMessage) => void,
@@ -258,6 +262,7 @@ async function drive(
   let graceOver: Promise<"grace"> | undefined;
   let result: SDKResultMessage | undefined;
   let background = 0; // live background tasks, from the latest `background_tasks_changed`
+  let promptQueued = false; // Claude Code says it queued the prompt and has not started it
   let ended = false; // the iterator finished on its own: the child has gone
   let closed = false;
   let logged = false; // a turn_aborted or turn_failed is in the log
@@ -300,8 +305,10 @@ async function drive(
       if (step === "grace") return result!;
       if (step.done) { ended = true; break; }
       const m = step.value;
+      if (queuedBy(m) === prompt) promptQueued = true;
       // A steer is logged as Claude Code takes it, ahead of the message that says so.
       for (const uuid of takenBy(m)) {
+        if (uuid === prompt) promptQueued = false;
         const text = queue.take(uuid);
         if (text === null) continue;
         record(promptEvent(text, uuid));
@@ -315,7 +322,7 @@ async function drive(
       else if (m.type === "system" && m.subtype === "background_tasks_changed") {
         background = m.tasks.filter((t) => t.ambient !== true).length;
         settle();
-      } else if (m.type === "result" && result === undefined) {
+      } else if (m.type === "result" && result === undefined && !promptQueued) {
         result = m;
         // With every steer taken and no background work the input closes, so the child goes. An untaken steer keeps it
         // open for Claude Code, and so does background work, which Claude Code wakes for when it ends: then the input
@@ -353,6 +360,12 @@ function takenBy(m: SDKMessage): string[] {
   }
   if (Array.isArray(frame.user_message_uuids)) taken.push(...frame.user_message_uuids.filter((u): u is string => typeof u === "string"));
   return taken;
+}
+
+/** The uuid of the user message `m` says Claude Code queued (a `command_lifecycle` that queued it), if any. */
+function queuedBy(m: SDKMessage): string | undefined {
+  const frame = m as { type: string; state?: unknown; command_uuid?: unknown };
+  return frame.type === "command_lifecycle" && frame.state === "queued" && typeof frame.command_uuid === "string" ? frame.command_uuid : undefined;
 }
 
 function turnFailed(error: string): MeddleEvent {
