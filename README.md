@@ -345,6 +345,7 @@ one, and sets a key picked from the table below (an `env.` key with the name typ
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
 | `roster.forget` | How long, in seconds, a member may go unheard of before a node counts it gone ([Addresses and forgetting](#addresses-and-forgetting)): `0` never, else at least `60`; `900` (three lighthouse announce TTLs) when unset. A node that sets `MEDDLE_FORGET_MS` uses its own instead. |
 | `defaults.model`, `defaults.effort` | The model, and the effort (`low`, `medium`, `high`, `xhigh` or `max`), of a turn whose task chose none, and what the dashboard picks for a new task; unset, `opus` and `medium`. A model cannot be set empty. |
+| `describe.prompt` | One line (no newline, at most 4096 characters) that asks an agent to describe its revisions; `Add a description (4-7 words) to your revision(s).` when unset or empty. Every project task's `CLAUDE.md` also asks the agent to describe each revision it makes (`jj describe`), and a turn rewrites the task's `CLAUDE.md` at its start when it differs from what meddle generates, so tasks made earlier ask it too. |
 | `update.within` | How long a rollout has, from its start, to be confirmed before it fails and rolls back ([Updating the pool](#updating-the-pool)): a duration such as `90s`, `30m` or `1h`; `30m` when unset. `meddle update --within` overrides it for one rollout. |
 | `update.health` | How long each node has, from its swap, to report healthy on the new build: a duration of at least `30s`; `2m` when unset. A rollout takes the value it starts with. |
 
@@ -1195,7 +1196,7 @@ Settings shows this node's id, the pool's name and id (or that no secret is set)
 Allow again on a removed one); then the
 pool settings, as a table of key, value and the node that set it, each with Unset, and a form that sets a key picked
 from `jj.user`, `jj.email`, `lighthouse.url`, `limits.running`, `roster.forget`, `defaults.model`, `defaults.effort`,
-`update.within`, `update.health` or `env.<NAME>` (see [Pool settings](#pool-settings)),
+`describe.prompt`, `update.within`, `update.health` or `env.<NAME>` (see [Pool settings](#pool-settings)),
 under a note that every member and its dashboard see these values, so none is for a secret; then the tokens in
 order (label, id, status, set by, expiry), with the one a turn would use now marked active and an Enable button on
 each `exhausted` or `disabled` one. Token values never pass through the dashboard: tokens are added and removed with

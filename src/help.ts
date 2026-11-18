@@ -168,6 +168,8 @@ const GROUPS: Group[] = [
           "variable for every task), lighthouse.url, limits.running (turns a node runs at once; 0 is no limit) and " +
           "roster.forget (seconds a member may go unheard of before it counts as gone; 0 is never), defaults.model and " +
           "defaults.effort (low, medium, high, xhigh or max) for tasks that chose none (unset: opus, medium), " +
+          "describe.prompt (one line, at most 4096 characters, that asks an agent to describe its revisions; unset: " +
+          "\"Add a description (4-7 words) to your revision(s).\"), " +
           "update.within (how long a rollout has to be confirmed; 30m by default) and update.health (how long a node " +
           "has after its swap to report healthy; 2m by default, at least 30s), as durations such as 90s, 30m or 1h. " +
           "Values replicate to " +

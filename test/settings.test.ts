@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { loadConfig, type NodeConfig } from "../src/config";
 import { buildEnv, type EngineInput } from "../src/engine/options";
 import { initColocated, jj, jjEnv } from "../src/jj";
-import { MAX_POOL_ENV, MAX_SETTING_KEY, MAX_SETTING_VALUE, PoolSettings, discoveryLighthouseUrl, reservedEnv, type SettingRow } from "../src/pool/settings";
+import { DESCRIBE_PROMPT, MAX_POOL_ENV, MAX_SETTING_KEY, MAX_SETTING_VALUE, PoolSettings, discoveryLighthouseUrl, reservedEnv, type SettingRow } from "../src/pool/settings";
 import { PoolStore } from "../src/pool/store";
 import { openDb } from "../src/store/db";
 import { twoPoolNodes } from "./pool-helpers";
@@ -334,6 +334,21 @@ test("default model and effort: unset reads opus at medium, a bad effort or empt
   expect(settings.defaultEffort()).toBe("high");
   expect(() => settings.set("defaults.effort", "huge")).toThrow("defaults.effort must be one of");
   expect(() => settings.set("defaults.model", "")).toThrow("must not be empty");
+});
+
+test("describe.prompt defaults, can be set, falls back when empty, and takes no newline", () => {
+  const { settings } = fresh();
+  expect(settings.describePrompt()).toBe(DESCRIBE_PROMPT);
+  expect(DESCRIBE_PROMPT).toBe("Add a description (4-7 words) to your revision(s).");
+  settings.set("describe.prompt", "Describe each revision in five words.");
+  expect(settings.describePrompt()).toBe("Describe each revision in five words.");
+  settings.set("describe.prompt", "");
+  expect(settings.describePrompt()).toBe(DESCRIBE_PROMPT);
+  expect(() => settings.set("describe.prompt", "one\ntwo")).toThrow(BAD_VALUE);
+  expect(() => settings.set("describe.prompt", "x".repeat(MAX_SETTING_VALUE + 1))).toThrow(BAD_VALUE);
+  settings.set("describe.prompt", "x".repeat(MAX_SETTING_VALUE));
+  settings.unset("describe.prompt");
+  expect(settings.describePrompt()).toBe(DESCRIBE_PROMPT);
 });
 
 test("update.within and update.health take durations, with their defaults when unset or not one", () => {

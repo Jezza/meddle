@@ -31,9 +31,30 @@ export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string 
     "",
     "This folder is a meddle task. Each project is a jj workspace; commit with jj.",
     "",
+    "Add a description (4-7 words) to each revision you make (jj describe).",
+    "",
     `To keep a side branch, give it a bookmark named meddle/task/${m.id}/<project>.<label> (for example meddle/task/${m.id}/<project>.spike). Bookmarks outside that namespace are not backed up and do not travel, and git refuses a name with a slash after the project name.`,
     "",
   ].join("\n");
+}
+
+/**
+ * Makes `<task>/CLAUDE.md` what `generatedClaudeMd` gives task `m` now, writing it only when its content differs: a task
+ * made before a line was added to it picks the line up, and an agent's edit to the file does not outlast the turn. `m`
+ * is the task's row's manifest, never `task.json`'s copy, which its agent can edit. A task with a project this node
+ * does not have is left as it is.
+ */
+export async function refreshClaudeMd(cfg: NodeConfig, db: Database, m: TaskManifest): Promise<void> {
+  const projects: Project[] = [];
+  for (const entry of m.projects) {
+    const project = getProject(db, entry.id);
+    if (project === null) return;
+    projects.push({ ...project, name: entry.name });
+  }
+  const file = join(paths(cfg).task(m.id), "CLAUDE.md");
+  const text = generatedClaudeMd(m, projects);
+  if (await readFile(file, "utf8").catch(() => null) === text) return;
+  await writeFile(file, text);
 }
 
 /**

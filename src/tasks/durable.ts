@@ -57,7 +57,7 @@ import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
 import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type Start, type TaskManifest } from "./manifest";
 import { MeddleMove, releaseFolder, type MoveInput } from "./move";
 import { promptTitle } from "./names";
-import { checkReceivedManifest, dropWorkspace, provisionFromManifest, provisionTask, SAFE_ID } from "./provision";
+import { checkReceivedManifest, dropWorkspace, provisionFromManifest, provisionTask, refreshClaudeMd, SAFE_ID } from "./provision";
 import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
 
 export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" | "moved" | "archived";
@@ -933,6 +933,11 @@ export class TaskRunner {
       this.#pending.delete(taskId);
       if (!moving) this.#emitState(taskId, "running");
       const manifest = await readManifest(this.#cfg, taskId);
+      // The task's CLAUDE.md as this meddle writes it, so a task made earlier is asked what newer ones are; the row's
+      // manifest names the projects. A turn does not fail for it.
+      await refreshClaudeMd(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest).catch((err: unknown) => {
+        this.#log(`meddle: task ${taskId}: CLAUDE.md was not refreshed: ${messageOf(err)}`);
+      });
       const primary = manifest.primaryProjectId;
       const deps = this.#replicaDeps();
       // A task without a project has no memory to sync.

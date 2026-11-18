@@ -286,6 +286,28 @@ test("a project id in task.json that the task's row lacks fails the turn", async
   }
   await h.close();
 });
+test("a turn rewrites a stale CLAUDE.md, and leaves a current one alone", async () => {
+  const { stat } = await import("node:fs/promises");
+  const { getProject } = await import("../src/projects/project");
+  const { generatedClaudeMd } = await import("../src/tasks/provision");
+  const { cfg, db, h, runner, m, settled } = await setup();
+  const file = join(paths(cfg).task(m.id), "CLAUDE.md");
+  const project = getProject(db, m.projects[0]!.id)!;
+  const current = generatedClaudeMd(m, [project]);
+  await writeFile(file, "Old text, as an older meddle wrote it.\n");
+  const first = settled(runner);
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await first;
+  expect(await readFile(file, "utf8")).toBe(current);
+  expect(current).toContain("Add a description (4-7 words) to each revision you make (jj describe).");
+  // The next turn finds it current and does not write it again.
+  const written = (await stat(file)).mtimeMs;
+  const second = settled(runner);
+  await runner.prompt(m.id, "Again.");
+  await second;
+  expect((await stat(file)).mtimeMs).toBe(written);
+  await h.close();
+});
 test("a prompt sent once the turn's input has closed waits, queued, and runs as the next turn", async () => {
   const { db, h, runner, m, turnsStarted } = await setup();
   let late: Promise<unknown> | undefined;
