@@ -27,8 +27,21 @@ export class NodeOffline extends Error {
 }
 
 /**
- * What a round asks of the world, for the train of project `projectId` on its branch. `MergeDeps` serve the merge task,
- * and `turn` the tasks' train turns too (it rejects with `NodeOffline` when the task's node is offline). Then:
+ * A task known not to exist any more: deleted, or archived. `MergeDeps.head` rejects with it for that, and only for that
+ * (a holder that is offline or doesn't answer is `NodeOffline` or another error, which says nothing of the task): a round
+ * resumed counts the merge task its checkpoint names as gone only so.
+ */
+export class TaskGone extends Error {
+  constructor(readonly taskId: string) {
+    super(`task ${taskId} is gone`);
+    this.name = "TaskGone";
+  }
+}
+
+/**
+ * What a round asks of the world, for the train of project `projectId` on its branch. `MergeDeps` serve the merge task
+ * (`head` rejects with `TaskGone` once it is known to be gone), and `turn` the tasks' train turns too (it rejects with
+ * `NodeOffline` when the task's node is offline). Then:
  * - `branch`: the branch's commit now (`B`);
  * - `candidates`: the eligible tasks (queued, idle, on an online node, not in a train turn, not sitting out; held back or
  *   not, since each round decides that afresh), in the queue's order, `tip` being the line's effective head, all of it
@@ -67,10 +80,11 @@ export type RoundStep = { step: "describing" | "picking" | "checking" | "landing
 
 /**
  * How a round ended. `landed`: the commit the branch was moved to, or null. `again`: whether another round should start
- * straight away, because this one could not finish against what it read (the branch moved or would not move, a task of
- * the batch left or changed), or left work for the next (a task waited for a later batch, or changed outside a turn; a
- * train turn ended with its task eligible again). `paused`: why the train pauses (its merge task got stuck or failed, or
- * the batch could not be trial merged), or null; Retry resumes from the round's last checkpoint.
+ * straight away, because this one could not finish against what it read (the branch moved, a task of the batch left or
+ * changed), or left work for the next (a task waited for a later batch, or changed outside a turn; a train turn ended
+ * with its task eligible again). `paused`: why the train pauses (its merge task got stuck or failed, the batch could not
+ * be trial merged, or the branch, still at `B`, refused the landing), or null; Retry resumes from the round's last
+ * checkpoint.
  */
 export type RoundResult = { landed: string | null; again: boolean; paused: string | null };
 
@@ -86,10 +100,12 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  * 3. A batch with two heads or more is checked by a merge task (`checkBatch`; never for one head). A task it blames
  *    leaves the batch, with the tasks holding its work, for a fix turn, and a fresh merge task checks the rest. A stuck
  *    check pauses the train.
- * 4. Unless a task of the batch (or one whose work it holds) left or changed meanwhile, the branch is moved from `B` to
- *    the merge, or to the single head (`advance`). If it can't be, the round starts over (`again`): every refusal says
- *    the branch is not as the round read it (it moved, became conflicted, or is still being fetched) or is briefly not
- *    taking input (an update), which a round read afresh settles; nothing stale lands.
+ * 4. Unless a task of the batch (or one whose work it holds) left or changed meanwhile (then the round starts over:
+ *    `again`), the branch is moved from `B` to the merge, or to the single head (`advance`). When that is refused, the
+ *    merge task is discarded. If the branch has moved since `B`, the round starts over against it (`again`); nothing
+ *    stale lands. If it is still at `B`, the refusal is one that lasts as long as nothing changes (the branch is
+ *    conflicted or behind its rows, the node takes no input, the merge isn't in the replica): the train pauses with it,
+ *    after step 5, rather than check the same batch again and again.
  * 5. After landing (or straight away, if nothing landed), each task to rebase gets a rebase turn onto the branch's new
  *    commit, and each blamed task a fix turn opening with the merge agent's report, all at once. A task whose own commits
  *    another task has built on can't rebase, and leaves. A rebase turn must leave the work merging cleanly.
@@ -100,9 +116,10 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  * left to acceptance, which archives it; any other is discarded, except a stuck one, left for the user to open.
  *
  * `resume` is the last checkpoint of a round cut off by a restart, or paused (Retry). A merge task it names is
- * discarded unless its merge landed, so the check starts afresh. The tasks it names as describing or rebasing had their
- * turns: one that is eligible again but still needs what its turn was for sits out rather than being asked again. Then
- * the round starts over. A failure of `deps` (but a task's turn or abandon) or of reading the repo rejects.
+ * discarded unless its merge landed or it is gone (`TaskGone`), so the check starts afresh; when its head can't be read
+ * for another reason, the round rejects before it checkpoints anything, so the checkpoint still names it for the next.
+ * The tasks it names as describing or rebasing had their turns: one that is eligible again but still needs what its turn
+ * was for sits out rather than being asked again. Then the round starts over. A failure of `deps` (but a task's turn or abandon) or of reading the repo rejects.
  */
 export async function runRound(deps: RoundDeps, cfg: NodeConfig, repo: string, prompt: string, resume?: RoundStep): Promise<RoundResult> {
   const round = new Round(deps, cfg, repo, prompt, await deps.branch());
@@ -119,6 +136,11 @@ export async function runRound(deps: RoundDeps, cfg: NodeConfig, repo: string, p
   const landing = await round.land(picked.batch, blamed);
   if (landing === "again") return { landed: null, again: true, paused: null };
   if ("paused" in landing) return { landed: null, again: false, paused: landing.paused };
+  if ("refused" in landing) {
+    // The branch is still at B, so the turns this round owes are as good as if nothing had been picked.
+    await round.rebase(round.B, picked.rebase, blamed, asked("rebasing"));
+    return { landed: null, again: false, paused: landing.refused };
+  }
 
   await round.rebase(landing.landed ?? round.B, picked.rebase, blamed, asked("rebasing"));
   return { landed: landing.landed, again: round.again, paused: null };
@@ -169,14 +191,19 @@ class Round {
     return { candidates, lines, queued };
   }
 
-  /** A merge task named by the round resumed: discarded unless its merge landed, or it is gone (its head can't be read). */
+  /**
+   * A merge task named by the round resumed: discarded unless its merge landed or it is gone (`TaskGone`). Any other
+   * failure to read its head rejects: it may still be there, and the checkpoint naming it must stay for the next resume.
+   */
   async clear(taskId: string): Promise<void> {
     let head: string;
     try {
       head = (await this.deps.head(taskId)).commitId;
-    } catch {
-      return;
+    } catch (err) {
+      if (err instanceof TaskGone) return;
+      throw err;
     }
+    // A merge that landed is in this repo, below B; one that isn't in the repo didn't land.
     if (await this.#graph.isAncestor(head, this.B).catch(() => false)) return;
     await this.deps.discard(taskId);
   }
@@ -296,7 +323,7 @@ class Round {
   }
 
   /** Steps 3 and 4: checks `batch` (a task blamed goes to `blamed`) and lands what passes, as `runRound` says. */
-  async land(batch: Candidate[], blamed: Blamed[]): Promise<{ landed: string | null } | { paused: string } | "again"> {
+  async land(batch: Candidate[], blamed: Blamed[]): Promise<{ landed: string | null } | { paused: string } | { refused: string } | "again"> {
     let rest = batch;
     while (rest.length > 0) {
       const ids = rest.map((c) => c.taskId);
@@ -324,9 +351,10 @@ class Round {
       await this.deps.checkpoint({ step: "landing", batch: ids, mergeTask });
       try {
         await this.deps.advance(this.B, L);
-      } catch {
+      } catch (err) {
         if (mergeTask !== null) await this.deps.discard(mergeTask);
-        return "again";
+        if ((await this.deps.branch()) !== this.B) return "again";
+        return { refused: `landing was refused: ${messageOf(err)}` };
       }
       return { landed: L };
     }

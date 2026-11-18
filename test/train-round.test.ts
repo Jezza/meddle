@@ -6,7 +6,7 @@ import { abandon, bookmarkSet, commitOf, commitsIn, initColocated, jj } from "..
 import type { LineRow } from "../src/pool/rows";
 import type { Candidate } from "../src/train/batch";
 import { describePrompt, mergeTitle, rebasePrompt } from "../src/train/prompts";
-import { NodeOffline, runRound, type RoundDeps, type RoundStep } from "../src/train/round";
+import { NodeOffline, runRound, TaskGone, type RoundDeps, type RoundStep } from "../src/train/round";
 import type { TrainTurnKind, TrainTurnOutcome } from "../src/train/tools";
 
 const DESCRIBE = "Add a description (4-7 words) to your revision(s).";
@@ -24,9 +24,10 @@ type Behaviour = (turn: { taskId: string; kind: TrainTurnKind; text: string }) =
 /**
  * A colocated repo whose `main` is one commit `B` holding `f.txt` (`LINES`) and `g.txt`, a fake queue of tasks whose
  * lines are bookmarks (`meddle/task/<id>/p`) in it, and fake `RoundDeps` over both: candidates are the queued tasks that
- * are neither archived nor sitting out, `advance` moves `main` (refusing unless it is at `old`), the merge task is the
- * repo's `@` (`jj new` of its parents), and a train turn runs the task's behaviour (`act`; the merge task's is under
- * "merge", and by default describes the merge).
+ * are neither archived nor sitting out, `advance` moves `main` (refusing unless it is at `old`, or with `refusal` when
+ * set), the merge task is the repo's `@` (`jj new` of its parents), and a train turn runs the task's behaviour (`act`;
+ * the merge task's is under "merge", and by default describes the merge). A call for a task in `offline` (the merge task
+ * too) rejects with `NodeOffline`, and reading the head of one in `gone` with `TaskGone`.
  */
 async function fixture() {
   const repo = await mkdtemp("/tmp/meddle-train-round-");
@@ -64,6 +65,8 @@ async function fixture() {
   const steps: RoundStep[] = [];
   /** The tasks whose node is offline, and its name: a call for them rejects. */
   const offline = new Map<string, string>();
+  const gone = new Set<string>();
+  const refuse = { with: null as string | null };
   const behaviours = new Map<string, Behaviour>();
   behaviours.set("merge", async () => { await jj(["describe", "-m", "Merge the batch"], repo); });
 
@@ -108,9 +111,16 @@ async function fixture() {
       await jj(["status"], repo);
       return outcome ?? { kind: "done" };
     },
-    head: async () => (await commitsIn(repo, "@", cfg))[0]!,
+    async head(taskId) {
+      if (gone.has(taskId)) throw new TaskGone(taskId);
+      const node = offline.get(taskId);
+      if (node !== undefined) throw new NodeOffline(node);
+      return (await commitsIn(repo, "@", cfg))[0]!;
+    },
     async discard(taskId) {
       log.push(`discard ${taskId}`);
+      const node = offline.get(taskId);
+      if (node !== undefined) throw new NodeOffline(node);
       discarded.push(taskId);
     },
     async abandonLeftovers(taskId, commits) {
@@ -124,6 +134,7 @@ async function fixture() {
       log.push("advance");
       const at = await commitOf(repo, "main");
       if (at !== old) throw new Error(`main is not at ${old}`);
+      if (refuse.with !== null) throw new Error(refuse.with);
       await bookmarkSet(repo, "main", next);
       advances.push([old, next]);
     },
@@ -145,7 +156,9 @@ async function fixture() {
   const run = (resume?: RoundStep) => runRound(deps, cfg, repo, DESCRIBE, resume);
   return {
     repo, cfg, B, on, task, tasks, tipOf, line, deps, run, log, turns, created, discarded, advances, abandoned, left, satOut,
-    heldBack, steps, offline, act: (id: string, f: Behaviour) => behaviours.set(id, f),
+    heldBack, steps, offline, gone, act: (id: string, f: Behaviour) => behaviours.set(id, f),
+    /** Makes `advance` refuse with `text` (null: as usual), with `main` where it is. */
+    refuse: (text: string | null) => { refuse.with = text; },
     /** The merge task's head now (the repo's `@`). */
     head: async () => (await commitsIn(repo, "@", cfg))[0]!,
     /** Describes `commit` as `message`, as an agent would (its line's bookmark follows it). */
@@ -542,4 +555,52 @@ test("blaming a contained task drops the task holding its work too", async () =>
   // tl can't rebase what tu has built on: it leaves rather than get its fix turn.
   expect(left).toEqual([["tl", "another task builds on this work, so it can't rebase"]]);
   expect(turns.map((t) => t.taskId)).toEqual(["m1"]);
+});
+
+test("a lasting refusal pauses the train, after the turns the round owes", async () => {
+  const { on, task, run, refuse, log, turns, discarded, advances, satOut, steps, M } = await movedOn();
+  const other = await on(M, "fix one", { "f.txt": edited(1, "ONE") });
+  await task("t3", other, { base: [M] });
+  // main stays at M, and refuses whatever lands on it.
+  refuse("main: its siblings must be merged first");
+
+  // Not `again`: the next round would check the same batch, to the same refusal.
+  expect(await run()).toEqual({ landed: null, again: false, paused: expect.stringContaining("main: its siblings must be merged first") });
+  expect(advances).toEqual([]);
+  // The merge task never outlives its batch, and the task to rebase still gets its turn onto main as it is.
+  expect(discarded).toEqual(["m1"]);
+  expect(turns.at(-1)).toEqual({ taskId: "t2", kind: "rebase", text: rebasePrompt(M) });
+  expect(log.slice(-3)).toEqual(["advance", "discard m1", "turn t2"]);
+  expect(satOut).toEqual([["t2", expect.stringContaining("still doesn't merge cleanly")]]);
+  expect(steps.at(-1)).toEqual({ step: "rebasing", batch: ["t2"], mergeTask: null });
+});
+
+test("a resumed round keeps the checkpoint while its merge task can't be reached, and counts only a gone one as gone", async () => {
+  const { repo, B, on, task, run, created, discarded, advances, steps, offline, gone, head, act } = await fixture();
+  const tip1 = await on(B, "first", { "f.txt": edited(1, "ONE") });
+  const tip2 = await on(B, "second", { "f.txt": edited(7, "SEVEN") });
+  await task("t1", tip1, { size: 2 });
+  await task("t2", tip2);
+  act("merge", async () => ({ kind: "failed", reason: "the agent crashed" }));
+  expect((await run()).paused).toContain("the agent crashed");
+  const last = steps.at(-1)!;
+  expect(last).toEqual({ step: "checking", batch: ["t1", "t2"], mergeTask: "m1" });
+
+  // Retry while m1's node is offline: whether m1 landed can't be told, so the round fails before it checkpoints anything.
+  offline.set("m1", "desk");
+  act("merge", async () => { await jj(["describe", "-m", "Merge the batch"], repo); });
+  await expect(run(last)).rejects.toBeInstanceOf(NodeOffline);
+  expect(steps.at(-1)).toBe(last);
+  expect(created).toHaveLength(1);
+  expect(discarded).toEqual([]);
+
+  // The user deleted m1 meanwhile: gone, so nothing is left to discard, and a fresh merge task checks the batch.
+  offline.delete("m1");
+  gone.add("m1");
+  const result = await run(last);
+  const L = await head();
+  expect(result).toEqual({ landed: L.commitId, again: false, paused: null });
+  expect(discarded).toEqual([]);
+  expect(created).toHaveLength(2);
+  expect(advances).toEqual([[B, L.commitId]]);
 });
