@@ -81,6 +81,15 @@ const MIGRATIONS = [
     updated_at TEXT NOT NULL,
     removed INTEGER NOT NULL DEFAULT 0
   )`,
+  // Each token's latest plan-usage reading on this node (src/token-usage.ts); local, never replicated.
+  `CREATE TABLE IF NOT EXISTS token_usage (
+    token_id TEXT PRIMARY KEY,
+    five_hour_utilization REAL NULL,
+    five_hour_resets_at TEXT NULL,
+    seven_day_utilization REAL NULL,
+    seven_day_resets_at TEXT NULL,
+    read_at TEXT NOT NULL
+  )`,
   // Where each task's line points (src/pool/rows.ts): written by the task's holder, the greater (epoch, seq) wins.
   // commit_id NULL is released; base is a JSON array of commit ids; seen_seq is the highest seq seen for the line.
   `CREATE TABLE IF NOT EXISTS line_rows (
