@@ -1,6 +1,6 @@
 // test/durable.test.ts
 import { test, expect, spyOn } from "bun:test";
-import { mkdtemp, mkdir, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { loadConfig, ensureDataDirs, paths, type NodeConfig } from "../src/config";
 import { openDb } from "../src/store/db";
@@ -17,7 +17,7 @@ import { listLineRows, writeBranchRow } from "../src/pool/rows";
 import { readManifest, transcriptPath, writeManifest, type TaskManifest } from "../src/tasks/manifest";
 import type { Attachment, Prompt } from "../src/blobs/attachment";
 import { createTask, setupNode } from "./helpers";
-import { peerReady, twoPoolNodes } from "./pool-helpers";
+import { peerReady, startPoolNode, twoPoolNodes } from "./pool-helpers";
 
 /** The home node id of the projects these tests add. */
 const PROJECT_HOME = "a".repeat(64);
@@ -740,6 +740,33 @@ test("steers reach the live turn in the order they were sent, a refused one betw
     await node.harness.close();
   }
 });
+
+test("a steer whose turn ends while its files are written, as the task begins to be archived, is refused, not left queued", async () => {
+  const A = await startPoolNode("hello.jsonl", { MEDDLE_FIXTURE_STALL: "1" });
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    const shot = await storedShot(A);
+    const initialised = nextInit(A.runner, m.id);
+    await A.runner.prompt(m.id, "look");
+    await initialised;
+    let archived: Promise<void> | undefined;
+    A.hooks.afterSteerContent = async (taskId) => {
+      // meanwhile the turn ends without the steer, and an archive of the idle task begins
+      const end = turnEnd(A.runner, taskId);
+      await A.runner.interrupt(taskId);
+      await end.idle;
+      archived = A.runner.archive(taskId);
+    };
+    await expect(A.runner.prompt(m.id, "and this", [shot])).rejects.toThrow("task is being archived");
+    await archived;
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "archived", queued: null });
+    expect(userEvents(A.db, m.id).map((u) => u.message.content)).toEqual(["look"]);
+  } finally {
+    await A.close();
+    A.db.close();
+    await rm(A.home, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test("an attachment keeps only its hash, name, type and size: nothing else a caller put on it is stored or logged", async () => {
   const node = await setupNode();

@@ -94,6 +94,8 @@ export type RunnerHooks = {
   afterEnterMove?(taskId: string, signal: AbortSignal): void | Promise<void>;
   /** Called once a turn's `token_fault` with `rerun: true` is in the log, before the `run` phase enters itself again. */
   afterTokenFault?(taskId: string): void | Promise<void>;
+  /** Called once what a steer sends Claude Code is made, before the steer goes into the turn's input. */
+  afterSteerContent?(taskId: string): void | Promise<void>;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
   callMs?: number;
 };
@@ -486,26 +488,11 @@ export class TaskRunner {
     // Whatever else a caller put on an attachment never reaches meddle's records (the queue, a turn's input, the log).
     const refs = attachments.map(({ hash, name, type, size }) => ({ hash, name, type, size }));
     const p: Prompt = { text, attachments: refs };
-    const row = this.#row(taskId);
-    if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
-    if (this.#archiving.has(taskId)) throw new Error("task is being archived");
-    refuseReceiving(row);
-    refuseMoved(row);
-    if (this.#isMoving(row)) {
-      // A restore-move sends the archive's row, which has no queue: nothing sent meanwhile would travel.
-      if (row.archived_on !== null) throw new Error("task is being restored; send it again once it has arrived");
-      // Queued prompts travel with the task, and its export reads them once the handoff has begun: one sent after that
-      // would be left behind.
-      const move = this.#moving.get(taskId);
-      if (move?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
-      // It travels with the task: never to a node that would drop its attachments.
-      if (p.attachments.length > 0) {
-        const refusal = this.noAttachmentsOn(move.to);
-        if (refusal !== null) throw new Error(refusal);
-      }
+    if (this.#refusePrompt(taskId, p) === "travels") {
       this.#enqueue(taskId, p);
       return "queued";
     }
+    const row = this.#row(taskId);
     let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
@@ -538,6 +525,32 @@ export class TaskRunner {
       throw err;
     }
     return "turn";
+  }
+
+  /**
+   * Throws why the task takes no prompt now (see `prompt`): it is archived or being archived, being received, moved
+   * away, being restored, moving past the point where its queue travels with it, or moving to a node that takes no
+   * attachments when `p` has some. `"travels"`: it is moving, and `p` may only join the queue that goes with it.
+   */
+  #refusePrompt(taskId: string, p: Prompt): "here" | "travels" {
+    const row = this.#row(taskId);
+    if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
+    if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+    refuseReceiving(row);
+    refuseMoved(row);
+    if (!this.#isMoving(row)) return "here";
+    // A restore-move sends the archive's row, which has no queue: nothing sent meanwhile would travel.
+    if (row.archived_on !== null) throw new Error("task is being restored; send it again once it has arrived");
+    // Queued prompts travel with the task, and its export reads them once the handoff has begun: one sent after that
+    // would be left behind.
+    const move = this.#moving.get(taskId);
+    if (move?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
+    // It travels with the task: never to a node that would drop its attachments.
+    if (p.attachments.length > 0) {
+      const refusal = this.noAttachmentsOn(move.to);
+      if (refusal !== null) throw new Error(refusal);
+    }
+    return "travels";
   }
 
   /**
@@ -659,11 +672,19 @@ export class TaskRunner {
    * Sends prompt `p` into a live turn's input, for Claude Code to take at its next chance; it is logged when taken.
    * What Claude Code is sent for it (its images inline, its files written under the task) is made first; a prompt the
    * turn can no longer take by then (its input closed with its `result` while it is still live, or it has ended) waits
-   * for the task's next turn instead.
+   * for the task's next turn instead, unless the task has meanwhile come to take no prompt (`#refusePrompt`): then it
+   * is refused as `prompt` would refuse it, rather than queued where nothing would take it.
    */
   async #send(taskId: string, queue: InputQueue, p: Prompt): Promise<"queued"> {
     const content = await promptContent(this.blobs.store, paths(this.#cfg).taskAttachments(taskId), p);
-    if (queue.ended || this.#live.get(taskId)?.queue !== queue) return this.#enqueueNext(taskId, p);
+    await this.#deps.hooks?.afterSteerContent?.(taskId);
+    if (queue.ended || this.#live.get(taskId)?.queue !== queue) {
+      if (this.#refusePrompt(taskId, p) === "travels") {
+        this.#enqueue(taskId, p);
+        return "queued";
+      }
+      return this.#enqueueNext(taskId, p);
+    }
     queue.push(p, "next", content);
     this.#emitQueued(taskId);
     return "queued";
