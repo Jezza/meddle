@@ -8,6 +8,9 @@ import { isBlobHash, MAX_BLOB_BYTES } from "./attachment";
 /** What a file being written is called until its hash is known: `.tmp-<uuid>`. */
 const TEMP_PREFIX = ".tmp-";
 
+/** Bytes a write refuses for what they are: more than it takes, or not the blob it expects. */
+export class BadBlob extends Error {}
+
 export class BlobStore {
   constructor(readonly dir: string) {}
 
@@ -31,8 +34,8 @@ export class BlobStore {
   /**
    * Stores the bytes `chunks` yields under their hash, and says which and how many they were; bytes already stored are
    * kept as they are. Rejects `blob exceeds <maxBytes> bytes` once more than `maxBytes` (by default the 64 MB limit) have
-   * come, and `blob does not match <hash>` when `expect` names another hash or size than the bytes have. However it
-   * fails, even in the source, no temporary file is left.
+   * come, and `blob does not match <hash>` when `expect` names another hash or size than the bytes have (both
+   * `BadBlob`). However it fails, even in the source, no temporary file is left.
    */
   async write(
     chunks: AsyncIterable<Uint8Array>,
@@ -48,7 +51,7 @@ export class BlobStore {
       try {
         for await (const chunk of chunks) {
           size += chunk.byteLength;
-          if (size > maxBytes) throw new Error(`blob exceeds ${maxBytes} bytes`);
+          if (size > maxBytes) throw new BadBlob(`blob exceeds ${maxBytes} bytes`);
           hasher.update(chunk);
           await handle.writeFile(chunk);
         }
@@ -60,7 +63,7 @@ export class BlobStore {
       const hash = hasher.digest("hex");
       const { expect } = options;
       if (expect !== undefined && (expect.hash !== hash || expect.size !== size)) {
-        throw new Error(`blob does not match ${expect.hash}`);
+        throw new BadBlob(`blob does not match ${expect.hash}`);
       }
       if (await this.has(hash)) await rm(temp, { force: true });
       else await rename(temp, this.path(hash));

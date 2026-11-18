@@ -5,7 +5,7 @@ import type { PeerStream, PoolNet } from "../pool/net";
 import { writeFrame, type StreamReader } from "../pool/frames";
 import { STALL_MS, TimedOut, withTimeout } from "../pool/stall";
 import { isBlobHash, MAX_BLOB_BYTES } from "./attachment";
-import type { BlobStore } from "./store";
+import { BadBlob, type BlobStore } from "./store";
 
 /*
  * A file moves on one `{ stream: "blob", kind: "file", hash }` stream. The serving side answers with one JSON frame
@@ -65,14 +65,29 @@ async function openBlob(store: BlobStore, hash: string) {
   }
 }
 
+/** A fault of the member a file is fetched from: its stream failed or stalled, or it sent what is not the file. */
+class PeerFault extends Error {}
+
 type Frame = Awaited<ReturnType<StreamReader["readFrame"]>>;
 
-/** The bytes of a file as the kind-1 frames `reader` has, until the stream ends; `stall` bounds the wait for each. */
-async function* fileBytes(reader: StreamReader, stall: (read: Promise<Frame>) => Promise<Frame>): AsyncGenerator<Uint8Array> {
-  for (let frame = await stall(reader.readFrame()); frame !== null; frame = await stall(reader.readFrame())) {
-    if (frame.kind !== BYTES) throw new Error("not file bytes");
+/** The bytes of a file as the kind-1 frames `reader` has, until the stream ends; each read goes through `peer`. */
+async function* fileBytes(reader: StreamReader, peer: (read: Promise<Frame>) => Promise<Frame>): AsyncGenerator<Uint8Array> {
+  for (let frame = await peer(reader.readFrame()); frame !== null; frame = await peer(reader.readFrame())) {
+    if (frame.kind !== BYTES) throw new PeerFault("not file bytes");
     yield frame.data;
   }
+}
+
+/** The size a member's answer announces, or null when it has none (the member is missing the file) or is not one. */
+function announcedSize(data: Uint8Array): number | null {
+  let size: unknown;
+  try {
+    size = (JSON.parse(decoder.decode(data)) as { size?: unknown } | null)?.size;
+  } catch {
+    return null;
+  }
+  // A size is what the peer will be held to: a lying peer costs no more than it announced.
+  return typeof size === "number" && Number.isSafeInteger(size) && size >= 0 && size <= MAX_BLOB_BYTES ? size : null;
 }
 
 /** What a fetcher needs of the pool's net. */
@@ -98,7 +113,8 @@ export class BlobFetcher {
    * Makes sure the blob with this hash is in the store: true when it is, or was fetched from a member (`prefer` first,
    * if it is online, then each other online member in turn); false when none has it. A member that cannot be reached,
    * resets, keeps a step waiting past the stall time, says it is missing the blob or sends bytes that are not it counts
-   * as not having it. Concurrent calls for one hash share one fetch. Rejects only when the store itself cannot be read.
+   * as not having it. Concurrent calls for one hash share one fetch. Rejects only when this node's store cannot be read
+   * or written (no space, no permission), which no other member would change.
    */
   ensure(hash: string, prefer?: string): Promise<boolean> {
     if (!isBlobHash(hash)) return Promise.resolve(false);
@@ -123,37 +139,39 @@ export class BlobFetcher {
   }
 
   /**
-   * Fetches the blob from one member; false when it fails in any way, a step kept waiting past the stall time
-   * included, leaving no stream open and no file kept.
+   * Fetches the blob from one member; false when the member fails in any way (a step kept waiting past the stall time
+   * included) or what it sends is not the blob, leaving no file kept and its stream reset. Rejects when this node
+   * cannot store the blob.
    */
   async #fetchFrom(net: Pick<PoolNet, "openStream">, peerId: string, hash: string): Promise<boolean> {
     let stalled = false;
-    const stall = <T>(step: Promise<T>, what: string): Promise<T> => withTimeout(step, this.#stallMs, what).catch((err: unknown) => {
+    /** A step the member takes: any failure of it, its stall included, is the member's. */
+    const peer = <T>(step: Promise<T>, what: string): Promise<T> => withTimeout(step, this.#stallMs, what).catch((err: unknown) => {
       if (err instanceof TimedOut) stalled = true;
-      throw err;
+      throw new PeerFault(`${what}: ${err instanceof Error ? err.message : String(err)}`);
     });
     const opening = net.openStream(peerId, { stream: "blob", kind: "file", hash });
     let s: PeerStream;
     try {
-      s = await stall(opening, "opening a stream");
+      s = await peer(opening, "opening a stream");
     } catch {
       // A stream that opens after all is reset as it comes.
       void opening.then(reset, () => {});
       return false;
     }
     try {
-      await stall(s.stream.send.finish(), "asking for the file");
-      const head = await stall(s.reader.readFrame(), "asking for the file");
-      if (head === null || head.kind !== HEADER) return false;
-      const answer = JSON.parse(decoder.decode(head.data)) as { size?: unknown };
-      const size = answer.size;
-      // A size is what the peer will be held to: a lying peer costs no more than it announced.
-      if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0 || size > MAX_BLOB_BYTES) return false;
-      const bytes = fileBytes(s.reader, (read) => stall(read, "reading the file"));
+      await peer(s.stream.send.finish(), "asking for the file");
+      const head = await peer(s.reader.readFrame(), "asking for the file");
+      const size = head === null || head.kind !== HEADER ? null : announcedSize(head.data);
+      if (size === null) return false;
+      const bytes = fileBytes(s.reader, (read) => peer(read, "reading the file"));
       await this.store.write(bytes, { maxBytes: size, expect: { hash, size } });
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      // The member's fault, or bytes that are not the blob (more than it announced included): another member may
+      // have it. Any other fault is this node's own store's.
+      if (err instanceof PeerFault || err instanceof BadBlob) return false;
+      throw err;
     } finally {
       // A read that stalled holds the stream's receiving half until the peer or the connection ends it, and stopping
       // that half waits for it: the reset is not waited for then.

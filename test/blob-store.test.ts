@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BlobStore } from "../src/blobs/store";
+import { BadBlob, BlobStore } from "../src/blobs/store";
 
 async function* chunks(...parts: string[]) { for (const p of parts) yield new TextEncoder().encode(p); }
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
@@ -21,6 +21,9 @@ test("too large, or not what was expected: refused, nothing left", async () => {
   const store = new BlobStore(join(await mkdtemp("/tmp/blobs-"), "blobs"));
   await expect(store.write(chunks("12345", "6"), { maxBytes: 5 })).rejects.toThrow("blob exceeds 5 bytes");
   await expect(store.write(chunks("hello"), { expect: { hash: sha("other"), size: 5 } })).rejects.toThrow(`blob does not match ${sha("other")}`);
+  // both are the bytes' fault, not the store's
+  await expect(store.write(chunks("123456"), { maxBytes: 5 })).rejects.toBeInstanceOf(BadBlob);
+  await expect(store.write(chunks("hello"), { expect: { hash: sha("hello"), size: 4 } })).rejects.toBeInstanceOf(BadBlob);
   expect(await readdir(store.dir)).toEqual([]);
 });
 

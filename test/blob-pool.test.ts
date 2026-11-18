@@ -1,6 +1,6 @@
 // test/blob-pool.test.ts — a node fetching a file it lacks from another node of the pool, by its hash.
 import { expect, test } from "bun:test";
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { MAX_BLOB_BYTES } from "../src/blobs/attachment";
 import { BlobFetcher, serveBlob } from "../src/blobs/pool";
@@ -223,6 +223,30 @@ test("a peer whose stream never opens is passed over for the next within the sta
     expect(await new BlobFetcher(sa, net, 200).ensure(hash, "stuck")).toBe(true);
     expect(Date.now() - started).toBeLessThan(2000);
   } finally {
+    await close();
+  }
+});
+
+test("a file this node cannot store rejects the fetch, and no other member is asked", async () => {
+  if (process.getuid?.() === 0) return; // root writes whatever the mode says
+  const { a, b, sa, sb, close } = await pair();
+  const locked = join(sa.dir, "..", "locked");
+  try {
+    const { hash } = await sb.write(chunks("from b"));
+    await mkdir(locked, { recursive: true });
+    await chmod(locked, 0o500);
+    const tried: string[] = [];
+    const net = {
+      online: () => [b.id, "other"],
+      openStream: (peerId: string, header: Parameters<PoolNet["openStream"]>[1]) => {
+        tried.push(peerId);
+        return peerId === b.id ? a.net.openStream(peerId, header) : Promise.reject(new Error("not connected"));
+      },
+    };
+    await expect(new BlobFetcher(new BlobStore(join(locked, "blobs")), net).ensure(hash)).rejects.toThrow("EACCES");
+    expect(tried).toEqual([b.id]);
+  } finally {
+    await chmod(locked, 0o700).catch(() => {});
     await close();
   }
 });
