@@ -27,6 +27,8 @@ test("viewOf and hashOf round-trip every route", () => {
     { name: "new", projectId: null },
     { name: "new", projectId: "p/1" },
     { name: "project", id: "p1" },
+    { name: "project", id: "p1", tab: "memory" },
+    { name: "project", id: "p1", tab: "tasks" },
     { name: "add-project" },
     { name: "node", nodeId: "abc" },
     { name: "settings" },
@@ -36,6 +38,10 @@ test("viewOf and hashOf round-trip every route", () => {
   expect(hashOf({ name: "task", nodeId: "abc", id: "t1", tab: "changes" })).toBe("#/task/abc/t1/changes");
   expect(viewOf("#/task/abc/t1")).not.toHaveProperty("tab");
   expect(viewOf("#/task/abc/t1/other")).toEqual({ name: "home" });
+  expect(hashOf({ name: "project", id: "p/1", tab: "memory" })).toBe("#/project/p%2F1/memory");
+  expect(viewOf("#/project/p1")).not.toHaveProperty("tab");
+  expect(viewOf("#/project/p1/graph")).toEqual({ name: "home" });
+  expect(viewOf("#/project/p1/other")).toEqual({ name: "home" });
   expect(viewOf("")).toEqual({ name: "home" });
   expect(viewOf("#/task/t1")).toEqual({ name: "home" });          // the Plan 1 shape no longer resolves
   expect(viewOf("#/pool")).toEqual({ name: "home" });             // the old pool and projects pages
