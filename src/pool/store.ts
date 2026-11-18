@@ -11,22 +11,25 @@ export type NodeProject = { id: string; name: string; home: string; defaultBranc
 /**
  * What a node reports about itself to the rest of the pool. `running`: its tasks in state `running` or `waiting`;
  * `limit`: how many may run at once (0 is no limit); `projects`: every project it holds; `attachments`: whether it takes
- * prompts with attachments. A node of an older meddle reports none of the four: they read as 0, 0, [] and false
- * (`withSummaryDefaults`).
+ * prompts with attachments; `mergeStarts`: whether it starts a task on a merge of several commits (`Start.parents`). A
+ * node of an older meddle reports none of the five: they read as 0, 0, [], false and false (`withSummaryDefaults`).
  */
 export type NodeSummary = {
   hostname: string; version: string; claudeCodeVersion: string; hostsTasks: boolean; taskCount: number;
-  running: number; limit: number; projects: NodeProject[]; attachments: boolean;
+  running: number; limit: number; projects: NodeProject[]; attachments: boolean; mergeStarts: boolean;
 };
 
-/** A summary as a peer may send it: an older meddle's has no `running`, `limit`, `projects` or `attachments`. */
-export type WireSummary = Omit<NodeSummary, "running" | "limit" | "projects" | "attachments"> & {
-  running?: number; limit?: number; projects?: NodeProject[]; attachments?: boolean;
+/** A summary as a peer may send it: an older meddle's has no `running`, `limit`, `projects`, `attachments` or `mergeStarts`. */
+export type WireSummary = Omit<NodeSummary, "running" | "limit" | "projects" | "attachments" | "mergeStarts"> & {
+  running?: number; limit?: number; projects?: NodeProject[]; attachments?: boolean; mergeStarts?: boolean;
 };
 
-/** A summary with what an older peer left out filled in: nothing running, no limit, no projects, no attachments. */
+/** A summary with what an older peer left out filled in: nothing running, no limit, no projects, no attachments, no merge starts. */
 export function withSummaryDefaults(s: WireSummary): NodeSummary {
-  return { ...s, running: s.running ?? 0, limit: s.limit ?? 0, projects: s.projects ?? [], attachments: s.attachments ?? false };
+  return {
+    ...s, running: s.running ?? 0, limit: s.limit ?? 0, projects: s.projects ?? [], attachments: s.attachments ?? false,
+    mergeStarts: s.mergeStarts ?? false,
+  };
 }
 
 /** An iroh endpoint address in JSON form: `id` is the node id. */

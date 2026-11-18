@@ -218,10 +218,13 @@ const AWAIT_LINE_CATCH_UP_MS = 5000;
 
 /**
  * Task `taskId`'s line `name` of project `projectId` as this node's service repo has it: resolves its row's commit once
- * jj there knows it. Until then it catches up on the project (`catchUp`, while no row has the line) or applies its rows
- * (`applyProject`, which fetches the commit), and rejects `line <t>/<n> is not here yet` after `timeoutMs`.
+ * jj there knows it, and with `withBase` every commit of its row's base too (a line on a merge has several, the
+ * first its commit). Until then it catches up on the project (`catchUp`, while no row has the line) or applies its rows
+ * (`applyProject`, which fetches the commits), and rejects `line <t>/<n> is not here yet` after `timeoutMs`.
  */
-export async function awaitLine(deps: ReplicaDeps, projectId: string, taskId: string, name: string, timeoutMs: number): Promise<string> {
+export async function awaitLine(
+  deps: ReplicaDeps, projectId: string, taskId: string, name: string, timeoutMs: number, options: { withBase?: boolean } = {},
+): Promise<string> {
   const { cfg, db } = deps;
   const deadline = Date.now() + timeoutMs;
   let wait = AWAIT_LINE_POLL_MS;
@@ -229,8 +232,9 @@ export async function awaitLine(deps: ReplicaDeps, projectId: string, taskId: st
     const row = listLineRows(db, projectId, taskId).find((r) => r.name === name);
     const project = getProject(db, projectId);
     if (row?.commit != null && project !== null) {
-      const known = await changesIn(project.replica, `present(${row.commit})`, cfg).catch(() => []);
-      if (known.length > 0) return row.commit;
+      const commits = new Set(options.withBase === true ? [row.commit, ...row.base] : [row.commit]);
+      const known = await changesIn(project.replica, [...commits].map((c) => `present(${c})`).join(" | "), cfg).catch(() => []);
+      if (new Set(known.map((k) => k.commitId)).size === commits.size) return row.commit;
     }
     const left = deadline - Date.now();
     if (left <= 0) throw new Error(`line ${taskId}/${name} is not here yet`);

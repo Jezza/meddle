@@ -8,7 +8,8 @@ import { loadConfig, ensureDataDirs, paths } from "../src/config";
 import { openDb } from "../src/store/db";
 import type { Database } from "bun:sqlite";
 import { addProjectFromFolder, type Project } from "../src/projects/project";
-import { resolveStarts } from "../src/projects/starts";
+import { mergeStartAt, resolveStarts } from "../src/projects/starts";
+import { listLineRows } from "../src/pool/rows";
 import { newId } from "../src/store/records";
 import { generatedClaudeMd, provisionFromManifest, provisionTask, cwdFor, unscopeWorkspace, workspaceImmutableHeads } from "../src/tasks/provision";
 import { git, gitImport, initColocated, isJjRepo, jj, workspaceConfigPath } from "../src/jj";
@@ -486,3 +487,60 @@ test("provision takes each start: a child start on its commit, an edit start edi
   await expect(provisionTask(cfg, db, { title: "t", taskId: "../x", starts: [start] })).rejects.toThrow("invalid task id: ../x");
   await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ ...start, base: ["all()"] }] })).rejects.toThrow("invalid commit: all()");
 });
+
+test("a multi-parent start makes a merge workspace", async () => {
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const home = await mkdtemp("/tmp/meddle-prov-");
+  const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/data`, MEDDLE_TASK_ROOT: `${home}/tasks` });
+  await ensureDataDirs(cfg);
+  await mkdir(cfg.taskRoot, { recursive: true });
+  const db = openDb(`${home}/data/meddle.sqlite`);
+  const read = async (repo: string, rev: string, template = "commit_id") =>
+    (await jj(["log", "--ignore-working-copy", "-r", rev, "--no-graph", "-T", template], repo)).trim();
+  await initCommitted(`${home}/a`);
+  const project = await addProjectFromFolder(cfg, db, `${home}/a`, PROJECT_HOME, "a");
+  const repo = project.replica;
+  // P (the default branch), and two commits on it that touch different files: a batch's task tips.
+  const P = await read(repo, "main");
+  const tips: string[] = [];
+  for (const name of ["x", "y"]) {
+    await jj(["new", P], repo);
+    await writeFile(`${repo}/${name}`, `${name}\n`);
+    await jj(["commit", "-m", name], repo);
+    tips.push(await read(repo, "@-"));
+  }
+  await jj(["new", P], repo);
+  const parents = [...tips, P];
+
+  const taskId = newId();
+  const deps = { cfg, db, selfId: PROJECT_HOME };
+  const start = await mergeStartAt(deps, { projectId: project.id, taskId, parents });
+  expect(start).toEqual({ projectId: project.id, mode: "child", commit: tips[0]!, base: parents, parents });
+  expect(listLineRows(db, project.id, taskId)).toMatchObject([{ name: "a", holder: PROJECT_HOME, epoch: 0, commit: tips[0], base: parents }]);
+
+  const m = await provisionTask(cfg, db, { title: "merge", taskId, starts: [start] });
+  const workspace = `${paths(cfg).task(taskId)}/a`;
+  // The workspace is a new commit on all of them, in order, and holds each one's files.
+  expect((await read(workspace, "@", 'parents.map(|c| c.commit_id()).join(" ")')).split(" ")).toEqual(parents);
+  expect(await readFile(`${workspace}/x`, "utf8")).toBe("x\n");
+  expect(await readFile(`${workspace}/y`, "utf8")).toBe("y\n");
+  expect(m.projects[0]).toMatchObject({ parent: tips[0], base: parents });
+  // Every parent is immutable to it.
+  expect((await jj(["config", "get", 'revset-aliases."immutable_heads()"'], workspace, cfg)).trim()).toBe(workspaceImmutableHeads(taskId, parents));
+  for (const c of parents) expect(await read(workspace, `${c} & immutable()`)).toBe(c);
+  expect(await read(repo, `meddle/task/${taskId}/a`)).toBe(await read(workspace, "@"));
+
+  // A start of one's own kind: no parents, an empty list, or a parent that is not a commit id.
+  const single = { projectId: project.id, mode: "child" as const, commit: P, base: [P] };
+  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ ...single, parents: [] }] })).rejects.toThrow("a start has no parents");
+  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ ...single, parents: [P, "all()"] }] })).rejects.toThrow("invalid commit: all()");
+  await expect(provisionTask(cfg, db, { title: "t", taskId: newId(), starts: [{ ...single, mode: "edit", parents: [P, tips[0]!] }] })).rejects.toThrow("a start on several parents is a child start");
+
+  // A merge start is refused before it writes a row: no parents, a parent the repo lacks, a bad task id.
+  const rows = listLineRows(db).length;
+  await expect(mergeStartAt(deps, { projectId: project.id, taskId: newId(), parents: [] })).rejects.toThrow("a merge start needs parents");
+  await expect(mergeStartAt(deps, { projectId: project.id, taskId: newId(), parents: [P, "1".repeat(40)] })).rejects.toThrow(`no revision ${"1".repeat(40)} in a`);
+  await expect(mergeStartAt(deps, { projectId: project.id, taskId: newId(), parents: [P, "all()"] })).rejects.toThrow("no revision all() in a");
+  await expect(mergeStartAt(deps, { projectId: project.id, taskId: "../x", parents })).rejects.toThrow("invalid task id: ../x");
+  expect(listLineRows(db)).toHaveLength(rows);
+}, 30_000);

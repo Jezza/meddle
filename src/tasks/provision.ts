@@ -200,9 +200,9 @@ function resolveProjects(db: Database, projectIds: string[]): Project[] {
  * Provisions task `taskId` from `starts`, the starts resolved for its projects, in order (the first the primary; none
  * for a task without a project). Each project gets a jj workspace in its service repo here at its start's commit,
  * which jj there must know (the task's line brought it), editing it in `edit` mode or a new change on it in `child`
- * mode. Each workspace is scoped to the task's line from its base (`scopeWorkspace`), and the task's bookmark
- * `meddle/task/<id>/<project>` points at its working copy, set without snapshotting the repo's own. On failure, removes
- * what it made.
+ * mode; a start with `parents` gets a new change with all of them (a merge), its `parent` the first. Each workspace is
+ * scoped to the task's line from its base (`scopeWorkspace`), and the task's bookmark `meddle/task/<id>/<project>`
+ * points at its working copy, set without snapshotting the repo's own. On failure, removes what it made.
  */
 export async function provisionTask(
   cfg: NodeConfig,
@@ -218,7 +218,9 @@ export async function provisionTask(
   const projects = resolveProjects(db, starts.map((s) => s.projectId));
   // Each goes into a revset, and a base into the workspace's jj config: nothing but a commit id.
   for (const start of starts) {
-    for (const c of [start.commit, ...start.base]) if (!COMMIT_ID.test(c)) throw new Error(`invalid commit: ${c}`);
+    for (const c of [start.commit, ...start.base, ...(start.parents ?? [])]) if (!COMMIT_ID.test(c)) throw new Error(`invalid commit: ${c}`);
+    if (start.parents?.length === 0) throw new Error("a start has no parents");
+    if (start.parents !== undefined && start.mode === "edit") throw new Error("a start on several parents is a child start");
   }
   await seedProfile(cfg);
   await ensurePlugins(cfg);
@@ -236,11 +238,12 @@ export async function provisionTask(
     const entries: TaskManifest["projects"] = [];
     for (const [i, project] of projects.entries()) {
       const start = starts[i]!;
-      const parent = start.commit;
+      // The first of a merge's parents stands for the start, as it does in the line's row.
+      const parent = start.parents?.[0] ?? start.commit;
       const base = [...start.base];
       const workspace = join(task, project.name);
       added.push({ replica: project.replica, workspace });
-      await workspaceAdd(project.replica, workspaceName, workspace, parent, cfg);
+      await workspaceAdd(project.replica, workspaceName, workspace, start.parents ?? start.commit, cfg);
       // Scoped first: on the home, the task's own line holds the commit an edit start works on.
       await scopeWorkspace(cfg, workspace, id, base);
       if (start.mode === "edit") await editIn(workspace, parent, cfg);

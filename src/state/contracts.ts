@@ -23,6 +23,8 @@ export const HandoffModeSchema = Type.Union([Type.Literal("edit"), Type.Literal(
 
 export const StartSchema = Type.Object({
   projectId: Type.String(), mode: HandoffModeSchema, commit: Type.String(), base: Type.Array(Type.String()),
+  /** Set for a start on a merge of these commits (`Start.parents`); a node older than this field would start on `commit` alone. */
+  parents: Type.Optional(Type.Array(Type.String())),
 });
 
 export const TaskManifestSchema = Type.Object({
@@ -42,6 +44,8 @@ export const TaskManifestSchema = Type.Object({
   /** Null for a task without a project. */
   primaryProjectId: Nullable(Type.String()),
   createdAt: Type.String(),
+  /** A merge task's project and the tasks it merges (`TaskManifest.merge`); absent on every other task. */
+  merge: Type.Optional(Type.Object({ project: Type.String(), batch: Type.Array(Type.String()) })),
 });
 
 export const PendingApprovalSchema = Type.Object({
@@ -666,9 +670,9 @@ export type SessionView = Type.Static<typeof SessionViewSchema>;
 export const WireAddrSchema = Type.Object({ id: Type.String(), relay: Nullable(Type.String()), direct: Type.Array(Type.String()) });
 
 /**
- * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit`, `projects` and
- * `attachments` are optional: an older meddle sends none of them, and they read as 0, 0, [] and false
- * (`withSummaryDefaults`).
+ * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit`, `projects`,
+ * `attachments` and `mergeStarts` are optional: an older meddle sends none of them, and they read as 0, 0, [], false
+ * and false (`withSummaryDefaults`).
  */
 export const NodeSummarySchema = Type.Object({
   hostname: Type.String(),
@@ -684,6 +688,8 @@ export const NodeSummarySchema = Type.Object({
   projects: Type.Optional(Type.Array(ProjectInfoSchema)),
   /** Whether the node takes prompts with attachments. */
   attachments: Type.Optional(Type.Boolean()),
+  /** Whether the node starts a task on a merge of several commits (`Start.parents`). */
+  mergeStarts: Type.Optional(Type.Boolean()),
 });
 
 /** One node of the pool's roster (`RosterRow`). */

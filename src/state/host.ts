@@ -1056,6 +1056,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   /**
    * Creates task `input.taskId` on member `target` (`PeerObject.createTaskAt`), its first prompt with it. Rejects
+   * `<node> runs an older meddle` before sending a start with `parents` to a node that does not say it takes them, and
    * `CreationSent` once the request went out: the target may have made the task all the same.
    */
   async function createOn(
@@ -1065,6 +1066,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       nameFromPrompt: boolean; model?: string; effort?: string;
     },
   ): Promise<TaskManifest> {
+    // A node older than `Start.parents` would start on the first parent alone: refused before anything is sent.
+    const refusal = input.starts.some((s) => s.parents !== undefined) ? runner.noMergeStartsOn(target) : null;
+    if (refusal !== null) throw new Error(refusal);
     const peer = await pool.peerRef(target, PeerObject);
     try {
       if (peer.variant !== "peer") throw new Error(`${shortId(target)} did not serve the peer variant of PeerObject`);

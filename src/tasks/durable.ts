@@ -409,10 +409,10 @@ export class TaskRunner {
   /**
    * Provisions task `taskId` (with no project, or several) from the starts the node asked resolved (`startAt`), in
    * order, the first the primary. With a pool, each project gets a service repo here when it has none
-   * (`ensureServiceRepo`), each start's line must reach it first (`awaitLine`: its row, and its commit fetched), and
-   * once the task is provisioned this node takes each line, one epoch up, and applies the project (which forgets the
-   * line's remote ref now that the task's own bookmark holds it). Refused for an id that is not one path segment, or
-   * that a task here already has.
+   * (`ensureServiceRepo`), each start's line must reach it first (`awaitLine`: its row, and its commit and every base
+   * commit fetched: a start on a merge has several), and once the task is provisioned this node takes each line, one
+   * epoch up, and applies the project (which forgets the line's remote ref now that the task's own bookmark holds it).
+   * Refused for an id that is not one path segment, or that a task here already has.
    */
   async create(input: { title: string; taskId: string; starts: Start[] }): Promise<TaskManifest> {
     const { taskId, starts } = input;
@@ -427,7 +427,7 @@ export class TaskRunner {
       if (project === null) throw new Error(`unknown project: ${start.projectId}`);
       names.set(start.projectId, project.name);
       if (deps === null) continue;
-      const at = await awaitLine(deps, start.projectId, taskId, project.name, AWAIT_LINE_MS);
+      const at = await awaitLine(deps, start.projectId, taskId, project.name, AWAIT_LINE_MS, { withBase: true });
       if (at !== start.commit) throw new Error(`the line of ${project.name} is not at ${start.commit.slice(0, 12)}`);
     }
     const manifest = await provisionTask(this.#cfg, this.#db, { title: input.title, taskId, starts });
@@ -592,6 +592,17 @@ export class TaskRunner {
     const summary = this.#pool?.store.row(to)?.summary ?? null;
     if (summary?.attachments === true) return null;
     return `${summary?.hostname ?? shortId(to)} runs a meddle that takes no attachments`;
+  }
+
+  /**
+   * Why node `to` must not be sent a start with `parents` (its summary does not say it starts a task on a merge, as an
+   * older meddle's does not, and it would start on the first parent alone), or null: what a creation on another node
+   * checks.
+   */
+  noMergeStartsOn(to: string): string | null {
+    const summary = this.#pool?.store.row(to)?.summary ?? null;
+    if (summary?.mergeStarts === true) return null;
+    return `${summary?.hostname ?? shortId(to)} runs an older meddle`;
   }
 
   /** Creates the task's next `meddle.turn`; the caller has reserved it in `#pending`. */
