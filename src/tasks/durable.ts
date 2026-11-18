@@ -2234,7 +2234,7 @@ export class TaskRunner {
   queue(taskId: string): TaskQueue | null {
     const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
     if (row === null) return null;
-    for (const p of (JSON.parse(row.manifest) as TaskManifest).projects) {
+    for (const p of queueProjects(row)) {
       const line = this.#ownLine(taskId, p);
       if (line !== null && line.queuedAt !== null) return { queuedAt: line.queuedAt, project: p.id };
     }
@@ -2257,11 +2257,11 @@ export class TaskRunner {
     return line !== undefined && line.holder === self ? line : null;
   }
 
-  /** Takes the task off the queue, if it is on it, and tells the listeners. */
+  /** Takes the task off the queue, if it is on it, and tells the listeners. A task without a project has no queue. */
   #unqueue(taskId: string, reason: string): void {
     const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
     if (row === null) return;
-    for (const p of (JSON.parse(row.manifest) as TaskManifest).projects) {
+    for (const p of queueProjects(row)) {
       const line = this.#ownLine(taskId, p);
       if (line === null || line.queuedAt === null) continue;
       setQueued(this.#db, p.id, taskId, p.name, null);
@@ -2873,6 +2873,14 @@ function manifestNames(row: TaskRow, projectId: string): boolean {
 }
 
 /** The `tasks.queued` value that holds `prompts`: null for none, else each one's `queueEntry`. */
+/**
+ * The projects of task `row` whose lines can carry its queue: its manifest's, none for a task without a project (a row
+ * whose manifest names no `projects` at all included).
+ */
+function queueProjects(row: TaskRow): ManifestProject[] {
+  return (JSON.parse(row.manifest) as Partial<TaskManifest>).projects ?? [];
+}
+
 function queuedColumn(prompts: Prompt[]): string | null {
   return prompts.length === 0 ? null : JSON.stringify(prompts.map(queueEntry));
 }

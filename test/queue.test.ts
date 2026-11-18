@@ -459,3 +459,21 @@ test("the task serves its queue, and Accept and Unqueue, to a client", async () 
     await close();
   }
 }, 60_000);
+
+test("a project-less task's prompt logs nothing about the queue: such a task has none", async () => {
+  const { nodes, close } = await queueNodes(1);
+  const A = nodes[0]!;
+  try {
+    // A task with no project, and a row whose manifest names no projects at all (as a stand-in row's `{}` does).
+    const none = await createTask(A, { title: "none", projectIds: [] });
+    const bare = await createTask(A, { title: "bare", projectIds: [] });
+    updateTask(A.db, bare.id, { manifest: "{}" });
+    for (const id of [none.id, bare.id]) {
+      expect(A.runner.queue(id)).toBeNull();
+      await promptAndWait(A, id, "Reply with the single word ok.");
+    }
+    expect(A.logs.filter((l) => l.startsWith("meddle: queue:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 60_000);
