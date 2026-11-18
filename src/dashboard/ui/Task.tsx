@@ -636,10 +636,11 @@ function CallRow({ tool }: { tool: ToolItem }) {
           : diff.fallback.length > 0 && <div class="diff"><div class="diff-body"><DiffRows rows={diff.fallback} /></div></div>)}
         {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
         {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}
-        {reports.length > 0 ? <>
-          <Reports reports={reports} />
-          {children.length > 0 && <Steps tools={entry?.tools ?? tool.children.filter((c) => c.kind === "tool").length} items={children} />}
-        </> : (children.length > 0 || tool.agentId !== undefined) && (
+        {/* A done agent's newest report is its result, its steps folded beneath; a running one's steps show as they come. */}
+        {reports.length > 0 && <Reports reports={reports} done={!running} />}
+        {reports.length > 0 && !running ? (
+          children.length > 0 && <Steps tools={entry?.tools ?? tool.children.filter((c) => c.kind === "tool").length} items={children} />
+        ) : (children.length > 0 || tool.agentId !== undefined) && (
           <div class="sub">
             {tool.agentId !== undefined && <p class="muted tool-note">agent {tool.agentId}</p>}
             <Items items={children} />
@@ -659,21 +660,28 @@ function AgentMeta({ entry, model }: { entry: AgentEntry; model: string | undefi
   return <span class="meta">{parts.filter((p) => p !== undefined).join(" · ")}</span>;
 }
 
-/** An agent's reports as its result: the newest in a card, the earlier ones (before a follow-up) behind a toggle. */
-function Reports({ reports }: { reports: readonly string[] }) {
+/**
+ * An agent's reports. Once it is `done`, the newest leads in a card as its result, the earlier ones (before a
+ * follow-up) behind a toggle; while it runs on a follow-up, every report so far is an earlier one.
+ */
+function Reports({ reports, done }: { reports: readonly string[]; done: boolean }) {
   const [earlier, setEarlier] = useState(false);
   const n = reports.length;
-  const shown = earlier ? [...reports.keys()].reverse() : [n - 1];
+  const behind = done ? n - 1 : n;
+  const shown = earlier ? [...reports.keys()].reverse() : done ? [n - 1] : [];
+  const toggle = behind > 0 && (
+    <button onClick={() => setEarlier(!earlier)}>{earlier ? "hide earlier" : behind > 1 ? "earlier reports" : "earlier report"}</button>
+  );
+  // The toggle heads the first card shown, or stands alone while none is.
+  if (shown.length === 0) return <div class="report-head">{toggle}</div>;
   return (
     <>
-      {shown.map((i) => (
+      {shown.map((i, at) => (
         <div key={i} class="report">
           <div class="report-head">
             <span>Report</span>
             {n > 1 && <span>{i + 1} of {n}</span>}
-            {n > 1 && i === n - 1 && (
-              <button onClick={() => setEarlier(!earlier)}>{earlier ? "hide earlier" : n > 2 ? "earlier reports" : "earlier report"}</button>
-            )}
+            {at === 0 && toggle}
           </div>
           <Markdown text={reports[i]!} />
         </div>
