@@ -1193,6 +1193,26 @@ order (label, id, status, set by, expiry), with the one a turn would use now mar
 each `exhausted` or `disabled` one. Token values never pass through the dashboard: tokens are added and removed with
 the CLI.
 
+### Attachments
+
+A prompt can carry files. In a task's composer or the New task form, paste an image (a screenshot), drop files on the
+box, or pick them with the paperclip. Each shows as a chip above the text, a thumbnail for an image, with × to take it
+off; Send and Start wait until every file is uploaded, and a prompt may be files with no text. The thread shows a
+prompt's images as thumbnails (a click opens the full image in a new tab) and its other files as chips that download
+them; queued messages show theirs too, and a prompt that could not be sent keeps its files for Retry and Edit. The New
+task form offers attaching only where the node takes files: Automatic places such a prompt on a node that does, and a
+node of an older meddle does not.
+
+Each PNG, JPEG, GIF or WebP image of at most 5 MiB once base64 (a file of about 3.75 MiB) goes into the message Claude
+gets, in the order attached, until the prompt's images reach 10 MiB of base64; any other image, and one past that,
+goes as a file only. Every file, images included, also lands at `<task>/.meddle/attachments/<hash>/<name>`, outside
+the task's workspaces, and the text Claude gets ends with a line naming each file and its path, so Claude can open it.
+
+A file uploads to the node the page came from (`PUT /blobs`), which stores it by its SHA-256 at
+`<data>/blobs/<hash>`, at most 64 MB a file. Files are never deleted. A node fetches a file it lacks from the pool:
+the task's node before it accepts the prompt (`attachment <name> is not on any online node` when none has it), a
+task's new node when it moves or is restored, and the page's node when it shows one (`GET /blobs/<hash>`).
+
 ## Service
 
 To run the node as a systemd user service, look at what would be installed first:

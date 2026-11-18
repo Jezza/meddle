@@ -4,6 +4,9 @@ import {
   activity, activityLine, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, keyOf, relativePath, toolSummary,
   toolTarget, type ThreadItem, type ToolItem, workspaceSource,
 } from "../src/dashboard/ui/thread-model";
+import type { Attachment } from "../src/blobs/attachment";
+
+const shot: Attachment = { hash: "a".repeat(64), name: "shot.png", type: "image/png", size: 1000 };
 test("tool calls get their results and subagent messages nest", () => {
   const items = buildThread([
     { seq: 1, message: { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } }] }, parent_tool_use_id: null } },
@@ -39,7 +42,13 @@ test("a prompt meddle recorded becomes a user item", () => {
     { seq: 1, message: { type: "meddle", subtype: "turn_started", at: "", resume: false } },
     { seq: 2, message: { type: "user", message: { role: "user", content: "Run: echo hi" }, parent_tool_use_id: null } },
   ]);
-  expect(items).toEqual([{ kind: "user", text: "Run: echo hi" }]);
+  expect(items).toEqual([{ kind: "user", text: "Run: echo hi", attachments: [] }]);
+});
+
+test("a prompt meddle recorded keeps its attachments, and drops a bad one", () => {
+  const items = buildThread([{ seq: 1, message: { type: "user", message: { role: "user", content: "look" }, parent_tool_use_id: null,
+    attachments: [shot, { ...shot, name: "../x" }] } }]);
+  expect(items).toEqual([{ kind: "user", text: "look", attachments: [shot] }]);
 });
 
 test("a turn's end carries when it was logged", () => {
@@ -86,11 +95,11 @@ test("foldSteps folds runs of calls that only look, with their thinking, and lea
   const edit = tool("Edit", { file_path: "a.rs", old_string: "a", new_string: "b" });
   const bash = tool("Bash", { command: "cargo check" });
   const items: ThreadItem[] = [
-    { kind: "user", text: "hi" }, thinking, read, vcs, grep, thinking, edit, bash,
+    { kind: "user", text: "hi", attachments: [] }, thinking, read, vcs, grep, thinking, edit, bash,
     { kind: "assistant", text: "", thinking: "" }, tool("Read", { file_path: "b.rs" }),
   ];
   expect(foldSteps(items)).toEqual([
-    { kind: "user", text: "hi" },
+    { kind: "user", text: "hi", attachments: [] },
     { kind: "explored", steps: [thinking, read, grep, thinking] as never },
     edit,
     bash,
@@ -106,7 +115,7 @@ test("foldSteps folds runs of calls that only look, with their thinking, and lea
   expect(foldSteps([read, { kind: "assistant", text: "so" }, grep, odd], true).map((i) => i.kind)).toEqual(["explored", "assistant", "explored", "unknown"]);
   expect(keyOf(foldSteps([read, grep])[0]!)).toBe(read.toolUseId);
   expect(keyOf(edit)).toBe(edit.toolUseId);
-  expect(keyOf({ kind: "user", text: "x" })).toBeUndefined();
+  expect(keyOf({ kind: "user", text: "x", attachments: [] })).toBeUndefined();
 });
 
 test("exploredLine counts what a run looked at by kind, a file read twice once", () => {
@@ -221,7 +230,7 @@ test("a skill's text goes with its Skill call, not into the thread as a message 
   expect(items.map((i) => i.kind)).toEqual(["tool", "assistant", "tool", "assistant", "user"]);
   expect(items[0]).toMatchObject({ name: "Skill", result: { text: "Launching skill: brainstorming" }, skill: "Base directory for this skill: /s\n\n# Brainstorming" });
   expect((items[2] as ToolItem).skill).toBeUndefined();
-  expect(items[4]).toEqual({ kind: "user", text: "something else" });
+  expect(items[4]).toEqual({ kind: "user", text: "something else", attachments: [] });
   expect(toolTarget(items[0] as ToolItem, "/w")).toBe("brainstorming");
 });
 

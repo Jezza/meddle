@@ -5,9 +5,12 @@ import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
 import { createContext, type RefObject } from "preact";
 import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import type { Attachment, Prompt } from "../../blobs/attachment";
 import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
+import { draftAttachments, readyToSend } from "./attach-model";
+import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFileTarget } from "./Attachments";
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
 import { composerKey } from "./composer-model";
@@ -75,7 +78,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   const manifest = useValue(task.manifest);
   const state = useValue(task.state);
   const pending = useValue(task.pending);
-  const queued = useValue(task.queued);
+  const queued = useValue(task.queuedPrompts);
   const move = useValue(task.move);
   const movedTo = useValue(task.movedTo);
   const archivedOn = useValue(task.archivedOn);
@@ -99,17 +102,20 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   const showChanges = switchable && tab === "changes";
   /** Shows every event in the thread, the ones it otherwise leaves out included. */
   const [raw, setRaw] = useState(false);
-  // What the composer holds, here so that a failed text's Edit can put it back; kept by task id, so that it is still
-  // there after another task (or a reload), and follows the task when it moves to another node.
+  // What the composer holds, its text and its files, here so that a failed prompt's Edit can put them back. Its text is
+  // kept by task id, so that it is still there after another task (or a reload), and follows the task when it moves to
+  // another node.
   const [draft, setDraft] = useDraft(`task.${manifest.id}`);
+  const drafts = useDrafts();
   const box = useRef<HTMLTextAreaElement>(null);
-  /** Texts the task could not be sent: this page's own, so they go with it. */
+  /** Prompts the task could not be sent: this page's own, so they go with it. */
   const [failed, setFailed] = useState<Failed[]>([]);
   const failedId = useRef(0);
   const dropFailed = (id: number) => setFailed((all) => all.filter((f) => f.id !== id));
   const editFailed = (f: Failed) => {
     dropFailed(f.id);
-    setDraft((d) => (d.trim() === "" ? f.text : `${d}\n\n${f.text}`));
+    if (f.text !== "") setDraft((d) => (d.trim() === "" ? f.text : `${d}\n\n${f.text}`));
+    drafts.restore(f.attachments);
     box.current?.focus();
   };
   return (
@@ -123,7 +129,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
       ) : (
         <Thread task={task} session={session} readOnly={archived} working={state === "running"} raw={raw} after={<>
           {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
-          {queued.map((text, i) => <Queued key={i} text={text} />)}
+          {queued.map((prompt, i) => <Queued key={i} prompt={prompt} />)}
           {!archived && failed.map((f) => (
             <FailedMessage key={f.id} task={task} failed={f} disabled={moving} onSent={() => dropFailed(f.id)} onEdit={() => editFailed(f)} />
           ))}
@@ -134,8 +140,8 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
         <div class="pending-strip">{pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}</div>
       )}
       {!archived && state !== "moved" && !showChanges && (
-        <Composer task={task} running={live} anyQueued={queued.length > 0} disabled={moving} text={draft} setText={setDraft} box={box}
-          onFailed={(text, error) => setFailed((all) => [...all, { id: ++failedId.current, text, error }])} />
+        <Composer task={task} running={live} anyQueued={queued.length > 0} disabled={moving} text={draft} setText={setDraft} drafts={drafts} box={box}
+          onFailed={(prompt, error) => setFailed((all) => [...all, { id: ++failedId.current, ...prompt, error }])} />
       )}
       <BottomBar task={task} pool={pool} node={node} nodeId={nodeId} archived={archived} archivedOn={archivedOn === null ? null : nameOf(archivedOn)} moving={moving} />
     </div>
@@ -404,7 +410,7 @@ const ThreadView = createContext<{ cwd: string; raw: boolean; task: TaskRef | nu
 function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
     case "user":
-      return <div class="user-text">{item.text}</div>;
+      return <PromptBody text={item.text} attachments={item.attachments} />;
     case "assistant":
       // Thinking alongside text is not shown; thinking on its own is, closed.
       return item.text !== "" ? <Markdown text={item.text} /> : <Thinking text={item.thinking ?? ""} />;
@@ -684,27 +690,39 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
 
 // ─── the composer and the bar ───
 
-/** A text the task was sent and has not started on: it joins the thread where Claude takes it. */
-function Queued({ text }: { text: string }) {
+/** Your message's files, then its text (none when it is blank). */
+function PromptBody({ text, attachments }: { text: string; attachments: Attachment[] }) {
+  return (
+    <>
+      <AttachmentList attachments={attachments} />
+      {(text.trim() !== "" || attachments.length === 0) && <div class="user-text">{text}</div>}
+    </>
+  );
+}
+
+/** A prompt the task was sent and has not started on: it joins the thread where Claude takes it. */
+function Queued({ prompt }: { prompt: Prompt }) {
   return (
     <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one; Ctrl+Enter in an empty box sends it now">
-      <div class="user-text">{text}</div>
+      <PromptBody text={prompt.text} attachments={prompt.attachments} />
       <span class="chip">queued</span>
     </div>
   );
 }
 
-type Failed = { id: number; text: string; error: string };
+type Failed = { id: number; text: string; attachments: Attachment[]; error: string };
 
-/** A text the task could not be sent: it stays in the thread, marked, to send again or take back into the composer. */
+/** A prompt the task could not be sent: it stays in the thread, marked, to send again or take back into the composer. */
 function FailedMessage({ task, failed, disabled, onSent, onEdit }: {
   task: TaskRef; failed: Failed; disabled: boolean; onSent(): void; onEdit(): void;
 }) {
   const action = useAction();
-  const retry = async () => { if (await action.run(() => task.prompt({ text: failed.text }))) onSent(); };
+  const retry = async () => {
+    if (await action.run(() => task.prompt({ text: failed.text, attachments: failed.attachments }))) onSent();
+  };
   return (
     <div class="msg you failed">
-      <div class="user-text">{failed.text}</div>
+      <PromptBody text={failed.text} attachments={failed.attachments} />
       <div class="failed-line error">
         <Iconoir name="warning" /><span>Not sent: {action.error ?? failed.error}</span>
         <span class="failed-acts">
@@ -716,18 +734,19 @@ function FailedMessage({ task, failed, disabled, onSent, onEdit }: {
   );
 }
 
-function Composer({ task, running, anyQueued, disabled, text, setText, box, onFailed }: {
+function Composer({ task, running, anyQueued, disabled, text, setText, drafts, box, onFailed }: {
   task: TaskRef; running: boolean;
-  /** The task has texts it has not started on: Ctrl+Enter in an empty box sends them now. */
+  /** The task has prompts it has not started on: Ctrl+Enter in an empty box sends them now. */
   anyQueued: boolean;
   disabled: boolean;
-  text: string; setText: Dispatch<StateUpdater<string>>; box: RefObject<HTMLTextAreaElement | null>;
-  onFailed(text: string, error: string): void;
+  text: string; setText: Dispatch<StateUpdater<string>>; drafts: Drafts; box: RefObject<HTMLTextAreaElement | null>;
+  onFailed(prompt: Prompt, error: string): void;
 }) {
   const [busy, setBusy] = useState(false);
   const [nowError, setNowError] = useState<string | null>(null);
   // A phone's keyboard has no Shift for a new line: there Enter makes one, and the button sends.
   const touch = matchMedia("(pointer: coarse)").matches;
+  const files = useFileTarget(drafts.add, !disabled);
   // Grows with what is typed, up to the stylesheet's max-height, instead of a drag handle. Measuring drops the box to
   // its natural height for a moment, so the field holds its height meanwhile: otherwise the thread above grows for that
   // moment and, scrolled to the bottom, Firefox clamps its scroll and the thread lands a couple of pixels lower.
@@ -740,19 +759,22 @@ function Composer({ task, running, anyQueued, disabled, text, setText, box, onFa
     el.style.height = `${el.scrollHeight + 2}px`;
     field.style.minHeight = "";
   }, [text]);
-  // Sent or not, the text leaves the box: a failed one goes into the thread (FailedMessage). What was typed meanwhile stays.
-  // `now` then sends what the running turn has not taken now, the text last, as Claude Code does; with an empty box,
-  // just what is queued.
+  // Sent or not, the prompt leaves the box: a failed one goes into the thread (FailedMessage). What was typed or
+  // attached meanwhile stays. `now` then sends what the running turn has not taken now, the prompt last, as Claude Code
+  // does; with an empty box (no text, no files), just what is queued.
   const send = async (now: boolean) => {
     const sent = text;
-    const empty = sent.trim() === "";
-    if (disabled || busy || (empty && !(now && anyQueued))) return;
+    const sentFiles = drafts.drafts;
+    const empty = sent.trim() === "" && sentFiles.length === 0;
+    if (disabled || busy || (empty ? !(now && anyQueued) : !readyToSend(sent, sentFiles))) return;
+    const prompt = { text: sent, attachments: draftAttachments(sentFiles) };
     setBusy(true);
     setNowError(null);
     try {
       if (!empty) {
-        const prompted = await task.prompt({ text: sent }).then(() => true, (err: unknown) => { onFailed(sent, errorText(err)); return false; });
+        const prompted = await task.prompt(prompt).then(() => true, (err: unknown) => { onFailed(prompt, errorText(err)); return false; });
         setText((t) => (t === sent ? "" : t));
+        for (const d of sentFiles) drafts.remove(d.id);
         if (!prompted) return;
       }
       if (now) await task.sendNow({}).catch((err: unknown) => setNowError(errorText(err)));
@@ -760,12 +782,13 @@ function Composer({ task, running, anyQueued, disabled, text, setText, box, onFa
       setBusy(false);
     }
   };
-  // The button takes the accent only once there is something to send.
-  const ready = !disabled && text.trim() !== "";
+  // The button takes the accent only once there is something to send, every file uploaded.
+  const ready = !disabled && readyToSend(text, drafts.drafts);
   const verb = running ? "Queue" : "Send";
   const keys = touch ? "" : running ? " (Enter; Ctrl+Enter sends now)" : " (Enter)";
   return (
-    <div class="composer">
+    <div class={files.dragging ? "composer drop" : "composer"} {...files.handlers}>
+      <DraftChips drafts={drafts.drafts} onRemove={drafts.remove} />
       <div class="composer-field">
         <textarea
           ref={box}
@@ -781,6 +804,7 @@ function Composer({ task, running, anyQueued, disabled, text, setText, box, onFa
             void send(action === "send-now");
           }}
         />
+        <AttachButton onFiles={drafts.add} disabled={disabled} />
         <button class={ready ? "send ready" : "send"} disabled={!ready || busy} onClick={() => send(false)} title={`${verb}${keys}`} aria-label={verb}>
           <Iconoir name="send" />
         </button>

@@ -1,9 +1,12 @@
 // A new task: the composer is the form. Its projects (the one it was opened under, more added), the node (Automatic,
-// where placement picks, or one that hosts tasks), and its first prompt; Start creates it through this node and opens it.
+// where placement picks, or one that hosts tasks), and its first prompt with its files; Start creates it through this
+// node and opens it.
 import type { Ref } from "@earendil-works/chord";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { NodeObject } from "../../state/contracts";
 import { type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
+import { draftAttachments, readyToSend } from "./attach-model";
+import { AttachButton, DraftChips, useDrafts, useFileTarget } from "./Attachments";
 import { type Anchor, MenuItem, ModelPicker, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
 import { projectChoices } from "./pool-model";
 import type { Open } from "./routes";
@@ -29,6 +32,7 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
   const [chosen, setChosen] = useState<string[]>(() => (projectId === null ? [] : [projectId]));
   // A prompt left unstarted is there again on coming back to a new task under the same project (or none).
   const [prompt, setPrompt] = useDraft(`new.${projectId ?? ""}`);
+  const drafts = useDrafts();
   const models = useValue(node.models);
   const defaults = useValue(pool.defaults);
   /** The model and effort picked; null while they are the pool's defaults. */
@@ -44,14 +48,20 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
   useEffect(() => input.current?.focus(), []);
   // A node that went offline (or stopped hosting tasks) since it was picked falls back to Automatic.
   const where = canHost.find((n) => n.nodeId === picked) ?? null;
+  // Placement picks a node that takes files when there are some; a node of an older meddle takes none.
+  const attaching = where === null || where.attachments;
+  const files = useFileTarget(drafts.add, attaching);
+  const ready = readyToSend(prompt, drafts.drafts);
   const nameOf = (id: string) => projects.find((p) => p.id === id)?.name ?? id;
   const lead = chosen.length === 0 ? null : nameOf(chosen[0]!);
 
   const start = async () => {
-    if (prompt.trim() === "" || action.busy) return;
+    if (!ready || action.busy) return;
     let created: { taskId: string; nodeId: string } | undefined;
     const ok = await action.run(async () => {
-      const { manifest, nodeId } = await node.createTask({ projects: chosen.map((id) => ({ id })), node: where?.nodeId ?? null, prompt, model, effort });
+      const { manifest, nodeId } = await node.createTask({
+        projects: chosen.map((id) => ({ id })), node: where?.nodeId ?? null, prompt, attachments: draftAttachments(drafts.drafts), model, effort,
+      });
       created = { taskId: manifest.id, nodeId };
     });
     if (ok && created !== undefined) {
@@ -66,7 +76,8 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
       <div class="new-empty">
         {lead === null ? <span>New task</span> : <span>New task in <b>{lead}</b>{chosen.length > 1 && ` and ${chosen.length - 1} more`}</span>}
       </div>
-      <div class="composer">
+      <div class={files.dragging ? "composer drop" : "composer"} {...files.handlers}>
+        <DraftChips drafts={drafts.drafts} onRemove={drafts.remove} />
         <textarea ref={input} rows={4} value={prompt} placeholder="What should Claude do?"
           onInput={(e) => setPrompt(e.currentTarget.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void start(); } }} />
@@ -83,7 +94,8 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
           <ModelPicker models={models} model={model} effort={effort} onModel={setChosenModel} onEffort={setChosenEffort} />
           <span class="bar-gap" />
           {action.error !== null && <span class="error">{action.error}</span>}
-          <button class="primary" disabled={action.busy || prompt.trim() === ""} onClick={() => void start()} title="Ctrl+Enter">
+          {attaching && <AttachButton onFiles={drafts.add} />}
+          <button class="primary" disabled={action.busy || !ready} onClick={() => void start()} title="Ctrl+Enter">
             {action.busy ? "Starting…" : "Start"}
           </button>
         </div>

@@ -13,6 +13,8 @@ import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, 
 import { composerKey } from "../src/dashboard/ui/composer-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
+import { blobUrl, type Draft, draftAttachments, nameFor, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
+import type { Attachment } from "../src/blobs/attachment";
 
 test("the dashboard bundle builds", async () => {
   const build = await Bun.build({ entrypoints: ["src/dashboard/ui/main.tsx"], target: "browser", format: "esm" });
@@ -435,4 +437,29 @@ test("composerKey: Enter sends (queued while a turn runs), Ctrl or Cmd+Enter sen
   expect(composerKey(key({}), { ...desk, touch: true })).toBeNull();
   expect(composerKey(key({ ctrlKey: true }), { ...desk, touch: true })).toBe("send-now");
   expect(composerKey(key({ key: "a" }), desk)).toBeNull();
+});
+
+const shot: Attachment = { hash: "a".repeat(64), name: "shot.png", type: "image/png", size: 1000 };
+const draft = (over: Partial<Draft> = {}): Draft => ({
+  id: 1, name: shot.name, type: shot.type, size: shot.size, preview: null, state: "done", attachment: shot, error: null, ...over,
+});
+
+test("readyToSend wants text or attachments, and every upload done", () => {
+  expect(readyToSend(" ", [])).toBe(false);
+  expect(readyToSend("", [draft({ state: "done" })])).toBe(true);
+  expect(readyToSend("hi", [draft({ state: "uploading" })])).toBe(false);
+  expect(readyToSend("hi", [draft({ state: "failed" })])).toBe(false);
+});
+
+test("blobUrl, sizeText, nameFor", () => {
+  expect(blobUrl({ ...shot, name: "a b.png" })).toBe(`/blobs/${shot.hash}?type=image%2Fpng&name=a%20b.png`);
+  expect([sizeText(512), sizeText(12_300), sizeText(3_400_000)]).toEqual(["512 B", "12 KB", "3.4 MB"]);
+  expect(nameFor({ name: "", type: "image/png" }, new Date(2026, 10, 17, 9, 5, 3))).toBe("pasted-20261117-090503.png");
+  expect(nameFor({ name: "../../a.png", type: "image/png" }, new Date())).toBe("_.._a.png");
+});
+
+test("draftAttachments takes the uploaded drafts' attachments; only the four image types show inline", () => {
+  const log: Attachment = { ...shot, name: "server.log", type: "application/octet-stream" };
+  expect(draftAttachments([draft(), draft({ id: 2, state: "uploading", attachment: null }), draft({ id: 3, attachment: log })])).toEqual([shot, log]);
+  expect(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml", ""].map(shownInline)).toEqual([true, true, true, true, false, false]);
 });
