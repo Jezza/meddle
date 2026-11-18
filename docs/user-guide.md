@@ -276,8 +276,8 @@ also lands at `<task>/.meddle/attachments/<hash>/<name>` for Claude to open. Fil
 ([Attachments](../README.md#attachments)).
 
 **Watching.** Any node's dashboard shows the whole pool: a sidebar of projects and their tasks (each with its state,
-what waits on you and the node it runs on), the nodes with their load at its foot, every task's thread wherever it
-runs, and notices for a failed turn, a login out of tokens or a move that rolled back. A node's own tasks and another node's open the same way; the page's node relays the other's over the
+what waits on you, how many of its subagents are running and the node it runs on), the nodes with their load at its
+foot, every task's thread wherever it runs, and notices for a failed turn, a login out of tokens or a move that rolled back. A node's own tasks and another node's open the same way; the page's node relays the other's over the
 pool.
 
 **Moving a task.** From the dashboard (the node in the task's bar, or Move to… on its sidebar row) or `meddle task move <id> <short id>`, with `--now` to interrupt a
