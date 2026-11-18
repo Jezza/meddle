@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import {
   activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, holdsCall, isRunning, keyOf,
-  relativePath, toolSummary, toolTarget, type ThreadItem, type ToolItem, workspaceSource,
+  missingCalls, relativePath, toolSummary, toolTarget, type ThreadItem, type ToolItem, workspaceSource,
 } from "../src/dashboard/ui/thread-model";
 import type { Attachment } from "../src/blobs/attachment";
 
@@ -449,4 +449,53 @@ test("holdsCall tells whether the events hold a call's tool_use, its start or re
   expect(holdsCall(events, "tA")).toBe(true);
   expect(holdsCall(events, "tZ")).toBe(false);
   expect(holdsCall([], "tA")).toBe(false);
+});
+
+test("missingCalls names the calls the events refer to that no loaded tool_use defines, once each, in first-seen order", () => {
+  // An agent's messages (its own calls defined among them) whose Agent call is older than the events.
+  expect(missingCalls([call(5, "tB", "Bash", { command: "ls" }, "tA"), answer(6, "tB", "a", "tA"), call(7, "tC", "Read", { file_path: "x" }, "tA")])).toEqual(["tA"]);
+  // Notices and starts whose call is older than the events.
+  expect(missingCalls([
+    sys(1, "task_notification", { task_id: "c1", tool_use_id: "tB", status: "completed", summary: "done" }),
+    sys(2, "task_started", { task_id: "c2", tool_use_id: "tC", task_type: "local_bash" }),
+    answer(3, "tD", "a", "tA"),
+    sys(4, "task_notification", { task_id: "c1", tool_use_id: "tB", status: "completed", summary: "done" }),
+  ])).toEqual(["tB", "tC", "tA"]);
+  // Nothing missing: every call is in, none is named, or a name is "" or not a string; other events' ids do not count.
+  const agent = [
+    call(1, "tA", "Agent", { description: "Implement Task 3", run_in_background: true }),
+    agentStart(2),
+    answer(3, "tA", "Async agent launched successfully."),
+    call(4, "tB", "Bash", { command: "bun test", run_in_background: true }, "tA"),
+    sys(5, "task_started", { task_id: "c1", tool_use_id: "tB", task_type: "local_bash", is_backgrounded: true, parent_task_id: "a1" }),
+    sys(6, "task_notification", { task_id: "c1", tool_use_id: "tB", status: "completed", summary: "done" }),
+  ];
+  expect(missingCalls(agent)).toEqual([]);
+  expect(missingCalls([
+    answer(1, "x", "a", ""),
+    { message: { type: "assistant", message: { content: [{ type: "text", text: "hi" }] }, parent_tool_use_id: 7 } },
+    sys(3, "task_notification", { task_id: "c1", status: "stopped", summary: "" }),
+    sys(4, "permission_denied", { tool_name: "Bash", tool_use_id: "tZ" }),
+    { message: { type: "stream_event", event: {}, parent_tool_use_id: "tY" } },
+  ])).toEqual([]);
+  expect(missingCalls([])).toEqual([]);
+  // A call defined later in the same events counts as defined.
+  expect(missingCalls([answer(1, "tB", "a", "tA"), sys(2, "task_notification", { task_id: "a1", tool_use_id: "tA", status: "completed", summary: "" }), call(3, "tA", "Agent", { description: "x" })])).toEqual([]);
+});
+
+test("a background call whose notice never came reads stopped once the agent it ran in has finished", () => {
+  const events = [
+    call(1, "tA", "Agent", { description: "Implement Task 3", run_in_background: true }),
+    agentStart(2),
+    call(3, "tB", "Bash", { command: "bun test", run_in_background: true }, "tA"),
+    sys(4, "task_started", { task_id: "c1", tool_use_id: "tB", task_type: "local_bash", is_backgrounded: true, parent_task_id: "a1" }),
+    call(5, "tM", "Monitor", { command: "tail -f log" }, "tA"),
+    sys(6, "task_started", { task_id: "m1", tool_use_id: "tM", task_type: "local_bash", is_backgrounded: true, parent_task_id: "a1" }),
+    sys(7, "task_notification", { task_id: "c1", tool_use_id: "tB", status: "completed", summary: 'Background command "bun test" completed (exit code 0)' }),
+  ];
+  const [bash, monitor] = (buildThread(events)[0] as ToolItem).children as [ToolItem, ToolItem];
+  expect([backgroundMeta(monitor), backgroundMeta(monitor, false)]).toEqual(["background", "stopped"]);
+  // A notice that came says how it ended, whatever became of the agent.
+  expect(backgroundMeta(bash, false)).toBe("exit 0");
+  expect(backgroundMeta(buildThread([call(1, "tB", "Bash", { command: "ls" })])[0] as ToolItem, false)).toBeNull();
 });

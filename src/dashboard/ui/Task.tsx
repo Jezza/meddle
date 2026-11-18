@@ -26,7 +26,7 @@ import { ago, type ProjectLine, projectLines, usageShort } from "./sidebar-model
 import { useOptionalValue } from "./sources";
 import {
   activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps,
-  holdsCall, isAgentCall, isLook, isRunning, keyOf, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
+  holdsCall, isAgentCall, isLook, isRunning, keyOf, missingCalls, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
 } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -36,6 +36,8 @@ type Pending = TaskRef["pending"]["value"][number];
 type LogEvent = SessionRef["window"]["value"][number];
 
 const EARLIER_PAGE = 200;
+/** How far below the top of the thread a row the thread was led to comes, in pixels. */
+const ARRIVAL_MARGIN = 8;
 /** Lines added and removed, at most, for a change's row to open by itself and show its diff. */
 const SMALL_DIFF = 12;
 const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
@@ -335,55 +337,76 @@ function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus
     if (el !== null && stick.current) el.scrollTop = el.scrollHeight;
   });
 
-  const loadEarlier = () => action.run(async () => {
-    if (oldest === undefined) return;
-    const earlier = await session.loadEarlier({ beforeSeq: oldest, limit: EARLIER_PAGE });
-    if (earlier.length < EARLIER_PAGE) setNoneEarlier(true);
-    stick.current = false;
-    setSeen((prev) => merged(prev, earlier));
-  });
-
-  // Led to an agent's row: earlier events load page by page back to the outermost holding agent's start, then on until
-  // its call (which comes before the start) is in, or none are left; then the row opens. Each page goes further back,
-  // so the loop ends. A pick while they load leads the same loop on to the newer pick; the pick standing when the view
-  // opened is not followed again.
+  // Earlier events load in one loop at a time, page by page, for as long as any of three reasons stands and earlier
+  // events remain:
+  // - "Load earlier" asks for one page;
+  // - the loaded events refer to a call that is not in (`missingCalls`), so what an agent ran would land in the main
+  //   thread;
+  // - a pick (`focus`) leads to an agent's row: back to the outermost holding agent's start, then on until its call
+  //   (which comes before the start) is in. The row opens as soon as they are, while the loop may go on for the rest.
+  // A pick or new events while it loads lead the same loop on (it reads both afresh at each page). Each page goes
+  // further back, so the loop ends. The pick standing when the view opened is not followed again. Loading above keeps
+  // the view at the bottom while you are there (`stick`).
+  const latest = useRef(events);
+  latest.current = events;
   const target = useRef(focus);
   target.current = focus;
   const followed = useRef(focus);
-  const seeking = useRef(false);
+  const loading = useRef(false);
   const [arrived, setArrived] = useState<Focus | null>(null);
-  useEffect(() => {
-    if (focus === followed.current || focus === null || focus.toolUseId === "" || seeking.current) return;
-    followed.current = focus;
-    seeking.current = true;
+  const missing = useMemo(() => missingCalls(events).length > 0, [events]);
+  /** The pick the thread has yet to lead to; null for none. */
+  const picked = () => {
+    const pick = target.current;
+    return pick !== followed.current && pick !== null && pick.toolUseId !== "" ? pick : null;
+  };
+  const arrive = (pick: Focus) => {
+    followed.current = pick;
+    setArrived(pick);
+  };
+  const load = (onePage: boolean) => {
+    const start = noneEarlier || oldest === undefined || oldest <= 1 ? undefined : oldest;
+    if (loading.current || (!onePage && picked() === null && (start === undefined || !missing))) return;
+    loading.current = true;
     void action.run(async () => {
       try {
-        let loaded: readonly LogEvent[] = events;
-        const short = (t: Focus | null, from: number) => t !== null && (from > t.seq || !holdsCall(loaded, t.holder));
-        let from = noneEarlier ? undefined : oldest;
-        while (from !== undefined && from > 1 && short(target.current, from)) {
+        let pages: readonly LogEvent[] = [];
+        const loaded = () => [...pages, ...latest.current];
+        for (let from = start, asked = onePage; ; asked = false) {
+          const pick = picked();
+          const short = pick !== null && from !== undefined && (from > pick.seq || !holdsCall(loaded(), pick.holder));
+          if (pick !== null && !short) arrive(pick);
+          if (from === undefined || !(asked || short || missingCalls(loaded()).length > 0)) break;
           const earlier = await session.loadEarlier({ beforeSeq: from, limit: EARLIER_PAGE });
-          const last = earlier.length < EARLIER_PAGE;
+          const next = earlier[0]?.seq;
+          // A page that does not reach further back (never one from a node that keeps to `loadEarlier`) ends it too.
+          const last = earlier.length < EARLIER_PAGE || next === undefined || next >= from;
           if (last) setNoneEarlier(true);
+          // The page you asked for shows where it lands, rather than the view staying at the bottom.
+          if (asked) stick.current = false;
           setSeen((prev) => merged(prev, earlier));
-          loaded = [...earlier, ...loaded];
-          from = last ? undefined : earlier[0]?.seq;
+          pages = [...earlier, ...pages];
+          from = last || next <= 1 ? undefined : next;
         }
       } finally {
-        seeking.current = false;
-        followed.current = target.current;
-        setArrived(target.current);
+        loading.current = false;
+        // A load that failed leaves its pick where it got to.
+        const pick = picked();
+        if (pick !== null) arrive(pick);
       }
     });
-  }, [focus]);
-  // Once the events are in: the row opens, and every row holding it (a parent agent's), and comes to the top.
+  };
+  useEffect(() => load(false), [focus, events]);
+  // Once the events are in: the row opens, and every row holding it (a parent agent's), and comes to the top of the
+  // thread. Only the thread scrolls, never the page around it.
   useLayoutEffect(() => {
-    if (arrived === null || arrived.toolUseId === "") return;
-    const row = scroller.current?.querySelector<HTMLDetailsElement>(`details[data-call="${CSS.escape(arrived.toolUseId)}"]`);
-    if (row == null) return;
+    const el = scroller.current;
+    if (el === null || arrived === null || arrived.toolUseId === "") return;
+    const row = el.querySelector<HTMLDetailsElement>(`details[data-call="${CSS.escape(arrived.toolUseId)}"]`);
+    if (row === null) return;
     for (let d: HTMLDetailsElement | null = row; d !== null; d = d.parentElement?.closest("details") ?? null) d.open = true;
     stick.current = false;
-    row.scrollIntoView({ block: "start" });
+    el.scrollTop += row.getBoundingClientRect().top - el.getBoundingClientRect().top - ARRIVAL_MARGIN;
   }, [arrived]);
 
   const lastClaude = blocks.at(-1)?.who === "claude";
@@ -398,7 +421,7 @@ function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus
       onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
       <div class="thread">
         {oldest !== undefined && oldest > 1 && !noneEarlier && (
-          <button class="earlier" disabled={action.busy} onClick={loadEarlier}>Load earlier</button>
+          <button class="earlier" disabled={action.busy} onClick={() => load(true)}>Load earlier</button>
         )}
         {action.error !== null && <p class="error">{action.error}</p>}
         {blocks.length === 0 && !tail && <p class="muted empty">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
@@ -490,6 +513,12 @@ type ThreadContext = {
 };
 const ThreadView = createContext<ThreadContext>({ cwd: "", raw: false, task: null, agents: new Map(), focused: null, focus: () => {} });
 
+/**
+ * Whether the agent whose row holds a row still runs; true outside any agent's. Nothing in an agent that has finished
+ * runs on, whether or not its notice came.
+ */
+const AgentRuns = createContext(true);
+
 function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
     case "user":
@@ -557,12 +586,14 @@ function StateText({ running, failed }: { running: boolean; failed: boolean }) {
 
 /** Calls that only look, folded: what they looked at in one row, each call inside; open by itself once one fails. */
 function ExploredRow({ steps }: { steps: Explored["steps"] }) {
+  const agentRuns = useContext(AgentRuns);
   const line = exploredLine(steps);
+  const running = line.running && agentRuns;
   return (
-    <details class={`step${line.failed > 0 ? " bad" : line.running ? " live" : ""}`} open={line.failed > 0}>
+    <details class={`step${line.failed > 0 ? " bad" : running ? " live" : ""}`} open={line.failed > 0}>
       <summary>
-        <Chevron /><Icon name={line.running ? "running" : "search"} />
-        <span class="verb">{line.running ? "Exploring" : "Explored"}</span>
+        <Chevron /><Icon name={running ? "running" : "search"} />
+        <span class="verb">{running ? "Exploring" : "Explored"}</span>
         <span class="target plain">{line.text}</span>
         {line.failed > 0 && <span class="meta">{line.failed} failed</span>}
       </summary>
@@ -585,10 +616,12 @@ function ToolRow({ tool }: { tool: ToolItem }) {
 /**
  * A call's row. A background call runs until its notice; an agent's, while the agent list says it does (by its
  * notices where the list has no entry for it, as on an older node), and it ends with the agent's report, its steps
- * folded beneath; a stopped or failed agent's row is red and open.
+ * folded beneath; a stopped or failed agent's row is red and open. A call in an agent that has finished runs no longer
+ * (a background one's meta says "stopped"), unless the list says it is an agent still running.
  */
 function CallRow({ tool }: { tool: ToolItem }) {
   const { cwd, raw, task, agents, focused, focus } = useContext(ThreadView);
+  const agentRuns = useContext(AgentRuns);
   const input = (tool.input ?? {}) as Record<string, unknown>;
   const edit = EDITS.includes(tool.name);
   const agent = isAgentCall(tool);
@@ -596,7 +629,7 @@ function CallRow({ tool }: { tool: ToolItem }) {
   // How an agent stands: as the agent list says, else as its latest notice did.
   const agentState = entry?.state ?? (agent ? tool.ended?.status : undefined);
   const stopped = agentState === "stopped" || agentState === "failed";
-  const running = entry !== undefined ? entry.state === "running" : isRunning(tool);
+  const running = entry !== undefined ? entry.state === "running" : isRunning(tool) && agentRuns;
   const failed = stopped || (entry === undefined && tool.result?.isError === true);
   const diff = useMemo(() => edit ? editDiff(tool) : null, [edit, tool.input, tool.result]);
   const children = useMemo(() => foldSteps(tool.children, raw), [tool.children, raw]);
@@ -604,7 +637,7 @@ function CallRow({ tool }: { tool: ToolItem }) {
   const kind = edit ? (tool.name === "Write" ? "write" : "edit") : tool.name === "Bash" ? "bash" : agent ? "agent" : isLook(tool) ? "search" : "tool";
   const target = toolTarget(tool, cwd);
   const code = exitCode(tool);
-  const background = agent ? null : backgroundMeta(tool);
+  const background = agent ? null : backgroundMeta(tool, agentRuns);
   const command = typeof input.command === "string" ? input.command : undefined;
   const result = tool.result;
   const reports = tool.reports ?? [];
@@ -622,6 +655,29 @@ function CallRow({ tool }: { tool: ToolItem }) {
   const isFocused = focused === tool.toolUseId;
   // Closing the row the agent list led to lets go of it there too.
   const onToggle = isFocused ? (e: { currentTarget: HTMLDetailsElement }) => { if (!e.currentTarget.open) focus(null); } : undefined;
+  const body = (
+    <div class="step-body">
+      {stopped && <p class="tool-note error">Stopped before it reported{entry?.orphaned === true && ": the session ended"}</p>}
+      {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
+      {diff !== null && (diff.hunks.length > 0
+        ? <DiffView hunks={diff.hunks} file={result?.original ?? null} {...fromWorkspace} />
+        : diff.fallback.length > 0 && <div class="diff"><div class="diff-body"><DiffRows rows={diff.fallback} /></div></div>)}
+      {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
+      {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}
+      {/* A done agent's newest report is its result, its steps folded beneath; a running one's steps show as they come. */}
+      {reports.length > 0 && <Reports reports={reports} done={!running} />}
+      {reports.length > 0 && !running ? (
+        children.length > 0 && <Steps tools={entry?.tools ?? tool.children.filter((c) => c.kind === "tool").length} items={children} />
+      ) : (children.length > 0 || tool.agentId !== undefined) && (
+        <div class="sub">
+          {tool.agentId !== undefined && <p class="muted tool-note">agent {tool.agentId}</p>}
+          <Items items={children} />
+        </div>
+      )}
+      {showResult && <pre class={failed ? "out error" : "out"}>{result.text}</pre>}
+      {tool.skill !== undefined && <pre class="out">{tool.skill}</pre>}
+    </div>
+  );
   return (
     <details class={`step${agent ? " agent" : ""}${failed ? " bad" : running ? " live" : ""}${isFocused ? " focus" : ""}`} data-call={tool.toolUseId}
       open={failed || (landed && diff.added + diff.removed <= SMALL_DIFF)} onToggle={onToggle}>
@@ -639,27 +695,7 @@ function CallRow({ tool }: { tool: ToolItem }) {
           <span class="now"><span class="dots" aria-hidden="true"><i /><i /><i /></span><span class="what">{entry.doing ?? "Working"}</span></span>
         )}
       </summary>
-      <div class="step-body">
-        {stopped && <p class="tool-note error">Stopped before it reported{entry?.orphaned === true && ": the session ended"}</p>}
-        {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
-        {diff !== null && (diff.hunks.length > 0
-          ? <DiffView hunks={diff.hunks} file={result?.original ?? null} {...fromWorkspace} />
-          : diff.fallback.length > 0 && <div class="diff"><div class="diff-body"><DiffRows rows={diff.fallback} /></div></div>)}
-        {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
-        {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}
-        {/* A done agent's newest report is its result, its steps folded beneath; a running one's steps show as they come. */}
-        {reports.length > 0 && <Reports reports={reports} done={!running} />}
-        {reports.length > 0 && !running ? (
-          children.length > 0 && <Steps tools={entry?.tools ?? tool.children.filter((c) => c.kind === "tool").length} items={children} />
-        ) : (children.length > 0 || tool.agentId !== undefined) && (
-          <div class="sub">
-            {tool.agentId !== undefined && <p class="muted tool-note">agent {tool.agentId}</p>}
-            <Items items={children} />
-          </div>
-        )}
-        {showResult && <pre class={failed ? "out error" : "out"}>{result.text}</pre>}
-        {tool.skill !== undefined && <pre class="out">{tool.skill}</pre>}
-      </div>
+      {agent ? <AgentRuns.Provider value={running}>{body}</AgentRuns.Provider> : body}
     </details>
   );
 }
@@ -717,10 +753,11 @@ function Steps({ tools, items }: { tools: number; items: readonly ShownItem[] })
  */
 function MessageRow({ tool, resumes }: { tool: ToolItem; resumes: string }) {
   const { agents, focus } = useContext(ThreadView);
+  const agentRuns = useContext(AgentRuns);
   const entry = agents.get(resumes);
   const input = (tool.input ?? {}) as Record<string, unknown>;
-  // Its run is over once the agent is, notice or not.
-  const running = isRunning(tool) && (entry === undefined || entry.state === "running");
+  // Its run is over once the agent is, notice or not; with no entry for it, once the agent this call is in is.
+  const running = isRunning(tool) && (entry !== undefined ? entry.state === "running" : agentRuns);
   const to = entry?.description ?? (typeof input.to === "string" ? input.to : "");
   const summary = typeof input.summary === "string" ? input.summary : "";
   return (

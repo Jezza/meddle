@@ -291,7 +291,8 @@
   .pending-strip .ask { max-width: 860px; margin: 0 auto 10px; }
   .banner { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 7px 16px; background: var(--warn-bg); color: var(--warn); border-bottom: 1px solid var(--warn-line); flex: none; }
   .banner-actions { margin-left: auto; display: flex; gap: 6px; }
-  .thread-scroll { flex: 1; overflow-y: auto; min-height: 0; }
+  /* Positioned, so that what is placed absolutely inside it (`.sr`) scrolls and clips with it rather than making the page scroll. */
+  .thread-scroll { flex: 1; overflow-y: auto; min-height: 0; position: relative; }
   .thread { max-width: 860px; margin: 0 auto; padding: 18px 22px 12px; }
   .thread .earlier { margin: 0 0 14px; }
   .msg { margin: 0 0 20px; }

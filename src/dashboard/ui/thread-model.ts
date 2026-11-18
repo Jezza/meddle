@@ -478,10 +478,32 @@ export function keyOf(item: ShownItem): string | undefined {
 
 /** Whether the events hold the call `toolUseId` (the `tool_use` its row is built from). */
 export function holdsCall(events: ReadonlyArray<{ message: unknown }>, toolUseId: string): boolean {
-  return events.some(({ message }) => {
+  return events.some(({ message }) => callsOf(message).includes(toolUseId));
+}
+
+/**
+ * The calls the events refer to that none of them holds (`holdsCall`), in the order first referred to: the call an
+ * agent's message belongs under (`parent_tool_use_id`), and the call a task's start or notice marks. Until it is in,
+ * what refers to it lands at the top of the thread.
+ */
+export function missingCalls(events: ReadonlyArray<{ message: unknown }>): string[] {
+  const held = new Set(events.flatMap(({ message }) => callsOf(message)));
+  const missing = new Set<string>();
+  for (const { message } of events) {
     const m = message as Message | null;
-    return m?.type === "assistant" && blocks((m.message as { content?: unknown } | undefined)?.content).some((b) => b.type === "tool_use" && b.id === toolUseId);
-  });
+    const call = m?.type === "assistant" || m?.type === "user" ? m.parent_tool_use_id
+      : m?.type === "system" && (m.subtype === "task_started" || m.subtype === "task_notification") ? m.tool_use_id
+      : undefined;
+    if (typeof call === "string" && call !== "" && !held.has(call)) missing.add(call);
+  }
+  return [...missing];
+}
+
+/** The calls a message holds: an assistant message's `tool_use` blocks, an agent's own among them. */
+function callsOf(message: unknown): string[] {
+  const m = message as Message | null;
+  if (m?.type !== "assistant") return [];
+  return blocks((m.message as { content?: unknown } | undefined)?.content).flatMap((b) => b.type === "tool_use" && typeof b.id === "string" ? [b.id] : []);
 }
 
 /** A path under the session's working directory, relative to it; any other as it is. */
@@ -571,12 +593,13 @@ export function isRunning(tool: ToolItem): boolean {
 }
 
 /**
- * What a background call's row says in its meta: null for any other call; "background" while it runs; once it has
- * ended, "ended" for a `Monitor` watcher, else the exit code its notice gave ("exit 0"), else the notice's status.
+ * What a background call's row says in its meta: null for any other call; "background" while it runs, or "stopped"
+ * when the agent it ran in has finished (`agentRuns` false) and its notice never came; once it has ended, "ended" for a
+ * `Monitor` watcher, else the exit code its notice gave ("exit 0"), else the notice's status.
  */
-export function backgroundMeta(tool: ToolItem): string | null {
+export function backgroundMeta(tool: ToolItem, agentRuns = true): string | null {
   if (tool.background !== true) return null;
-  if (tool.ended === undefined) return "background";
+  if (tool.ended === undefined) return agentRuns ? "background" : "stopped";
   if (tool.name === "Monitor") return "ended";
   const code = /exit code (\d+)/.exec(tool.ended.text);
   return code === null ? tool.ended.status : `exit ${code[1]}`;
