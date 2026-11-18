@@ -1,6 +1,6 @@
-import { test, expect, beforeEach } from "bun:test";
+import { test, expect, afterEach, beforeEach } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdtemp, readdir, readFile, stat, writeFile, mkdir } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BlobStore } from "../src/blobs/store";
 import { materialize, promptContent } from "../src/blobs/content";
@@ -11,18 +11,22 @@ async function* chunks(...parts: (string | Uint8Array)[]) {
 }
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]); // a few bytes are enough; nothing decodes them
 
+let home: string;
 let store: BlobStore;
 let dir: string;
 let shot: Attachment;
 let text: Attachment;
 beforeEach(async () => {
-  const home = await mkdtemp("/tmp/blob-content-");
+  home = await mkdtemp("/tmp/blob-content-");
   store = new BlobStore(join(home, "blobs"));
   dir = join(home, "task", ".meddle", "attachments");
   const png = await store.write(chunks(PNG_BYTES));
   const log = await store.write(chunks("line\n"));
   shot = { hash: png.hash, name: "shot.png", type: "image/png", size: png.size };
   text = { hash: log.hash, name: "server.log", type: "text/plain", size: log.size };
+});
+afterEach(async () => {
+  await rm(home, { recursive: true, force: true });
 });
 
 test("images go inline, every file goes as a path", async () => {

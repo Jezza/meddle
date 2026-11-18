@@ -1,6 +1,6 @@
 // test/dashboard-blobs.test.ts — a browser uploading a file to its node and downloading one by its hash.
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createHost } from "@earendil-works/chord";
 import { MAX_BLOB_BYTES } from "../src/blobs/attachment";
@@ -10,17 +10,21 @@ import { startDashboard, type Dashboard } from "../src/dashboard/server";
 
 const sha = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 
+let home: string;
 let store: BlobStore;
 let dashboard: Dashboard;
 let url: string;
 
 beforeAll(async () => {
-  store = new BlobStore(join(await mkdtemp("/tmp/dashboard-blobs-"), "blobs"));
+  home = await mkdtemp("/tmp/dashboard-blobs-");
+  store = new BlobStore(join(home, "blobs"));
   dashboard = await startDashboard({ port: 0 }, createHost({ name: "node", self: "node" }), undefined, new BlobFetcher(store, null));
   url = dashboard.url;
 });
 afterAll(async () => {
   await dashboard.stop();
+  // a 64 MB file among what the tests stored
+  await rm(home, { recursive: true, force: true });
 });
 
 const temps = async () => (await readdir(store.dir)).filter((f) => f.startsWith(".tmp-"));
@@ -199,5 +203,6 @@ test("a store that cannot be read or written is a 500 with a reason", async () =
   } finally {
     logged.mockRestore();
     await broken.stop();
+    await rm(base, { recursive: true, force: true });
   }
 });
