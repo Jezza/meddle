@@ -34,11 +34,11 @@ test("hello: every message is recorded, the result returns, the child exits", as
 });
 test("a train turn's prompt is logged as meddle's train_turn, not as a prompt of the user's", async () => {
   const { db, input, fixture } = await setup();
-  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "Describe it.", attachments: [] }, db, approvals: new Approvals(), train: "describe" });
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "Describe it.", attachments: [] }, db, approvals: new Approvals(), train: { kind: "describe", after: 7 } });
   expect((await done).type).toBe("result");
   const recorded = listEvents(db, "abc").map(e => e.message as any);
   expect(recorded[0]).toMatchObject({ type: "meddle", subtype: "turn_started" });
-  expect(recorded[1]).toEqual({ type: "meddle", subtype: "train_turn", kind: "describe", text: "Describe it." });
+  expect(recorded[1]).toEqual({ type: "meddle", subtype: "train_turn", kind: "describe", text: "Describe it.", after: 7 });
   expect(recorded.filter(m => m.type === "user" && m.message?.content === "Describe it.")).toEqual([]);
 });
 test("approval: the dashboard's answer unblocks the tool", async () => {

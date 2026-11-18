@@ -12,12 +12,13 @@ import type { MeddleEvent } from "../src/engine/session";
 import { listLineRows } from "../src/pool/rows";
 import { DESCRIBE_PROMPT } from "../src/pool/settings";
 import { PeerObject } from "../src/state/contracts";
-import { appendEvent, listEvents } from "../src/store/events";
+import { listEvents } from "../src/store/events";
 import { getTask, queuedOf } from "../src/store/records";
 import { CARRY_ON_PROMPT, TaskRunner, type RunnerHooks } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
 import { describePrompt, mergePrompt, mergeTitle, rebasePrompt } from "../src/train/prompts";
 import { TRAIN_TOOLS, trainOutcome, trainToolList, trainTools } from "../src/train/tools";
+import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { createTask, replay, setupNode } from "./helpers";
 import { peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -84,7 +85,7 @@ test("train turns force auto and get meddle's tools; the user's next turn has th
     // The task's own mode is untouched.
     expect(node.runner.settings(m.id).permissionMode).toBe("default");
     // The train's prompt is logged as meddle's, not as a prompt of the user's.
-    expect(trainTurns(node.db, m.id)).toEqual([{ type: "meddle", subtype: "train_turn", kind: "describe", text: "Describe it." }]);
+    expect(trainTurns(node.db, m.id)).toEqual([{ type: "meddle", subtype: "train_turn", kind: "describe", text: "Describe it.", after: expect.any(Number) }]);
     expect(userPrompts(node.db, m.id)).toEqual([]);
 
     const idle = nextIdle(node.runner, m.id);
@@ -208,36 +209,85 @@ test("prompts sent during a train turn wait for it: queued, not steered; the tas
   }
 }, 90_000);
 
-test("a task whose agent declines leaves the queue with the agent's reason, before a prompt that waited runs", async () => {
+/** One task of node A's project, with work, accepted; and the tools its train turns' `meddle` server gets, as wired. */
+async function acceptedTask(A: GitPoolNode) {
+  const P = A.project;
+  const m = await createTask(A, { title: "t", projectIds: [P.id] });
+  await withWork(A, m.id);
+  await A.runner.accept(m.id);
+  let tools: SdkMcpToolDefinition<any>[] | undefined;
+  A.hooks.trainTools = (id, wired) => { if (id === m.id) tools = wired; };
+  const queuedAt = () => listLineRows(A.db, P.id, m.id).find((r) => r.name === "a")?.queuedAt ?? null;
+  const left: string[] = [];
+  A.runner.onQueue((id, queue, reason) => { if (id === m.id && queue === null) left.push(String(reason)); });
+  /** Calls the `decline` of the train turn now running, as its agent would. */
+  const decline = async (reason: string) => {
+    await until("the train's tools", () => tools !== undefined, true);
+    await tools!.find((t) => t.name === "decline")!.handler({ reason }, {});
+  };
+  return { m, queuedAt, left, decline };
+}
+
+test("a decline takes the task off its queue as it is logged, with no call waiting; asked again, the train hears it and prompts no one", async () => {
   const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
   const A = nodes[0]!;
   try {
-    const P = A.project;
-    const m = await createTask(A, { title: "t", projectIds: [P.id] });
-    await withWork(A, m.id);
-    await A.runner.accept(m.id);
-    const queuedAt = () => listLineRows(A.db, P.id, m.id).find((r) => r.name === "a")?.queuedAt ?? null;
+    const { m, queuedAt, left, decline } = await acceptedTask(A);
     expect(queuedAt()).not.toBeNull();
-    const left: string[] = [];
-    A.runner.onQueue((id, queue, reason) => { if (id === m.id && queue === null) left.push(String(reason)); });
-
-    const outcome = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    // The call that starts the turn is dropped, as one cut off by a restart (or a lost link) would be.
+    void A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
     await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
-    // A second call joins the turn; a prompt sent meanwhile waits for it.
-    const joined = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
-    expect(await A.runner.prompt(m.id, "Meanwhile.")).toBe("queued");
-    // The agent calls decline: its handler logs into the task's log, as the turn's own `meddle` server's does.
-    const [decline] = trainToolList("rebase", (e) => { appendEvent(A.db, m.id, e); });
-    await decline!.handler({ reason: "the API it fixes is gone" }, {});
-
-    expect(await outcome).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
-    expect(await joined).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+    await decline("the API it fixes is gone");
+    // The turn still runs, so no call has heard how it went: the decline itself took the task off.
+    expect(A.runner.liveQuery(m.id)).not.toBeNull();
     expect(queuedAt()).toBeNull();
     expect(A.runner.queue(m.id)).toBeNull();
-    // The prompt that waited runs next; the task had left already, once, for the agent's reason.
+    expect(left).toEqual(["the API it fixes is gone"]);
+    expect(messages(A.db, m.id).filter((e) => e.subtype === "train_decline")).toEqual([
+      { type: "meddle", subtype: "train_decline", reason: "the API it fixes is gone" },
+    ]);
+    await until("the state", () => A.runner.state(m.id), "idle", 30_000);
+
+    // Asked again for that turn, the train is told of the decline; the agent is not prompted again.
+    const turns = () => messages(A.db, m.id).filter((e) => e.subtype === "turn_started").length;
+    expect(turns()).toBe(1);
+    expect(await A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"))).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+    expect(turns()).toBe(1);
+    expect(trainTurns(A.db, m.id)).toHaveLength(1);
+    expect(left).toEqual(["the API it fixes is gone"]);
+    // Accepted again, the task is the train's again: it asks afresh.
+    await A.runner.accept(m.id);
+    expect(await A.runner.trainTurn(m.id, "rebase", rebasePrompt("4567cdef"))).toEqual({ kind: "done" });
+    expect(trainTurns(A.db, m.id).map((e) => e.text)).toEqual([rebasePrompt("0123abcd"), rebasePrompt("4567cdef")]);
+    expect(queuedAt()).not.toBeNull();
+  } finally {
+    await close();
+  }
+}, 90_000);
+
+test("the agent's reason stands however the turn's end, the calls that join it and a prompt that waited fall", async () => {
+  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
+  const A = nodes[0]!;
+  try {
+    const { m, queuedAt, left, decline } = await acceptedTask(A);
+    const outcome = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
+    // A call joins before the decline; a prompt sent meanwhile waits for the turn, which ends with it waiting.
+    const before = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    expect(await A.runner.prompt(m.id, "Meanwhile.")).toBe("queued");
+    await decline("the API it fixes is gone");
+    expect(left).toEqual(["the API it fixes is gone"]);
+    // A call that joins after the decline hears it too.
+    const after = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+
+    for (const call of [outcome, before, after]) expect(await call).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+    expect(queuedAt()).toBeNull();
+    expect(A.runner.queue(m.id)).toBeNull();
+    // The prompt that waited runs next; its start found the task off the queue already, so the reason stands, told once.
     await until("the user's prompt", () => userPrompts(A.db, m.id), ["Meanwhile."], 30_000);
     await until("the state", () => A.runner.state(m.id), "idle", 30_000);
     expect(left).toEqual(["the API it fixes is gone"]);
+    expect(trainTurns(A.db, m.id)).toHaveLength(1);
   } finally {
     await close();
   }
@@ -275,7 +325,7 @@ test("trainTurn runs on another node, through PeerObject.trainTurn", async () =>
       if (peer.variant !== "peer") throw new Error("not the peer variant");
       const text = rebasePrompt("0123abcd");
       expect(await peer.trainTurn({ taskId: m.id, kind: "rebase", text })).toEqual({ kind: "done" });
-      expect(trainTurns(B.db, m.id)).toEqual([{ type: "meddle", subtype: "train_turn", kind: "rebase", text }]);
+      expect(trainTurns(B.db, m.id)).toEqual([{ type: "meddle", subtype: "train_turn", kind: "rebase", text, after: expect.any(Number) }]);
       expect(B.runner.state(m.id)).toBe("idle");
       // A task the node does not have is refused, as any call on it would be.
       await expect(peer.trainTurn({ taskId: "nope", kind: "describe", text })).rejects.toThrow("unknown task");
@@ -288,7 +338,8 @@ test("trainTurn runs on another node, through PeerObject.trainTurn", async () =>
 }, 90_000);
 
 test("a train turn cut off by a restart: asking again joins its rerun, whose outcome counts what came before", async () => {
-  const node = await setupNode("hello.jsonl", { MEDDLE_FIXTURE_STALL: "1" });
+  let tools: SdkMcpToolDefinition<any>[] | undefined;
+  const node = await setupNode("hello.jsonl", { MEDDLE_FIXTURE_STALL: "1" }, { hooks: { trainTools: (_id, wired) => { tools = wired; } } });
   const { cfg, db } = node;
   const m = await createTask(node, { title: "t", projectIds: [node.project.id] });
   const initialised = new Promise<void>((res) => node.runner.onEvent((id, _s, msg: { type?: string; subtype?: string }) => {
@@ -297,7 +348,7 @@ test("a train turn cut off by a restart: asking again joins its rerun, whose out
   // The first process stalls before the result; the agent declines; then the process goes.
   void node.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd")).catch(() => {});
   await initialised;
-  appendEvent(db, m.id, { type: "meddle", subtype: "train_decline", reason: "the API it fixes is gone" });
+  await tools!.find((t) => t.name === "decline")!.handler({ reason: "the API it fixes is gone" }, {});
   await node.harness.close();
 
   // A fresh process holds its Harness until asked again, so the rerun cannot finish first.

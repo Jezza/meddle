@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
-import type { PermissionMode, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionMode, Query, SDKMessage, SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
@@ -33,7 +33,8 @@ import { branchChanges, lineChanges, listLineRows, mergeLineRows, setQueued, wri
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
 import {
-  appendEvent, lastSeq, latestEventOfType, listEventsBetween, listEventsTail, listPromptAttachments, type EventRecord,
+  appendEvent, lastSeq, latestEventOfType, listEventsBetween, listEventsOfKinds, listEventsTail, listPromptAttachments,
+  type EventRecord,
 } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
@@ -54,7 +55,9 @@ import { markToken, pickToken } from "../token";
 import { recordUsage, usageReadingOf } from "../token-usage";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
-import { TRAIN_TOOLS, trainOutcome, trainTools, type TrainTurnKind, type TrainTurnOutcome } from "../train/tools";
+import {
+  declineReason, TRAIN_TOOLS, trainOutcome, trainServer, trainToolList, type TrainTurnKind, type TrainTurnOutcome,
+} from "../train/tools";
 import { acceptanceOf, branchTips, containedIn, effectiveHead, type Acceptance, type BranchTips, type LineName } from "./accept";
 import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
 import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type ManifestProject, type Start, type TaskManifest } from "./manifest";
@@ -106,6 +109,8 @@ export type RunnerHooks = {
   afterSteerContent?(taskId: string): void | Promise<void>;
   /** Called with what a turn's Claude Code is started with (`#engineInput`), before it starts. */
   engineInput?(taskId: string, input: Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">): void;
+  /** Called with the tools a train turn's `meddle` server serves, as wired (`#engineInput`): a test calls them so. */
+  trainTools?(taskId: string, tools: SdkMcpToolDefinition<any>[]): void;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
   callMs?: number;
 };
@@ -642,30 +647,32 @@ export class TaskRunner {
    * train turn of `kind` already running (one a restart cut off from the call that started it) is joined, whatever its
    * text; a train turn the restart limit parked has failed. Refused, before anything starts, as `#refuseElsewhere`
    * refuses, while the task is being archived, while it runs another turn (`task is running`: the user's, or the
-   * train's of another kind) or has prompts waiting, and while a pool update holds turns. A turn whose agent declined
-   * takes the task off its queue here, its holder, with the agent's reason (`onQueue` tells it), whether this call
-   * started the turn or joined it.
+   * train's of another kind) or has prompts waiting, and while a pool update holds turns.
+   *
+   * The agent's `decline` takes the task off its queue here, its holder, with the agent's reason, as it is logged
+   * (`#engineInput`), whether or not a call waits for the turn: a call cut off by a restart, or one that never comes,
+   * changes nothing. Asked again for a task turn of `kind` once the latest one ended declined, and the task is still off
+   * its queue, this answers that decline and prompts no one: it is what a call cut off from that turn would have heard.
    */
   async trainTurn(taskId: string, kind: TrainTurnKind, text: string): Promise<TrainTurnOutcome> {
     // On the task's prompt chain: a prompt sent meanwhile either came first (and the task is busy) or sees the turn.
     const turn = await serialised(`prompt\0${taskId}`, () => this.#startTrainTurn(taskId, kind, text));
-    if (turn === "parked") return { kind: "failed", reason: "the task's turn is parked; retry it" };
+    if (!("end" in turn)) return turn;
     const end = await turn.end;
-    // Nothing is awaited from the turn's end to the unqueue: a prompt that waited for the turn starts after it (its
-    // turn is created first), so the task leaves for the agent's reason rather than as input of the user's.
     const events = listEventsBetween(this.#db, taskId, turn.after, end, ["meddle", "result"]);
     const outcome = trainOutcome(events.map((e) => e.message));
-    if (outcome.kind === "declined") this.#leaveQueue(taskId, outcome.reason.trim() === "" ? "its agent declined" : outcome.reason);
+    // Done as the decline was logged; again here, which changes nothing then (`#unqueue` writes only a queued task).
+    if (outcome.kind === "declined") this.#leaveQueue(taskId, declineReason(outcome.reason));
     return outcome;
   }
 
   /**
    * Starts the train's turn for `trainTurn`, or joins the one running: its events are those after `after`, up to `end`'s
-   * seq. `"parked"`: the one running is parked.
+   * seq. Or answers at once: the one running is parked (failed), or the latest of `kind` declined (`#declined`).
    */
   async #startTrainTurn(
     taskId: string, kind: TrainTurnKind, text: string,
-  ): Promise<{ after: number; end: Promise<number> } | "parked"> {
+  ): Promise<{ after: number; end: Promise<number> } | TrainTurnOutcome> {
     const refuse = () => {
       this.#refuseElsewhere(taskId);
       if (this.#archiving.has(taskId)) throw new Error("task is being archived");
@@ -684,11 +691,13 @@ export class TaskRunner {
     if (running !== undefined && input?.train !== undefined && (isParked(running) || input.train.kind === kind)) {
       if (!isParked(running)) return { after: input.freshAfter ?? 0, end: joined.end };
       joined.cancel();
-      return "parked";
+      return { kind: "failed", reason: "the task's turn is parked; retry it" };
     }
     joined.cancel();
     // Nothing is awaited from here until the turn is reserved.
     refuse();
+    const declined = this.#declined(taskId, kind);
+    if (declined !== null) return declined;
     const busy = running !== undefined || this.#live.has(taskId) || this.#pending.has(taskId) || this.#row(taskId).state !== "idle";
     if (busy) throw new Error("task is running");
     if (this.queued(taskId).length > 0) throw new Error("task has prompts waiting");
@@ -704,6 +713,24 @@ export class TaskRunner {
       throw err;
     }
     return { after, end: started.end };
+  }
+
+  /**
+   * The decline a task turn of `kind` would answer without running: the first `train_decline` logged since the task's
+   * latest train turn of `kind` began (its `train_turn`'s `after`, the same on a rerun), while the task is off its
+   * queue (a decline took it off; accepting it again lets the train ask afresh). Null otherwise, and always for the
+   * merge task, which is never queued and has no `decline`.
+   */
+  #declined(taskId: string, kind: TrainTurnKind): TrainTurnOutcome | null {
+    if (kind === "merge" || this.queue(taskId) !== null) return null;
+    const latest = listEventsOfKinds(this.#db, taskId, ["meddle:train_turn"])
+      .map((e) => e.message as { kind?: unknown; after?: unknown })
+      .findLast((m) => m.kind === kind);
+    if (latest === undefined || typeof latest.after !== "number") return null;
+    const decline = listEventsBetween(this.#db, taskId, latest.after, lastSeq(this.#db, taskId), ["meddle"])
+      .map((e) => e.message as { subtype?: unknown; reason?: unknown })
+      .find((m) => m.subtype === "train_decline");
+    return decline === undefined ? null : { kind: "declined", reason: typeof decline.reason === "string" ? decline.reason : "" };
   }
 
   /**
@@ -1087,7 +1114,7 @@ export class TaskRunner {
         input: await this.#engineInput(taskId, manifest, resume, picked.value, train),
         prompt,
         content,
-        ...(train === undefined ? {} : { train }),
+        ...(train === undefined ? {} : { train: { kind: train, after: input.freshAfter ?? 0 } }),
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -2639,7 +2666,9 @@ export class TaskRunner {
 
   /**
    * What the task's turn starts Claude Code with. A train turn (`train`) runs in `auto` whatever the task's mode (which
-   * stays as it is), with meddle's train tools (`trainTools`, calls logged in the task's log) allowed without asking.
+   * stays as it is), with meddle's train tools (`trainToolList`) allowed without asking. A call is logged in the task's
+   * log; a `decline` takes the task off its queue then and there, with the agent's reason: this node runs the turn, so it
+   * holds the task's line, and nothing waits on a caller of `trainTurn`, which a restart may have cut off.
    */
   async #engineInput(
     taskId: string,
@@ -2682,8 +2711,13 @@ export class TaskRunner {
     input.effort = chosen.effort ?? this.#pool?.settings.defaultEffort() ?? FALLBACK_EFFORT;
     if (train !== undefined) {
       input.permissionMode = "auto";
-      input.extraMcpServers = { meddle: trainTools(train, (e) => this.#record(taskId, e)) };
+      const tools = trainToolList(train, (e) => {
+        this.#record(taskId, e);
+        if (e.subtype === "train_decline") this.#leaveQueue(taskId, declineReason(e.reason));
+      });
+      input.extraMcpServers = { meddle: trainServer(tools) };
       input.allowedTools = [...TRAIN_TOOLS];
+      this.#deps.hooks?.trainTools?.(taskId, tools);
     } else if (permissionMode !== undefined) {
       input.permissionMode = permissionMode;
     }

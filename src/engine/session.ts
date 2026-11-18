@@ -19,8 +19,11 @@ import { buildOptions, type EngineInput } from "./options";
 /** meddle's own entries in a task's event log, interleaved with the SDK's messages. */
 export type MeddleEvent =
   | { type: "meddle"; subtype: "turn_started"; at: string; resume: boolean }
-  /** A train turn's prompt, logged in place of a user prompt (`runTurn`): what the train asked, shown as meddle's. */
-  | { type: "meddle"; subtype: "train_turn"; kind: TrainTurnKind; text: string }
+  /**
+   * A train turn's prompt, logged in place of a user prompt (`runTurn`): what the train asked, shown as meddle's.
+   * `after`: the seq the train turn's events follow (its `freshAfter`), the same on each of its attempts.
+   */
+  | { type: "meddle"; subtype: "train_turn"; kind: TrainTurnKind; text: string; after: number }
   /** The task's agent called meddle's `decline` tool in a train turn. */
   | { type: "meddle"; subtype: "train_decline"; reason: string }
   /** The merge agent called meddle's `blame` tool, naming the task responsible. */
@@ -148,8 +151,11 @@ export type RunTurnArgs = {
   prompt: Prompt;
   /** What Claude Code is sent for `prompt`; its text when not given. */
   content?: UserContent;
-  /** A train turn of this kind: its prompt is logged as meddle's (`train_turn`), not as a user prompt. */
-  train?: TrainTurnKind;
+  /**
+   * A train turn, of `kind`, whose events follow seq `after`: its prompt is logged as meddle's (`train_turn`), not as a
+   * user prompt.
+   */
+  train?: { kind: TrainTurnKind; after: number };
   db: Database;
   approvals: Approvals;
   queue?: InputQueue;
@@ -200,7 +206,7 @@ export function runTurn(args: RunTurnArgs): {
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
   record(args.train === undefined
     ? promptEvent(args.prompt, uuid)
-    : { type: "meddle", subtype: "train_turn", kind: args.train, text: args.prompt.text });
+    : { type: "meddle", subtype: "train_turn", kind: args.train.kind, text: args.prompt.text, after: args.train.after });
 
   const canUseTool: CanUseTool = (toolName, toolInput, options) => args.approvals.ask({
     requestId: options.requestId,

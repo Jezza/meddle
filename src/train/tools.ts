@@ -58,7 +58,17 @@ export function trainToolList(kind: TrainTurnKind, record: (e: MeddleEvent) => v
 
 /** An in-process MCP server named `meddle` with the tools of a train turn of `kind` (`trainToolList`). */
 export function trainTools(kind: TrainTurnKind, record: (e: MeddleEvent) => void): McpSdkServerConfigWithInstance {
-  return createSdkMcpServer({ name: "meddle", version: "1", tools: trainToolList(kind, record) });
+  return trainServer(trainToolList(kind, record));
+}
+
+/** An in-process MCP server named `meddle` serving `tools` (made by `trainToolList`). */
+export function trainServer(tools: SdkMcpToolDefinition<any>[]): McpSdkServerConfigWithInstance {
+  return createSdkMcpServer({ name: "meddle", version: "1", tools });
+}
+
+/** What a decline's `reason` takes the task off its queue with: the agent's words, or `its agent declined` without any. */
+export function declineReason(reason: string): string {
+  return reason.trim() === "" ? "its agent declined" : reason;
 }
 
 /**
