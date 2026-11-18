@@ -28,12 +28,14 @@ export type MergeDeps = {
  * - `ready`: `mergeTask`'s line head `L` (a commit id) is the merge, described, with no conflicts and no file changed;
  * - `blamed`: the merge agent blamed the batch's task `task` (its id) for a failure, and the merge task is discarded;
  * - `stuck`: the batch can't be checked, or the merge agent didn't get a verdict right (its turn failed, or follow-ups
- *   didn't put it right), and the train pauses for `reason`. A merge task made is left for the user to open.
+ *   didn't put it right), and the train pauses for `reason`. The merge task made is left alive, for the user to open and
+ *   for Retry to carry on with, and `mergeTask` is its id (the caller discards it when it unqueues a task or the branch
+ *   moves); `null` when none was made (nothing to merge, or the trial merge failed).
  */
 export type MergeVerdict =
   | { kind: "ready"; mergeTask: string; L: string }
   | { kind: "blamed"; task: string; reason: string }
-  | { kind: "stuck"; reason: string };
+  | { kind: "stuck"; reason: string; mergeTask: string | null };
 
 /** The follow-up turns the merge agent gets to put its result right, before the train gives up on it (Global Constraints). */
 const FOLLOW_UPS = 3;
@@ -59,7 +61,7 @@ export async function checkBatch(
   deps: MergeDeps, cfg: NodeConfig, repo: string, input: { projectId: string; B: string; batch: Candidate[]; prompt: string },
 ): Promise<MergeVerdict> {
   const { batch } = input;
-  const stuck = (reason: string): MergeVerdict => ({ kind: "stuck", reason });
+  const stuck = (reason: string, mergeTask: string | null = null): MergeVerdict => ({ kind: "stuck", reason, mergeTask });
 
   const parents = await mergeParents(gitGraph(cfg, repo), input.B, batch.map((c) => c.tip));
   if (parents.length < 2) return stuck(`the batch has ${parents.length} head${parents.length === 1 ? "" : "s"}, so there is no merge to check`);
@@ -83,8 +85,8 @@ export async function checkBatch(
   for (let followUps = 0; ; followUps++) {
     const outcome = await deps.turn(taskId, "merge", text);
     let problems: Problem[];
-    if (outcome.kind === "failed") return stuck(`the merge agent's turn failed: ${outcome.reason}`);
-    if (outcome.kind === "declined") return stuck(`the merge agent declined: ${outcome.reason}`);
+    if (outcome.kind === "failed") return stuck(`the merge agent's turn failed: ${outcome.reason}`, taskId);
+    if (outcome.kind === "declined") return stuck(`the merge agent declined: ${outcome.reason}`, taskId);
     if (outcome.kind === "blamed") {
       const blamed = blamedTask(batch, outcome.task);
       if (blamed !== undefined) {
@@ -101,7 +103,7 @@ export async function checkBatch(
       if (problems.length === 0) return { kind: "ready", mergeTask: taskId, L: head.commitId };
     }
     if (followUps === FOLLOW_UPS) {
-      return stuck(`the merge agent did not put the merge right after ${FOLLOW_UPS} follow-ups: ${problems.map((p) => p.what).join("; ")}`);
+      return stuck(`the merge agent did not put the merge right after ${FOLLOW_UPS} follow-ups: ${problems.map((p) => p.what).join("; ")}`, taskId);
     }
     text = `The merge ${change} can't land yet: ${problems.map((p) => p.what).join("; ")}. ${problems.map((p) => p.fix).join(" ")}`;
   }

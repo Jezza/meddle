@@ -99,13 +99,11 @@ test("a changed file is caught", async () => {
   });
 
   const verdict = await run();
-  expect(verdict.kind).toBe("stuck");
-  if (verdict.kind !== "stuck") throw new Error("unreachable");
-  expect(verdict.reason).toContain("g.txt");
+  expect(verdict).toEqual({ kind: "stuck", reason: expect.stringContaining("g.txt"), mergeTask: "m1" });
   // The first turn and three follow-ups, the second to fourth naming the file.
   expect(turns.map((t) => t.kind)).toEqual(["merge", "merge", "merge", "merge"]);
   for (const t of turns.slice(1)) expect(t.text).toContain("g.txt");
-  // A stuck merge task stays, for the user to open.
+  // A stuck merge task stays, for the user to open and Retry to carry on with: the verdict names it.
   expect(discarded).toEqual([]);
 });
 
@@ -200,10 +198,7 @@ test("a failed turn is stuck with its reason, and a decline too", async () => {
   for (const outcome of [{ kind: "failed", reason: "the agent crashed" }, { kind: "declined", reason: "no thanks" }] as const) {
     const { turns, discarded, run, act } = await fixture();
     act(async () => outcome);
-    const verdict = await run();
-    expect(verdict.kind).toBe("stuck");
-    if (verdict.kind !== "stuck") throw new Error("unreachable");
-    expect(verdict.reason).toContain(outcome.reason);
+    expect(await run()).toEqual({ kind: "stuck", reason: expect.stringContaining(outcome.reason), mergeTask: "m1" });
     expect(turns).toHaveLength(1);
     expect(discarded).toEqual([]);
   }
@@ -215,16 +210,13 @@ test("a batch that doesn't merge cleanly is stuck, with no merge task made", asy
   const clashing: Candidate = { taskId: "t3", title: "Clash", tip: clash, base: [B], workspace: null, size: 1 };
 
   const verdict = await run({ batch: [...batch, clashing] });
-  expect(verdict.kind).toBe("stuck");
-  if (verdict.kind !== "stuck") throw new Error("unreachable");
-  expect(verdict.reason).toContain("f.txt");
+  expect(verdict).toEqual({ kind: "stuck", reason: expect.stringContaining("f.txt"), mergeTask: null });
   expect(created).toEqual([]);
 });
 
 test("a batch with one head is no merge", async () => {
   const { batch, created, run } = await fixture();
-  const verdict = await run({ batch: [batch[0]!] });
-  expect(verdict.kind).toBe("stuck");
+  expect(await run({ batch: [batch[0]!] })).toEqual({ kind: "stuck", reason: expect.stringContaining("no merge"), mergeTask: null });
   expect(created).toEqual([]);
 });
 
