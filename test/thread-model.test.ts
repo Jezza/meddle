@@ -1,8 +1,8 @@
 // test/thread-model.test.ts
 import { test, expect } from "bun:test";
 import {
-  activity, activityLine, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, keyOf, relativePath, toolSummary,
-  toolTarget, type ThreadItem, type ToolItem, workspaceSource,
+  activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, isRunning, keyOf,
+  relativePath, toolSummary, toolTarget, type ThreadItem, type ToolItem, workspaceSource,
 } from "../src/dashboard/ui/thread-model";
 import type { Attachment } from "../src/blobs/attachment";
 
@@ -302,4 +302,120 @@ test("activityLine: thinking says so longer the longer it runs; only a turn that
   expect(activityLine("Writing", 40, 15).stall).toBe(0.5);
   expect(activityLine("Working", 40, 40)).toEqual({ text: "Working", stall: 1 });
   expect([duration(0), duration(59), duration(61), duration(3600)]).toEqual(["0s", "59s", "1m 1s", "60m 0s"]);
+});
+
+const call = (seq: number, id: string, name: string, input: object, parent: string | null = null) =>
+  ({ seq, message: { type: "assistant", message: { id: `m${seq}`, content: [{ type: "tool_use", id, name, input }] }, parent_tool_use_id: parent } });
+const answer = (seq: number, id: string, content: string, parent: string | null = null) =>
+  ({ seq, message: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content }] }, parent_tool_use_id: parent } });
+const sys = (seq: number, subtype: string, over: object) => ({ seq, message: { type: "system", subtype, ...over } });
+const agentStart = (seq: number, over: object = {}) =>
+  sys(seq, "task_started", { task_id: "a1", tool_use_id: "tA", task_type: "local_agent", is_backgrounded: true, description: "Implement Task 3", ...over });
+
+test("a background agent runs until its notice; its commands' notices mark their rows and stay out of the main thread", () => {
+  const events = [
+    call(1, "tA", "Agent", { description: "Implement Task 3", run_in_background: true, model: "sonnet" }),
+    agentStart(2),
+    answer(3, "tA", "Async agent launched successfully."),
+    call(4, "tB", "Bash", { command: "bun test", run_in_background: true }, "tA"),
+    sys(5, "task_started", { task_id: "c1", tool_use_id: "tB", task_type: "local_bash", is_backgrounded: true, parent_task_id: "a1" }),
+    answer(6, "tB", "Command running in background with ID: c1", "tA"),
+  ];
+  const items = buildThread(events);
+  expect(items).toHaveLength(1);
+  const agent = items[0] as ToolItem;
+  expect(agent).toMatchObject({ name: "Agent", background: true });
+  expect(isRunning(agent)).toBe(true);
+  expect(isRunning(agent.children[0] as ToolItem)).toBe(true);
+  expect(backgroundMeta(agent.children[0] as ToolItem)).toBe("background");
+  const later = buildThread([...events,
+    sys(7, "task_notification", { task_id: "c1", tool_use_id: "tB", status: "completed", summary: 'Background command "bun test" completed (exit code 0)' })]);
+  expect(later).toHaveLength(1);
+  expect(backgroundMeta((later[0] as ToolItem).children[0] as ToolItem)).toBe("exit 0");
+});
+
+test("an agent's reports are its SubagentHandback messages; a SendMessage follow-up runs it again from its own row", () => {
+  const events = [
+    call(1, "tA", "Agent", { description: "Implement Task 3", run_in_background: true }),
+    agentStart(2),
+    answer(3, "tA", "Async agent launched successfully."),
+    call(4, "tH", "SubagentHandback", { message: "Status: DONE_WITH_CONCERNS" }, "tA"),
+    answer(5, "tH", "Report delivered to your caller.", "tA"),
+    sys(6, "task_notification", { task_id: "a1", tool_use_id: "tA", status: "completed", summary: "This agent's report was delivered to you as a message…" }),
+    call(7, "tS", "SendMessage", { to: "a1", summary: "Fix the fetcher", message: "Fix needed before review" }),
+    answer(8, "tS", "Resuming agent a1"),
+    agentStart(9, { tool_use_id: "tS", prompt: "Fix needed before review" }),
+    call(10, "tH2", "SubagentHandback", { message: "Status: DONE" }, "tA"),
+  ];
+  const items = buildThread(events);
+  const agent = items[0] as ToolItem;
+  expect(agent.children).toEqual([]);
+  expect(agent.reports).toEqual(["Status: DONE_WITH_CONCERNS", "Status: DONE"]);
+  expect(isRunning(agent)).toBe(true);
+  const send = items.find((i): i is ToolItem => i.kind === "tool" && i.name === "SendMessage")!;
+  expect(send).toMatchObject({ resumes: "tA", background: true });
+  expect(isRunning(send)).toBe(true);
+  expect(items.filter((i) => i.kind === "status")).toEqual([{ kind: "status", text: 'Agent "Implement Task 3" finished' }]);
+  const done = buildThread([...events, sys(11, "task_notification", { task_id: "a1", tool_use_id: "tS", status: "completed", summary: "" })]);
+  expect(isRunning(done[0] as ToolItem)).toBe(false);
+  expect(isRunning(done.find((i): i is ToolItem => i.kind === "tool" && i.name === "SendMessage")!)).toBe(false);
+  expect(done.filter((i) => i.kind === "status")).toHaveLength(2);
+});
+
+test("an agent's notice that it has not reported yet says it waits on its own commands", () => {
+  const items = buildThread([
+    call(1, "tA", "Agent", { description: "Implement Task 7" }),
+    agentStart(2),
+    sys(3, "task_notification", { task_id: "a1", tool_use_id: "tA", status: "completed",
+      summary: "This agent has not reported yet: it is waiting on its own background work and will deliver its report through SubagentHandback when that finishes." }),
+  ]);
+  expect(items.at(-1)).toEqual({ kind: "status", text: 'Agent "Implement Task 7" is waiting on its own commands' });
+});
+
+test("the line under the thread waits on agents while the main session has nothing of its own running", () => {
+  const items = buildThread([call(1, "tA", "Agent", { description: "x" }), agentStart(2), answer(3, "tA", "Async agent launched successfully.")]);
+  expect(activity(null, items, 2)).toBe("Waiting on 2 agents");
+  expect(activity(null, items, 1)).toBe("Waiting on 1 agent");
+  // An older node serves no count: the thread's own running background agents stand in.
+  expect(activity(null, items)).toBe("Waiting on 1 agent");
+  const busy = buildThread([call(1, "tA", "Agent", { description: "x" }), agentStart(2), answer(3, "tA", "Async agent launched successfully."), call(4, "tB", "Bash", { command: "ls" })]);
+  expect(activity(null, busy, 2)).toBe("Running Bash");
+  expect(activityLine("Waiting on 2 agents", 300, 300).stall).toBe(0);
+});
+
+test("a command's notice ends its row and keeps today's line at the top; a start or notice with no row stays as it was; a stopped agent says so", () => {
+  const items = buildThread([
+    call(1, "tB", "Bash", { command: "make", run_in_background: true }),
+    sys(2, "task_started", { task_id: "c1", tool_use_id: "tB", task_type: "local_bash", is_backgrounded: true }),
+    sys(3, "task_started", { task_id: "c2", tool_use_id: "gone", task_type: "local_bash", is_backgrounded: true }),
+    sys(4, "task_notification", { task_id: "c1", tool_use_id: "tB", status: "failed", summary: 'Background command "make" failed with exit code 2' }),
+    sys(5, "task_notification", { task_id: "c3", tool_use_id: "gone", status: "stopped", summary: "" }),
+    call(6, "tM", "Monitor", { command: "tail -f log" }),
+    sys(7, "task_started", { task_id: "m1", tool_use_id: "tM", task_type: "local_bash", is_backgrounded: true }),
+    sys(8, "task_notification", { task_id: "m1", tool_use_id: "tM", status: "completed", summary: "Monitor ended" }),
+    call(9, "tA", "Agent", { description: "Review Task 2" }),
+    agentStart(10, { description: "Review Task 2" }),
+    sys(11, "task_notification", { task_id: "a1", tool_use_id: "tA", status: "stopped", summary: "" }),
+    // A report outside an agent's run is an ordinary call.
+    call(12, "tH", "SubagentHandback", { message: "hi" }),
+  ]);
+  expect(items.map((i) => i.kind)).toEqual(["tool", "unknown", "status", "status", "tool", "status", "tool", "status", "tool"]);
+  const [make, , madeLine, goneLine, watch, watchLine, agent, agentLine, stray] = items as [ToolItem, ThreadItem, ThreadItem, ThreadItem, ToolItem, ThreadItem, ToolItem, ThreadItem, ToolItem];
+  expect(isRunning(make)).toBe(false);
+  expect(backgroundMeta(make)).toBe("exit 2");
+  expect(madeLine).toEqual({ kind: "status", text: 'Background command "make" failed with exit code 2' });
+  expect(goneLine).toEqual({ kind: "status", text: "Task stopped" });
+  expect(backgroundMeta(watch)).toBe("ended");
+  expect(watchLine).toEqual({ kind: "status", text: "Monitor ended (completed)" });
+  expect(backgroundMeta(agent)).toBe("stopped");
+  expect(agentLine).toEqual({ kind: "status", text: 'Agent "Review Task 2" stopped' });
+  expect(stray).toMatchObject({ name: "SubagentHandback" });
+  expect(backgroundMeta(stray)).toBeNull();
+  expect(isRunning(stray)).toBe(true);
+});
+
+test("a call of the session's own running before a background agent is what the line says", () => {
+  const items = buildThread([call(1, "tB", "Bash", { command: "ls" }), call(2, "tA", "Agent", { description: "x" }), agentStart(3), answer(4, "tA", "Async agent launched successfully.")]);
+  expect(activity(null, items, 1)).toBe("Running Bash");
+  expect(activity(null, [])).toBe("Working");
 });

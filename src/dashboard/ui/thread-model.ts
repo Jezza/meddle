@@ -18,6 +18,14 @@ export type ThreadItem =
     agentId?: string;
     /** A Skill call's skill: the text the session sends after the call's result, as a message of its own. */
     skill?: string;
+    /** The call started a background task, so its result is a receipt, and it runs until `ended`. */
+    background?: boolean;
+    /** How its task ended, from its latest notice; a later `task_started` of the task clears it. */
+    ended?: { status: string; text: string };
+    /** An Agent call's reports, oldest first: the `message` of each `SubagentHandback` call in its run. */
+    reports?: string[];
+    /** On a `SendMessage` call that resumed an agent: the `toolUseId` of that agent's own row. */
+    resumes?: string;
   }
   | { kind: "question"; toolUseId: string; questions: unknown }
   | { kind: "denied"; toolName: string; reason?: string; reasonType?: string }
@@ -35,12 +43,20 @@ type Message = { type?: unknown; subtype?: unknown; [key: string]: unknown };
  * Builds the thread from events in seq order. Progress frames (`PROGRESS_KINDS`) are left out (the session's
  * `live` cell covers `stream_event`s), and so is a status that only says a request went out or the session went idle; an assistant message streamed as several events with one id becomes one item; a `tool_result` attaches
  * to its `tool_use`, and a skill's text to its Skill call; a message with a `parent_tool_use_id` nests under that call.
+ * A `task_started` or `task_notification` marks the call it belongs to (`background`, `ended`) instead of being an
+ * item, and a status line only when that call is at the top; an agent's `SubagentHandback` calls are its `reports`.
  */
 export function buildThread(events: Array<{ seq: number; message: unknown; at?: string }>): ThreadItem[] {
   const top: ThreadItem[] = [];
   const tools = new Map<string, ToolItem>();
   /** Question tool uses: their results are the answers the question item already stands for. */
   const questions = new Set<string>();
+  /** `SubagentHandback` tool uses: their results are the report the agent's `reports` already holds. */
+  const handbacks = new Set<string>();
+  /** The calls pushed onto `top`. */
+  const topTools = new Set<string>();
+  /** The row each task's notices mark, by task id: for an agent, the Agent call that first started it. */
+  const rows = new Map<string, ToolItem>();
   const assistants = new Map<string, AssistantItem>();
   const denials = new Map<string, DeniedItem>();
   /** By the list they are in, Skill calls whose result has landed and whose skill's text has not, in call order. */
@@ -101,13 +117,22 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
         else item.thinking = (item.thinking ?? "") + str(block.thinking);
       } else if (block.type === "tool_use") {
         const toolUseId = str(block.id);
+        const parent = typeof m.parent_tool_use_id === "string" ? tools.get(m.parent_tool_use_id) : undefined;
+        const report = block.name === "SubagentHandback" && parent !== undefined && isAgentCall(parent)
+          ? (block.input as { message?: unknown } | undefined)?.message
+          : undefined;
         if (block.name === "AskUserQuestion") {
           questions.add(toolUseId);
           list.push({ kind: "question", toolUseId, questions: (block.input as { questions?: unknown } | undefined)?.questions });
+        } else if (typeof report === "string") {
+          // An agent's report is its row's, not a row of its own.
+          handbacks.add(toolUseId);
+          parent!.reports = [...(parent!.reports ?? []), report];
         } else {
           const tool: ToolItem = { kind: "tool", name: str(block.name), input: block.input, toolUseId, children: [] };
           tools.set(toolUseId, tool);
           list.push(tool);
+          if (list === top) topTools.add(toolUseId);
         }
       } else if (block.type !== "redacted_thinking") {
         list.push({ kind: "unknown", type: `assistant:${String(block.type)}`, raw: block });
@@ -131,7 +156,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
           if (typeof result.originalFile === "string") tool.result.original = textLines(result.originalFile);
           if (typeof result.agentId === "string") tool.agentId = result.agentId;
           if (tool.name === "Skill" && !tool.result.isError) unsent.set(list, [...(unsent.get(list) ?? []), tool]);
-        } else if (!questions.has(id)) {
+        } else if (!questions.has(id) && !handbacks.has(id)) {
           list.push({ kind: "unknown", type: "tool_result", raw: block });
         }
       } else if (block.type === "text") {
@@ -168,19 +193,68 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
         top.push({ kind: "status", text: `Conversation compacted (${String(meta.trigger)}, ${tokens} tokens)` });
         return;
       }
-      case "task_notification": {
-        // A summary may already say how the task ended ("… completed (exit code 0)"), or only what it was.
-        const summary = str(m.summary);
-        const status = str(m.status);
-        const text = summary === "" ? `Task ${status}` : status === "" || summary.includes(status) ? summary : `${summary} (${status})`;
-        top.push({ kind: "status", text });
+      case "task_started":
+        addTaskStarted(m);
         return;
-      }
+      case "task_notification":
+        addTaskNotification(m);
+        return;
       case "init":
         // The bar beneath the thread shows the model.
         return;
       default:
         top.push(unknown(m));
+    }
+  }
+
+  /**
+   * A task's start marks the call it belongs to: an agent's, the Agent call that first started it (a follow-up's
+   * carries the `SendMessage` call's id, and that call is marked to lead to the agent's row); any other task's, the
+   * call that started it. A start with no such call is left as an unknown message.
+   */
+  function addTaskStarted(m: Message) {
+    const taskId = str(m.task_id);
+    const named = tools.get(str(m.tool_use_id));
+    const row = m.task_type === "local_agent" ? rows.get(taskId) ?? named : named;
+    if (row === undefined) {
+      top.push(unknown(m));
+      return;
+    }
+    if (taskId !== "") rows.set(taskId, row);
+    startTask(row, m.is_backgrounded === true);
+    if (named !== undefined && named !== row) {
+      named.resumes = row.toolUseId;
+      startTask(named, true);
+    }
+  }
+
+  /**
+   * A task's notice ends the call it belongs to, and the call it names when that is another (a follow-up's
+   * `SendMessage`). The thread keeps a status line for a call at the top, since the notice may be why Claude picks up
+   * again; a notice with no call to mark is a status line as it comes.
+   */
+  function addTaskNotification(m: Message) {
+    // A summary may already say how the task ended ("… completed (exit code 0)"), or only what it was.
+    const summary = str(m.summary);
+    const status = str(m.status);
+    const text = summary === "" ? `Task ${status}` : status === "" || summary.includes(status) ? summary : `${summary} (${status})`;
+    const named = tools.get(str(m.tool_use_id));
+    const row = rows.get(str(m.task_id)) ?? named;
+    if (row === undefined) {
+      top.push({ kind: "status", text });
+      return;
+    }
+    row.ended = { status, text: summary };
+    if (named !== undefined) named.ended = row.ended;
+    if (!topTools.has(row.toolUseId)) return;
+    if (!isAgentCall(row)) {
+      top.push({ kind: "status", text });
+    } else {
+      const label = `Agent "${str((row.input as { description?: unknown } | null)?.description)}"`;
+      top.push({
+        kind: "status",
+        text: summary.startsWith(NOT_REPORTED) ? `${label} is waiting on its own commands` : `${label} ${AGENT_ENDS[status] ?? (status || "ended")}`,
+      });
     }
   }
 
@@ -225,6 +299,22 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
     if (typeof reasonType === "string") item.reasonType = reasonType;
   }
 }
+
+/** A call's task has (re)started: it runs until its notice if the task is in the background. */
+function startTask(tool: ToolItem, background: boolean) {
+  if (background) tool.background = true;
+  else delete tool.background;
+  delete tool.ended;
+}
+
+const isAgentCall = (tool: ToolItem): boolean => tool.name === "Agent" || tool.name === "Task";
+const isBackgroundAgent = (item: ThreadItem): item is ToolItem => item.kind === "tool" && isAgentCall(item) && item.background === true;
+
+/** How an agent's status line says its notice's `status`. */
+const AGENT_ENDS: Record<string, string> = { completed: "finished", stopped: "stopped", failed: "failed" };
+
+/** What the summary of an agent's notice starts with when it has ended its turn to wait on its own background commands. */
+const NOT_REPORTED = "This agent has not reported yet";
 
 function unknown(m: Message): ThreadItem {
   const type = typeof m.subtype === "string" ? `${String(m.type)}:${m.subtype}` : String(m.type);
@@ -464,11 +554,30 @@ export function exitCode(tool: ToolItem): number | undefined {
   return match === null ? undefined : Number(match[1]);
 }
 
+/** Whether a call is still going: a background one until its notice, any other until its result. */
+export function isRunning(tool: ToolItem): boolean {
+  return tool.background === true ? tool.ended === undefined : tool.result === undefined;
+}
+
+/**
+ * What a background call's row says in its meta: null for any other call; "background" while it runs; once it has
+ * ended, "ended" for a `Monitor` watcher, else the exit code its notice gave ("exit 0"), else the notice's status.
+ */
+export function backgroundMeta(tool: ToolItem): string | null {
+  if (tool.background !== true) return null;
+  if (tool.ended === undefined) return "background";
+  if (tool.name === "Monitor") return "ended";
+  const code = /exit code (\d+)/.exec(tool.ended.text);
+  return code === null ? tool.ended.status : `exit ${code[1]}`;
+}
+
 /**
  * What a running turn is doing, for the line under it: the content block streaming (a thinking block says so even
- * when the API leaves its text out), else the call still waiting on its result (into a subagent's own calls).
+ * when the API leaves its text out), else the call still running (into a subagent's own calls). With no call of the
+ * session's own running, it is waiting on its background agents: `agentsRunning` of them, or (an older node serves no
+ * count) the thread's own running background Agent calls.
  */
-export function activity(live: Live, items: readonly ThreadItem[]): string {
+export function activity(live: Live, items: readonly ThreadItem[], agentsRunning = 0): string {
   if (live !== null) {
     if (live.block === "tool_use" || live.block === "server_tool_use") {
       return live.tool !== undefined ? `Writing a ${live.tool} call` : "Writing a tool call";
@@ -478,13 +587,16 @@ export function activity(live: Live, items: readonly ThreadItem[]): string {
     return "Thinking";
   }
   const names: string[] = [];
-  for (let list = items; ;) {
-    const tool = list.findLast((i): i is ToolItem => i.kind === "tool" && i.result === undefined);
+  // At the top, a background agent working is not a call of the session's own running.
+  for (let list = items, depth = 0; ; depth++) {
+    const tool = list.findLast((i): i is ToolItem => i.kind === "tool" && isRunning(i) && (depth > 0 || !isBackgroundAgent(i)));
     if (tool === undefined) break;
     names.push(tool.name);
     list = tool.children;
   }
-  return names.length > 0 ? `Running ${names.join(" › ")}` : "Working";
+  if (names.length > 0) return `Running ${names.join(" › ")}`;
+  const agents = agentsRunning > 0 ? agentsRunning : items.filter((i) => isBackgroundAgent(i) && isRunning(i)).length;
+  return agents > 0 ? `Waiting on ${agents} ${agents === 1 ? "agent" : "agents"}` : "Working";
 }
 
 /** Seconds as the activity line says them: `12s`, `3m 4s`. */
@@ -495,13 +607,14 @@ export function duration(seconds: number): string {
 /**
  * The activity line for what a turn is doing (`activity`), `phase` seconds into it and `quiet` seconds since
  * anything last streamed or landed. Thinking says so longer as it runs on, and is never stalled (its text may not
- * stream at all), nor is a running call; anything else stalls from 10 s of quiet, fully at 20 s (`stall` 0 to 1).
+ * stream at all), nor is a running call or a wait on agents; anything else stalls from 10 s of quiet, fully at 20 s
+ * (`stall` 0 to 1).
  */
 export function activityLine(doing: string, phase: number, quiet: number): { text: string; stall: number } {
   if (doing === "Thinking") {
     const text = phase < 10 ? "Thinking" : phase < 20 ? "Still thinking" : phase < 30 ? "Thinking more" : phase < 45 ? "Thinking some more" : "Deep in thought";
     return { text, stall: 0 };
   }
-  if (doing.startsWith("Running ")) return { text: doing, stall: 0 };
+  if (doing.startsWith("Running ") || doing.startsWith("Waiting on ")) return { text: doing, stall: 0 };
   return { text: doing, stall: Math.min(1, Math.max(0, (quiet - 10) / 10)) };
 }
