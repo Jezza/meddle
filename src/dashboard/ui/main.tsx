@@ -115,7 +115,7 @@ function Body({ hosts, pool, node, index, view, open, update }: {
     case "home": return <Home hosts={hosts} pool={pool} index={index} open={open} />;
     case "task": return <TaskView key={`${view.nodeId}/${view.id}`} hosts={hosts} pool={pool} nodeId={view.nodeId} taskId={view.id} tab={view.tab} />;
     case "new": return <NewTask hosts={hosts} pool={pool} projectId={view.projectId} open={open} />;
-    case "project": return <ProjectPage key={view.id} hosts={hosts} pool={pool} index={index} id={view.id} />;
+    case "project": return <ProjectPage key={view.id} hosts={hosts} pool={pool} index={index} id={view.id} tab={view.tab} />;
     case "add-project": return <AddProject node={node} />;
     case "node": return <NodePage key={view.nodeId} hosts={hosts} pool={pool} index={index} nodeId={view.nodeId} update={update} />;
     case "settings": return <Settings pool={pool} />;
