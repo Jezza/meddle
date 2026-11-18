@@ -1,5 +1,5 @@
 // One task: its head (title, state, actions), the thread from the session's event log with what waits on you inline,
-// its agents, the composer, and the bar beneath (each project with its line, the latest turn's tokens; the node,
+// its agents, the composer, and the bar beneath (each project with its line, the context and plan usage; the node,
 // permission mode, model and effort).
 import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
 import type { Host, Ref } from "@earendil-works/chord";
@@ -22,8 +22,10 @@ import { DiffRows, DiffView } from "./diff";
 import { Chevron, Icon, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
-import { ago, type ProjectLine, projectLines, usageShort } from "./sidebar-model";
+import { ago, type ProjectLine, projectLines } from "./sidebar-model";
 import { useOptionalValue } from "./sources";
+import { UsageMeter, useNow } from "./Usage";
+import { contextMeter, readAgo, windowMeter } from "./usage-model";
 import {
   activity, activityLine, agentEndNote, backgroundMeta, buildThread, callRuns, cwdOf, duration, EDITS, editDiff, exitCode, type Explored,
   exploredLine, foldSteps, holdsCall, isAgentCall, isLook, isRunning, keyOf, missingCalls, type ShownItem, textLines, toolSummary, toolTarget,
@@ -1063,18 +1065,28 @@ function Composer({ task, running, anyQueued, disabled, text, setText, drafts, b
 }
 
 /** A task bookmark as the bar shows it: its name after `meddle/task/<id>/`, then its change (or "conflicted"). */
-/** The bar beneath the composer: each project with its line, the latest turn's tokens; the node, model and effort. */
+/**
+ * The bar beneath the composer: each project with its line, the task's context and the plan usage of the login its
+ * node's next turn uses; the node, model and effort.
+ */
 function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
   task: TaskRef; pool: PoolRef; node: NodeRef; nodeId: string; archived: boolean; archivedOn: string | null; moving: boolean;
 }) {
   const manifest = useValue(task.manifest);
   const bookmarks = useValue(task.bookmarks);
   const contextUsage = useValue(task.contextUsage);
+  const context = useValue(task.context);
+  const active = useValue(node.activeUsage);
+  const now = useNow();
   const nodes = useValue(pool.nodes);
   const hostname = useValue(node.hostname);
   const [moveAt, setMoveAt] = useState<Anchor | null>(null);
   const [projectsAt, setProjectsAt] = useState<Anchor | null>(null);
-  const usage = usageShort(contextUsage);
+  const ctx = contextMeter(context, contextUsage);
+  const reading = active?.reading ?? null;
+  const limits = reading === null ? [] : [windowMeter("5h", reading.fiveHour, reading.readAt, now), windowMeter("7d", reading.sevenDay, reading.readAt, now)]
+    .filter((m) => m !== null)
+    .map((m) => ({ ...m, title: `${m.title}\ntoken "${active!.label}" · ${readAgo(reading.readAt, now)}` }));
   const lines = projectLines(manifest.id, manifest.projects, bookmarks);
   return (
     <footer class="bar">
@@ -1095,10 +1107,11 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
           ◉ <span class="bar-name">{lines[0]!.name}</span>{lines.length > 1 && <span class="muted"> +{lines.length - 1}</span>} ▾
         </button>
       </>}
-      {usage !== null && <>
-        <span class="bar-sep" />
-        <span class="bar-item" title="The latest turn's tokens, summed over its API calls">{usage}</span>
-      </>}
+      <span class="bar-sep" />
+      {ctx !== null && <UsageMeter meter={ctx} />}
+      {limits.length > 0
+        ? limits.map((m) => <UsageMeter key={m.label} meter={m} class="bar-item" />)
+        : <span class="bar-item" title="No turn on this node has read the plan usage of the login it uses next">5h / 7d: no data</span>}
       <span class="bar-gap" />
       {archived ? (
         <span class="bar-item" title={nodeId}>⌂ archived on {archivedOn ?? hostname}</span>

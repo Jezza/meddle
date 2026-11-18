@@ -515,6 +515,16 @@
     .bar-projects + .bar-collapsed { display: inline-flex; }
   }
   .bar-sep { width: 1px; height: 14px; background: var(--line-strong); }
+  .usage-meter { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .usage-k { color: var(--faint); }
+  .usage-meter .meter { display: inline-block; width: 34px; height: 5px; border-radius: 3px; background: var(--line-strong); overflow: hidden; }
+  .usage-meter .meter > i { display: block; height: 100%; background: var(--muted); }
+  .usage-meter.level-warn, .usage-meter.level-warn .usage-k { color: var(--warn); }
+  .usage-meter.level-warn .meter > i { background: var(--warn); }
+  .usage-meter.level-bad, .usage-meter.level-bad .usage-k { color: var(--bad); }
+  .usage-meter.level-bad .meter > i { background: var(--bad); }
+  .usage-meter.faded { opacity: 0.55; }
+  .usage-note { margin-left: 2px; }
   .rev { display: inline-flex; align-items: center; gap: 5px; background: none; border: none; border-radius: 4px; padding: 0 4px; color: var(--fg-soft); font: 12px ui-monospace, "JetBrains Mono", Menlo, monospace; white-space: nowrap; }
   .rev:hover { background: var(--hover); }
   .rev .ico { color: var(--muted); }
