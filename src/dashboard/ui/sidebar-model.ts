@@ -10,6 +10,8 @@ export type TaskEntry = {
   state: string;
   /** Approvals and questions waiting on you. */
   pending: number;
+  /** Sub-agents of the task running; 0 from a node that does not say. */
+  agents: number;
   /** When the task's row last changed (ISO); "" from a node that does not say. */
   activityAt: string;
   createdAt: string;
@@ -155,7 +157,8 @@ export function usageShort(value: unknown): string | null {
   return `${tokens(input)} in · ${tokens(usage.output_tokens ?? 0)} out`;
 }
 
-function tokens(n: number): string {
+/** A count in short: `412`, `2.1k`, `80k`, `1.4M`. */
+export function tokens(n: number): string {
   if (n < 1000) return String(n);
   if (n < 10_000) return `${(n / 1000).toFixed(1)}k`;
   if (n < 1_000_000) return `${Math.round(n / 1000)}k`;

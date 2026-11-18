@@ -87,6 +87,8 @@ function TaskSourceLoaded({ task, nodeId, id, archived, report }: { task: TaskRe
   const move = useValue(task.move);
   // A node of an older meddle has no `activityAt`: its tasks sort by creation.
   const activityAt = useOptionalValue(task, "activityAt") ?? "";
+  // Likewise `agentsRunning`: such a node's tasks run no agents.
+  const agents = useOptionalValue(task, "agentsRunning") ?? 0;
   useEffect(() => {
     const key = `${nodeId}/${archived ? "archived/" : ""}${id}`;
     report(key, {
@@ -95,18 +97,19 @@ function TaskSourceLoaded({ task, nodeId, id, archived, report }: { task: TaskRe
       projects: manifest.projects.map((p) => ({ id: p.id, name: p.name })),
       state,
       pending: pending.length,
+      agents,
       activityAt,
       createdAt: manifest.createdAt,
       moveTo: move?.to ?? null,
     });
     return () => report(key, null);
-  }, [task, nodeId, id, archived, manifest, state, pending, move, activityAt, report]);
+  }, [task, nodeId, id, archived, manifest, state, pending, move, agents, activityAt, report]);
   return null;
 }
 
 /** A state member a node of an older meddle may not have: its value, or undefined there. */
-function useOptionalValue(task: TaskRef, member: "activityAt"): string | undefined {
-  const readable = (task as unknown as Record<string, unknown>)[member] as TaskRef["activityAt"] | undefined;
+export function useOptionalValue<M extends "activityAt" | "agents" | "agentsRunning">(task: TaskRef, member: M): TaskRef[M]["value"] | undefined {
+  const readable = (task as unknown as Record<string, unknown>)[member] as TaskRef[M] | undefined;
   const [, tick] = useState(0);
   useEffect(() => readable?.subscribe(() => tick((n) => n + 1)), [readable]);
   try {
