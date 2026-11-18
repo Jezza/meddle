@@ -2,7 +2,8 @@
 // Env: MEDDLE_FIXTURE (path to a .jsonl recording), MEDDLE_FIXTURE_STALL=1 (pause before `result` until stdin ends or,
 // as Claude Code ends an interrupted turn, an `interrupt` arrives: then the `result` comes as `error_during_execution`
 // and the stand-in exits; an `interrupt` with `send_now` does that only when a user message it has not used is waiting,
-// and is answered `nothing_waiting` otherwise, as Claude Code's is),
+// and is answered `nothing_waiting` otherwise, as Claude Code's is; a `cancel_async_message` drops the user message it
+// names when it has not been used, as Claude Code drops one still queued),
 // MEDDLE_FIXTURE_RESULTS_MS=<ms> (wait that long before every `result`: slow turns),
 // MEDDLE_FIXTURE_LATER_RESULTS_MS=<ms> (wait that long before each `result` after the first: a slow later turn),
 // MEDDLE_FIXTURE_BACKGROUND_MS=<ms> (wait that long before each `task_notification`: background work that outlasts its
@@ -23,7 +24,7 @@ type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t:
 type HookMatcher = { matcher?: string; hookCallbackIds?: string[] };
 type Frame = {
   type: string; subtype?: string; uuid?: string; message?: { content?: unknown }; request_id?: string;
-  request?: { subtype?: string; hooks?: Record<string, HookMatcher[]>; send_now?: boolean }; response?: { request_id?: string };
+  request?: { subtype?: string; hooks?: Record<string, HookMatcher[]>; send_now?: boolean; message_uuid?: string }; response?: { request_id?: string };
 };
 type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
 type Step = { need: Need; uuid?: string } | { emit: string; frame: Frame };
@@ -124,6 +125,18 @@ function answerSendNow(f: Frame): boolean {
   return cut;
 }
 
+/**
+ * Answers a `cancel_async_message` as Claude Code does: a user message that arrived and has not been used is dropped
+ * (`cancelled: true`, with its uuid); any other is not (`cancelled: false`).
+ */
+function answerCancel(f: Frame) {
+  const uuid = f.request?.message_uuid;
+  const waiting = arrived.find(a => !a.used && a.frame.type === "user" && a.frame.uuid === uuid);
+  if (waiting === undefined) { answer(f, { cancelled: false }); return; }
+  waiting.used = true;
+  answer(f, { cancelled: true, message_uuid: uuid });
+}
+
 let buf = "";
 process.stdin.on("data", (chunk: Buffer) => {
   buf += chunk.toString();
@@ -136,6 +149,7 @@ process.stdin.on("data", (chunk: Buffer) => {
     if (f.type === "control_request" && f.request?.subtype === "initialize") hooks = f.request.hooks ?? {};
     let cut = false; // the turn is interrupted
     if (f.type === "control_request" && f.request?.subtype === "interrupt" && f.request.send_now === true) cut = answerSendNow(f);
+    else if (f.type === "control_request" && f.request?.subtype === "cancel_async_message") answerCancel(f);
     else if (f.type === "control_request") { answer(f); cut = f.request?.subtype === "interrupt"; }
     if (cut && stalling && heldResult !== undefined) {
       write(JSON.stringify({ ...JSON.parse(heldResult), subtype: "error_during_execution", is_error: true, errors: [] }));

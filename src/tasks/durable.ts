@@ -202,7 +202,13 @@ export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHook
   },
 });
 
-type LiveTurn = { query: Query; queue: InputQueue; sendNow: () => Promise<SendNowOutcome | undefined>; state: "running" | "waiting" };
+type LiveTurn = {
+  query: Query;
+  queue: InputQueue;
+  sendNow: () => Promise<SendNowOutcome | undefined>;
+  takeBack: () => Promise<Prompt[]>;
+  state: "running" | "waiting";
+};
 
 /** How long a turn interrupted by a "move now" has to end before it is closed. */
 const INTERRUPT_GRACE_MS = 15_000;
@@ -247,6 +253,8 @@ export class TaskRunner {
   #log: (line: string) => void;
   /** Tasks whose new `meddle.turn` is being created or has not started running yet. */
   #pending = new Set<string>();
+  /** The queued prompt `startQueued` is starting a task's turn with, until it has left `queued`. */
+  #starting = new Map<string, Prompt>();
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
   #stateListeners = new Set<(taskId: string, state: TaskState) => void>();
   #queuedListeners = new Set<(taskId: string) => void>();
@@ -605,6 +613,7 @@ export class TaskRunner {
     const [head] = queuedOf(row);
     if (head === undefined) return;
     this.#pending.add(taskId);
+    this.#starting.set(taskId, head);
     try {
       await this.#createTurn({
         taskId, prompt: head.text, attachments: head.attachments,
@@ -612,6 +621,7 @@ export class TaskRunner {
       });
     } catch (err) {
       this.#pending.delete(taskId);
+      this.#starting.delete(taskId);
       throw err;
     }
     // This is the one taker, kept single by `#pending`; meanwhile a prompt may join the tail, or the steers a turn
@@ -622,6 +632,7 @@ export class TaskRunner {
       const rest = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
       updateTask(this.#db, taskId, { queued: queuedColumn(rest) });
     })();
+    this.#starting.delete(taskId);
     this.#emitQueued(taskId);
   }
 
@@ -735,6 +746,34 @@ export class TaskRunner {
     const live = this.#live.get(taskId);
     if (live === undefined) return "nothing_waiting";
     return live.sendNow();
+  }
+
+  /**
+   * Takes back what the task has been sent and not started on, as `queued` lists it: the live turn's steers Claude Code
+   * has not taken (one it takes meanwhile stays taken), then the prompts queued for later turns, each with its
+   * attachments. It waits for the task's prompts sent before it (see `prompt`), so it takes those back too. A prompt
+   * whose turn is being started stays, so it never both runs and comes back. Answers the prompts taken back, oldest
+   * first; refused while the task is not live here (its queue travels with a move).
+   */
+  takeBackQueued(taskId: string): Promise<Prompt[]> {
+    return serialised(`prompt\0${taskId}`, () => this.#takeBackQueued(taskId));
+  }
+
+  async #takeBackQueued(taskId: string): Promise<Prompt[]> {
+    this.#refuseElsewhere(taskId);
+    const live = await this.#live.get(taskId)?.takeBack() ?? [];
+    // `startQueued` takes the prompt it starts out of `queued` once its turn exists: until then it stays there.
+    const starting = this.#starting.get(taskId);
+    let later: Prompt[] = [];
+    this.#db.transaction(() => {
+      const queued = queuedOf(this.#row(taskId));
+      // as `startQueued` does, the first prompt equal to the one starting (text and attachments) stays
+      const at = starting === undefined ? -1 : queued.findIndex((q) => Bun.deepEquals(q, starting));
+      later = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
+      updateTask(this.#db, taskId, { queued: queuedColumn(at === -1 ? [] : [queued[at]!]) });
+    })();
+    this.#emitQueued(taskId);
+    return [...live, ...later];
   }
 
   /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
@@ -918,7 +957,7 @@ export class TaskRunner {
       const content = await promptContent(this.blobs.store, attachmentsDir, prompt);
       const queue = new InputQueue();
       let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
-      const { query, done, sendNow } = runTurn({
+      const { query, done, sendNow, takeBack } = runTurn({
         input: await this.#engineInput(taskId, manifest, resume, picked.value),
         prompt,
         content,
@@ -933,7 +972,7 @@ export class TaskRunner {
         },
         onTokenFault: (f) => { fault = f; },
       });
-      this.#live.set(taskId, { query, queue, sendNow, state: "running" });
+      this.#live.set(taskId, { query, queue, sendNow, takeBack, state: "running" });
       notify(this.#liveListeners, (cb) => cb(taskId));
       let result: Awaited<typeof done>;
       try {
