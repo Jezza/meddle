@@ -30,6 +30,22 @@ export function agentSeconds(agent: AgentEntry, now: number): number {
   return agent.state === "running" ? secondsSince(agent.startedAt, now) : Math.round(agent.ms / 1000);
 }
 
+/**
+ * The agent whose row holds this one's in the thread: an agent launched by an agent has its row inside its parent's,
+ * so `parent` is followed up through `agents` to one with no listed parent (the agent itself when it has none).
+ */
+export function rootOf(agent: AgentEntry, agents: readonly AgentEntry[]): AgentEntry {
+  const seen = new Set<string>();
+  let at = agent;
+  for (let up = at.parent; up !== null && !seen.has(at.id); up = at.parent) {
+    seen.add(at.id);
+    const parent = agents.find((a) => a.id === up);
+    if (parent === undefined) break;
+    at = parent;
+  }
+  return at;
+}
+
 /** The agents' states in words (`2 running · 1 done · 1 stopped`), leaving out the noughts; "" for none. */
 export function agentCounts(agents: readonly AgentEntry[]): string {
   return tally(agents, [["running", "running"], ["completed", "done"], ["stopped", "stopped"], ["failed", "failed"]], " · ");

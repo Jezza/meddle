@@ -476,6 +476,14 @@ export function keyOf(item: ShownItem): string | undefined {
   return undefined;
 }
 
+/** Whether the events hold the call `toolUseId` (the `tool_use` its row is built from). */
+export function holdsCall(events: ReadonlyArray<{ message: unknown }>, toolUseId: string): boolean {
+  return events.some(({ message }) => {
+    const m = message as Message | null;
+    return m?.type === "assistant" && blocks((m.message as { content?: unknown } | undefined)?.content).some((b) => b.type === "tool_use" && b.id === toolUseId);
+  });
+}
+
 /** A path under the session's working directory, relative to it; any other as it is. */
 export function relativePath(path: string, cwd: string): string {
   return cwd !== "" && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path;

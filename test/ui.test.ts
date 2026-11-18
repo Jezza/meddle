@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import { branchLines, listedOnline, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
-import { agentCounts, foldedLine, panelRows } from "../src/dashboard/ui/agents-model";
+import { agentCounts, foldedLine, panelRows, rootOf } from "../src/dashboard/ui/agents-model";
 import type { AgentEntry } from "../src/state/contracts";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
@@ -573,6 +573,21 @@ test("panelRows: running agents with their step and numbers, then the newest fin
   expect(panelRows(many, NOW, false)).toMatchObject({ earlier: "27 earlier: 27 done" });
   expect(panelRows(many, NOW, false).rows).toHaveLength(3);
   expect(panelRows([], NOW, false)).toEqual({ rows: [], earlier: null });
+});
+
+test("rootOf follows an agent's parents up to the outermost listed one", () => {
+  const outer = agentEntry("outer", { seq: 10 });
+  const middle = agentEntry("middle", { seq: 40, parent: "outer" });
+  const inner = agentEntry("inner", { seq: 90, parent: "middle" });
+  const list = [inner, middle, outer];
+  expect(rootOf(inner, list)).toBe(outer);
+  expect(rootOf(outer, list)).toBe(outer);
+  // A parent the list does not hold (a background command's id, say) ends the climb.
+  expect(rootOf(agentEntry("lost", { parent: "gone" }), list).description).toBe("lost");
+  // Parents in a loop end too.
+  const a = agentEntry("a", { parent: "b" });
+  const b = agentEntry("b", { parent: "a" });
+  expect([a, b]).toContain(rootOf(a, [a, b]));
 });
 
 test("foldedLine: the running agents with their times, then the rest; or that all are finished", () => {

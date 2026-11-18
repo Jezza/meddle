@@ -1,7 +1,7 @@
 // test/thread-model.test.ts
 import { test, expect } from "bun:test";
 import {
-  activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, isRunning, keyOf,
+  activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, holdsCall, isRunning, keyOf,
   relativePath, toolSummary, toolTarget, type ThreadItem, type ToolItem, workspaceSource,
 } from "../src/dashboard/ui/thread-model";
 import type { Attachment } from "../src/blobs/attachment";
@@ -442,4 +442,11 @@ test("a resumed agent's row runs in the background again whatever its start says
   const wake = agentStart(9, { prompt: "<task-notification>a command ended</task-notification>", is_backgrounded: undefined });
   expect(running([...followUp, ended(8, "tS"), wake])).toBe(true);
   expect(running([...followUp, ended(8, "tS"), wake, ended(10, "tA")])).toBe(false);
+});
+
+test("holdsCall tells whether the events hold a call's tool_use, its start or result alone not counting", () => {
+  const events = [call(1, "tA", "Agent", { description: "Implement Task 3" }), agentStart(2, { task_id: "a2", tool_use_id: "tZ" }), answer(3, "tZ", "done")];
+  expect(holdsCall(events, "tA")).toBe(true);
+  expect(holdsCall(events, "tZ")).toBe(false);
+  expect(holdsCall([], "tA")).toBe(false);
 });

@@ -11,7 +11,7 @@ import { type AgentEntry, type Live as LiveState, NodeObject, SessionObject, Tas
 import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useDraft, useObject, useTick, useValue } from "./hooks";
 import { AgentsPanel } from "./Agents";
-import { agentSeconds } from "./agents-model";
+import { agentSeconds, rootOf } from "./agents-model";
 import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFileTarget } from "./Attachments";
 import { Changes } from "./Changes";
@@ -26,7 +26,7 @@ import { ago, type ProjectLine, projectLines, usageShort } from "./sidebar-model
 import { useOptionalValue } from "./sources";
 import {
   activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps,
-  isAgentCall, isLook, isRunning, keyOf, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
+  holdsCall, isAgentCall, isLook, isRunning, keyOf, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
 } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -150,7 +150,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
       )}
       {/* Above the composer, or where it would be on an archived task. */}
       {state !== "moved" && !showChanges && (
-        <AgentsPanel agents={agents} selected={focus?.toolUseId || null} onPick={(agent) => setFocus(aim(agent.toolUseId, agent.seq))} />
+        <AgentsPanel agents={agents} selected={focus?.toolUseId || null} onPick={(agent) => setFocus(aim(agent.toolUseId, agents))} />
       )}
       {!archived && state !== "moved" && !showChanges && (
         <Composer task={task} running={live} anyQueued={queued.length > 0} disabled={moving} text={draft} setText={setDraft} drafts={drafts} box={box}
@@ -284,13 +284,21 @@ function blocksOf(items: readonly ShownItem[]): Block[] {
 }
 
 /**
- * An agent row the thread is led to: the call that first started the agent, and the seq of that start, which the
- * thread loads back to. `n` counts the picks, so picking the same agent again leads there again.
+ * An agent row the thread is led to: the call that first started the agent (`toolUseId`); and the start (`seq`) and
+ * call (`holder`) of the outermost agent whose row holds it (`rootOf`), which the thread loads back to, then on until
+ * that call is in. `n` counts the picks, so picking the same agent again leads there again.
  */
-type Focus = { toolUseId: string; seq: number; n: number };
+type Focus = { toolUseId: string; seq: number; holder: string; n: number };
 
-/** Leads the thread to `toolUseId`'s row, loading back to `seq`. */
-const aim = (toolUseId: string, seq: number) => (prev: Focus | null): Focus => ({ toolUseId, seq, n: (prev?.n ?? 0) + 1 });
+/**
+ * Leads the thread to `toolUseId`'s row. An agent the list has no entry for (an older node) has no start to aim at:
+ * the thread loads only until its call is in.
+ */
+const aim = (toolUseId: string, agents: readonly AgentEntry[]) => (prev: Focus | null): Focus => {
+  const agent = agents.find((a) => a.toolUseId === toolUseId);
+  const root = agent === undefined ? undefined : rootOf(agent, agents);
+  return { toolUseId, seq: root?.seq ?? Infinity, holder: root?.toolUseId || toolUseId, n: (prev?.n ?? 0) + 1 };
+};
 
 const NO_AGENTS: readonly AgentEntry[] = [];
 
@@ -315,9 +323,8 @@ function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus
   // A read-only thread has no task to open a large file's diff from: its workspace is gone, and the read refused.
   const view = useMemo((): ThreadContext => ({
     cwd: cwdOf(events), raw, task: readOnly ? null : task, agents: byCall, focused: focus?.toolUseId || null,
-    // An agent the list has no entry for (an older node) has its row in the thread already: nothing to load.
-    focus: (toolUseId) => setFocus(toolUseId === null ? null : aim(toolUseId, byCall.get(toolUseId)?.seq ?? Infinity)),
-  }), [events, raw, task, readOnly, byCall, focus, setFocus]);
+    focus: (toolUseId) => setFocus(toolUseId === null ? null : aim(toolUseId, agents)),
+  }), [events, raw, task, readOnly, byCall, agents, focus, setFocus]);
   const oldest = events[0]?.seq;
 
   // Kept at the bottom while you are there; left alone while you read further up.
@@ -336,9 +343,10 @@ function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus
     setSeen((prev) => merged(prev, earlier));
   });
 
-  // Led to an agent's row: earlier events load page by page until its start is in (or none are left), then it opens.
-  // A pick while they load leads the same loop on to the newer pick; the pick standing when the view opened is not
-  // followed again.
+  // Led to an agent's row: earlier events load page by page back to the outermost holding agent's start, then on until
+  // its call (which comes before the start) is in, or none are left; then the row opens. Each page goes further back,
+  // so the loop ends. A pick while they load leads the same loop on to the newer pick; the pick standing when the view
+  // opened is not followed again.
   const target = useRef(focus);
   target.current = focus;
   const followed = useRef(focus);
@@ -350,12 +358,15 @@ function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus
     seeking.current = true;
     void action.run(async () => {
       try {
+        let loaded: readonly LogEvent[] = events;
+        const short = (t: Focus | null, from: number) => t !== null && (from > t.seq || !holdsCall(loaded, t.holder));
         let from = noneEarlier ? undefined : oldest;
-        while (from !== undefined && from > 1 && target.current !== null && from > target.current.seq) {
+        while (from !== undefined && from > 1 && short(target.current, from)) {
           const earlier = await session.loadEarlier({ beforeSeq: from, limit: EARLIER_PAGE });
           const last = earlier.length < EARLIER_PAGE;
           if (last) setNoneEarlier(true);
           setSeen((prev) => merged(prev, earlier));
+          loaded = [...earlier, ...loaded];
           from = last ? undefined : earlier[0]?.seq;
         }
       } finally {
