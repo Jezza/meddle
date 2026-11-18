@@ -13,6 +13,7 @@ import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "../src/dashboard/ui/changes-model";
 import { composerKey, withTakenBack } from "../src/dashboard/ui/composer-model";
+import { contextMeter, levelOf, readAgo, windowMeter } from "../src/dashboard/ui/usage-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 import { blobUrl, type Draft, draftAttachments, guardDrops, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
@@ -213,6 +214,49 @@ test("nodeLineText sums a node up for the footer", () => {
 test("usageShort: the latest turn's tokens in short", () => {
   expect(usageShort(null)).toBeNull();
   expect(usageShort({ usage: { input_tokens: 10, cache_read_input_tokens: 40_000, output_tokens: 2100 } })).toBe("40k in · 2.1k out");
+});
+
+test("levelOf: warn from 80%, bad from 95%", () => {
+  expect(levelOf(0.79)).toBe("ok");
+  expect(levelOf(0.8)).toBe("warn");
+  expect(levelOf(0.949)).toBe("warn");
+  expect(levelOf(0.95)).toBe("bad");
+});
+
+test("contextMeter: the latest call's tokens over its model's window", () => {
+  const usage = { modelUsage: { m: { contextWindow: 1_000_000 } }, usage: { input_tokens: 10, output_tokens: 2100 } };
+  const meter = contextMeter({ tokens: 375_000, model: "m" }, usage)!;
+  expect(meter).toMatchObject({ label: "ctx", text: "375k / 1M", fraction: 0.375, level: "ok", faded: false });
+  expect(meter.title).toContain("375,000");
+  expect(meter.title).toContain("latest turn: 10 in · 2.1k out");
+  expect(contextMeter({ tokens: 860_000, model: "m" }, usage)!.level).toBe("warn");
+  // A window not known yet (before the first result, or another model's): the count alone, no bar.
+  const unknown = contextMeter({ tokens: 375_000, model: "other" }, usage)!;
+  expect(unknown.text).toBe("375k");
+  expect(unknown.fraction).toBeNaN();
+  expect(contextMeter(null, usage)).toBeNull();
+  expect(contextMeter(undefined, usage)).toBeNull();
+});
+
+test("windowMeter: a limit's share used, its reset, faded when stale or reset", () => {
+  const now = Date.parse("2026-11-18T12:00:00.000Z");
+  const at = (ms: number) => new Date(now + ms).toISOString();
+  const fresh = windowMeter("5h", { utilization: 0.27, resetsAt: at(3600_000) }, at(-120_000), now)!;
+  expect(fresh).toMatchObject({ label: "5h", text: "27%", fraction: 0.27, level: "ok", faded: false });
+  expect(fresh.note).toStartWith("resets ");
+  expect(fresh.title).toStartWith("5-hour limit: 27% used, resets ");
+  expect(windowMeter("7d", { utilization: 0.27, resetsAt: at(3600_000) }, at(-120_000), now)!.title).toStartWith("7-day limit: ");
+  expect(windowMeter("5h", { utilization: 1.4, resetsAt: at(3600_000) }, at(0), now)).toMatchObject({ text: "100%", fraction: 1, level: "bad" });
+  expect(windowMeter("5h", { utilization: 0.9, resetsAt: at(-1) }, at(-120_000), now))
+    .toMatchObject({ text: "0%", fraction: 0, level: "ok", faded: true, note: "reset" });
+  expect(windowMeter("5h", { utilization: 0.27, resetsAt: at(3600_000) }, at(-31 * 60_000), now)!.faded).toBe(true);
+  expect(windowMeter("5h", { utilization: 0.27, resetsAt: null }, at(0), now)).toMatchObject({ text: "27%", note: null });
+  expect(windowMeter("5h", null, at(0), now)).toBeNull();
+});
+
+test("readAgo: how old a reading is", () => {
+  const now = Date.parse("2026-11-18T12:00:00.000Z");
+  expect(readAgo(new Date(now - 120_000).toISOString(), now)).toBe("read 2m ago");
 });
 
 test("projectLines: each project with its own line's change id, in manifest order", () => {

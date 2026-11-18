@@ -3,7 +3,7 @@ import { test, expect } from "bun:test";
 import { NodeObject, ProjectObject, TaskObject, SessionObject } from "../src/state/host";
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent, listEvents } from "../src/store/events";
-import { errorResultFixture } from "./helpers";
+import { errorResultFixture, sideAssistantsFixture } from "./helpers";
 import { linkClient, peerReady, startPoolNode, storedShot, twoPoolNodes } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
 import { getTask } from "../src/store/records";
@@ -16,6 +16,7 @@ import { paths, type NodeConfig } from "../src/config";
 import { jj } from "../src/jj";
 import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
 import { ensureServiceRepo } from "../src/projects/replicas";
+import { listTokens } from "../src/token";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -48,10 +49,14 @@ test("claudeCodeVersion reads the pinned SDK's manifest", () => {
 });
 
 test("a client follows a task through a prompted turn over a link", async () => {
-  const { client, metrics, project, close } = await connect();
+  const { client, metrics, project, db, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
     expect(node.projectIds.value).toContain(project.id);
+    const token = listTokens(db)[0]!;
+    // No turn has used the token yet: it is the active one, with no reading.
+    expect(node.activeUsage.value).toEqual({ tokenId: token.id, label: token.label, reading: null });
+    expect(node.tokenUsage.value).toEqual({});
     expect(node.metrics.value).toBeNull();
     metrics.start();
     await until(node.metrics, (m) => m !== null);
@@ -78,6 +83,13 @@ test("a client follows a task through a prompted turn over a link", async () => 
     expect(session.live.value).toBeNull();
     await until(task.contextUsage, (u) => u !== null);
     expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 376 } });
+    await until(task.context, (c) => c !== null);
+    expect(task.context.value).toEqual({ tokens: 376, model: "claude-haiku-5-5" });
+    // The turn's rate_limit_event (hello.jsonl: 27% of five hours, 33% of seven days) is the token's reading.
+    const usage = await until(node.activeUsage, (u) => u?.reading != null);
+    const read = { fiveHour: { utilization: 0.27 }, sevenDay: { utilization: 0.33 } };
+    expect(usage).toMatchObject({ tokenId: token.id, label: token.label, reading: read });
+    expect(node.tokenUsage.value[token.id]).toMatchObject(read);
     expect(task.permissionMode.value).toBe("auto");
     // none chosen: the pool's default, not the turn's
     expect(task.model.value).toBeNull();
@@ -101,6 +113,40 @@ test("a client follows a task through a prompted turn over a link", async () => 
     await until(task.effort, (e) => e === "low");
     task.release();
     session.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("a turn's subagent and synthetic messages leave the task's context at its main thread's", async () => {
+  const { client, project, close } = await connect(await sideAssistantsFixture());
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await task.prompt({ text: "Reply with the single word ok." });
+    await until(task.contextUsage, (u) => u !== null);
+    expect(task.context.value).toEqual({ tokens: 376, model: "claude-haiku-5-5" });
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("a plan-usage reading that cannot be written does not fail the turn", async () => {
+  const { client, project, db, close } = await connect();
+  try {
+    // Every write of a reading fails (as a busy or full database would); reading them still works.
+    db.run("CREATE TRIGGER no_usage BEFORE INSERT ON token_usage BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await task.prompt({ text: "Reply with the single word ok." });
+    const notes = await until(node.notifications, (n) => n.some((x) => x.taskId === manifest.id && x.kind !== "approval"));
+    expect(notes.filter((x) => x.taskId === manifest.id).map((x) => x.kind)).toEqual(["finished"]);
+    task.release();
     node.release();
   } finally {
     await close();
@@ -354,12 +400,20 @@ test("a task's activation reads its log summary from the newest events, and its 
     appendEvent(db, id, { type: "system", subtype: "status", permissionMode: "plan" });
     // A later status without a mode (a compaction notice) must not hide the mode change.
     appendEvent(db, id, { type: "system", subtype: "status", status: "compacting" });
-    for (let i = 0; i < 249; i++) appendEvent(db, id, { type: "assistant", n: i });
+    // The context is the newest main-thread call's: not a subagent's, nor a synthetic message's, nor one without usage.
+    appendEvent(db, id, {
+      type: "assistant", parent_tool_use_id: null,
+      message: { model: "claude-opus-5-5", usage: { input_tokens: 2, cache_read_input_tokens: 1000, cache_creation_input_tokens: 10 } },
+    });
+    appendEvent(db, id, { type: "assistant", parent_tool_use_id: "tu1", message: { model: "claude-haiku-5-5", usage: { input_tokens: 5 } } });
+    appendEvent(db, id, { type: "assistant", parent_tool_use_id: null, message: { model: "<synthetic>", usage: { input_tokens: 0 } } });
+    for (let i = 0; i < 246; i++) appendEvent(db, id, { type: "assistant", n: i });
     appendEvent(db, id, { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } } });
     const task = await client.get(TaskObject, { id });
     expect(task.lastSeq.value).toBe(255);
     expect(task.permissionMode.value).toBe("plan");
     expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 1 } });
+    expect(task.context.value).toEqual({ tokens: 1012, model: "claude-opus-5-5" });
     const session = await client.get(SessionObject, { taskId: id });
     expect(session.window.value).toHaveLength(200);
     expect(session.window.value.at(-1)!.seq).toBe(254);

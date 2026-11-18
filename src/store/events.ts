@@ -113,6 +113,20 @@ export function latestEventOfType(db: Database, taskId: string, type: string, su
   return row === null ? null : { seq: row.seq, message: JSON.parse(row.json), at: row.at };
 }
 
+/**
+ * The task's newest assistant message of the main thread that reports usage (no `parent_tool_use_id`, a
+ * `message.usage`, not one Claude Code made up as `<synthetic>`), or null.
+ */
+export function latestMainAssistant(db: Database, taskId: string): EventRecord | null {
+  const row = db.query<{ seq: number; at: string; json: string }, [string]>(
+    `SELECT seq, at, json FROM events WHERE task_id = ? AND type = 'assistant'
+       AND json_extract(json, '$.parent_tool_use_id') IS NULL AND json_extract(json, '$.message.usage') IS NOT NULL
+       AND coalesce(json_extract(json, '$.message.model'), '') != '<synthetic>'
+     ORDER BY seq DESC LIMIT 1`,
+  ).get(taskId);
+  return row === null ? null : { seq: row.seq, message: JSON.parse(row.json), at: row.at };
+}
+
 /** The task's newest `type`/`subtype` event whose JSON has a non-null top-level `field`, or null. */
 export function latestEventWithField(db: Database, taskId: string, type: string, subtype: string, field: string): EventRecord | null {
   const row = db.query<{ seq: number; at: string; json: string }, [string, string, string, string]>(

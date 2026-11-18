@@ -1155,8 +1155,10 @@ A task opens beside the sidebar: its title (✎ renames it), state and actions (
 Delete for an archived one), its thread with the assistant's text as Markdown and each run of tool calls folded into
 one line, what waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
 was sent and has not taken yet (`queued`), its subagents (below), the composer (Queue while a turn runs, Send otherwise),
-and a bar with its projects, its node, its bookmark, the latest turn's tokens, its permission mode, and its model and
-effort as one pill (the pool's defaults where it chose none) that opens the node's models and the efforts the picked
+and a bar with its projects, its node, its bookmark, its context (the tokens its latest API call sent, over the model's
+window) and the 5-hour and 7-day plan usage of the login its node's next turn uses (the latest reading turns there got;
+`no data` before one), its permission mode, and its model and effort as one pill (the pool's defaults where it chose
+none) that opens the node's models and the efforts the picked
 one takes. The node in the bar opens the move menu: every other member, those that cannot take the task greyed with why,
 and whether the move waits for the running turn or interrupts it (see [Moving a task](#moving-a-task)); a task that
 moved is followed to its new node. A subagent's work stays inside its row in the thread: the row spins until the agent

@@ -29,7 +29,8 @@ import {
   type Project,
 } from "../projects/project";
 import {
-  latestEventOfType, latestEventWithField, listEvents, listEventsOfKinds, listEventsTail, type EventRecord,
+  latestEventOfType, latestEventWithField, latestMainAssistant, listEvents, listEventsOfKinds, listEventsTail,
+  type EventRecord,
 } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
@@ -40,6 +41,7 @@ import { taskNamespace, type ManifestProject, type Start, type TaskManifest } fr
 import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
+import { activeUsage as activeUsageNow, tokenUsages } from "../token-usage";
 import { gated } from "../update/gate";
 import { VERSION } from "../version";
 import { AGENT_EVENT_KINDS, EMPTY_AGENT_LOG, foldAgentLog, runningCount, servedAgents } from "./agents";
@@ -300,6 +302,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const archivedIds = self.state("archivedIds", NodeStore.def.members.archivedIds, { init: () => listArchivedTasks(db).map((t) => t.id) });
     const projectIds = self.state("projectIds", NodeStore.def.members.projectIds, { init: projectIdsNow });
     const token = self.state("token", NodeStore.def.members.token, { init: () => tokenNow(cfg, db) });
+    const tokenUsage = self.state("tokenUsage", NodeStore.def.members.tokenUsage, { init: () => tokenUsages(db) });
+    const activeUsage = self.state("activeUsage", NodeStore.def.members.activeUsage, { init: () => activeUsageNow(cfg, db) });
     const metricsNow = self.state("metrics", NodeStore.def.members.metrics, { init: () => metrics.latest() });
     const hostsTasks = self.state("hostsTasks", NodeStore.def.members.hostsTasks, { init: async () => (await checkTaskRoot(cfg)).ok });
     const hostingProblem = self.state("hostingProblem", NodeStore.def.members.hostingProblem, {
@@ -328,6 +332,14 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (problem !== hostingProblem.value) hostingProblem.replace(ctx, problem);
     };
 
+    /** A reading recorded, a token picked or removed: the readings and the active token's are read again. */
+    const refreshUsage = async (ctx: Ctx) => {
+      const active = await activeUsageNow(cfg, db);
+      if (ctx.signal.aborted) return;
+      tokenUsage.replace(ctx, tokenUsages(db));
+      activeUsage.replace(ctx, active);
+    };
+
     const notify = (ctx: Ctx, n: Omit<Notification, "id" | "at">) => {
       const note = { id: crypto.randomUUID(), at: new Date().toISOString(), ...n };
       notifications.replace(ctx, [...notifications.value, note].slice(-NOTIFICATIONS_KEPT));
@@ -337,6 +349,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const m = message as Message;
       const afterNoToken = noTokenFailures.delete(taskId);
       if (tokenFaultOf(message as SDKMessage) !== null) faulted.add(taskId);
+      // The turn recorded the reading before this event went out.
+      if (m.type === "rate_limit_event") await refreshUsage(ctx);
       if (m.type === "result") {
         const error = resultError(m);
         // A turn its token failed says so in the `token_fault` that follows (or reruns with the next token): one
@@ -390,6 +404,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("samples", samples, async (sample, ctx) => {
       metricsNow.replace(ctx, sample);
       token.replace(ctx, await tokenNow(cfg, db));
+      await refreshUsage(ctx);
       await refreshHostsTasks(ctx);
     });
     // A move that failed says where and why; the task is live here again.
@@ -424,6 +439,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const next = await tokenNow(cfg, db);
       // The host may have closed while the file was read (a change as the node shuts down).
       if (!ctx.signal.aborted) token.replace(ctx, next);
+      await refreshUsage(ctx);
       await refreshHostsTasks(ctx);
     });
 
@@ -437,6 +453,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       hostingProblem,
       metrics: metricsNow,
       token,
+      tokenUsage,
+      activeUsage,
       taskIds,
       archivedIds,
       projectIds,
@@ -552,6 +570,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       hostingProblem: store.hostingProblem,
       metrics: store.metrics,
       token: store.token,
+      tokenUsage: store.tokenUsage,
+      activeUsage: store.activeUsage,
       taskIds: store.taskIds,
       archivedIds: store.archivedIds,
       projectIds: store.projectIds,
@@ -873,6 +893,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       agents,
       // Chord pushes a derived value only when it differs, so a progress frame leaves this alone for the sidebars.
       agentsRunning: self.derive([agents], (list) => runningCount(list)),
+      context: self.derive([log], (l) => l.context),
       move,
       movedTo,
       archivedOn,
@@ -1120,6 +1141,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       latestEventOfType(db, taskId, "system", "init"),
       latestEventWithField(db, taskId, "system", "status", "permissionMode"),
       latestEventOfType(db, taskId, "result"),
+      latestMainAssistant(db, taskId),
     ].filter((e) => e !== null).sort((a, b) => a.seq - b.seq);
     const log = foldTaskLog(EMPTY_TASK_LOG, latest);
     return { ...log, lastSeq: listEventsTail(db, taskId, { limit: 1 })[0]?.seq ?? 0 };
@@ -1143,9 +1165,12 @@ function questionText(req: PendingApproval): string {
 
 // ─── folding the event log into a task's log summary and a session's view ───
 
-const EMPTY_TASK_LOG: TaskLog = { lastSeq: 0, permissionMode: null, contextUsage: null };
+const EMPTY_TASK_LOG: TaskLog = { lastSeq: 0, permissionMode: null, contextUsage: null, context: null };
 
-/** `permissionMode` from the latest `system` `init` or `status`; `contextUsage` from the latest `result`. */
+/**
+ * `permissionMode` from the latest `system` `init` or `status`; `contextUsage` from the latest `result`; `context` from
+ * the latest main-thread assistant message with usage that Claude Code did not make up (`latestMainAssistant`).
+ */
 function foldTaskLog(log: TaskLog, events: EventRecord[]): TaskLog {
   const next = { ...log };
   for (const { seq, message } of events) {
@@ -1155,9 +1180,27 @@ function foldTaskLog(log: TaskLog, events: EventRecord[]): TaskLog {
       if (typeof m.permissionMode === "string") next.permissionMode = m.permissionMode;
     } else if (m.type === "result") {
       next.contextUsage = { usage: m.usage ?? null, modelUsage: m.modelUsage ?? null };
+    } else if (m.type === "assistant") {
+      const context = contextOf(m);
+      if (context !== null) next.context = context;
     }
   }
   return next;
+}
+
+type Usage = { input_tokens?: unknown; cache_read_input_tokens?: unknown; cache_creation_input_tokens?: unknown };
+
+/** The context a main-thread assistant message's call sent, or null for a subagent's, a synthetic one or no usage. */
+function contextOf(m: Message): TaskLog["context"] {
+  if (m.parent_tool_use_id != null) return null;
+  const message = m.message as { model?: unknown; usage?: Usage | null } | undefined;
+  const usage = message?.usage;
+  if (usage === undefined || usage === null || message?.model === "<synthetic>") return null;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  return {
+    tokens: n(usage.input_tokens) + n(usage.cache_read_input_tokens) + n(usage.cache_creation_input_tokens),
+    model: typeof message?.model === "string" ? message.model : null,
+  };
 }
 
 const EMPTY_SESSION: SessionView = { lastSeq: 0, window: [], live: null };

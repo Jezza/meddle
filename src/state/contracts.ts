@@ -66,6 +66,18 @@ export const NodeMetricsSchema = Type.Object({
   diskFreeKb: Type.Number(),
 });
 
+/** A limit window of a token's plan usage (`UsageWindow`): the share used, 0–1, and when it resets. */
+const UsageWindowSchema = Nullable(Type.Object({ utilization: Type.Number(), resetsAt: Nullable(Type.String()) }));
+
+/** A token's latest plan-usage reading on a node (`UsageReading`). */
+export const UsageReadingSchema = Type.Object({ fiveHour: UsageWindowSchema, sevenDay: UsageWindowSchema, readAt: Type.String() });
+
+/**
+ * The tokens a task's latest main-thread API call sent (input, cache read and cache creation: how full its context
+ * window is) and the model it went to; null before the first.
+ */
+const TaskContextSchema = Nullable(Type.Object({ tokens: Type.Number(), model: Nullable(Type.String()) }));
+
 /** A model Claude Code offers (its `ModelInfo`): the alias or id a turn takes, what the dashboard shows, its efforts. */
 export const ModelSchema = Type.Object({
   value: Type.String(),
@@ -136,6 +148,10 @@ const nodeState = {
   metrics: Nullable(NodeMetricsSchema),
   /** Whether this node holds a usable token now (`pickToken`), and when that one expires. */
   token: Type.Object({ present: Type.Boolean(), expiresAt: Nullable(Type.String()) }),
+  /** This node's latest plan-usage reading of each token not removed, by token id (`tokenUsages`). */
+  tokenUsage: Type.Record(Type.String(), UsageReadingSchema),
+  /** The token this node's next turn uses, else its first (`activeUsage`), with its reading here; null with no token. */
+  activeUsage: Nullable(Type.Object({ tokenId: Type.String(), label: Type.String(), reading: Nullable(UsageReadingSchema) })),
   /** The tasks that live on this node (archived, moved and received-but-not-yet-active ones left out). */
   taskIds: Type.Array(Type.String()),
   /** The tasks archived on this node: their rows and archive are here, their folder is not. */
@@ -445,6 +461,8 @@ export const TaskObject = remote("meddle.task", {
          * `agentsRunning`: read a missing member as 0.
          */
         agentsRunning: Type.Number(),
+        /** The context the latest main-thread API call sent, and its model (`TaskContextSchema`). */
+        context: TaskContextSchema,
         /** The task's move in progress: to which node, the step it is at, and the error failing it (if any). */
         move: Nullable(Type.Object({ to: Type.String(), phase: Type.String(), error: Nullable(Type.String()) })),
         /** The node a `moved` task went to. */
@@ -608,6 +626,7 @@ export const TaskLogSchema = Type.Object({
   lastSeq: Type.Number(),
   permissionMode: Nullable(Type.String()),
   contextUsage: Type.Unknown(),
+  context: TaskContextSchema,
 });
 export type TaskLog = Type.Static<typeof TaskLogSchema>;
 
