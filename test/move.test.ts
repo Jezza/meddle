@@ -18,7 +18,7 @@ import type { NodeSummary } from "../src/pool/store";
 import { readArchive, runJanitor, writeArchive } from "../src/tasks/archive";
 import { TaskRunner } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
-import { listLineRows, mergeLineRows, writeBranchRow } from "../src/pool/rows";
+import { listLineRows, mergeLineRows, setQueued, writeBranchRow } from "../src/pool/rows";
 import { readManifest, sideBookmark, transcriptPath, type TaskManifest } from "../src/tasks/manifest";
 import { MOVE_NOW_FOLLOW_UP } from "../src/tasks/move";
 import { workspaceImmutableHeads } from "../src/tasks/provision";
@@ -714,6 +714,75 @@ test("an activation the receiver refuses rolls the move back with the sender two
     const next = `a ${A.id} ${row.epoch + 2} ${await commitAt(A, workspaceA, "@")}`;
     expect(epochsOn(A, P, m.id)).toBe(next);
     await until("the line's row on B", () => epochsOn(B, P, m.id), next);
+  } finally {
+    await close();
+  }
+}, 30_000);
+
+/** The `queuedAt` of line `a` of task `taskId` in project `projectId` on `node` (undefined when it has no such row). */
+function queuedOn(node: GitPoolNode, projectId: string, taskId: string): string | null | undefined {
+  return listLineRows(node.db, projectId, taskId).find((r) => r.name === "a")?.queuedAt;
+}
+
+test("a moved task stays queued: the target's row has queuedAt as the request and the activation carry it, through its next turn and a move back", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    const P = A.project.id;
+    const queuedAt = "2026-11-18T10:00:00.000Z";
+    setQueued(A.db, P, m.id, "a", queuedAt);
+    await peerReady(A, B);
+    await peerReady(B, A);
+    // Received, not yet activated: the row is still the sender's, queue included.
+    const ref = await peerOn(A, B);
+    try {
+      expect(await ref.receiveTask(request(A, m))).toEqual({ ok: true });
+      expect(queuedOn(B, P, m.id)).toBe(queuedAt);
+      expect(epochsOn(B, P, m.id)).toContain(A.id);
+    } finally {
+      ref.release();
+    }
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "moved", moved_to: B.id });
+    // B holds the line one epoch up, still queued; so does A's copy of it.
+    expect(epochsOn(B, P, m.id)).toContain(B.id);
+    expect(queuedOn(B, P, m.id)).toBe(queuedAt);
+    await until("the queue on A's copy", () => queuedOn(A, P, m.id), queuedAt);
+
+    // B's turn end writes the line anew, and the queue stays.
+    await writeFile(join(paths(B.cfg).task(m.id), "a", "more"), "more\n");
+    await promptAndWait(B, m.id, "On B.");
+    expect(queuedOn(B, P, m.id)).toBe(queuedAt);
+    await until("the queue on A's copy", () => queuedOn(A, P, m.id), queuedAt);
+
+    await B.runner.moveTo(m.id, A.id, false);
+    await moveSettled(B.harness.harness);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle" });
+    expect(listLineRows(A.db, P, m.id)).toMatchObject([{ holder: A.id, queuedAt }]);
+    expect(queuedOn(A, P, m.id)).toBe(queuedAt);
+  } finally {
+    await close();
+  }
+}, 45_000);
+
+test("a move that rolls back keeps the task queued where it was", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const m = await turnedTask(A);
+    const P = A.project.id;
+    const queuedAt = "2026-11-18T10:00:00.000Z";
+    setQueued(A.db, P, m.id, "a", queuedAt);
+    await peerReady(A, B);
+    await peerReady(B, A);
+    B.hooks.beforeActivate = () => {
+      throw new Error("activation broke");
+    };
+    await A.runner.moveTo(m.id, B.id, false);
+    await moveSettled(A.harness.harness);
+    expect(getTask(A.db, m.id)).toMatchObject({ state: "idle", moved_to: null });
+    expect(listLineRows(A.db, P, m.id)).toMatchObject([{ holder: A.id, queuedAt }]);
+    await until("the queue on B's copy", () => queuedOn(B, P, m.id), queuedAt);
   } finally {
     await close();
   }

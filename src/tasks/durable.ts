@@ -29,7 +29,7 @@ import type { StreamReader } from "../pool/frames";
 import { getProject, listProjects, type Project } from "../projects/project";
 import { defaultBranchCommit } from "../projects/starts";
 import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRows } from "../projects/lines";
-import { branchChanges, lineChanges, listLineRows, mergeLineRows, writeLineRow, type LineRow } from "../pool/rows";
+import { branchChanges, lineChanges, listLineRows, mergeLineRows, writeLineRow, type LineRowIn } from "../pool/rows";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
 import { appendEvent, latestEventOfType, listEventsTail, listPromptAttachments, type EventRecord } from "../store/events";
@@ -1168,7 +1168,7 @@ export class TaskRunner {
    * stay `from`'s until the task is activated here, and a receive abandoned or refused leaves none of this node's.
    */
   async receiveTask(
-    manifest: TaskManifest, from: string, version: string, lineRows: readonly LineRow[],
+    manifest: TaskManifest, from: string, version: string, lineRows: readonly LineRowIn[],
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const ours = claudeCodeVersion();
     if (version !== ours || ours === "unknown" || version === "unknown") return { ok: false, reason: `claude code ${ours} here, ${version} there` };

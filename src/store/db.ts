@@ -158,6 +158,8 @@ const ADDED_COLUMNS = [
   { table: "roster", column: "reached_addr", type: "TEXT" },
   // Where a token sits in the order turns try them (src/token.ts); NULL for a row from before it: sorted by set_at.
   { table: "tokens", column: "rank", type: "REAL" },
+  // When a task was queued for its project's train, on the line row of the project's own line (src/pool/rows.ts); NULL for not queued.
+  { table: "line_rows", column: "queued_at", type: "TEXT" },
 ];
 
 export function openDb(path: string): Database {

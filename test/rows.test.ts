@@ -5,9 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/store/db";
 import {
-  listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, settleBranchRows, waitingBranchRows,
+  lineChanges, listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, setQueued, settleBranchRows, waitingBranchRows,
   writeBranchRow, writeLineRow, type BranchRow, type LineRow,
 } from "../src/pool/rows";
+import { holdLineRows, reclaimLineRows, releaseLineRows } from "../src/projects/lines";
+import { LineRowSchema } from "../src/state/contracts";
 
 const A = "a".repeat(40);
 const B = "b".repeat(64);
@@ -15,7 +17,7 @@ const N1 = "1".repeat(64);
 const N2 = "2".repeat(64);
 
 function line(epoch: number, seq: number, extra: Partial<LineRow> = {}): LineRow {
-  return { project: "p", task: "t", name: "w", holder: N1, epoch, seq, commit: A, base: [B], archived: false, ...extra };
+  return { project: "p", task: "t", name: "w", holder: N1, epoch, seq, commit: A, base: [B], archived: false, queuedAt: null, ...extra };
 }
 
 function branch(seq: number, extra: Partial<BranchRow> = {}): BranchRow {
@@ -214,4 +216,130 @@ test("writeLineRow writes above the highest seq seen for the line, a losing row'
   expect(writeLineRow(db, rest)).toEqual(line(1, 8, { holder: N2, commit: null }));
   expect(listLineRows(db, "p", "t")).toEqual([line(1, 8, { holder: N2, commit: null })]);
   expect(listLineRows(db, "p", "other")).toEqual([]);
+});
+
+const QUEUED = "2026-11-18T10:00:00.000Z";
+
+/** `row` as a node of a meddle before queues sends it: no `queuedAt` at all. */
+function withoutQueue(row: LineRow): Omit<LineRow, "queuedAt"> {
+  const { queuedAt: _, ...rest } = row;
+  return rest;
+}
+
+test("queuedAt replicates through merge", () => {
+  const one = openDb(":memory:");
+  const two = openDb(":memory:");
+  const { seq: _, queuedAt: __, ...first } = line(0, 0);
+  writeLineRow(one, first);
+  const queued = setQueued(one, "p", "t", "w", QUEUED);
+  // Everything else as it was, written above the line's seq.
+  expect(queued).toEqual(line(0, 2, { queuedAt: QUEUED }));
+  expect(listLineRows(one)).toEqual([queued]);
+
+  const heard: Array<{ project: string; task: string }> = [];
+  const off = lineChanges.subscribe((l) => heard.push(l));
+  try {
+    expect(mergeLineRows(two, listLineRows(one))).toEqual({ changed: ["p"], rejected: 0 });
+    expect(heard).toEqual([{ project: "p", task: "t" }]);
+  } finally {
+    off();
+  }
+  expect(listLineRows(two)).toEqual([queued]);
+
+  // Unqueued, it replicates the same way: the newer row wins with its null.
+  const cleared = setQueued(one, "p", "t", "w", null);
+  expect(cleared).toEqual(line(0, 3, { queuedAt: null }));
+  mergeLineRows(two, [cleared]);
+  expect(listLineRows(two)).toEqual([cleared]);
+
+  // A row with no line to hold it has no queue to set.
+  expect(() => setQueued(one, "p", "t", "other", QUEUED)).toThrow("no line row");
+});
+
+test("queuedAt is part of the wire row, and a row with something else there is dropped", async () => {
+  const { Value } = await import("typebox/value");
+  expect(Value.Check(LineRowSchema, line(0, 1, { queuedAt: QUEUED }))).toBe(true);
+  expect(Value.Check(LineRowSchema, line(0, 1))).toBe(true);
+  expect(Value.Check(LineRowSchema, withoutQueue(line(0, 1)))).toBe(true);
+
+  const db = openDb(":memory:");
+  expect(mergeLineRows(db, [line(0, 1, { queuedAt: 7 as unknown as string })])).toEqual({ changed: [], rejected: 1 });
+  expect(listLineRows(db)).toEqual([]);
+});
+
+test("a row from a node of a meddle before queues is stored with no queue", () => {
+  const db = openDb(":memory:");
+  expect(mergeLineRows(db, [withoutQueue(line(0, 1))])).toEqual({ changed: ["p"], rejected: 0 });
+  expect(listLineRows(db)).toEqual([line(0, 1, { queuedAt: null })]);
+});
+
+test("writers that omit queuedAt keep it", () => {
+  const db = openDb(":memory:");
+  const self = N1;
+  const { seq: _, queuedAt: __, ...first } = line(0, 0);
+  writeLineRow(db, first);
+  setQueued(db, "p", "t", "w", QUEUED);
+  const queued = () => listLineRows(db, "p", "t").map((r) => [r.name, r.queuedAt]);
+
+  // A write that moves the line, one that says nothing of the queue, and one that says null.
+  const moved = writeLineRow(db, { ...first, commit: B.slice(0, 40) });
+  expect(moved).toMatchObject({ commit: B.slice(0, 40), queuedAt: QUEUED });
+  expect(writeLineRow(db, { ...first, queuedAt: undefined })).toMatchObject({ queuedAt: QUEUED });
+  expect(queued()).toEqual([["w", QUEUED]]);
+  expect(writeLineRow(db, { ...first, queuedAt: null })).toMatchObject({ queuedAt: null });
+  setQueued(db, "p", "t", "w", QUEUED);
+
+  // The handovers and the release in src/projects/lines.ts pass no queue either.
+  expect(holdLineRows(db, N2, "t")).toEqual(["w"]);
+  expect(listLineRows(db, "p", "t")).toMatchObject([{ holder: N2, epoch: 1, queuedAt: QUEUED }]);
+  expect(reclaimLineRows(db, self, "t", false)).toEqual(["w"]);
+  expect(listLineRows(db, "p", "t")).toMatchObject([{ holder: self, epoch: 2, queuedAt: QUEUED }]);
+  expect(releaseLineRows(db, "t", [])).toEqual(["w"]);
+  expect(listLineRows(db, "p", "t")).toMatchObject([{ commit: null, queuedAt: QUEUED }]);
+
+  // A write of a key with no row yet has no queue to keep.
+  expect(writeLineRow(db, { ...first, name: "x" })).toMatchObject({ queuedAt: null });
+});
+
+test("an older relay without the field doesn't clear it", () => {
+  const db = openDb(":memory:");
+  const queued = line(0, 4, { queuedAt: QUEUED });
+  mergeLineRows(db, [queued]);
+  // The same row as a node of a meddle before queues relays it: equal epoch, seq and content, and no queue.
+  expect(mergeLineRows(db, [withoutQueue(queued)])).toEqual({ changed: [], rejected: 0 });
+  expect(listLineRows(db)).toEqual([queued]);
+});
+
+test("rows of an equal key, seq and content, differing only in queuedAt, settle on the queued one in either order", () => {
+  const queued = line(0, 4, { queuedAt: QUEUED });
+  const later = line(0, 4, { queuedAt: "2026-11-18T11:00:00.000Z" });
+  const relayed = withoutQueue(line(0, 4));
+  for (const order of [[queued, relayed], [relayed, queued], [relayed, later, queued], [queued, later, relayed]]) {
+    const db = openDb(":memory:");
+    for (const row of order) mergeLineRows(db, [row]);
+    expect(listLineRows(db)).toEqual([order.includes(later) ? later : queued]);
+  }
+});
+
+test("a database from before queues gets the column, its rows unqueued, and keeps writing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "meddle-rows-"));
+  try {
+    const path = join(dir, "db.sqlite");
+    const old = new Database(path);
+    old.exec(`CREATE TABLE line_rows (project TEXT NOT NULL, task TEXT NOT NULL, name TEXT NOT NULL, holder TEXT NOT NULL,
+      epoch INTEGER NOT NULL, seq INTEGER NOT NULL, commit_id TEXT NULL, base TEXT NOT NULL, archived INTEGER NOT NULL,
+      seen_seq INTEGER NOT NULL, PRIMARY KEY (project, task, name))`);
+    old.query("INSERT INTO line_rows VALUES ('p', 't', 'w', ?, 0, 3, ?, ?, 0, 3)").run(N1, A, JSON.stringify([B]));
+    old.close();
+    const db = openDb(path);
+    expect(listLineRows(db)).toEqual([line(0, 3)]);
+    expect(setQueued(db, "p", "t", "w", QUEUED)).toEqual(line(0, 4, { queuedAt: QUEUED }));
+    db.close();
+    // Opened again, the column is not added twice, and the queue stays.
+    const again = openDb(path);
+    expect(listLineRows(again)).toEqual([line(0, 4, { queuedAt: QUEUED })]);
+    again.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

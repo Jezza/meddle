@@ -4,6 +4,9 @@
 // - A line row, keyed (project, task, name), is written by the task's holder; the greater (epoch, seq) wins.
 // - A branch row, keyed (project, branch, node), is written by that node; the greater seq wins.
 // Equal on those, the greater content wins, so that every node settles on the same row.
+// A line row also says when its task was queued for the project's train (`queuedAt`), the holder's to write
+// (`setQueued`). It is not part of the content: a row without it (a copy relayed by a node of a meddle before queues)
+// never beats one with it, and a write that says nothing of it keeps the one stored.
 // A peer's branch row waits (`branch_rows_waiting`) until this node holds the commit it names, and only then is it
 // used and relayed: a push is seen nowhere its commit is not, so no node judges a push against a row it can't read,
 // and every node that hands a row on can hand its commit on too. A waiting row's seq still counts for its writer's
@@ -15,18 +18,24 @@ import { COMMIT_ID, SAFE_ID } from "../tasks/provision";
 /** A branch row, named by its writer and seq: what a branch row's `drops` list. */
 export type RowRef = { node: string; seq: number };
 
-/** Where line `name` of task `task` points: `commit` null is released; `base` are its base commits. */
+/**
+ * Where line `name` of task `task` points: `commit` null is released; `base` are its base commits; `queuedAt` is when
+ * the task was queued for the project's train (the line of the project's own name carries it), null for not queued.
+ */
 export type LineRow = {
   project: string; task: string; name: string; holder: string; epoch: number; seq: number;
-  commit: string | null; base: string[]; archived: boolean;
+  commit: string | null; base: string[]; archived: boolean; queuedAt: string | null;
 };
+
+/** A line row as a peer sends it: no `queuedAt` from a node of a meddle before queues. */
+export type LineRowIn = Omit<LineRow, "queuedAt"> & { queuedAt?: string | null };
 
 /** Where node `node` puts branch `branch`: `commit` null is deleted; `drops` are the rows it replaced. */
 export type BranchRow = { project: string; branch: string; node: string; seq: number; commit: string | null; drops: RowRef[] };
 
 type LineRecord = {
   project: string; task: string; name: string; holder: string; epoch: number; seq: number; commit_id: string | null;
-  base: string; archived: number; seen_seq: number;
+  base: string; archived: number; queued_at: string | null; seen_seq: number;
 };
 
 type BranchRecord = { project: string; branch: string; node: string; seq: number; commit_id: string | null; drops: string };
@@ -110,7 +119,7 @@ function isCommit(commit: unknown): commit is string {
 }
 
 /** A peer's line row as this node stores it, or null when no node would write it. */
-function acceptLine(r: LineRow): LineRow | null {
+function acceptLine(r: LineRowIn): LineRow | null {
   const ok = typeof r.project === "string"
     && typeof r.task === "string" && SAFE_ID.test(r.task)
     && typeof r.name === "string"
@@ -118,11 +127,12 @@ function acceptLine(r: LineRow): LineRow | null {
     && Number.isSafeInteger(r.epoch) && Number.isSafeInteger(r.seq)
     && (r.commit === null || isCommit(r.commit))
     && Array.isArray(r.base) && r.base.every(isCommit)
-    && typeof r.archived === "boolean";
+    && typeof r.archived === "boolean"
+    && (r.queuedAt === undefined || r.queuedAt === null || typeof r.queuedAt === "string");
   if (!ok) return null;
   return {
     project: r.project, task: r.task, name: r.name, holder: r.holder, epoch: r.epoch, seq: r.seq, commit: r.commit,
-    base: [...r.base], archived: r.archived,
+    base: [...r.base], archived: r.archived, queuedAt: r.queuedAt ?? null,
   };
 }
 
@@ -145,7 +155,7 @@ function acceptBranch(r: BranchRow): BranchRow | null {
 function lineOf(r: LineRecord): LineRow {
   return {
     project: r.project, task: r.task, name: r.name, holder: r.holder, epoch: r.epoch, seq: r.seq, commit: r.commit_id,
-    base: JSON.parse(r.base) as string[], archived: r.archived !== 0,
+    base: JSON.parse(r.base) as string[], archived: r.archived !== 0, queuedAt: r.queued_at,
   };
 }
 
@@ -167,12 +177,15 @@ function branchRecord(db: Database, project: string, branch: string, node: strin
 
 function putLine(db: Database, r: LineRow, seenSeq: number): void {
   db.query(
-    `INSERT INTO line_rows (project, task, name, holder, epoch, seq, commit_id, base, archived, seen_seq)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO line_rows (project, task, name, holder, epoch, seq, commit_id, base, archived, queued_at, seen_seq)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (project, task, name) DO UPDATE SET holder = excluded.holder, epoch = excluded.epoch,
        seq = excluded.seq, commit_id = excluded.commit_id, base = excluded.base, archived = excluded.archived,
-       seen_seq = excluded.seen_seq`,
-  ).run(r.project, r.task, r.name, r.holder, r.epoch, r.seq, r.commit, JSON.stringify(r.base), r.archived ? 1 : 0, seenSeq);
+       queued_at = excluded.queued_at, seen_seq = excluded.seen_seq`,
+  ).run(
+    r.project, r.task, r.name, r.holder, r.epoch, r.seq, r.commit, JSON.stringify(r.base), r.archived ? 1 : 0, r.queuedAt,
+    seenSeq,
+  );
 }
 
 function putBranch(db: Database, r: BranchRow, table: BranchTable = "branch_rows"): void {
@@ -187,7 +200,10 @@ function deleteBranch(db: Database, r: Pick<BranchRow, "project" | "branch" | "n
   db.query(`DELETE FROM ${table} WHERE project = ? AND branch = ? AND node = ?`).run(r.project, r.branch, r.node);
 }
 
-/** Everything a line row carries but its key, epoch and seq, as one comparable string. */
+/**
+ * Everything a line row carries but its key, epoch, seq and `queuedAt`, as one comparable string. Not `queuedAt`: a
+ * copy of a row relayed by a node that does not know the field has none, and must not beat the row it came from.
+ */
 function lineContent(r: LineRow): string {
   return JSON.stringify([r.holder, r.commit, r.base, r.archived]);
 }
@@ -197,11 +213,17 @@ function branchContent(r: BranchRow): string {
   return JSON.stringify([r.commit, r.drops]);
 }
 
-/** Whether line row `r` wins over `local`, of the same key: the greater (epoch, seq), then the greater content. */
+/**
+ * Whether line row `r` wins over `local`, of the same key: the greater (epoch, seq), then the greater content, then
+ * the greater `queuedAt` (none the least), so that a copy without the queue never clears it, and every node settles
+ * on the row with it.
+ */
 function lineWins(r: LineRow, local: LineRow): boolean {
   if (r.epoch !== local.epoch) return r.epoch > local.epoch;
   if (r.seq !== local.seq) return r.seq > local.seq;
-  return lineContent(r) > lineContent(local);
+  const [content, localContent] = [lineContent(r), lineContent(local)];
+  if (content !== localContent) return content > localContent;
+  return (r.queuedAt ?? "") > (local.queuedAt ?? "");
 }
 
 /** Whether branch row `r` wins over `local`, of the same key: the greater seq, then the greater content. */
@@ -213,9 +235,10 @@ function branchWins(r: BranchRow, local: BranchRow): boolean {
 /**
  * Merges a peer's line rows: per (project, task, name), the greater (epoch, seq) wins, then the greater content.
  * `changed` are the projects whose rows changed; `rejected` counts the rows dropped (a task id failing `SAFE_ID`, a
- * commit or base that is not 40 or 64 hex characters, an epoch or seq that is not an integer, a malformed field).
+ * commit or base that is not 40 or 64 hex characters, an epoch or seq that is not an integer, a `queuedAt` that is
+ * neither a string nor null, a malformed field).
  */
-export function mergeLineRows(db: Database, rows: readonly LineRow[]): { changed: string[]; rejected: number } {
+export function mergeLineRows(db: Database, rows: readonly LineRowIn[]): { changed: string[]; rejected: number } {
   const projects = new Set<string>();
   const keys = new Set<string>();
   let rejected = 0;
@@ -333,15 +356,35 @@ export function allBranchRows(db: Database): BranchRow[] {
   return db.query<BranchRecord, []>("SELECT * FROM branch_rows ORDER BY project, branch, node").all().map(branchOf);
 }
 
-/** Writes a line row (this node being its holder) at one above the highest seq seen for the line. */
-export function writeLineRow(db: Database, row: Omit<LineRow, "seq">): LineRow {
+/**
+ * Writes a line row (this node being its holder) at one above the highest seq seen for the line. A `row` that does not
+ * say `queuedAt` keeps the one the line has (none for a line with no row yet): only `setQueued` changes the queue.
+ */
+export function writeLineRow(db: Database, row: Omit<LineRow, "seq" | "queuedAt"> & { queuedAt?: string | null }): LineRow {
   const written = db.transaction(() => {
     const local = lineRecord(db, row.project, row.task, row.name);
     // seen_seq is never below the stored row's seq.
     const r: LineRow = {
       project: row.project, task: row.task, name: row.name, holder: row.holder, epoch: row.epoch,
       seq: (local?.seen_seq ?? 0) + 1, commit: row.commit, base: [...row.base], archived: row.archived,
+      queuedAt: row.queuedAt === undefined ? local?.queued_at ?? null : row.queuedAt,
     };
+    putLine(db, r, r.seq);
+    return r;
+  }).immediate();
+  linesChanged([JSON.stringify([written.project, written.task])]);
+  return written;
+}
+
+/**
+ * Sets when line `name` of task `task` was queued (null: not queued), as its holder: the row is written at one above
+ * the highest seq seen for the line, everything else as it is. Throws when this node has no row of the line.
+ */
+export function setQueued(db: Database, project: string, task: string, name: string, queuedAt: string | null): LineRow {
+  const written = db.transaction(() => {
+    const local = lineRecord(db, project, task, name);
+    if (local === null) throw new Error(`no line row ${project}/${task}/${name}`);
+    const r: LineRow = { ...lineOf(local), seq: local.seen_seq + 1, queuedAt };
     putLine(db, r, r.seq);
     return r;
   }).immediate();

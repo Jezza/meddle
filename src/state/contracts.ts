@@ -750,6 +750,8 @@ export const LineRowSchema = Type.Object({
   commit: Nullable(Type.String()),
   base: Type.Array(Type.String()),
   archived: Type.Boolean(),
+  /** When the task was queued for the project's train, null for not queued; absent from a node of a meddle before queues. */
+  queuedAt: Type.Optional(Nullable(Type.String())),
 });
 
 /**
