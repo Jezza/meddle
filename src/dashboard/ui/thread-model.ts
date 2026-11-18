@@ -309,7 +309,8 @@ function startTask(tool: ToolItem, background: boolean) {
   delete tool.ended;
 }
 
-const isAgentCall = (tool: ToolItem): boolean => tool.name === "Agent" || tool.name === "Task";
+/** Whether a call starts a subagent: `Agent`, or `Task` as older Claude Code names it. */
+export const isAgentCall = (tool: ToolItem): boolean => tool.name === "Agent" || tool.name === "Task";
 const isBackgroundAgent = (item: ThreadItem): item is ToolItem => item.kind === "tool" && isAgentCall(item) && item.background === true;
 
 /** How an agent's status line says its notice's `status`. */
@@ -459,7 +460,7 @@ export function toolTarget(tool: ToolItem, cwd: string): string {
   const field = (key: string) => typeof input[key] === "string" ? input[key] as string : undefined;
   const file = field("file_path") ?? field("notebook_path");
   if (file !== undefined) return relativePath(file, cwd);
-  if (tool.name === "Agent" || tool.name === "Task") return field("description") ?? "";
+  if (isAgentCall(tool)) return field("description") ?? "";
   if (tool.name === "Skill") return field("skill") ?? "";
   const pattern = field("pattern");
   const path = field("path");

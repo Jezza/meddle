@@ -1,14 +1,17 @@
 // One task: its head (title, state, actions), the thread from the session's event log with what waits on you inline,
-// the composer, and the bar beneath (each project with its line, the latest turn's tokens; the node, permission mode, model and effort).
+// its agents, the composer, and the bar beneath (each project with its line, the latest turn's tokens; the node,
+// permission mode, model and effort).
 import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
 import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
 import { createContext, type RefObject } from "preact";
 import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { Attachment, Prompt } from "../../blobs/attachment";
-import { type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
+import { type AgentEntry, type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
-import { errorText, type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
+import { errorText, type Hosts, useAction, useDraft, useObject, useTick, useValue } from "./hooks";
+import { AgentsPanel } from "./Agents";
+import { agentSeconds } from "./agents-model";
 import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFileTarget } from "./Attachments";
 import { Changes } from "./Changes";
@@ -16,13 +19,14 @@ import { changeCount } from "./changes-model";
 import { composerKey } from "./composer-model";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
-import { Chevron, Iconoir } from "./icons";
+import { Chevron, Icon, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { ago, type ProjectLine, projectLines, usageShort } from "./sidebar-model";
+import { useOptionalValue } from "./sources";
 import {
-  activity, activityLine, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps, isLook,
-  keyOf, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
+  activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps,
+  isAgentCall, isLook, isRunning, keyOf, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
 } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -87,6 +91,10 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   const nodeId = useValue(node.nodeId);
   const nodes = useValue(pool.nodes);
   const nameOf = (id: string) => nodes.find((n) => n.nodeId === id)?.hostname ?? shortId(id);
+  // A node of an older meddle serves no `agents`: its tasks have none to list.
+  const agents = useOptionalValue(task, "agents") ?? NO_AGENTS;
+  /** The agent row the agent list (or a `Message` row) last led the thread to. */
+  const [focus, setFocus] = useState<Focus | null>(null);
 
   // A task that moved on is followed to where it went.
   useEffect(() => {
@@ -127,7 +135,8 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
       {showChanges ? <Changes task={task} /> : state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
       ) : (
-        <Thread task={task} session={session} readOnly={archived} working={state === "running"} raw={raw} after={<>
+        <Thread task={task} session={session} readOnly={archived} working={state === "running"} raw={raw}
+          agents={agents} focus={focus} setFocus={setFocus} after={<>
           {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
           {queued.map((prompt, i) => <Queued key={i} prompt={prompt} />)}
           {!archived && failed.map((f) => (
@@ -138,6 +147,10 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
       {/* The thread holds what waits on you; beside the changes, it waits beneath them. */}
       {showChanges && pending.length > 0 && (
         <div class="pending-strip">{pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}</div>
+      )}
+      {/* Above the composer, or where it would be on an archived task. */}
+      {state !== "moved" && !showChanges && (
+        <AgentsPanel agents={agents} selected={focus?.toolUseId || null} onPick={(agent) => setFocus(aim(agent.toolUseId, agent.seq))} />
       )}
       {!archived && state !== "moved" && !showChanges && (
         <Composer task={task} running={live} anyQueued={queued.length > 0} disabled={moving} text={draft} setText={setDraft} drafts={drafts} box={box}
@@ -270,11 +283,25 @@ function blocksOf(items: readonly ShownItem[]): Block[] {
   return out;
 }
 
-function Thread({ task, session, readOnly, working, raw, after }: {
-  task: TaskRef; session: SessionRef; readOnly: boolean; working: boolean; raw: boolean; after: preact.ComponentChildren;
+/**
+ * An agent row the thread is led to: the call that first started the agent, and the seq of that start, which the
+ * thread loads back to. `n` counts the picks, so picking the same agent again leads there again.
+ */
+type Focus = { toolUseId: string; seq: number; n: number };
+
+/** Leads the thread to `toolUseId`'s row, loading back to `seq`. */
+const aim = (toolUseId: string, seq: number) => (prev: Focus | null): Focus => ({ toolUseId, seq, n: (prev?.n ?? 0) + 1 });
+
+const NO_AGENTS: readonly AgentEntry[] = [];
+
+function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus, after }: {
+  task: TaskRef; session: SessionRef; readOnly: boolean; working: boolean; raw: boolean;
+  agents: readonly AgentEntry[]; focus: Focus | null; setFocus: Dispatch<StateUpdater<Focus | null>>;
+  after: preact.ComponentChildren;
 }) {
   const window = useValue(session.window);
   const live = useValue(session.live);
+  const agentsRunning = useOptionalValue(task, "agentsRunning") ?? 0;
   /** Every event seen since the view opened: the window slides past events, and "load earlier" adds older ones. */
   const [seen, setSeen] = useState<Map<number, LogEvent>>(() => new Map());
   const [noneEarlier, setNoneEarlier] = useState(false);
@@ -284,8 +311,13 @@ function Thread({ task, session, readOnly, working, raw, after }: {
   const events = useMemo(() => [...merged(seen, window).values()].sort((a, b) => a.seq - b.seq), [seen, window]);
   const items = useMemo(() => buildThread(events), [events]);
   const blocks = useMemo(() => blocksOf(foldSteps(items, raw)), [items, raw]);
+  const byCall = useMemo(() => new Map(agents.map((a) => [a.toolUseId, a])), [agents]);
   // A read-only thread has no task to open a large file's diff from: its workspace is gone, and the read refused.
-  const view = useMemo(() => ({ cwd: cwdOf(events), raw, task: readOnly ? null : task }), [events, raw, task, readOnly]);
+  const view = useMemo((): ThreadContext => ({
+    cwd: cwdOf(events), raw, task: readOnly ? null : task, agents: byCall, focused: focus?.toolUseId || null,
+    // An agent the list has no entry for (an older node) has its row in the thread already: nothing to load.
+    focus: (toolUseId) => setFocus(toolUseId === null ? null : aim(toolUseId, byCall.get(toolUseId)?.seq ?? Infinity)),
+  }), [events, raw, task, readOnly, byCall, focus, setFocus]);
   const oldest = events[0]?.seq;
 
   // Kept at the bottom while you are there; left alone while you read further up.
@@ -304,10 +336,49 @@ function Thread({ task, session, readOnly, working, raw, after }: {
     setSeen((prev) => merged(prev, earlier));
   });
 
+  // Led to an agent's row: earlier events load page by page until its start is in (or none are left), then it opens.
+  // A pick while they load leads the same loop on to the newer pick; the pick standing when the view opened is not
+  // followed again.
+  const target = useRef(focus);
+  target.current = focus;
+  const followed = useRef(focus);
+  const seeking = useRef(false);
+  const [arrived, setArrived] = useState<Focus | null>(null);
+  useEffect(() => {
+    if (focus === followed.current || focus === null || focus.toolUseId === "" || seeking.current) return;
+    followed.current = focus;
+    seeking.current = true;
+    void action.run(async () => {
+      try {
+        let from = noneEarlier ? undefined : oldest;
+        while (from !== undefined && from > 1 && target.current !== null && from > target.current.seq) {
+          const earlier = await session.loadEarlier({ beforeSeq: from, limit: EARLIER_PAGE });
+          const last = earlier.length < EARLIER_PAGE;
+          if (last) setNoneEarlier(true);
+          setSeen((prev) => merged(prev, earlier));
+          from = last ? undefined : earlier[0]?.seq;
+        }
+      } finally {
+        seeking.current = false;
+        followed.current = target.current;
+        setArrived(target.current);
+      }
+    });
+  }, [focus]);
+  // Once the events are in: the row opens, and every row holding it (a parent agent's), and comes to the top.
+  useLayoutEffect(() => {
+    if (arrived === null || arrived.toolUseId === "") return;
+    const row = scroller.current?.querySelector<HTMLDetailsElement>(`details[data-call="${CSS.escape(arrived.toolUseId)}"]`);
+    if (row == null) return;
+    for (let d: HTMLDetailsElement | null = row; d !== null; d = d.parentElement?.closest("details") ?? null) d.open = true;
+    stick.current = false;
+    row.scrollIntoView({ block: "start" });
+  }, [arrived]);
+
   const lastClaude = blocks.at(-1)?.who === "claude";
   // Kept for the whole running turn, not only while text streams, so it does not blink out between steps.
   const tail = live !== null || working;
-  const doing = activity(live, items);
+  const doing = activity(live, items, agentsRunning);
   /** Changes whenever anything streams or lands, so the activity line can tell a quiet turn from a busy one. */
   const pulse = `${events.at(-1)?.seq ?? 0}:${live?.text.length ?? -1}:${live?.thinking.length ?? -1}:${live?.block ?? ""}`;
   return (
@@ -380,15 +451,6 @@ function Live({ live, doing, pulse }: { live: LiveState; doing: string; pulse: s
 
 const seconds = (ms: number) => Math.max(0, Math.floor(ms / 1000));
 
-/** Renders again every `ms` while mounted. */
-function useTick(ms: number) {
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const timer = setInterval(() => setTick((n) => n + 1), ms);
-    return () => clearInterval(timer);
-  }, [ms]);
-}
-
 /** When `key` last changed (or the component mounted). */
 function useSince(key: string): number {
   const last = useRef<{ key: string; at: number } | null>(null);
@@ -403,9 +465,19 @@ export function Markdown({ text }: { text: string }) {
 
 /**
  * What every row in the thread reads: the session's working directory (paths show relative to it), the Raw toggle,
- * and the task, whose workspace a large file's diff opens from.
+ * the task, whose workspace a large file's diff opens from, and its agents, which an Agent row's state and numbers
+ * come from.
  */
-const ThreadView = createContext<{ cwd: string; raw: boolean; task: TaskRef | null }>({ cwd: "", raw: false, task: null });
+type ThreadContext = {
+  cwd: string; raw: boolean; task: TaskRef | null;
+  /** The task's agents by the call that first started each (`AgentEntry.toolUseId`). */
+  agents: ReadonlyMap<string, AgentEntry>;
+  /** The call whose row the thread was last led to, highlighted; null for none. */
+  focused: string | null;
+  /** Leads the thread to the row of an agent's call (as picking it in the agent list does); null lets go of it. */
+  focus(toolUseId: string | null): void;
+};
+const ThreadView = createContext<ThreadContext>({ cwd: "", raw: false, task: null, agents: new Map(), focused: null, focus: () => {} });
 
 function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
@@ -467,29 +539,6 @@ function Thinking({ text }: { text: string }) {
   );
 }
 
-const ICONS = {
-  search: <><circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5 14 14" /></>,
-  edit: <path d="M10.5 2.5l3 3L6 13H3v-3z" />,
-  write: <><path d="M4 1.5h5l3 3v10H4z" /><path d="M8 7.5v4.5M5.75 9.75h4.5" /></>,
-  bash: <><path d="M2.5 4l4 4-4 4" /><path d="M8 12.5h5.5" /></>,
-  agent: <><circle cx="4" cy="3.5" r="1.5" /><circle cx="4" cy="12.5" r="1.5" /><circle cx="12" cy="6" r="1.5" /><path d="M4 5v6M12 7.5c0 2.5-3 3-6.5 4" /></>,
-  tool: <><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M5.5 8h5" /></>,
-  raw: <path d="M5 3.5 1.5 8 5 12.5M11 3.5 14.5 8 11 12.5" />,
-  thought: <path d="M3 3.5h10v7H7l-3 2.5v-2.5H3z" />,
-  failed: <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />,
-  running: <path d="M8 2a6 6 0 1 1-6 6" />,
-} as const;
-
-/** A call's icon in its small square, tinted by `name` (index.html's `.chip`). */
-function Icon({ name }: { name: keyof typeof ICONS }) {
-  return (
-    <span class={`chip ${name}`}>
-      <svg class={name === "running" ? "ic spin" : "ic"} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
-        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{ICONS[name]}</svg>
-    </span>
-  );
-}
-
 /** A row's state, for screen readers: its icon says it only by shape. */
 function StateText({ running, failed }: { running: boolean; failed: boolean }) {
   return running ? <span class="sr">running</span> : failed ? <span class="sr">failed</span> : null;
@@ -516,23 +565,40 @@ function ExploredRow({ steps }: { steps: Explored["steps"] }) {
 /**
  * One call as a row: its icon (a spinner while it runs, a cross once it fails), its name, what it acted on, and what
  * came of it; open, its diff, output or subagent. A failed call opens by itself, and so does a landed change of at
- * most `SMALL_DIFF` lines.
+ * most `SMALL_DIFF` lines. A `SendMessage` that resumed an agent is a `Message` row leading to the agent's own.
  */
 function ToolRow({ tool }: { tool: ToolItem }) {
-  const { cwd, raw, task } = useContext(ThreadView);
-  const running = tool.result === undefined;
-  const failed = tool.result?.isError === true;
+  return tool.resumes !== undefined ? <MessageRow tool={tool} resumes={tool.resumes} /> : <CallRow tool={tool} />;
+}
+
+/**
+ * A call's row. A background call runs until its notice; an agent's, while the agent list says it does (by its
+ * notices where the list has no entry for it, as on an older node), and it ends with the agent's report, its steps
+ * folded beneath; a stopped or failed agent's row is red and open.
+ */
+function CallRow({ tool }: { tool: ToolItem }) {
+  const { cwd, raw, task, agents, focused, focus } = useContext(ThreadView);
   const input = (tool.input ?? {}) as Record<string, unknown>;
   const edit = EDITS.includes(tool.name);
-  const agent = tool.name === "Agent" || tool.name === "Task";
+  const agent = isAgentCall(tool);
+  const entry = agent ? agents.get(tool.toolUseId) : undefined;
+  // How an agent stands: as the agent list says, else as its latest notice did.
+  const agentState = entry?.state ?? (agent ? tool.ended?.status : undefined);
+  const stopped = agentState === "stopped" || agentState === "failed";
+  const running = entry !== undefined ? entry.state === "running" : isRunning(tool);
+  const failed = stopped || (entry === undefined && tool.result?.isError === true);
   const diff = useMemo(() => edit ? editDiff(tool) : null, [edit, tool.input, tool.result]);
   const children = useMemo(() => foldSteps(tool.children, raw), [tool.children, raw]);
 
   const kind = edit ? (tool.name === "Write" ? "write" : "edit") : tool.name === "Bash" ? "bash" : agent ? "agent" : isLook(tool) ? "search" : "tool";
   const target = toolTarget(tool, cwd);
   const code = exitCode(tool);
+  const background = agent ? null : backgroundMeta(tool);
   const command = typeof input.command === "string" ? input.command : undefined;
   const result = tool.result;
+  const reports = tool.reports ?? [];
+  // An agent's result is its report only from an older Claude Code, in the foreground: a background one's is its launch receipt.
+  const showResult = result !== undefined && result.text !== "" && !(edit && !failed) && !(agent && (reports.length > 0 || tool.background === true));
   // Counts only for a change that landed: a running edit's input overstates it, a failed one's never applied.
   const landed = diff !== null && result !== undefined && !failed;
   const model = agent && typeof input.model === "string" ? input.model : undefined;
@@ -542,8 +608,12 @@ function ToolRow({ tool }: { tool: ToolItem }) {
     side: "new" as const,
     load: () => task.workspaceFile({ path: source.path }).then((text) => text === null ? null : textLines(text)),
   };
+  const isFocused = focused === tool.toolUseId;
+  // Closing the row the agent list led to lets go of it there too.
+  const onToggle = isFocused ? (e: { currentTarget: HTMLDetailsElement }) => { if (!e.currentTarget.open) focus(null); } : undefined;
   return (
-    <details class={`step${failed ? " bad" : running ? " live" : ""}`} open={failed || (landed && diff.added + diff.removed <= SMALL_DIFF)}>
+    <details class={`step${agent ? " agent" : ""}${failed ? " bad" : running ? " live" : ""}${isFocused ? " focus" : ""}`} data-call={tool.toolUseId}
+      open={failed || (landed && diff.added + diff.removed <= SMALL_DIFF)} onToggle={onToggle}>
       <summary title={typeof input.file_path === "string" ? input.file_path : command}>
         <Chevron /><Icon name={running ? "running" : failed ? "failed" : kind} /><StateText running={running} failed={failed} />
         <span class="verb">{tool.name}</span>
@@ -552,24 +622,95 @@ function ToolRow({ tool }: { tool: ToolItem }) {
           <span class="meta"><span class="add">+{diff.added}</span> <span class="del">−{diff.removed}</span></span>
         )}
         {code !== undefined && <span class="meta">exit {code}</span>}
-        {model !== undefined && <span class="meta">{model}</span>}
+        {background !== null && <span class="meta">{background}</span>}
+        {entry !== undefined ? <AgentMeta entry={entry} model={model} /> : model !== undefined && <span class="meta">{model}</span>}
+        {entry?.state === "running" && (
+          <span class="now"><span class="dots" aria-hidden="true"><i /><i /><i /></span><span class="what">{entry.doing ?? "Working"}</span></span>
+        )}
       </summary>
       <div class="step-body">
+        {stopped && <p class="tool-note error">Stopped before it reported{entry?.orphaned === true && ": the session ended"}</p>}
         {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
         {diff !== null && (diff.hunks.length > 0
           ? <DiffView hunks={diff.hunks} file={result?.original ?? null} {...fromWorkspace} />
           : diff.fallback.length > 0 && <div class="diff"><div class="diff-body"><DiffRows rows={diff.fallback} /></div></div>)}
         {command !== undefined && (command.includes("\n") || command !== target) && <pre class="out">{command}</pre>}
         {diff === null && command === undefined && !agent && <pre class="out">{json(tool.input)}</pre>}
-        {(children.length > 0 || tool.agentId !== undefined) && (
+        {reports.length > 0 ? <>
+          <Reports reports={reports} />
+          {children.length > 0 && <Steps tools={entry?.tools ?? tool.children.filter((c) => c.kind === "tool").length} items={children} />}
+        </> : (children.length > 0 || tool.agentId !== undefined) && (
           <div class="sub">
             {tool.agentId !== undefined && <p class="muted tool-note">agent {tool.agentId}</p>}
             <Items items={children} />
           </div>
         )}
-        {result !== undefined && result.text !== "" && !(edit && !failed) && <pre class={failed ? "out error" : "out"}>{result.text}</pre>}
+        {showResult && <pre class={failed ? "out error" : "out"}>{result.text}</pre>}
         {tool.skill !== undefined && <pre class="out">{tool.skill}</pre>}
       </div>
+    </details>
+  );
+}
+
+/** An agent row's meta from the agent list: its model, how many tools it used and for how long, ticking while it runs. */
+function AgentMeta({ entry, model }: { entry: AgentEntry; model: string | undefined }) {
+  useTick(entry.state === "running" ? 1000 : null);
+  const parts = [model, `${entry.tools} tools`, duration(agentSeconds(entry, Date.now()))];
+  return <span class="meta">{parts.filter((p) => p !== undefined).join(" · ")}</span>;
+}
+
+/** An agent's reports as its result: the newest in a card, the earlier ones (before a follow-up) behind a toggle. */
+function Reports({ reports }: { reports: readonly string[] }) {
+  const [earlier, setEarlier] = useState(false);
+  const n = reports.length;
+  const shown = earlier ? [...reports.keys()].reverse() : [n - 1];
+  return (
+    <>
+      {shown.map((i) => (
+        <div key={i} class="report">
+          <div class="report-head">
+            <span>Report</span>
+            {n > 1 && <span>{i + 1} of {n}</span>}
+            {n > 1 && i === n - 1 && (
+              <button onClick={() => setEarlier(!earlier)}>{earlier ? "hide earlier" : n > 2 ? "earlier reports" : "earlier report"}</button>
+            )}
+          </div>
+          <Markdown text={reports[i]!} />
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** An agent's steps beneath its report, folded into one closed row saying how many tools it used. */
+function Steps({ tools, items }: { tools: number; items: readonly ShownItem[] }) {
+  return (
+    <details class="step">
+      <summary><Chevron /><Icon name="search" /><span class="verb">Steps</span><span class="target plain muted">{tools} tools</span></summary>
+      <div class="sub"><Items items={items} /></div>
+    </details>
+  );
+}
+
+/**
+ * A `SendMessage` that resumed an agent: one line, "Message to <the agent>" and the message's summary, spinning while
+ * the run it started is running. It does not open: it leads to the agent's row, where that run shows.
+ */
+function MessageRow({ tool, resumes }: { tool: ToolItem; resumes: string }) {
+  const { agents, focus } = useContext(ThreadView);
+  const entry = agents.get(resumes);
+  const input = (tool.input ?? {}) as Record<string, unknown>;
+  // Its run is over once the agent is, notice or not.
+  const running = isRunning(tool) && (entry === undefined || entry.state === "running");
+  const to = entry?.description ?? (typeof input.to === "string" ? input.to : "");
+  const summary = typeof input.summary === "string" ? input.summary : "";
+  return (
+    <details class={`step${running ? " live" : ""}`} data-call={tool.toolUseId}>
+      <summary title={typeof input.message === "string" ? input.message : undefined} onClick={(e) => { e.preventDefault(); focus(resumes); }}>
+        <Chevron /><Icon name={running ? "running" : "agent"} /><StateText running={running} failed={false} />
+        <span class="verb">Message</span>
+        <span class="target plain">to {to}{summary !== "" && <span class="muted"> · {summary}</span>}</span>
+      </summary>
     </details>
   );
 }

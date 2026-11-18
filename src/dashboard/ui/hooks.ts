@@ -224,6 +224,33 @@ export function useDraft(key: string): [string, Dispatch<StateUpdater<string>>] 
   return [text, set];
 }
 
+/** Renders again every `ms` while mounted; never for null. */
+export function useTick(ms: number | null) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (ms === null) return;
+    const timer = setInterval(() => setTick((n) => n + 1), ms);
+    return () => clearInterval(timer);
+  }, [ms]);
+}
+
+/** A switch remembered per browser under `key` (`store`); off where it never was, or storage is out of reach. */
+export function stored(key: string): boolean {
+  try {
+    return localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function store(key: string, on: boolean): void {
+  try {
+    localStorage.setItem(key, on ? "1" : "0");
+  } catch {
+    // a private window: remembered for this page only
+  }
+}
+
 export function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }

@@ -25,6 +25,11 @@ function tally(agents: readonly AgentEntry[], words: StateWords, separator: stri
     .join(separator);
 }
 
+/** How long an agent has worked, in whole seconds: since `startedAt` while it runs, else its final `ms`. */
+export function agentSeconds(agent: AgentEntry, now: number): number {
+  return agent.state === "running" ? secondsSince(agent.startedAt, now) : Math.round(agent.ms / 1000);
+}
+
 /** The agents' states in words (`2 running · 1 done · 1 stopped`), leaving out the noughts; "" for none. */
 export function agentCounts(agents: readonly AgentEntry[]): string {
   return tally(agents, [["running", "running"], ["completed", "done"], ["stopped", "stopped"], ["failed", "failed"]], " · ");
@@ -37,8 +42,7 @@ function row(agent: AgentEntry, now: number): AgentRow {
     : agent.state === "completed" ? (agent.endedAt === null ? "done" : `done ${ago(now - Date.parse(agent.endedAt))} ago`)
     : agent.state === "failed" ? "failed"
     : agent.orphaned ? "stopped with the session" : "stopped";
-  const time = running ? secondsSince(agent.startedAt, now) : Math.round(agent.ms / 1000);
-  return { agent, doing, nums: `${agent.tools} tools · ${tokens(agent.tokens)} · ${duration(time)}` };
+  return { agent, doing, nums: `${agent.tools} tools · ${tokens(agent.tokens)} · ${duration(agentSeconds(agent, now))}` };
 }
 
 /**
