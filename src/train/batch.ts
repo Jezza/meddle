@@ -122,6 +122,18 @@ export async function classify(
 }
 
 /**
+ * The commits of `B..c.tip` that are candidate `c`'s own, children first: neither the revision it started from and what
+ * is below it (`c.base`) nor another task's work (as `classify` tells it), each with whether `c` may change it
+ * (`mutable`, read as `classify` reads it). What a rebase of `c`'s work would have to rewrite.
+ */
+export async function ownWork(cfg: NodeConfig, repo: string, B: string, c: Candidate, lines: readonly LineRow[]): Promise<CommitInfo[]> {
+  const landing = `(::${c.tip} ~ ::${B} ~ ${below(c.base)})`;
+  const work = await foreignWork(cfg, repo, c, landing, lines);
+  const others = new Set([...work.values()].flatMap((commitIds) => [...commitIds]));
+  return (await landingCommits(cfg, repo, c, landing)).filter((k) => !others.has(k.commitId));
+}
+
+/**
  * Splits `eligible` (queued tasks that are idle, online and not in a train turn) by how they meet the branch's commit
  * `B`: the biggest first (`size`; the queue's order among equals), a task whose trial merge with `B` is clean joins the
  * `batch` when its merge with `B` and the batch so far is clean too, and otherwise waits for the next round (`later`).
