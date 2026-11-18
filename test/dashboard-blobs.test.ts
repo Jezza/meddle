@@ -60,7 +60,8 @@ test("a download's name is encoded into its header, whatever it holds", async ()
   await fetch(`${url}blobs`, { method: "PUT", body: "hello" });
   const name = 'résumé "1"\r\nSet-Cookie: a=b.txt';
   const r = await fetch(`${url}blobs/${sha("hello")}?type=text/plain&name=${encodeURIComponent(name)}`);
-  expect(r.headers.get("content-disposition")).toBe(`attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+  // its control characters made `_`, as in any name
+  expect(r.headers.get("content-disposition")).toBe(`attachment; filename*=UTF-8''${encodeURIComponent('résumé "1"__Set-Cookie: a=b.txt')}`);
   expect(r.headers.get("set-cookie")).toBeNull();
   // no name at all is still a file with a name
   const bare = await fetch(`${url}blobs/${sha("hello")}`);

@@ -31,6 +31,11 @@ test("cleanName keeps a base name", () => {
   expect(cleanName("...")).toBe("file");
   expect(cleanName("")).toBe("file");
   expect(cleanName("shot.png")).toBe("shot.png");
+  // control characters (a newline would break the list of files a prompt gets) go as separators do
+  expect(cleanName("a\nb\r\t.png")).toBe("a_b__.png");
+  expect(cleanName("\x00x\x1f\x7f.log")).toBe("_x__.log");
+  expect(cleanName("\n.bashrc")).toBe("_.bashrc");
+  expect(cleanName("café ünï 😀.png")).toBe("café ünï 😀.png");
   const long = cleanName("x".repeat(300) + ".png");
   expect(long.length).toBe(200);
   expect(long.endsWith(".png")).toBe(true);
@@ -43,7 +48,7 @@ test("cleanName cuts a long name without splitting a character, and a long exten
   expect(cleanName("a." + "x".repeat(300))).toBe(("a." + "x".repeat(300)).slice(0, 200));
 });
 test("everything cleanName returns is a name attachmentProblem accepts", () => {
-  for (const name of ["../../x", ".bashrc", "...", "", "x".repeat(300) + ".png", "a\\b/c", "😀".repeat(300), "😀." + "x".repeat(199)]) {
+  for (const name of ["../../x", ".bashrc", "...", "", "x".repeat(300) + ".png", "a\\b/c", "😀".repeat(300), "😀." + "x".repeat(199), "a\nb", "\x7f", "\x00.x"]) {
     expect(attachmentProblem(att({ name: cleanName(name) }))).toBeNull();
   }
 });
@@ -58,6 +63,8 @@ test("attachmentProblem refuses what a node must not write", () => {
   expect(attachmentProblem(att())).toBeNull();
   expect(attachmentProblem(att({ hash: "zz" }))).not.toBeNull();
   for (const name of ["../x", ".bashrc", "a/b", "a\\b", "", "x".repeat(201)]) expect(attachmentProblem(att({ name }))).not.toBeNull();
+  for (const name of ["a\nb.png", "a\rb", "tab\there", "nul\x00", "\x1fx", "del\x7f"]) expect(attachmentProblem(att({ name }))).toStartWith("name");
+  expect(attachmentProblem(att({ name: "café ünï 😀 (1).png" }))).toBeNull();
   expect(attachmentProblem(att({ name: "x".repeat(200) }))).toBeNull();
   expect(attachmentProblem(att({ size: -1 }))).not.toBeNull();
   expect(attachmentProblem(att({ size: 1.5 }))).not.toBeNull();

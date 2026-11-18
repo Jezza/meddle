@@ -21,6 +21,8 @@ export const IMAGE_BUDGET_BASE64 = 10 * 1024 * 1024;
 export const INLINE_IMAGE_TYPES: readonly string[] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 const MAX_NAME = 200;
+/** What a name may not hold: a separator, or a control character (a newline would break the list a prompt gets). */
+const NOT_IN_NAME = /[/\\\x00-\x1f\x7f]/;
 
 /** Whether `s` is a SHA-256 digest as 64 lowercase hex characters. */
 export function isBlobHash(s: string): boolean {
@@ -32,9 +34,12 @@ export function base64Length(bytes: number): number {
   return 4 * Math.ceil(bytes / 3);
 }
 
-/** A name safe to write: no separators, no leading dot, at most 200 characters keeping the extension, else `file`. */
+/**
+ * A name safe to write: separators and control characters made `_`, no leading dot, at most 200 characters keeping the
+ * extension, else `file`.
+ */
 export function cleanName(name: string): string {
-  const flat = name.replace(/[/\\]/g, "_").replace(/^\.+/, "");
+  const flat = name.replace(new RegExp(NOT_IN_NAME.source, "g"), "_").replace(/^\.+/, "");
   if (flat.length <= MAX_NAME) return flat || "file";
   const dot = flat.lastIndexOf(".");
   // An extension longer than half the name is not worth keeping, and keeping it could cut the stem to nothing.
@@ -62,8 +67,8 @@ export function attachmentProblem(a: unknown): string | null {
   if (typeof a !== "object" || a === null) return "not an object";
   const { hash, name, type, size } = a as Record<string, unknown>;
   if (typeof hash !== "string" || !isBlobHash(hash)) return "hash is not 64 lowercase hex characters";
-  if (typeof name !== "string" || name === "" || name.length > MAX_NAME || /[/\\]/.test(name) || name.startsWith(".")) {
-    return `name is not a base name of 1 to ${MAX_NAME} characters without a leading dot`;
+  if (typeof name !== "string" || name === "" || name.length > MAX_NAME || NOT_IN_NAME.test(name) || name.startsWith(".")) {
+    return `name is not a base name of 1 to ${MAX_NAME} characters without a leading dot or control characters`;
   }
   if (typeof type !== "string") return "type is not a string";
   if (typeof size !== "number" || !Number.isInteger(size) || size < 0) return "size is not a count of bytes";
