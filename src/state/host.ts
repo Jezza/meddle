@@ -803,7 +803,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       queued.replace(ctx, now.map((p) => p.text));
       queuedPrompts.replace(ctx, now);
     };
-    self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) refreshQueued(ctx); });
+    self.on("queued", queuedChanges, (event, ctx) => {
+      if (event.taskId !== id) return;
+      refreshQueued(ctx);
+      // The runner tells the queue right after it drops the turn's process, ahead of the idle state: agents stop running now.
+      refreshLiveTurn(ctx);
+    });
     // What changed between the cells' init and the listeners starting.
     self.task(async (ctx) => {
       state.replace(ctx, runner.state(id));
