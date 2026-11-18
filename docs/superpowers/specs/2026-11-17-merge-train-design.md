@@ -78,9 +78,12 @@ through: a task whose premise broke leaves the train.
   it: a new prompt, a steer into the turn that was running when Accept was pressed, Send now, or Retry. Answering an
   approval doesn't count: it continues the work the user accepted. A task that leaves shows why, and can be accepted
   again (designer's call).
-- While the train is using a task (a describe, rebase or fix turn of the train's, or a batch it's in being checked or
-  landed), messages the user sends to it wait, and Send now has no effect on the train's turn. When the train lets go,
-  a message that was waiting runs, and the task leaves the queue for the reason above.
+- While the train runs a turn of its own on a task (a describe, rebase or fix turn), messages the user sends to it
+  wait, and Send now has no effect on the train's turn. When that turn ends, a message that was waiting runs, and the
+  task leaves the queue for the reason above.
+- A message to a task whose batch is being checked runs at once. Like any other input, it takes the task off the
+  queue: it's an unqueue plus the message, and the check stops as for Unqueue (see "Pauses and stopping") (the user's
+  call).
 
 ### The conductor
 
@@ -205,8 +208,11 @@ When a train turn ends, the task is eligible again, and the next round starts.
   off mid-work, but nothing lands and no new round starts. The train stays paused, across restarts, until Resume.
   Resume carries on, and the round checks again first, in case the branch moved meanwhile. It's for "I'm about to push
   to main myself; hold off".
-- **Unqueue** takes a single task off, at any time. If it's in the batch being checked, the merge task is discarded and
-  the round starts over without it. That covers the other reason for stopping a round, so there's no Stop.
+- **Unqueue** takes a single task off, at any time. If it's in the batch being checked, the check stops at once: the
+  merge agent's turn is interrupted, the merge task is discarded, and the round starts over without it (the user's
+  call: the merge agent must stop including a task the user took off the train). This applies however the task leaves
+  the queue during the check: Unqueue, a message, archiving. That covers the other reason for stopping a round, so
+  there's no Stop.
 
 Things that need the user (a task that left the train, a task sitting out) are shown as **dashboard notices**, the
 existing top-right notices that failed turns and moves use, until dismissed (see "The dashboard").
