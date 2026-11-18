@@ -928,8 +928,9 @@ batch being checked is not held: a message to it runs, which takes it off the qu
 **Sitting out.** A task whose train turn fails (after meddle's own reruns for tokens), or ends without doing its job
 (revisions still undescribed or conflicted, or still not merging cleanly with the branch after the rebase), stays
 queued but is not eligible: it sits out. The train page shows it as `sitting out`, and a notice gives the reason, with
-Retry (also on its row). Only Retry brings it back, so the train never sends the same prompt round after round. A task
-whose node is offline sits out too, as `waiting for <node>`, and comes back by itself when the node does.
+Retry (also on its row). Only Retry brings it back (Unqueue takes it off the train instead), so the train never sends
+the same prompt round after round. A task whose node is offline sits out too, as `waiting for <node>`, and comes back
+by itself when the node does.
 
 **Pausing.** When the merge agent gets stuck (follow-ups that gave no verdict), its turn fails, or the branch refuses
 the landing for a reason that outlasts the round (conflicted, or behind its rows), the train pauses with `Paused:
@@ -1327,9 +1328,11 @@ activity; a merge task of the train shows among them as `🚂 Merge <task titles
 a new task. Failed turns, moves and token trouble show as notices in the top right until dismissed, and so do the
 train's, for a task that needs you: `<task> left meddle's train: <reason>` (Open task, and Accept again; a task you
 took off yourself is no news), `<task> is sitting out: <reason>` (Open task, and Retry) and `<task> includes work from
-<other task>, which isn't queued` (Open task). Each is raised once for its condition, and dismissing it clears it; the
-task is a normal task again, with Accept back in its header and menu. It flags a pool whose members run different
-meddle or Claude Code versions in the Nodes header.
+<other task>, which isn't queued` (Open task). Each is raised once for its condition, and dismissing a notice only
+clears the notice. A task that left the train is a normal task again, with Accept back in its header and menu. A task
+that sits out, or is held back, is still queued (its header offers Unqueue): Retry brings back one that sits out, and
+a held-back one is settled by accepting the other task or unqueueing this one. It flags a pool whose members run
+different meddle or Claude Code versions in the Nodes header.
 
 A task opens beside the sidebar: its title (✎ renames it), state (a queued task says `🚂 queued` beside it, as a
 partly accepted one says so; the 🚂 links to the train page) and actions (Interrupt, Retry, Archive, then Accept, or
