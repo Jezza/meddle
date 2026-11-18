@@ -819,15 +819,17 @@ are refused while an update awaits confirmation.
 A task **leaves the queue** when:
 
 - you take it off: Unqueue in the dashboard (its header, its ⋯ menu, or its row on the train page), or `task unqueue
-  <task-id>...`, which prints `unqueued <id>`, or `<id> is not queued` for a task that was not. Unqueueing a task of
-  the batch the train is checking doesn't stop the check: once the merge task's turn ends, the train discards the merge
-  task and the round starts over without it;
+  <task-id>...`, which prints `unqueued <id>`, or `<id> is not queued` for a task that was not;
 - you archive it;
 - anything of yours runs in it after you accepted: a new prompt, a message steered into the turn that was running when
   you pressed Accept, Send now, or Retry. Its work is about to change, and you accepted the version before. Answering
   an approval does not count: it carries on the work you accepted;
 - the train gives up on it: its agent declines, or a commit that would land can't be made pushable by the task
   (below).
+
+When a task of the batch the train is checking leaves (you unqueue it, send it a message or archive it), the check
+stops at once: the merge agent's turn is interrupted, the merge task is discarded, and the round starts over without
+the task. Nothing pauses for it.
 
 A task the train took off shows why as a notice in the dashboard (see [Dashboard](#dashboard)) and as a line in its
 conversation (`Declined: <reason>` when its agent declined, `Left meddle's train: <reason>` otherwise), and can be
@@ -933,7 +935,8 @@ Every train turn runs in `auto` permission mode, whatever the task's own mode is
 your turns. `decline` and `blame` need no approval. A train turn shows in the task's conversation like any prompt, marked
 as meddle's. While one runs on a task, what you send to it waits for the task's next turn, and Send now has nothing to
 send into it; the message runs when the train lets go, and takes the task off the queue then (above). A task in the
-batch being checked is not held: a message to it runs, which takes it off the queue and starts the round over without it.
+batch being checked is not held: a message to it runs at once, which takes it off the queue and stops the check, as
+Unqueue does (above).
 
 **Sitting out.** A task whose train turn fails (after meddle's own reruns for tokens), or ends without doing its job
 (revisions still undescribed or conflicted, or still not merging cleanly with the branch after the rebase, or not on

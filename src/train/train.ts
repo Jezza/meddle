@@ -30,7 +30,7 @@ import { containedIn, effectiveHead } from "../tasks/accept";
 import { TurnsHeld, type MeddleHooks, type RunnerHolds, type TaskRunner, type TrainTaskStatus } from "../tasks/durable";
 import type { TaskManifest } from "../tasks/manifest";
 import { sizeOf, type Candidate } from "./batch";
-import { NodeOffline, runRound, TaskGone, waitingFor, type RoundDeps, type RoundResult, type RoundStep } from "./round";
+import { BatchChanged, NodeOffline, runRound, TaskGone, waitingFor, type RoundDeps, type RoundResult, type RoundStep } from "./round";
 
 /** What `meddle.train` is given: the project whose train runs a round. */
 export type TrainInput = { projectId: string };
@@ -361,12 +361,15 @@ type Ended =
  * What a round keeps while it runs: its `B`, whether it read its candidates yet, why a landing was refused for now, why
  * a pool update holds it up (`held`) and the tasks whose turns that refused, the node each merge task it made (or
  * resumed) was placed on, and the held-back entries it carried in (`carried`: those of the tasks its first `candidates`
- * answered) with the tasks it held back (`reheld`).
+ * answered) with the tasks it held back (`reheld`). Also its step, as last checkpointed (null before the first), and the
+ * task of the batch being checked that left the queue meanwhile (`left`, null while none did), with `leaving`, which
+ * resolves as it is recorded: the check stops then (`BatchChanged`).
  */
 type RoundRun = {
   B: string | null; first: boolean; transient: string | null;
   held: string | null; heldTasks: Set<string>; mergeNodes: Map<string, string>;
   carried: Set<string>; reheld: Set<string>;
+  step: RoundStep | null; left: string | null; leaving: PromiseWithResolvers<void>;
 };
 
 /** How one project's train runs on its home. */
@@ -398,6 +401,13 @@ function closed(signal: AbortSignal): Promise<never> {
 /** Whether a pool update holds turns or work here: no round starts meanwhile. */
 function held(holds: RunnerHolds): boolean {
   return holds.turns !== null || holds.work !== null;
+}
+
+/** Task `taskId` of the batch `round` checks left the queue: the check stops (the first such task is the one recorded). */
+function stopCheck(round: RoundRun, taskId: string): void {
+  if (round.left !== null) return;
+  round.left = taskId;
+  round.leaving.resolve();
 }
 
 function pace(streak: number): number {
@@ -439,6 +449,8 @@ class Conductor {
   #ready = false;
   readonly #stops: Array<() => void> = [];
   readonly #trains = new Map<string, ProjectTrain>();
+  /** What the round under way here keeps, by project. */
+  readonly #rounds = new Map<string, RoundRun>();
   /** What each queued task's own line was as last seen (`queuedAt`, commit, holder), by project and task. */
   readonly #seen = new Map<string, string>();
   /** The titles of tasks held elsewhere, as their holders last said. */
@@ -657,7 +669,8 @@ class Conductor {
 
   /**
    * A line row of task `taskId` changed: a round starts when its own line was queued, left the queue, or moved while
-   * queued (another node's task ends its turn so here). Leaving the queue also drops what the train kept of it.
+   * queued (another node's task ends its turn so here). Leaving the queue also drops what the train kept of it, and
+   * stops the check of a batch it is in (`#batchLeft`).
    */
   #lineChanged(projectId: string, taskId: string): void {
     const project = this.#home(projectId);
@@ -669,8 +682,22 @@ class Conductor {
     const was = this.#seen.get(key) ?? null;
     if (now === null) this.#seen.delete(key);
     else this.#seen.set(key, now);
-    if (!queued) this.#prune(project);
+    if (!queued) {
+      this.#prune(project);
+      this.#batchLeft(projectId, taskId);
+    }
     if (now !== was) this.#kick(projectId);
+  }
+
+  /**
+   * Task `taskId` is not on project `projectId`'s queue (unqueued, a message of the user's ran in it, archived): when it
+   * is in the batch the round under way here is checking, the check stops at once. The round records it (`left`): from
+   * then on its merge turn is no longer waited for, and no merge task or merge turn starts (`BatchChanged`), so the
+   * round discards its merge task, which interrupts the turn, and starts over without the task.
+   */
+  #batchLeft(projectId: string, taskId: string): void {
+    const round = this.#rounds.get(projectId);
+    if (round?.step?.step === "checking" && round.step.batch.includes(taskId)) stopCheck(round, taskId);
   }
 
   /** A task here went idle (a turn of it ended): a round of the train it is queued on starts. */
@@ -767,6 +794,7 @@ class Conductor {
     const resume = at ?? train.round ?? undefined;
     const round: RoundRun = {
       B: null, first: true, transient: null, held: null, heldTasks: new Set(), mergeNodes: new Map(), carried: new Set(), reheld: new Set(),
+      step: null, left: null, leaving: Promise.withResolvers<void>(),
     };
     if (resume?.mergeTask != null && resume.mergeNode !== undefined) round.mergeNodes.set(resume.mergeTask, resume.mergeNode);
     const deps = this.#roundDeps(project, round, runtime, context, stopping);
@@ -775,6 +803,8 @@ class Conductor {
       updateTrain(this.#db, projectId, (t) => ({ ...t, round: afterHold(t.round, round.heldTasks) }));
       return end({ kind: "heldUp" });
     };
+    // While it runs, a task that leaves the batch it checks stops the check (`#batchLeft`).
+    this.#rounds.set(projectId, round);
     let result: RoundResult;
     try {
       const running = runRound(deps, this.#cfg, project.replica, this.#pool.settings.describePrompt(), resume);
@@ -788,11 +818,18 @@ class Conductor {
       if (err instanceof TrainPaused) return end({ kind: "held" });
       this.#log(`meddle: train: a round of ${project.name} failed: ${messageOf(err)}`);
       return end({ kind: "failed", error: err });
+    } finally {
+      if (this.#rounds.get(projectId) === round) this.#rounds.delete(projectId);
     }
     if (stopping()) return this.#halt(runtime);
     // A check the hold stopped reads as stuck, and a turn it refused as failed: neither is.
     if (round.held !== null) return heldUp();
     const paused = result.paused;
+    if (paused !== null && round.left !== null) {
+      // A check that got stuck (or failed) just as a task of its batch left is stopped all the same: nothing pauses, and
+      // the next round discards its merge task, which the checkpoint kept names, and starts over without the task.
+      return end({ kind: "round", result: { landed: null, again: true, paused: null }, transient: null });
+    }
     if (paused !== null) {
       updateTrain(this.#db, projectId, (t) => ({ ...t, paused: t.paused ?? paused }));
       return end({ kind: "round", result, transient: round.transient === paused ? paused : null });
@@ -818,6 +855,10 @@ class Conductor {
    * While a pool update holds turns here, no turn and no merge task starts (`HeldUp`), and neither does one a holder
    * refuses for its own hold; from then on the round starts nothing more (only cleaning up, and recording what has
    * happened, go on), a task whose turn the hold refused does not sit out, and the round ends held up.
+   *
+   * Once a task of the batch being checked has left the queue (`#batchLeft`, or found off it as the merge task would be
+   * made), the merge turn running is no longer waited for, and no merge task, merge turn or landing starts: each is
+   * refused with `BatchChanged`, so the round discards its merge task and starts over.
    */
   #roundDeps(project: Project, round: RoundRun, runtime: TrainRuntime, context: Context, stopping: () => boolean): RoundDeps {
     const projectId = project.id;
@@ -847,6 +888,12 @@ class Conductor {
       const holds = this.#runner.holds().turns;
       if (holds !== null) holdUp(holds, taskId);
     };
+    /** Once a task of the batch being checked has left the queue (`RoundRun.left`), merge work is refused. */
+    const unchanged = () => {
+      if (round.left !== null) throw new BatchChanged(round.left);
+    };
+    /** Rejects with `BatchChanged` as soon as a task of the batch being checked leaves the queue. */
+    const changed = (): Promise<never> => round.leaving.promise.then(() => { throw new BatchChanged(round.left!); });
     const checkpoint = async (step: RoundStep) => {
       work();
       // Step 1 has decided which tasks are held back: those it answered and did not hold back again no longer are.
@@ -856,6 +903,8 @@ class Conductor {
       const kept = saved(step, step.mergeTask === null ? undefined : round.mergeNodes.get(step.mergeTask));
       await runtime.commit(() => ({ status: "running", checkpoint: { phase: "round", ...kept } }), context);
       updateTrain(this.#db, projectId, (t) => ({ ...t, round: kept }));
+      // Only now: a task that leaves as the landing is recorded still left the batch being checked.
+      round.step = kept;
     };
     return {
       projectId,
@@ -883,6 +932,7 @@ class Conductor {
       },
       advance: async (old, next) => {
         work();
+        unchanged();
         await this.#advance(project, round, old, next);
       },
       leave: async (taskId, reason, declined) => {
@@ -908,15 +958,31 @@ class Conductor {
       checkpoint,
       createMergeTask: async (input) => {
         work();
+        // No merge task checks a batch a task of which has left the queue, since it was picked too.
+        const queued = new Set(queueOf(this.#db, project).map((r) => r.task));
+        const gone = input.batch.find((id) => !queued.has(id));
+        if (gone !== undefined) stopCheck(round, gone);
+        unchanged();
         const holds = this.#runner.holds().turns;
         if (holds !== null) return holdUp(holds, null);
         return this.#createMergeTask(project, input, round, checkpoint);
       },
       turn: async (taskId, kind, text) => {
         startFor(taskId);
+        const merge = kind === "merge";
+        if (merge) unchanged();
         try {
-          return await this.#onHolder(project, taskId, round, (r) => r.trainTurn(taskId, kind, text), (peer) => peer.trainTurn({ taskId, kind, text }));
+          const turn = this.#onHolder(project, taskId, round, (r) => r.trainTurn(taskId, kind, text), (peer) => peer.trainTurn({ taskId, kind, text }));
+          if (!merge) return await turn;
+          // The merge turn is waited for only while its batch stands: once a task of it leaves, the round discards the
+          // merge task, which interrupts the turn, and what the turn comes to is nobody's.
+          turn.catch(() => {});
+          const outcome = await Promise.race([turn, changed()]);
+          // One that ended (failed, say) just as a task of the batch left is stopped all the same.
+          unchanged();
+          return outcome;
         } catch (err) {
+          if (merge) unchanged();
           if (err instanceof TurnsHeld || err instanceof HeldUp) return holdUp(err.message, taskId);
           throw err;
         }

@@ -6,7 +6,7 @@ import { abandon, bookmarkSet, commitOf, commitsIn, initColocated, jj } from "..
 import type { LineRow } from "../src/pool/rows";
 import type { Candidate } from "../src/train/batch";
 import { describePrompt, mergeTitle, rebasePrompt } from "../src/train/prompts";
-import { NodeOffline, runRound, TaskGone, type RoundDeps, type RoundStep } from "../src/train/round";
+import { BatchChanged, NodeOffline, runRound, TaskGone, type RoundDeps, type RoundStep } from "../src/train/round";
 import type { TrainTurnKind, TrainTurnOutcome } from "../src/train/tools";
 
 const DESCRIBE = "Add a description (4-7 words) to your revision(s).";
@@ -469,6 +469,66 @@ test("a branch that moved before landing starts the round over", async () => {
   expect(await run()).toEqual({ landed: null, again: true, paused: null });
   expect(advances).toEqual([]);
   expect(discarded).toEqual(["m1"]);
+});
+
+test("BatchChanged from the merge turn rounds again without pausing", async () => {
+  const { B, on, task, tasks, run, created, discarded, advances, satOut, left, log, act } = await fixture();
+  const tip1 = await on(B, "first", { "f.txt": edited(1, "ONE") });
+  const tip2 = await on(B, "second", { "f.txt": edited(7, "SEVEN") });
+  await task("t1", tip1, { size: 2 });
+  await task("t2", tip2);
+  // While the merge agent checks the batch, the user unqueues t2: the conductor stops the check, and the merge turn
+  // rejects so.
+  act("merge", async () => {
+    tasks.get("t2")!.queued = false;
+    throw new BatchChanged("t2");
+  });
+
+  // Nothing pauses, nothing lands, nobody sits out or is taken off: the merge task is discarded, and the round starts over.
+  expect(await run()).toEqual({ landed: null, again: true, paused: null });
+  expect(discarded).toEqual(["m1"]);
+  expect(satOut).toEqual([]);
+  expect(left).toEqual([]);
+  expect(advances).toEqual([]);
+  expect(log).toEqual(["create m1", "turn m1", "discard m1"]);
+
+  // Without t2: t1 is a single head, landed as it is.
+  expect(await run()).toEqual({ landed: tip1, again: false, paused: null });
+  expect(advances).toEqual([[B, tip1]]);
+  expect(created).toHaveLength(1);
+});
+
+test("BatchChanged before the merge task is made, or as the batch lands, rounds again too", async () => {
+  const { B, on, task, deps, run, created, discarded, advances, satOut, steps } = await fixture();
+  const tip1 = await on(B, "first", { "f.txt": edited(1, "ONE") });
+  const tip2 = await on(B, "second", { "f.txt": edited(7, "SEVEN") });
+  await task("t1", tip1, { size: 2 });
+  await task("t2", tip2);
+
+  // A task left before the merge task was made: none is, so none is discarded.
+  const create = deps.createMergeTask;
+  deps.createMergeTask = async () => { throw new BatchChanged("t2"); };
+  expect(await run()).toEqual({ landed: null, again: true, paused: null });
+  expect(created).toEqual([]);
+  expect(discarded).toEqual([]);
+
+  // A task left as the check ended: the landing is refused so, and the merge task is discarded.
+  deps.createMergeTask = create;
+  const advance = deps.advance;
+  deps.advance = async () => { throw new BatchChanged("t2"); };
+  expect(await run()).toEqual({ landed: null, again: true, paused: null });
+  expect(discarded).toEqual(["m1"]);
+  expect(advances).toEqual([]);
+  expect(satOut).toEqual([]);
+
+  // The merge task can't be discarded as the check stops: the round rejects, its checkpoint still naming the merge task,
+  // for the next round to discard.
+  deps.advance = advance;
+  deps.turn = async () => { throw new BatchChanged("t2"); };
+  deps.discard = async () => { throw new Error("desk did not answer"); };
+  await expect(run()).rejects.toThrow("desk did not answer");
+  expect(steps.at(-1)).toEqual({ step: "checking", batch: ["t1", "t2"], mergeTask: "m2" });
+  expect(created).toHaveLength(2);
 });
 
 test("a stuck check pauses, and the round resumed from it checks afresh", async () => {

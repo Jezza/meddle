@@ -16,7 +16,7 @@ import { getProject } from "../src/projects/project";
 import { defaultBranchCommit } from "../src/projects/starts";
 import { createNodeHost } from "../src/state/host";
 import { getTask, listTasks } from "../src/store/records";
-import { TaskRunner } from "../src/tasks/durable";
+import { TaskRunner, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
 import type { TaskManifest } from "../src/tasks/manifest";
 import type { TrainTurnKind, TrainTurnOutcome } from "../src/train/tools";
@@ -300,6 +300,135 @@ test("a push during checking restarts the round against the new main", async () 
     await waitFor("both tasks and the merge task archived", () =>
       [t1.id, t2.id, merge.tasks[1]!].every((id) => getTask(n.db, id)?.state === "archived"));
   } finally {
+    await close();
+  }
+}, 180_000);
+
+/** The merge task live on node `n` whose turn runs there, once there is one. */
+function runningMergeTask(n: GitPoolNode): string | undefined {
+  return liveMergeTasks(n).find((id) => n.runner.state(id) === "running");
+}
+
+test("unqueueing a batch task stops the check at once", async () => {
+  // Every turn's stand-in Claude Code stalls before its `result` until it is interrupted: the merge agent's turn never
+  // ends by itself.
+  const { nodes, close } = await poolNodes(1, { extraEnv: { MEDDLE_FIXTURE_STALL: "1" } });
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await waitFor("the merge agent's turn", () => runningMergeTask(n) !== undefined);
+    const m = runningMergeTask(n)!;
+    expect(trainState(n.db, P).round).toMatchObject({ step: "checking", mergeTask: m });
+
+    await n.runner.unqueue(t1.id, UNQUEUED_BY_USER);
+    // The check stops at once: the merge agent's turn is interrupted, and the merge task discarded.
+    await waitFor("the merge task discarded", () => getTask(n.db, m) === null, 20_000);
+    // Nothing paused, and the round starts over without t1: t2, on main, is a single head and lands as it is.
+    await waitFor("t2 to land", async () => (await mainOf(n, P)) === t2.tip, 30_000);
+    expect(trainState(n.db, P).paused).toBeNull();
+    expect(liveMergeTasks(n)).toEqual([]);
+    await waitFor("t2 archived", () => getTask(n.db, t2.id)?.state === "archived");
+    expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [] });
+    // t1 is off the train, nothing of it landed, and it doesn't sit out.
+    expect(n.runner.queue(t1.id)).toBeNull();
+    expect(getTask(n.db, t1.id)?.state).toBe("idle");
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a message to a batch task during the check stops it too", async () => {
+  const { nodes, close } = await poolNodes(1, { extraEnv: { MEDDLE_FIXTURE_STALL: "1" } });
+  const n = nodes[0]!;
+  const left: Array<[string, string | null]> = [];
+  let t1: { id: string } | null = null;
+  try {
+    const P = n.project.id;
+    n.runner.onQueue((taskId, queue, reason) => { if (queue === null) left.push([taskId, reason]); });
+    t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await waitFor("the merge agent's turn", () => runningMergeTask(n) !== undefined);
+    const m = runningMergeTask(n)!;
+
+    // The message runs at once, which takes t1 off the queue, and the check stops.
+    expect(await n.runner.prompt(t1.id, "Also handle z.")).toBe("turn");
+    expect(left).toEqual([[t1.id, UNQUEUED_BY_INPUT]]);
+    await waitFor("the merge task discarded", () => getTask(n.db, m) === null, 20_000);
+    await waitFor("t2 to land", async () => (await mainOf(n, P)) === t2.tip, 30_000);
+    expect(trainState(n.db, P).paused).toBeNull();
+    expect(liveMergeTasks(n)).toEqual([]);
+    await waitFor("t2 archived", () => getTask(n.db, t2.id)?.state === "archived");
+    expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [] });
+    expect(n.runner.state(t1.id)).toBe("running");
+  } finally {
+    if (t1 !== null) await n.runner.interrupt(t1.id).catch(() => {});
+    await close();
+  }
+}, 180_000);
+
+test("a batch task that leaves just as the merge turn fails by itself pauses nothing", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    const merges: string[] = [];
+    // The user unqueues t1 as the merge agent's turn fails.
+    n.hooks.trainTurn = async (taskId, kind) => {
+      if (kind !== "merge") return undefined;
+      merges.push(taskId);
+      await n.runner.unqueue(t1.id, UNQUEUED_BY_USER);
+      return { kind: "failed", reason: "the agent crashed" };
+    };
+    await acceptAll(n, P, [t1.id, t2.id]);
+    // No stuck pause: the round starts over without t1, and t2 lands as it is.
+    await waitFor("t2 to land", async () => (await mainOf(n, P)) === t2.tip);
+    expect(trainState(n.db, P).paused).toBeNull();
+    expect(merges).toHaveLength(1);
+    await waitFor("the merge task discarded", () => getTask(n.db, merges[0]!) === null);
+    await waitFor("t2 archived", () => getTask(n.db, t2.id)?.state === "archived");
+    expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [] });
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("unqueueing a batch task stops a check on another node too", async () => {
+  // B's turns stall until interrupted; the home, A, hosts no tasks, so its merge tasks go to B.
+  const { A, B, close } = await twoPoolNodes({ nodes: [{}, { extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }] });
+  const stops: Array<() => void> = [];
+  try {
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const P = A.project.id;
+    await waitFor("A's project in B's roster", () => B.store.row(A.id)?.summary?.projects?.some((p) => p.id === P) === true);
+    await rm(A.cfg.taskRoot, { recursive: true, force: true });
+    pauseTrain(A.db, P, "accepting");
+    const t1 = await taskWithWork(B, P, "x.txt");
+    const t2 = await taskWithWork(B, P, "y.txt");
+    await B.runner.accept(t1.id);
+    await B.runner.accept(t2.id);
+    stops.push(...appliers(A, B));
+    await waitFor("both queued on A", () => trainState(A.db, P).queued.length === 2);
+    pauseTrain(A.db, P, null);
+    await waitFor("the merge agent's turn on B", () => runningMergeTask(B) !== undefined);
+    const m = runningMergeTask(B)!;
+
+    // Unqueued on B, its holder: the home hears of it, and B interrupts the merge turn and discards the merge task.
+    await B.runner.unqueue(t1.id, UNQUEUED_BY_USER);
+    await waitFor("B to drop the merge task", () => getTask(B.db, m) === null, 30_000);
+    await waitFor("t2 to land", async () => (await mainOf(A, P)) === t2.tip, 30_000);
+    expect(trainState(A.db, P).paused).toBeNull();
+    await waitFor("B to archive t2", () => getTask(B.db, t2.id)?.state === "archived");
+    expect(liveMergeTasks(B)).toEqual([]);
+    expect(B.runner.queue(t1.id)).toBeNull();
+  } finally {
+    for (const stop of stops) stop();
     await close();
   }
 }, 180_000);

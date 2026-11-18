@@ -39,9 +39,23 @@ export class TaskGone extends Error {
 }
 
 /**
+ * A task of the batch being checked (`taskId`) left the queue meanwhile: Unqueue, a message of the user's, its archive.
+ * The check stops at once: `MergeDeps.turn` rejects with it (the merge turn running is no longer waited for), and so do
+ * `createMergeTask` and `advance` once it is known. The round discards the merge task, which interrupts its turn, and
+ * starts over without the task (`again`): nothing pauses, and nobody sits out.
+ */
+export class BatchChanged extends Error {
+  constructor(readonly taskId: string) {
+    super(`task ${taskId} left the batch being checked`);
+    this.name = "BatchChanged";
+  }
+}
+
+/**
  * What a round asks of the world, for the train of project `projectId` on its branch. `MergeDeps` serve the merge task
  * (`head` rejects with `TaskGone` once it is known to be gone), and `turn` the tasks' train turns too (it rejects with
- * `NodeOffline` when the task's node is offline). Then:
+ * `NodeOffline` when the task's node is offline). Once a task of the batch being checked has left the queue, the merge
+ * task's `turn`, `createMergeTask` and `advance` reject with `BatchChanged`. Then:
  * - `branch`: the branch's commit now (`B`);
  * - `candidates`: the eligible tasks (queued, idle, on an online node, not in a train turn, not sitting out; held back or
  *   not, since each round decides that afresh), in the queue's order, `tip` being the line's effective head, all of it
@@ -101,7 +115,8 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  *    leaves the batch, with the tasks holding its work, for a fix turn, and a fresh merge task checks the rest. A batch
  *    that doesn't merge cleanly after all (jj's merge isn't git's trial merge) puts its smallest task back, with the
  *    tasks holding its work, for a later round, and the rest is checked again; when that would leave nothing, the tasks
- *    left are to rebase instead. A stuck check pauses the train.
+ *    left are to rebase instead. A stuck check pauses the train. A check a task of the batch left (`BatchChanged`)
+ *    stops: its merge task is discarded, and the round starts over (`again`).
  * 4. Unless a task of the batch (or one whose work it holds) left or changed meanwhile (then the round starts over:
  *    `again`), the branch is moved from `B` to the merge, or to the single head (`advance`). When that is refused, the
  *    merge task is discarded. If the branch has moved since `B`, the round starts over against it (`again`); nothing
@@ -343,6 +358,7 @@ class Round {
       if (parents.length > 1) {
         await this.deps.checkpoint({ step: "checking", batch: ids, mergeTask: null });
         const verdict = await this.#check(rest);
+        if (verdict.kind === "changed") return "again";
         if (verdict.kind === "stuck") return { paused: verdict.reason };
         if (verdict.kind === "unclean") {
           // The batch is the biggest first: the smallest task waits for a later round, unless nothing would be left.
@@ -375,7 +391,7 @@ class Round {
         await this.deps.advance(this.B, L);
       } catch (err) {
         if (mergeTask !== null) await this.deps.discard(mergeTask);
-        if ((await this.deps.branch()) !== this.B) return "again";
+        if (err instanceof BatchChanged || (await this.deps.branch()) !== this.B) return "again";
         return { refused: `landing was refused: ${messageOf(err)}` };
       }
       return { landed: L };
@@ -386,9 +402,10 @@ class Round {
   /**
    * `checkBatch`, with the merge task it makes recorded (`checkpoint`). When the check fails outright (`deps` rejects),
    * the merge task is discarded and the check is stuck; one that can't be discarded then is still named by the
-   * checkpoint, for the round resumed to discard.
+   * checkpoint, for the round resumed to discard. A check a task of the batch left (`BatchChanged`) is `changed`, once
+   * its merge task is discarded; one that can't be discarded then rejects, for the next round to discard it.
    */
-  async #check(batch: Candidate[]): Promise<MergeVerdict> {
+  async #check(batch: Candidate[]): Promise<MergeVerdict | { kind: "changed" }> {
     const { deps } = this;
     const ids = batch.map((c) => c.taskId);
     const made = { task: null as string | null };
@@ -409,6 +426,10 @@ class Round {
     try {
       return await checkBatch(tracked, this.cfg, this.repo, { projectId: deps.projectId, B: this.B, batch, prompt: this.prompt });
     } catch (err) {
+      if (err instanceof BatchChanged) {
+        if (made.task !== null) await deps.discard(made.task);
+        return { kind: "changed" };
+      }
       if (made.task !== null) await deps.discard(made.task).catch(() => {});
       return { kind: "stuck", reason: failure(err, "the batch's check failed"), mergeTask: null };
     }
