@@ -32,7 +32,9 @@ import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRow
 import { branchChanges, lineChanges, listLineRows, mergeLineRows, setQueued, writeLineRow, type LineRow, type LineRowIn } from "../pool/rows";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
-import { appendEvent, latestEventOfType, listEventsTail, listPromptAttachments, type EventRecord } from "../store/events";
+import {
+  appendEvent, lastSeq, latestEventOfType, listEventsBetween, listEventsTail, listPromptAttachments, type EventRecord,
+} from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
   clearTaskLog,
@@ -52,6 +54,7 @@ import { markToken, pickToken } from "../token";
 import { recordUsage, usageReadingOf } from "../token-usage";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
+import { TRAIN_TOOLS, trainOutcome, trainTools, type TrainTurnKind, type TrainTurnOutcome } from "../train/tools";
 import { acceptanceOf, branchTips, containedIn, effectiveHead, type Acceptance, type BranchTips, type LineName } from "./accept";
 import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
 import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type ManifestProject, type Start, type TaskManifest } from "./manifest";
@@ -64,10 +67,14 @@ export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" 
 
 /**
  * One turn's input: its prompt's text and attachments (an input stored by an older meddle has no `attachments`: none).
- * `freshAfter` (the first turn of a task received from another node): the cut-off check looks only at events after
- * this seq, so a turn the sender ended (by moving the task) is never taken for one this node must carry on.
+ * `freshAfter` (the first turn of a task received from another node, and every train turn): the cut-off check looks
+ * only at events after this seq, so a turn the sender ended (by moving the task), or one before the train's, is never
+ * taken for one this node must carry on. `train`: a turn of the merge train's (`trainTurn`), run in `auto` with
+ * meddle's train tools, its prompt logged as meddle's; what it logged after `freshAfter` says how it went.
  */
-type TurnInput = { taskId: string; prompt: string; attachments?: Attachment[]; freshAfter?: number };
+type TurnInput = {
+  taskId: string; prompt: string; attachments?: Attachment[]; freshAfter?: number; train?: { kind: TrainTurnKind };
+};
 /**
  * Where a turn is. `tokenRetries`: how often `run` was entered again after the turn's token failed it (at most once). A
  * checkpoint stored by an older meddle has none: read it as 0.
@@ -97,6 +104,8 @@ export type RunnerHooks = {
   afterTokenFault?(taskId: string): void | Promise<void>;
   /** Called once what a steer sends Claude Code is made, before the steer goes into the turn's input. */
   afterSteerContent?(taskId: string): void | Promise<void>;
+  /** Called with what a turn's Claude Code is started with (`#engineInput`), before it starts. */
+  engineInput?(taskId: string, input: Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">): void;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
   callMs?: number;
 };
@@ -217,6 +226,8 @@ type LiveTurn = {
   sendNow: () => Promise<SendNowOutcome | undefined>;
   takeBack: () => Promise<Prompt[]>;
   state: "running" | "waiting";
+  /** A turn of the train's: the user's prompts wait for it, and Send now has nothing to send into it. */
+  train?: TrainTurnKind;
 };
 
 /** How long a turn interrupted by a "move now" has to end before it is closed. */
@@ -491,11 +502,12 @@ export class TaskRunner {
    * it, so one with attachments is refused when the node it goes to does not take them (`<host> runs a meddle that
    * takes no attachments`).
    * A steer goes into the turn's input, for Claude Code to take into the running turn at its next chance (or as a
-   * turn of its own once that one ends), and is `queued` until it does. A prompt the live turn can no longer take (its
-   * input closed with its `result`), or for a turn that is being created, resumed by the Harness or retried after it
-   * was parked (which this retries), is queued for the task's next turn. A task left `running` with no turn here or in
-   * the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the prompt started a turn,
-   * `"queued"` when it waits to be taken (a steer, or a prompt for a later turn).
+   * turn of its own once that one ends), and is `queued` until it does. A turn of the train's (`trainTurn`) takes no
+   * steer: a prompt sent while one runs or is pending waits for the task's next turn. A prompt the live turn can no
+   * longer take (its input closed with its `result`), or for a turn that is being created, resumed by the Harness or
+   * retried after it was parked (which this retries), is queued for the task's next turn. A task left `running` with
+   * no turn here or in the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the prompt
+   * started a turn, `"queued"` when it waits to be taken (a steer, or a prompt for a later turn).
    */
   prompt(taskId: string, text: string, attachments: Attachment[] = []): Promise<"turn" | "queued"> {
     // A chain of its own: never behind the task's receive, import or activation (`taskKey`).
@@ -515,7 +527,8 @@ export class TaskRunner {
     let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
-      if (live !== undefined) return this.#send(taskId, live.queue, p);
+      // The train's turn takes no steer: the prompt waits for the task's next turn, the user's own.
+      if (live !== undefined) return live.train === undefined ? this.#send(taskId, live.queue, p) : this.#enqueueNext(taskId, p);
       const turn = await this.#durableTurn(taskId);
       // Held: a parked turn waits for the hold to lift (retrying it would start it).
       if (turn !== undefined && isParked(turn) && this.#holds.turns === null) await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
@@ -619,6 +632,71 @@ export class TaskRunner {
   async #createTurn(input: TurnInput): Promise<void> {
     const root = await this.#harness.root(BACKGROUND_CONTEXT);
     await root.commit((tx) => tx.createTask(MeddleTurn, input, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
+  }
+
+  /**
+   * Runs a turn of the merge train's on the task, `kind` with prompt `text`, and answers how it went (`trainOutcome`,
+   * from what the turn logged, so a restart loses nothing). It is a durable turn like the user's, started apart from
+   * their input, so the task stays on its queue: it runs in `auto` with meddle's train tools (`#engineInput`), its
+   * prompt shows as meddle's, the user's prompts wait for it (`prompt`), and Send now has nothing to send into it. A
+   * train turn of `kind` already running (one a restart cut off from the call that started it) is joined, whatever its
+   * text; a train turn the restart limit parked has failed. Refused, before anything starts, as `#refuseElsewhere`
+   * refuses, while the task is being archived, while it runs another turn (`task is running`: the user's, or the
+   * train's of another kind) or has prompts waiting, and while a pool update holds turns.
+   */
+  async trainTurn(taskId: string, kind: TrainTurnKind, text: string): Promise<TrainTurnOutcome> {
+    // On the task's prompt chain: a prompt sent meanwhile either came first (and the task is busy) or sees the turn.
+    const turn = await serialised(`prompt\0${taskId}`, () => this.#startTrainTurn(taskId, kind, text));
+    if (turn === "parked") return { kind: "failed", reason: "the task's turn is parked; retry it" };
+    const end = await turn.end;
+    return trainOutcome(listEventsBetween(this.#db, taskId, turn.after, end, ["meddle", "result"]).map((e) => e.message));
+  }
+
+  /**
+   * Starts the train's turn for `trainTurn`, or joins the one running: its events are those after `after`, up to `end`'s
+   * seq. `"parked"`: the one running is parked.
+   */
+  async #startTrainTurn(
+    taskId: string, kind: TrainTurnKind, text: string,
+  ): Promise<{ after: number; end: Promise<number> } | "parked"> {
+    const refuse = () => {
+      this.#refuseElsewhere(taskId);
+      if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+    };
+    refuse();
+    // Listening before looking: a train turn that ends while the Harness is asked is still heard.
+    const joined = this.#turnEnd(taskId);
+    let running: TaskInspection | undefined;
+    try {
+      running = await this.#durableTurn(taskId);
+    } catch (err) {
+      joined.cancel();
+      throw err;
+    }
+    const input = running?.record.input as TurnInput | undefined;
+    if (running !== undefined && input?.train !== undefined && (isParked(running) || input.train.kind === kind)) {
+      if (!isParked(running)) return { after: input.freshAfter ?? 0, end: joined.end };
+      joined.cancel();
+      return "parked";
+    }
+    joined.cancel();
+    // Nothing is awaited from here until the turn is reserved.
+    refuse();
+    const busy = running !== undefined || this.#live.has(taskId) || this.#pending.has(taskId) || this.#row(taskId).state !== "idle";
+    if (busy) throw new Error("task is running");
+    if (this.queued(taskId).length > 0) throw new Error("task has prompts waiting");
+    if (this.#holds.turns !== null) throw new Error(this.#holds.turns);
+    const after = lastSeq(this.#db, taskId);
+    const started = this.#turnEnd(taskId);
+    this.#pending.add(taskId);
+    try {
+      await this.#createTurn({ taskId, prompt: text, freshAfter: after, train: { kind } });
+    } catch (err) {
+      this.#pending.delete(taskId);
+      started.cancel();
+      throw err;
+    }
+    return { after, end: started.end };
   }
 
   /**
@@ -765,12 +843,13 @@ export class TaskRunner {
    * Sends the steers the task's running turn has not taken now, as Claude Code's own "send now" does: in order, into
    * the turn when Claude Code can fit them in, or else it cuts the turn short and runs them next. A steer `prompt` sent
    * just before is among them; texts queued for the task's next turn are not (they run next already). Answers what
-   * Claude Code says it did, `nothing_waiting` without a running turn.
+   * Claude Code says it did, `nothing_waiting` without a running turn or for a turn of the train's (what the user sent
+   * meanwhile waits for the turn after it).
    */
   async sendNow(taskId: string): Promise<SendNowOutcome | undefined> {
     this.#refuseElsewhere(taskId);
     const live = this.#live.get(taskId);
-    if (live === undefined) return "nothing_waiting";
+    if (live === undefined || live.train !== undefined) return "nothing_waiting";
     const outcome = await live.sendNow();
     // Input of the user's runs now, when there was any: a queued task is no longer what they accepted.
     if (outcome === "delivering" || outcome === "stopped") this.#inputRuns(taskId);
@@ -805,10 +884,14 @@ export class TaskRunner {
     return [...live, ...later];
   }
 
-  /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
+  /**
+   * Switches the live turn's permission mode, if any, and keeps it for the task's later turns. A turn of the train's
+   * keeps `auto`: the mode is the user's turns'.
+   */
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
     this.#refuseElsewhere(taskId);
-    await this.liveQuery(taskId)?.setPermissionMode(mode);
+    const live = this.#live.get(taskId);
+    if (live?.train === undefined) await live?.query.setPermissionMode(mode);
     this.#updateSettings(taskId, { permissionMode: mode });
   }
 
@@ -992,10 +1075,12 @@ export class TaskRunner {
       const content = await promptContent(this.blobs.store, attachmentsDir, prompt);
       const queue = new InputQueue();
       let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
+      const train = input.train?.kind;
       const { query, done, sendNow, takeBack } = runTurn({
-        input: await this.#engineInput(taskId, manifest, resume, picked.value),
+        input: await this.#engineInput(taskId, manifest, resume, picked.value, train),
         prompt,
         content,
+        ...(train === undefined ? {} : { train }),
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -1014,7 +1099,7 @@ export class TaskRunner {
         },
         onTokenFault: (f) => { fault = f; },
       });
-      this.#live.set(taskId, { query, queue, sendNow, takeBack, state: "running" });
+      this.#live.set(taskId, { query, queue, sendNow, takeBack, state: "running", ...(train === undefined ? {} : { train }) });
       notify(this.#liveListeners, (cb) => cb(taskId));
       let result: Awaited<typeof done>;
       try {
@@ -2282,6 +2367,31 @@ export class TaskRunner {
     }
   }
 
+  /**
+   * Resolves as the task's turn now running (or its next) ends, with the seq of the task's newest event then: what that
+   * turn logged ends there, before a turn that follows starts. `cancel` stops listening.
+   */
+  #turnEnd(taskId: string): { end: Promise<number>; cancel(): void } {
+    const { promise, resolve, reject } = Promise.withResolvers<number>();
+    const waiters = this.#turnWaiters.get(taskId) ?? new Set<() => void>();
+    this.#turnWaiters.set(taskId, waiters);
+    const wake = () => {
+      try {
+        resolve(lastSeq(this.#db, taskId));
+      } catch (err) {
+        reject(err);
+      }
+    };
+    waiters.add(wake);
+    return {
+      end: promise,
+      cancel: () => {
+        waiters.delete(wake);
+        if (waiters.size === 0 && this.#turnWaiters.get(taskId) === waiters) this.#turnWaiters.delete(taskId);
+      },
+    };
+  }
+
   /** Resolves when a turn of the task ends, after `ms`, or when `context` aborts. */
   #nextTurnEnd(taskId: string, ms: number, context: Context): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -2520,11 +2630,16 @@ export class TaskRunner {
     return tasks.find((t) => t.record.kind === MeddleTurn.definition.name && (t.record.input as TurnInput).taskId === taskId);
   }
 
+  /**
+   * What the task's turn starts Claude Code with. A train turn (`train`) runs in `auto` whatever the task's mode (which
+   * stays as it is), with meddle's train tools (`trainTools`, calls logged in the task's log) allowed without asking.
+   */
   async #engineInput(
     taskId: string,
     manifest: TaskManifest,
     resume: boolean,
     token: string,
+    train?: TrainTurnKind,
   ): Promise<Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">> {
     // A project's meddle context is the one captured at the task's start, from the task's row: not `task.json` nor the
     // workspace, which its agent can edit. The row alone names the projects, their workspaces and their contexts; a
@@ -2558,10 +2673,17 @@ export class TaskRunner {
     const { permissionMode } = chosen;
     input.model = chosen.model ?? this.#pool?.settings.defaultModel() ?? FALLBACK_MODEL;
     input.effort = chosen.effort ?? this.#pool?.settings.defaultEffort() ?? FALLBACK_EFFORT;
-    if (permissionMode !== undefined) input.permissionMode = permissionMode;
+    if (train !== undefined) {
+      input.permissionMode = "auto";
+      input.extraMcpServers = { meddle: trainTools(train, (e) => this.#record(taskId, e)) };
+      input.allowedTools = [...TRAIN_TOOLS];
+    } else if (permissionMode !== undefined) {
+      input.permissionMode = permissionMode;
+    }
     if (this.#deps.claudePath !== undefined) input.claudePath = this.#deps.claudePath;
     if (this.#deps.claudeRuntime !== undefined) input.claudeRuntime = this.#deps.claudeRuntime;
     if (this.#deps.extraEnv !== undefined) input.extraEnv = this.#deps.extraEnv;
+    this.#deps.hooks?.engineInput?.(taskId, input);
     return input;
   }
 

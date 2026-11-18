@@ -11,6 +11,7 @@ import {
 import type { Attachment, Prompt } from "../blobs/attachment";
 import type { UserContent } from "../blobs/content";
 import { appendEvent } from "../store/events";
+import type { TrainTurnKind } from "../train/tools";
 import type { Approvals } from "./approvals";
 import { InputQueue } from "./input";
 import { buildOptions, type EngineInput } from "./options";
@@ -18,6 +19,12 @@ import { buildOptions, type EngineInput } from "./options";
 /** meddle's own entries in a task's event log, interleaved with the SDK's messages. */
 export type MeddleEvent =
   | { type: "meddle"; subtype: "turn_started"; at: string; resume: boolean }
+  /** A train turn's prompt, logged in place of a user prompt (`runTurn`): what the train asked, shown as meddle's. */
+  | { type: "meddle"; subtype: "train_turn"; kind: TrainTurnKind; text: string }
+  /** The task's agent called meddle's `decline` tool in a train turn. */
+  | { type: "meddle"; subtype: "train_decline"; reason: string }
+  /** The merge agent called meddle's `blame` tool, naming the task responsible. */
+  | { type: "meddle"; subtype: "train_blame"; task: string; reason: string }
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
   | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput }
@@ -36,6 +43,11 @@ export type MeddleEvent =
     rerun: boolean;
     retried?: true;
   };
+
+/** Whether `m` is one of the train's events (`train_turn`, `train_decline`, `train_blame`): none ends a turn. */
+export function isTrainEvent(m: { type?: unknown; subtype?: unknown }): boolean {
+  return m.type === "meddle" && (m.subtype === "train_turn" || m.subtype === "train_decline" || m.subtype === "train_blame");
+}
 
 /**
  * What a `token_fault` that ended a turn says, for a notification or the CLI: `no usable token`, or the token, what
@@ -136,6 +148,8 @@ export type RunTurnArgs = {
   prompt: Prompt;
   /** What Claude Code is sent for `prompt`; its text when not given. */
   content?: UserContent;
+  /** A train turn of this kind: its prompt is logged as meddle's (`train_turn`), not as a user prompt. */
+  train?: TrainTurnKind;
   db: Database;
   approvals: Approvals;
   queue?: InputQueue;
@@ -152,7 +166,8 @@ export type RunTurnArgs = {
 /**
  * Starts one Claude Code turn and returns its handle at once. `done` records every message, and
  * resolves with the `result` once the child has gone (so a later `resume` never races it). The turn's own prompt is
- * logged as written, with its attachments' refs, and Claude Code is sent `content` for it.
+ * logged as written, with its attachments' refs (a train turn's as meddle's `train_turn`), and Claude Code is sent
+ * `content` for it.
  *
  * Prompts pushed into `queue` while the turn runs steer it: each is logged (`promptEvent`, with its uuid) when Claude
  * Code takes it, which it does into the running turn or, after that turn's `result`, as a turn of its own (an `init`,
@@ -183,7 +198,9 @@ export function runTurn(args: RunTurnArgs): {
   const uuid = queue.push(args.prompt, "next", args.content);
   queue.take(uuid);
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
-  record(promptEvent(args.prompt, uuid));
+  record(args.train === undefined
+    ? promptEvent(args.prompt, uuid)
+    : { type: "meddle", subtype: "train_turn", kind: args.train, text: args.prompt.text });
 
   const canUseTool: CanUseTool = (toolName, toolInput, options) => args.approvals.ask({
     requestId: options.requestId,

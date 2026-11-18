@@ -27,7 +27,7 @@ import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
-import { resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
+import { isTrainEvent, resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
 import { PoolObject, ProjectObject } from "./state/contracts";
 import { createNodeHost, NodeObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
@@ -1126,8 +1126,11 @@ async function promptOn(client: Host, socket: WebSocket, id: string, text: strin
           faulted = false;
           continue;
         }
-        // The SDK's own messages after the result (the child's last words) do not decide; meddle's next one does.
-        if (provisional !== null && type === "meddle") return finished.reject(provisional);
+        // The SDK's own messages after the result (the child's last words) do not decide; meddle's next one does, unless
+        // it is the train's (a prompt or a tool call: neither ends a turn).
+        if (provisional !== null && type === "meddle" && !isTrainEvent(message as { type?: unknown; subtype?: unknown })) {
+          return finished.reject(provisional);
+        }
         if (tokenFaultOf(message as Parameters<typeof tokenFaultOf>[0]) !== null) faulted = true;
         if (type === "result") {
           const error = resultError(message as { subtype?: unknown; is_error?: unknown });

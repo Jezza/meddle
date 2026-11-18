@@ -123,10 +123,13 @@ export type PeerObjectDeps = {
   changes: Subscribable<null>;
   /** Fires when this node's own state may have changed (each metrics sample, each pool change): `hostsTasks` is re-read. */
   recheck?: Subscribable<null>;
-  /** Whether a node is a member of this node's pool: only a member may create a task here. */
+  /** Whether a node is a member of this node's pool: only a member may create a task here, or run a train turn. */
   isMember(nodeId: string): boolean;
-  /** Receives tasks other nodes move here (each call names the calling node), and creates tasks members place here. */
-  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel" | "setEffort">;
+  /**
+   * Receives tasks other nodes move here (each call names the calling node), creates tasks members place here, and runs
+   * the train turns members ask for.
+   */
+  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel" | "setEffort" | "trainTurn">;
 };
 
 /** A project as another node sees it. */
@@ -180,6 +183,10 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         // A `moved` row is what a task that went on left here: it holds nothing.
         const row = getTask(db, id);
         return row !== null && row.state !== "moved";
+      },
+      trainTurn: ({ taskId, kind, text }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return deps.runner.trainTurn(taskId, kind, text);
       },
       // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
       createTaskAt: async ({ title, taskId, starts, prompt, attachments = [], nameFromPrompt, model, effort }) => {

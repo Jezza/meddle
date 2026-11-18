@@ -456,11 +456,14 @@ function merged(into: Map<number, LogEvent>, events: readonly LogEvent[]): Map<n
   return next;
 }
 
-/** A block: your message in a card, Claude's items, status lines on their own. */
+/** A block: your message in a card (meddle's, the train's, marked so), Claude's items, status lines on their own. */
 function BlockView({ block, children }: { block: Block; children?: preact.ComponentChildren }) {
   const items = <Items items={block.items} />;
   if (block.who === "status") return <div class="status-block">{items}{children}</div>;
-  if (block.who === "user") return <div class="msg you">{items}</div>;
+  if (block.who === "user") {
+    const meddle = block.items[0]?.kind === "user" && block.items[0].by === "meddle";
+    return <div class={meddle ? "msg you meddle" : "msg you"}>{items}</div>;
+  }
   return <div class="msg claude">{items}{children}</div>;
 }
 
@@ -534,7 +537,9 @@ const AgentRuns = createContext(true);
 function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
     case "user":
-      return <PromptBody text={item.text} attachments={item.attachments} />;
+      if (item.by !== "meddle") return <PromptBody text={item.text} attachments={item.attachments} />;
+      // The merge train's prompt: meddle sent it, not you.
+      return <><div class="by" title="The merge train asked this">meddle</div><PromptBody text={item.text} attachments={item.attachments} /></>;
     case "assistant":
       // Thinking alongside text is not shown; thinking on its own is, closed.
       return item.text !== "" ? <Markdown text={item.text} /> : <Thinking text={item.thinking ?? ""} />;

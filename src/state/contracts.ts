@@ -48,6 +48,17 @@ export const TaskManifestSchema = Type.Object({
   merge: Type.Optional(Type.Object({ project: Type.String(), batch: Type.Array(Type.String()) })),
 });
 
+/** A turn of the merge train's (`TrainTurnKind`). */
+export const TrainTurnKindSchema = Type.Union([Type.Literal("describe"), Type.Literal("rebase"), Type.Literal("fix"), Type.Literal("merge")]);
+
+/** How a train turn went (`TrainTurnOutcome`). */
+export const TrainTurnOutcomeSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("done") }),
+  Type.Object({ kind: Type.Literal("declined"), reason: Type.String() }),
+  Type.Object({ kind: Type.Literal("blamed"), task: Type.String(), reason: Type.String() }),
+  Type.Object({ kind: Type.Literal("failed"), reason: Type.String() }),
+]);
+
 export const PendingApprovalSchema = Type.Object({
   requestId: Type.String(),
   taskId: Type.String(),
@@ -881,6 +892,16 @@ export const PeerObject = remote("meddle.peer", {
         ),
         /** Whether this node has task `id` (a `moved` row, left by a task that went on, is not having it). */
         taskHeld: method(Type.Object({ id: Type.String() }), Type.Boolean()),
+        /**
+         * Runs a turn of the merge train's on task `taskId` here for the caller (a member only; `forbidden` otherwise),
+         * `kind` with prompt `text`, and answers how it went once it has ended (`TaskRunner.trainTurn`): the conductor
+         * drives tasks on other nodes so. A train turn already running there is joined. Refused as `trainTurn` refuses.
+         * A node older than this method has none.
+         */
+        trainTurn: method(
+          Type.Object({ taskId: Type.String(), kind: TrainTurnKindSchema, text: Type.String() }),
+          TrainTurnOutcomeSchema,
+        ),
       },
     },
   },

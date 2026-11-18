@@ -171,7 +171,7 @@ test("a new task with attachments is not placed on a node that takes none, nor c
   }
 }, 60_000);
 
-test("PeerObject.createTaskAt refuses a peer that is not a member, before creating anything", async () => {
+test("PeerObject.createTaskAt (and trainTurn) refuses a peer that is not a member, before creating anything", async () => {
   const db = openDb(":memory:");
   const created: unknown[] = [];
   const never: Subscribable<null> = { subscribe: () => () => {} };
@@ -193,6 +193,7 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
       nameFromPrompt: async () => {},
       setModel: async () => {},
       setEffort: async () => {},
+      trainTurn: async () => { created.push("trainTurn"); return { kind: "done" as const }; },
     },
   });
   const [down, up] = memoryLinkPair();
@@ -204,6 +205,10 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
     let refusal: unknown = null;
     await peer.createTaskAt({ title: "t", taskId: "0123456789ab", starts: [{ projectId: "p", mode: "child", commit: "1".repeat(40), base: ["1".repeat(40)] }], prompt: "hi" })
       .catch((err: unknown) => { refusal = err; });
+    expect(refusal).toMatchObject({ code: "forbidden" });
+    expect(created).toEqual([]);
+    refusal = null;
+    await peer.trainTurn({ taskId: "0123456789ab", kind: "describe", text: "hi" }).catch((err: unknown) => { refusal = err; });
     expect(refusal).toMatchObject({ code: "forbidden" });
     expect(created).toEqual([]);
     peer.release();

@@ -45,6 +45,23 @@ test("a prompt meddle recorded becomes a user item", () => {
   expect(items).toEqual([{ kind: "user", text: "Run: echo hi", attachments: [] }]);
 });
 
+test("the train's prompt shows as a prompt marked as meddle's; its tools' calls as status lines", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "meddle", subtype: "turn_started", at: "", resume: true } },
+    { seq: 2, message: { type: "meddle", subtype: "train_turn", kind: "rebase", text: "main moved on, …" } },
+    { seq: 3, message: { type: "meddle", subtype: "train_decline", reason: "the API it fixes is gone" } },
+    { seq: 4, message: { type: "meddle", subtype: "train_turn", kind: "merge", text: "Check that A and B work together on main. …" } },
+    { seq: 5, message: { type: "meddle", subtype: "train_blame", task: "A", reason: "test/a.test.ts fails" } },
+  ]);
+  expect(items).toEqual([
+    { kind: "status", text: "Turn resumed" },
+    { kind: "user", text: "main moved on, …", attachments: [], by: "meddle" },
+    { kind: "status", text: "Declined: the API it fixes is gone" },
+    { kind: "user", text: "Check that A and B work together on main. …", attachments: [], by: "meddle" },
+    { kind: "status", text: "Blamed A: test/a.test.ts fails" },
+  ]);
+});
+
 test("a prompt meddle recorded keeps its attachments, and drops a bad one", () => {
   const items = buildThread([{ seq: 1, message: { type: "user", message: { role: "user", content: "look" }, parent_tool_use_id: null,
     attachments: [shot, { ...shot, name: "../x" }] } }]);
