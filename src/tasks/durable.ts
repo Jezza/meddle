@@ -500,7 +500,7 @@ export class TaskRunner {
       if (move?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
       // It travels with the task: never to a node that would drop its attachments.
       if (p.attachments.length > 0) {
-        const refusal = this.#noAttachmentsOn(move.to);
+        const refusal = this.noAttachmentsOn(move.to);
         if (refusal !== null) throw new Error(refusal);
       }
       this.#enqueue(taskId, p);
@@ -561,8 +561,11 @@ export class TaskRunner {
     if (size !== a.size) throw new Error("bad attachment: size does not match its file");
   }
 
-  /** Why node `to` must not be given prompts with attachments (its summary does not say it takes them), or null. */
-  #noAttachmentsOn(to: string): string | null {
+  /**
+   * Why node `to` must not be given prompts with attachments (its summary does not say it takes them, as an older
+   * meddle's does not), or null: what a move and a new task's placement check.
+   */
+  noAttachmentsOn(to: string): string | null {
     const summary = this.#pool?.store.row(to)?.summary ?? null;
     if (summary?.attachments === true) return null;
     return `${summary?.hostname ?? shortId(to)} runs a meddle that takes no attachments`;
@@ -1961,7 +1964,7 @@ export class TaskRunner {
     const theirs = summary.claudeCodeVersion;
     if (ours !== theirs || ours === "unknown" || theirs === "unknown") throw new Error(`claude code ${ours} here, ${theirs} there`);
     if (this.queued(row.id).some((p) => p.attachments.length > 0)) {
-      const refusal = this.#noAttachmentsOn(to);
+      const refusal = this.noAttachmentsOn(to);
       if (refusal !== null) throw new Error(refusal);
     }
   }

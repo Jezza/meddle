@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import type { Database } from "bun:sqlite";
 import { SecretKey, type Connection, type Endpoint } from "@number0/iroh";
 import { createHost, memoryLinkPair, type Host, type Subscribable } from "@earendil-works/chord";
+import type { Attachment } from "../src/blobs/attachment";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "../src/config";
 import { writeHelperWrapper, writePreReceiveHook } from "../src/git/scripts";
 import { acceptGitStreams } from "../src/git/serve";
@@ -25,7 +26,7 @@ import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
 import { listProjects } from "../src/projects/project";
 import { countRunningTasks, listLiveTasks } from "../src/store/records";
-import type { RunnerHooks } from "../src/tasks/durable";
+import type { RunnerHooks, TaskRunner } from "../src/tasks/durable";
 import { VERSION, claudeCodeVersion } from "../src/version";
 import { setupNode } from "./helpers";
 
@@ -459,4 +460,10 @@ export async function peerReady(from: GitPoolNode, to: GitPoolNode): Promise<voi
     if (Date.now() > deadline) throw new Error(`no PeerObject of ${shortId(to.id)}: ${String(last)}`);
     await Bun.sleep(20);
   }
+}
+
+/** Puts a few bytes into `node`'s blob store; answers them as an attachment named `shot.png`. */
+export async function storedShot(node: { runner: TaskRunner }): Promise<Attachment> {
+  const { hash, size } = await node.runner.blobs.store.write((async function* () { yield new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]); })());
+  return { hash, name: "shot.png", type: "image/png", size };
 }

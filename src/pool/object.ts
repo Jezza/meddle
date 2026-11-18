@@ -69,8 +69,8 @@ type PoolNode = Type.Static<typeof defaultState.nodes>[number];
 
 /**
  * One roster row as a dashboard sees it; this node's own row shows its live summary. A summary from an older meddle
- * (no `running`, `limit` or `projects`) shows 0, 0 and [], as placement reads it. `lastSeenAt` is the newer of the
- * node's own last word and the newest report of a member connected to it.
+ * (no `running`, `limit`, `projects` or `attachments`) shows 0, 0, [] and false, as placement reads it. `lastSeenAt` is
+ * the newer of the node's own last word and the newest report of a member connected to it.
  */
 export function nodeOf(
   row: WireRosterRow, selfId: string, live: Live, online: readonly string[], gone: readonly string[] = [],
@@ -92,6 +92,7 @@ export function nodeOf(
     running: summary?.running ?? 0,
     limit: summary?.limit ?? 0,
     projects: summary?.projects ?? [],
+    attachments: summary?.attachments ?? false,
     lastSeenAt: self ? live.at : heard,
     gone: !self && gone.includes(row.nodeId),
     link: self ? null : links[row.nodeId] ?? null,

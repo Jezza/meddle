@@ -5,9 +5,11 @@ import { createHost, memoryLinkPair, type Subscribable } from "@earendil-works/c
 import { NodeObject, PeerObject } from "../src/state/contracts";
 import { servePeer } from "../src/state/host";
 import { listEvents } from "../src/store/events";
-import { getTask } from "../src/store/records";
+import { getTask, listTasks } from "../src/store/records";
 import { openDb } from "../src/store/db";
-import { linkClient, peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+import { listLineRows } from "../src/pool/rows";
+import type { NodeSummary } from "../src/pool/store";
+import { linkClient, peerReady, storedShot, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 import { createTask } from "./helpers";
 
 async function eventually(cond: () => boolean, what: () => string, ms = 10_000): Promise<void> {
@@ -114,6 +116,52 @@ test("a prompt given with the task runs as its first turn on the node chosen", a
       expect(untitled.manifest.title).toMatch(/^[a-z]+ [a-z]+ [a-z]+$/);
       const titleOnB = () => getTask(B.db, untitled.manifest.id)?.title;
       await eventually(() => titleOnB() === "ok", () => `Haiku's title on B, not ${titleOnB()}`, 20_000);
+    } finally {
+      nodeA.release();
+    }
+  } finally {
+    await linked.close();
+    await close();
+  }
+}, 60_000);
+
+test("a new task with attachments is not placed on a node that takes none, nor created on one named", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const linked = linkClient(A.host);
+  try {
+    await peerReady(A, B);
+    await peerReady(B, A);
+    await knowsProject(A, B, B.project.id);
+    const row = A.store.row(B.id)!;
+    // What A last heard of B, dated later than anything B sends meanwhile: an older meddle's summary, or B's own.
+    const heard = (summary: Omit<NodeSummary, "attachments">) => A.store.seen(B.id, "9999-01-01T00:00:00.000Z", summary as NodeSummary, row.lastAddr);
+    const { attachments: _, ...older } = { ...row.summary!, hostname: "older-b" };
+    heard(older);
+    const shot = await storedShot(A);
+    const userMessages = (node: GitPoolNode, id: string) => listEvents(node.db, id).map((e) => e.message as any).filter((m) => m.type === "user");
+    const resulted = (node: GitPoolNode, id: string) => listEvents(node.db, id).some((e) => (e.message as any).type === "result");
+    const nodeA = await linked.client.get(NodeObject, {});
+    try {
+      // B, the project's home, is where placement would put it; it takes no attachments, so A takes the task.
+      const placed = await nodeA.createTask({ title: "t", projects: [{ id: B.project.id }], node: null, prompt: "look", attachments: [shot] });
+      expect(placed.nodeId).toBe(A.id);
+      await eventually(() => resulted(A, placed.manifest.id), () => "A's turn", 20_000);
+      expect(userMessages(A, placed.manifest.id)).toMatchObject([{ message: { content: "look" }, attachments: [shot] }]);
+
+      // Named, it is refused before anything is written.
+      const rows = listLineRows(A.db, B.project.id).length;
+      await expect(nodeA.createTask({ title: "n", projects: [{ id: B.project.id }], node: B.id, prompt: "look", attachments: [shot] }))
+        .rejects.toThrow("older-b runs a meddle that takes no attachments");
+      expect(listLineRows(A.db, B.project.id)).toHaveLength(rows);
+      expect(listTasks(B.db)).toEqual([]);
+
+      // B saying it takes them, the task goes to B, which fetches the file from A for its first turn.
+      heard(row.summary!);
+      const there = await nodeA.createTask({ title: "u", projects: [{ id: B.project.id }], node: null, prompt: "look", attachments: [shot] });
+      expect(there.nodeId).toBe(B.id);
+      await eventually(() => resulted(B, there.manifest.id), () => "B's turn", 20_000);
+      expect(userMessages(B, there.manifest.id)).toMatchObject([{ message: { content: "look" }, attachments: [shot] }]);
+      expect(await B.runner.blobs.store.has(shot.hash)).toBe(true);
     } finally {
       nodeA.release();
     }
