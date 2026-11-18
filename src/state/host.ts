@@ -33,7 +33,7 @@ import {
   type EventRecord,
 } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
-import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
+import { UNQUEUED_BY_USER, type MoveState, type TaskRunner, type TaskState } from "../tasks/durable";
 import {
   ChangesError, changeDiff, changeFile, changesProbe, taskChanges, workspaceFile, type ChangesProbe, type ProjectChanges,
 } from "../tasks/changes";
@@ -261,6 +261,10 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   };
   const acceptances: Subscribable<{ taskId: string }> = {
     subscribe: (cb) => runner.onAcceptance((taskId) => cb({ taskId })),
+  };
+  // A task queued on its project's train, or leaving it (`reason`).
+  const queueChanges: Subscribable<{ taskId: string; reason: string | null }> = {
+    subscribe: (cb) => runner.onQueue((taskId, _queue, reason) => cb({ taskId, reason })),
   };
   const moves: Subscribable<{ taskId: string; move: MoveState | null }> = {
     subscribe: (cb) => runner.onMove((taskId, move) => cb({ taskId, move })),
@@ -746,6 +750,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const movedTo = self.state("movedTo", members.movedTo, { init: () => getTask(db, id)?.moved_to ?? null });
     const archivedOn = self.state("archivedOn", members.archivedOn, { init: () => archivedOnNow(id) });
     const acceptance = self.state("acceptance", members.acceptance, { init: () => runner.acceptance(id) });
+    const queue = self.state("queue", members.queue, { init: () => runner.queue(id) });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
     const queued = self.state("queued", members.queued, { init: () => runner.queued(id).map((p) => p.text) });
     const queuedPrompts = self.state("queuedPrompts", members.queuedPrompts, { init: () => runner.queued(id) });
@@ -758,6 +763,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     // Read once the object is up (`self.task` below), not before: a dashboard opens one per task it lists.
     const changes = self.state("changes", members.changes, { init: () => [] });
     const activityAt = self.state("activityAt", members.activityAt, { init: () => getTask(db, id)?.updated_at ?? "" });
+    /** Brings `queue` up to the task's line row: what Accept, Unqueue, the user's input and an archive write, and a move brings. */
+    const refreshQueue = (ctx: Ctx) => {
+      const now = runner.queue(id);
+      if (JSON.stringify(now) !== JSON.stringify(queue.value)) queue.replace(ctx, now);
+    };
     /** Brings the manifest and the activity time up to the row (a rename, a restore). */
     const refreshRow = (ctx: Ctx) => {
       const row = getTask(db, id);
@@ -810,6 +820,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (on !== archivedOn.value) archivedOn.replace(ctx, on);
       refreshRow(ctx);
       refreshLiveTurn(ctx);
+      // A task received from another node comes with its line rows, and so its queue.
+      refreshQueue(ctx);
       // A turn's end set (and pushed) them; a move fetched or forgot them.
       return refreshLines(ctx);
     });
@@ -819,6 +831,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("ticks", slowTicks, (_event, ctx) => refreshLines(ctx));
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
+    self.on("queues", queueChanges, (event, ctx) => { if (event.taskId === id) refreshQueue(ctx); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
     /** Brings `queued` and `queuedPrompts` up to the runner. */
     const refreshQueued = (ctx: Ctx) => {
@@ -835,6 +848,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       movedTo.replace(ctx, getTask(db, id)?.moved_to ?? null);
       archivedOn.replace(ctx, archivedOnNow(id));
       acceptance.replace(ctx, runner.acceptance(id));
+      refreshQueue(ctx);
       pending.replace(ctx, approvals.pending(id));
       refreshQueued(ctx);
       refreshRow(ctx);
@@ -898,6 +912,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       movedTo,
       archivedOn,
       acceptance,
+      queue,
       bookmarks,
       changes,
       activityAt,
@@ -909,6 +924,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       interrupt: () => runner.interrupt(id),
       sendNow: async () => { await runner.sendNow(id); },
       takeBackQueued: async () => ({ prompts: await runner.takeBackQueued(id) }),
+      accept: () => runner.accept(id),
+      unqueue: () => runner.unqueue(id, UNQUEUED_BY_USER),
       retry: () => runner.retry(id),
       approve: async ({ requestId, updatedInput }) => {
         answer(requestId, (req) => ({ behavior: "allow", updatedInput: updatedInput ?? req.input }));

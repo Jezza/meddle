@@ -29,7 +29,7 @@ import type { StreamReader } from "../pool/frames";
 import { getProject, listProjects, type Project } from "../projects/project";
 import { defaultBranchCommit } from "../projects/starts";
 import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRows } from "../projects/lines";
-import { branchChanges, lineChanges, listLineRows, mergeLineRows, writeLineRow, type LineRowIn } from "../pool/rows";
+import { branchChanges, lineChanges, listLineRows, mergeLineRows, setQueued, writeLineRow, type LineRow, type LineRowIn } from "../pool/rows";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
 import { appendEvent, latestEventOfType, listEventsTail, listPromptAttachments, type EventRecord } from "../store/events";
@@ -52,9 +52,9 @@ import { markToken, pickToken } from "../token";
 import { recordUsage, usageReadingOf } from "../token-usage";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
-import { acceptanceOf, branchTips, type Acceptance, type BranchTips, type LineName } from "./accept";
+import { acceptanceOf, branchTips, containedIn, effectiveHead, type Acceptance, type BranchTips, type LineName } from "./accept";
 import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
-import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type Start, type TaskManifest } from "./manifest";
+import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type ManifestProject, type Start, type TaskManifest } from "./manifest";
 import { MeddleMove, releaseFolder, type MoveInput } from "./move";
 import { promptTitle } from "./names";
 import { checkReceivedManifest, dropWorkspace, provisionFromManifest, provisionTask, refreshClaudeMd, SAFE_ID } from "./provision";
@@ -111,6 +111,14 @@ export type RunnerHolds = { turns: string | null; work: string | null; hosting: 
 
 /** A move of a task in progress here: where to, the step it is at, and the error that is failing it (if any). */
 export type MoveState = { to: string; phase: string; error: string | null };
+
+/** A task queued on its project's train: when the user accepted it, and the project's id. */
+export type TaskQueue = { queuedAt: string; project: string };
+
+/** Why a task left the queue: the user's Unqueue; input of the user's that runs in it; its archive (or delete). */
+export const UNQUEUED_BY_USER = "you unqueued it";
+export const UNQUEUED_BY_INPUT = "you sent it a prompt";
+export const UNQUEUED_ARCHIVED = "archived";
 
 export type RunnerDeps = {
   claudePath?: string;
@@ -293,6 +301,7 @@ export class TaskRunner {
   /** Per task, the check of its acceptance made again later: the last one lacked a commit a row names. */
   #acceptRetries = new Map<string, ReturnType<typeof setTimeout>>();
   #acceptanceListeners = new Set<(taskId: string, acceptance: Acceptance) => void>();
+  #queueListeners = new Set<(taskId: string, queue: TaskQueue | null, reason: string | null) => void>();
   /** Per task, the accepted idle task waiting for its turn to leave the Harness (`#awaitTurnGone`). */
   #acceptTurnWaits = new Set<string>();
   /** Tasks whose check lacked a commit a row names, and those whose lack is logged already (once per task). */
@@ -534,6 +543,7 @@ export class TaskRunner {
       this.#pending.delete(taskId);
       throw err;
     }
+    this.#inputRuns(taskId);
     return "turn";
   }
 
@@ -645,6 +655,8 @@ export class TaskRunner {
       updateTask(this.#db, taskId, { queued: queuedColumn(rest) });
     })();
     this.#starting.delete(taskId);
+    // The prompt runs now: sent after the task was accepted (`accept` refuses while one waits), it changes what was accepted.
+    this.#inputRuns(taskId);
     this.#emitQueued(taskId);
   }
 
@@ -710,6 +722,8 @@ export class TaskRunner {
       return this.#enqueueNext(taskId, p);
     }
     queue.push(p, "next", content);
+    // Taken into the turn the user accepted the task in, which now has more to do than what they accepted.
+    this.#inputRuns(taskId);
     this.#emitQueued(taskId);
     return "queued";
   }
@@ -757,7 +771,10 @@ export class TaskRunner {
     this.#refuseElsewhere(taskId);
     const live = this.#live.get(taskId);
     if (live === undefined) return "nothing_waiting";
-    return live.sendNow();
+    const outcome = await live.sendNow();
+    // Input of the user's runs now, when there was any: a queued task is no longer what they accepted.
+    if (outcome === "delivering" || outcome === "stopped") this.#inputRuns(taskId);
+    return outcome;
   }
 
   /**
@@ -882,6 +899,7 @@ export class TaskRunner {
     if (turn !== undefined && isParked(turn)) {
       if (this.#holds.turns !== null) throw new Error(this.#holds.turns);
       await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+      this.#inputRuns(taskId);
       return;
     }
     if (this.#row(taskId).state === "idle" && latestEventOfType(this.#db, taskId, "meddle", "turn_started") !== null) {
@@ -1522,6 +1540,8 @@ export class TaskRunner {
           release = (await acceptanceOf(deps, manifest, tipsOf)).contained;
         } else await this.#writeLinesNext(taskId, { archived: true });
         await writeArchive(this.#cfg, this.#db, taskId, paths(this.#cfg).archiveFile(taskId));
+        // Off the queue as it is archived (nothing awaited between): a line released below says no more of it.
+        this.#leaveQueue(taskId, UNQUEUED_ARCHIVED);
         // Recorded before the folder goes: a node that stops in between has an archived task whose leftovers a
         // restore clears, never an idle one without its folder.
         updateTask(this.#db, taskId, { state: "archived", archived_on: self, archived_at: new Date().toISOString() });
@@ -1769,6 +1789,8 @@ export class TaskRunner {
       }
       const deps = this.#replicaDeps();
       const manifest = JSON.parse(row.manifest) as TaskManifest;
+      // A queue the archive left (an older meddle's) must not outlive the lines it was written on.
+      if (row.state === "archived") this.#leaveQueue(taskId, UNQUEUED_ARCHIVED);
       if (deps !== null) {
         await releaseFolder(this.#cfg, this.#db, taskId);
         await this.#releaseTask(deps, manifest, row.state === "archived");
@@ -1987,6 +2009,132 @@ export class TaskRunner {
     if (verdict === "no") this.#acceptance.delete(taskId);
     else this.#acceptance.set(taskId, verdict);
     notify(this.#acceptanceListeners, (cb) => cb(taskId, verdict));
+  }
+
+  // ─── queueing a task on its project's train ───
+
+  /**
+   * Accepts task `taskId`: queues it on its project's train by recording on the task's own line row, which this node
+   * holds, when (`setQueued`), so the queue replicates and moves with the task. An idle or a running task can be
+   * accepted; a running one stays queued when its turn ends. Accepting a queued task changes nothing. Refused:
+   * - while the task is not live here, or is moving or being archived (the state's own message);
+   * - a merge task: `a merge task lands with its train`;
+   * - work in several projects: `accept handles one project for now; push to land the rest`;
+   * - prompts waiting, queued for a later turn or steered into the running turn: `send or clear the waiting prompts
+   *   first`, so that nothing newer than what the user accepted runs after it;
+   * - no work to land, the line's effective head at or below its base or already on the project's default branch:
+   *   `nothing to land: the task's work is already on <branch>`.
+   * One at a time with the task's prompts (their chain), so that a prompt sent just before is waiting or has run, and
+   * one sent just after unqueues it.
+   */
+  accept(taskId: string): Promise<void> {
+    return serialised(`prompt\0${taskId}`, () => this.#accept(taskId));
+  }
+
+  async #accept(taskId: string): Promise<void> {
+    const deps = this.#replicaDeps();
+    if (deps === null) throw new Error("this node has no pool");
+    /** Throws why the task cannot be accepted now; the manifest of one that can. Asked again once git has answered. */
+    const check = (): TaskManifest => {
+      this.#refuseElsewhere(taskId);
+      if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+      const manifest = JSON.parse(this.#row(taskId).manifest) as TaskManifest;
+      if (manifest.merge !== undefined) throw new Error("a merge task lands with its train");
+      if (manifest.projects.length > 1) throw new Error("accept handles one project for now; push to land the rest");
+      if (this.queued(taskId).length > 0) throw new Error("send or clear the waiting prompts first");
+      return manifest;
+    };
+    const p = check().projects[0];
+    if (p === undefined) throw new Error("nothing to land: the task has no project");
+    const project = getProject(this.#db, p.id);
+    if (project === null) throw new Error(`unknown project: ${p.id}`);
+    const line = this.#ownLine(taskId, p);
+    if (line === null || line.commit === null) throw new Error(`this node holds no line of ${project.name} for the task`);
+    if (line.queuedAt !== null) return;
+    const branch = project.defaultBranch;
+    if (branch === null) throw new Error(`${project.name} has no default branch to land on`);
+    const { cfg } = deps;
+    const head = await effectiveHead(cfg, project.replica, line.commit);
+    // Work is what is above the line's base commits and not on the branch yet.
+    const base = [...new Set([...line.base, ...p.base])];
+    const tip = await defaultBranchCommit({ cfg, db: deps.db, selfId: deps.pool.identity.id, pool: deps.pool, log: this.#log }, project);
+    if ((await containedIn(cfg, project.replica, head, base)) || (await containedIn(cfg, project.replica, head, [tip]))) {
+      throw new Error(`nothing to land: the task's work is already on ${branch}`);
+    }
+    // Nothing is awaited from here on: a move, an archive or a queue that came in meanwhile counts.
+    check();
+    const now = this.#ownLine(taskId, p);
+    if (now === null || now.queuedAt !== null) return;
+    const queuedAt = new Date().toISOString();
+    setQueued(this.#db, p.id, taskId, p.name, queuedAt);
+    notify(this.#queueListeners, (cb) => cb(taskId, { queuedAt, project: p.id }, null));
+  }
+
+  /**
+   * Takes task `taskId` off its project's train for `reason` (what `onQueue` tells, and the dashboard shows): its line
+   * row says it is not queued. A task not queued stays as it is. Refused while the task is not live here (moved,
+   * archived, being received) or is moving.
+   */
+  async unqueue(taskId: string, reason: string): Promise<void> {
+    this.#refuseElsewhere(taskId);
+    this.#unqueue(taskId, reason);
+  }
+
+  /** Where task `taskId` is queued (when, and the project's id), as its line row says; null when it is not, or not held here. */
+  queue(taskId: string): TaskQueue | null {
+    const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
+    if (row === null) return null;
+    for (const p of (JSON.parse(row.manifest) as TaskManifest).projects) {
+      const line = this.#ownLine(taskId, p);
+      if (line !== null && line.queuedAt !== null) return { queuedAt: line.queuedAt, project: p.id };
+    }
+    return null;
+  }
+
+  /**
+   * Called whenever a task is queued here (`queue` is where, `reason` null) or leaves the queue (`queue` null, and
+   * the `reason` it went, as `unqueue` was given it or as input of the user's or an archive made it).
+   */
+  onQueue(cb: (taskId: string, queue: TaskQueue | null, reason: string | null) => void): () => void {
+    this.#queueListeners.add(cb);
+    return () => { this.#queueListeners.delete(cb); };
+  }
+
+  /** Task `taskId`'s own line row of its project `p`, when this node holds it: the row that says whether it is queued. */
+  #ownLine(taskId: string, p: ManifestProject): LineRow | null {
+    const self = this.#pool?.identity.id;
+    const line = listLineRows(this.#db, p.id, taskId).find((r) => r.name === p.name);
+    return line !== undefined && line.holder === self ? line : null;
+  }
+
+  /** Takes the task off the queue, if it is on it, and tells the listeners. */
+  #unqueue(taskId: string, reason: string): void {
+    const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
+    if (row === null) return;
+    for (const p of (JSON.parse(row.manifest) as TaskManifest).projects) {
+      const line = this.#ownLine(taskId, p);
+      if (line === null || line.queuedAt === null) continue;
+      setQueued(this.#db, p.id, taskId, p.name, null);
+      notify(this.#queueListeners, (cb) => cb(taskId, null, reason));
+    }
+  }
+
+  /** `#unqueue` for what must go on whether or not it works: a failure is logged (`meddle: queue: …`), never thrown. */
+  #leaveQueue(taskId: string, reason: string): void {
+    try {
+      this.#unqueue(taskId, reason);
+    } catch (err) {
+      this.#log(`meddle: queue: ${taskId} was not taken off its queue (${reason}): ${messageOf(err)}`);
+    }
+  }
+
+  /**
+   * Input of the user's runs in the task (a prompt starts a turn or is steered into one, Send now delivers, Retry runs
+   * a turn again): a task accepted before it is no longer what the user accepted, so it leaves the queue. Never called
+   * for a turn of the train's, nor an approval's answer, which carries on the work that was accepted.
+   */
+  #inputRuns(taskId: string): void {
+    this.#leaveQueue(taskId, UNQUEUED_BY_INPUT);
   }
 
   // ─── moving a task to another node ───

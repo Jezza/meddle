@@ -479,6 +479,12 @@ export const TaskObject = remote("meddle.task", {
          */
         acceptance: Type.Union([Type.Literal("accepted"), Type.Literal("partly"), Type.Literal("no")]),
         /**
+         * Whether the user accepted the task for its project's train, and still has it queued: when (ISO) and the
+         * project's id; null when it is not queued. Read from the task's own line row, which its holder writes, so it
+         * moves with the task. A node older than this serves no `queue`: read a missing member as null.
+         */
+        queue: Nullable(Type.Object({ queuedAt: Type.String(), project: Type.String() })),
+        /**
          * Every local bookmark under the task's namespace, per project (its id) in the manifest's order: the project's
          * own and the side bookmarks. Re-read when projects change, when the task changes state, and every 60 s.
          */
@@ -520,6 +526,20 @@ export const TaskObject = remote("meddle.task", {
          * turn is starting, stays. Refused while the task is not live here.
          */
         takeBackQueued: method(Type.Object({}), Type.Object({ prompts: Type.Array(PromptSchema) })),
+        /**
+         * Accepts the task: queues it on its project's train, where its work waits to land on the project's default
+         * branch. Idle and running tasks can be accepted; accepting a queued task changes nothing. Refused `nothing to
+         * land: the task's work is already on <branch>`, `send or clear the waiting prompts first`, `accept handles one
+         * project for now; push to land the rest`, `a merge task lands with its train`, and while the task is not live
+         * here (moved, archived, being received) or is moving.
+         */
+        accept: method(Type.Object({})),
+        /**
+         * Takes the task off its project's train. A task not queued stays as it is; refused while it is not live here.
+         * Input of the user's that runs in an accepted task does the same (a prompt, a steer, Send now, Retry);
+         * answering an approval does not.
+         */
+        unqueue: method(Type.Object({})),
         /** Runs the task's turn again after repeated crashes parked it, or, for an idle task that has had a turn, starts one that carries on from it (after an interrupt or a failure); rejects otherwise. */
         retry: method(Type.Object({})),
         approve: method(Type.Object({ requestId: Type.String(), updatedInput: Type.Optional(Type.Record(Type.String(), Type.Unknown())) })),
