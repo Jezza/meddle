@@ -10,6 +10,7 @@ import { open, rename, rm, chmod, type FileHandle } from "node:fs/promises";
 import { writeLine } from "../pool/frames";
 import { shortId } from "../pool/identity";
 import type { PeerStream } from "../pool/net";
+import { STALL_MS, withTimeout } from "../pool/stall";
 import { messageOf, parseMessage, ROLLOUT_V, type RolloutMessage, type RolloutView } from "./wire";
 
 /** What the channel needs of the pool's net (`PoolNet` has it). */
@@ -29,14 +30,6 @@ const SEND_CHUNK = 256 * 1024;
 async function reset(s: PeerStream): Promise<void> {
   await s.stream.send.reset(0n).catch(() => {});
   await s.stream.recv.stop(0n).catch(() => {});
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms); }),
-  ]).finally(() => clearTimeout(timer));
 }
 
 /** What the accepting side does: merge a peer's message and answer with its view; find a binary it can serve. */
@@ -130,9 +123,6 @@ export type BinaryWant = { build: string; platform: string; sha256: string; size
 export class Unavailable extends Error {}
 /** What the peer sent is not the binary the rollout names (its size or its SHA-256). Another member may have it. */
 export class BadBinary extends Error {}
-
-/** How long a fetch waits for the next piece of a binary before it gives the peer up. */
-export const STALL_MS = 60_000;
 
 /**
  * Fetches a binary from `peerId` into `dest` (by way of `<dest>.part`, made executable): streamed to disk, its size and

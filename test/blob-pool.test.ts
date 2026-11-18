@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { MAX_BLOB_BYTES } from "../src/blobs/attachment";
-import { BlobFetcher } from "../src/blobs/pool";
+import { BlobFetcher, serveBlob } from "../src/blobs/pool";
 import { BlobStore } from "../src/blobs/store";
 import { writeFrame, type StreamReader } from "../src/pool/frames";
 import type { PeerStream, PoolNet } from "../src/pool/net";
@@ -174,6 +174,54 @@ test("a size over the limit is refused without reading, and a reset stream count
     stop();
     expect(asked).toBe(2);
     expect(await readdir(sa.dir).catch(() => [])).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
+test("a peer that keeps a fetch waiting is given up after the stall time, and the hash can be had again", async () => {
+  const { a, b, sa, sb, close } = await pair(false);
+  try {
+    const { hash } = await sb.write(chunks("from b"));
+    /** Held, so that no stream b leaves unanswered is closed by being dropped. */
+    const held: PeerStream[] = [];
+    let asked = 0;
+    // b takes the first ask and never answers, answers the second with a size and nothing after, and serves the rest
+    const stop = answerWith(b.net, async (s) => {
+      held.push(s);
+      asked += 1;
+      if (asked === 2) await writeFrame(s.stream.send, 0, encode(JSON.stringify({ size: 6 })));
+      else if (asked > 2) await serveBlob(s, sb);
+    });
+    const fetcher = new BlobFetcher(sa, a.net, 200);
+    for (const _ of ["no answer", "no bytes"]) {
+      const started = Date.now();
+      expect(await fetcher.ensure(hash)).toBe(false);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+      expect(Date.now() - started).toBeLessThan(2000);
+    }
+    expect(await readdir(sa.dir).catch(() => [])).toEqual([]);
+    // a fetch that failed holds nothing up: the same hash, asked for again, is fetched
+    expect(await fetcher.ensure(hash)).toBe(true);
+    expect(asked).toBe(3);
+    stop();
+  } finally {
+    await close();
+  }
+});
+
+test("a peer whose stream never opens is passed over for the next within the stall time", async () => {
+  const { a, b, sa, sb, close } = await pair();
+  try {
+    const { hash } = await sb.write(chunks("from b"));
+    const net = {
+      online: () => ["stuck", b.id],
+      openStream: (peerId: string, header: Parameters<PoolNet["openStream"]>[1]) =>
+        peerId === b.id ? a.net.openStream(peerId, header) : new Promise<PeerStream>(() => {}),
+    };
+    const started = Date.now();
+    expect(await new BlobFetcher(sa, net, 200).ensure(hash, "stuck")).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2000);
   } finally {
     await close();
   }
