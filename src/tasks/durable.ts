@@ -466,7 +466,9 @@ export class TaskRunner {
    * First every attachment must be valid (else `bad attachment: <why>`), its file here, fetched from the pool when it
    * is not (else `attachment <name> is not on any online node`), and the size it says (else `bad attachment: size does
    * not match its file`): a prompt refused for one queues nothing, and the next is taken as usual. Only an
-   * attachment's `hash`, `name`, `type` and `size` are kept.
+   * attachment's `hash`, `name`, `type` and `size` are kept. A prompt sent while the task waits to move travels with
+   * it, so one with attachments is refused when the node it goes to does not take them (`<host> runs a meddle that
+   * takes no attachments`).
    * A steer goes into the turn's input, for Claude Code to take into the running turn at its next chance (or as a
    * turn of its own once that one ends), and is `queued` until it does. A prompt the live turn can no longer take (its
    * input closed with its `result`), or for a turn that is being created, resumed by the Harness or retried after it
@@ -494,7 +496,13 @@ export class TaskRunner {
       if (row.archived_on !== null) throw new Error("task is being restored; send it again once it has arrived");
       // Queued prompts travel with the task, and its export reads them once the handoff has begun: one sent after that
       // would be left behind.
-      if (this.#moving.get(taskId)?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
+      const move = this.#moving.get(taskId);
+      if (move?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
+      // It travels with the task: never to a node that would drop its attachments.
+      if (p.attachments.length > 0) {
+        const refusal = this.#noAttachmentsOn(move.to);
+        if (refusal !== null) throw new Error(refusal);
+      }
       this.#enqueue(taskId, p);
       return "queued";
     }
@@ -544,10 +552,20 @@ export class TaskRunner {
     for (const a of attachments) {
       if (!(await this.blobs.ensure(a.hash))) throw new Error(`attachment ${a.name} is not on any online node`);
     }
-    for (const a of attachments) {
-      const { size } = await stat(this.blobs.store.path(a.hash));
-      if (size !== a.size) throw new Error("bad attachment: size does not match its file");
-    }
+    for (const a of attachments) await this.#checkSize(a);
+  }
+
+  /** Throws `bad attachment: size does not match its file` unless the stored file is the size `a` says. */
+  async #checkSize(a: Attachment): Promise<void> {
+    const { size } = await stat(this.blobs.store.path(a.hash));
+    if (size !== a.size) throw new Error("bad attachment: size does not match its file");
+  }
+
+  /** Why node `to` must not be given prompts with attachments (its summary does not say it takes them), or null. */
+  #noAttachmentsOn(to: string): string | null {
+    const summary = this.#pool?.store.row(to)?.summary ?? null;
+    if (summary?.attachments === true) return null;
+    return `${summary?.hostname ?? shortId(to)} runs a meddle that takes no attachments`;
   }
 
   /** Creates the task's next `meddle.turn`; the caller has reserved it in `#pending`. */
@@ -1125,8 +1143,9 @@ export class TaskRunner {
   /**
    * Imports the task `from` sends over a `blob` stream into its `receiving` row (what an earlier attempt imported is
    * replaced), keeping its settings, queued prompts and turn count. Every file its queued prompts name is fetched (from
-   * `from` first) before it answers: one no member gives fails the import (`attachment <name> could not be fetched
-   * from <short id>`). Refused `forbidden` unless the task is being received from `from`.
+   * `from` first) before it answers: one no member gives (`attachment <name> could not be fetched from <short id>`),
+   * or one that is not the size its attachment says (`bad attachment: size does not match its file`), fails the
+   * import. Refused `forbidden` unless the task is being received from `from`.
    */
   async importIncoming(taskId: string, from: string, reader: StreamReader): Promise<Receipt> {
     return serialised(taskKey(taskId), async () => {
@@ -1136,6 +1155,7 @@ export class TaskRunner {
       const queued = got.queued.map(promptOf);
       for (const a of queued.flatMap((p) => p.attachments)) {
         if (!(await this.blobs.ensure(a.hash, from))) throw new Error(`attachment ${a.name} could not be fetched from ${shortId(from)}`);
+        await this.#checkSize(a);
       }
       // The manifest checked as the task was received, not the stream's copy.
       await adoptTranscriptSlot(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest);
@@ -1203,8 +1223,8 @@ export class TaskRunner {
    * Writes the files of the task's logged prompts under it again (`materialize`), so that the paths Claude Code was
    * given in earlier turns still work after a move or a restore. Best effort: each file is fetched when it is not here
    * (from `prefer` first); one no online node has is logged (`meddle: task <id>: attachment <name> is not on any online
-   * node`) and left out, as is one that cannot be written. Stops once the task leaves (moving, archived, moved), so
-   * that nothing is written into a folder taken off this node. Never rejects.
+   * node`) and left out, as is one that is not the size its attachment says or cannot be written. Stops once the task
+   * leaves (moving, archived, moved), so that nothing is written into a folder taken off this node. Never rejects.
    */
   async #rewriteAttachments(taskId: string, prefer?: string): Promise<void> {
     const here = () => {
@@ -1225,6 +1245,7 @@ export class TaskRunner {
             this.#log(`meddle: task ${taskId}: attachment ${a.name} is not on any online node`);
             continue;
           }
+          await this.#checkSize(a);
           if (!here()) return;
           await materialize(this.blobs.store, dir, a);
         } catch (err) {
@@ -1939,8 +1960,9 @@ export class TaskRunner {
     const ours = claudeCodeVersion();
     const theirs = summary.claudeCodeVersion;
     if (ours !== theirs || ours === "unknown" || theirs === "unknown") throw new Error(`claude code ${ours} here, ${theirs} there`);
-    if (!summary.attachments && this.queued(row.id).some((p) => p.attachments.length > 0)) {
-      throw new Error(`${summary.hostname} runs a meddle that takes no attachments`);
+    if (this.queued(row.id).some((p) => p.attachments.length > 0)) {
+      const refusal = this.#noAttachmentsOn(to);
+      if (refusal !== null) throw new Error(refusal);
     }
   }
 

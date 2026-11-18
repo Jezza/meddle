@@ -1629,7 +1629,7 @@ test("a task with an attachment queued does not move to a node that takes none",
   }
 }, 15_000);
 
-test("an import whose queued prompt's file the sender cannot give fails, and the task stays being received", async () => {
+test("an import whose queued prompt's file the sender cannot give, or is not the size it says, fails, and the task stays being received", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     const m = await turnedTask(A);
@@ -1648,6 +1648,15 @@ test("an import whose queued prompt's file the sender cannot give fails, and the
       expect(got).toBeNull();
       expect(failures).toEqual([`attachment lost.png could not be fetched from ${shortId(A.id)}`]);
       expect(getTask(B.db, m.id)).toMatchObject({ state: "receiving", queued: null });
+
+      // A file A has, which says it is a byte longer than it is: fetched, then refused.
+      const shot = await stored(A, "shot.png", [1, 2, 3]);
+      const queued = JSON.stringify([{ text: "look", attachments: [{ ...shot, size: shot.size + 1 }] }]);
+      A.db.query("UPDATE tasks SET queued = ? WHERE id = ?").run(queued, m.id);
+      expect((await sendTask(A, B, m.id)).got).toBeNull();
+      expect(failures.at(-1)).toBe("bad attachment: size does not match its file");
+      expect(await B.runner.blobs.store.has(shot.hash)).toBe(true);
+      expect(getTask(B.db, m.id)).toMatchObject({ state: "receiving", queued: null });
     } finally {
       ref.release();
     }
@@ -1655,3 +1664,37 @@ test("an import whose queued prompt's file the sender cannot give fails, and the
     await close();
   }
 }, 15_000);
+
+test("a prompt with attachments sent while its task waits to move is refused unless the target takes them; text alone queues as before", async () => {
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ fixture: "approval.jsonl" }, {}] });
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    await peerReady(A, B);
+    const row = A.store.row(B.id)!;
+    // What A last heard of B, dated later than anything B sends meanwhile: an older meddle's summary, or B's own.
+    const heard = (summary: Omit<NodeSummary, "attachments">) => A.store.seen(B.id, "9999-01-01T00:00:00.000Z", summary as NodeSummary, row.lastAddr);
+    const { attachments: _, ...older } = { ...row.summary!, hostname: "older-b" };
+    heard(older);
+    const waiting = stateOn(A, m.id, "waiting");
+    await A.runner.prompt(m.id, "Run: echo hi");
+    await waiting;
+    // Nothing with a file is queued: the move starts, and waits for the turn.
+    await A.runner.moveTo(m.id, B.id, false);
+    await until("A's row", () => getTask(A.db, m.id)!.state, "moving");
+    const shot = await stored(A, "shot.png", [1, 2, 3]);
+    await expect(A.runner.prompt(m.id, "look", [shot])).rejects.toThrow("older-b runs a meddle that takes no attachments");
+    expect(await A.runner.prompt(m.id, "text alone")).toBe("queued");
+    heard(row.summary!);
+    expect(await A.runner.prompt(m.id, "look again", [shot])).toBe("queued");
+    expect(A.runner.queued(m.id)).toEqual([{ text: "text alone", attachments: [] }, { text: "look again", attachments: [shot] }]);
+
+    const { done } = watchTurns(B, m.id, 2);
+    for (const q of A.runner.approvals.pending(m.id)) A.runner.approvals.answer(q.requestId, { behavior: "allow", updatedInput: q.input });
+    await moveSettled(A.harness.harness);
+    await done;
+    expect(turnMarks(listEvents(B.db, m.id)).slice(-6)).toEqual(["start", "user:text alone", "result", "start", "user:look again", "result"]);
+    expect(existsSync(join(paths(B.cfg).taskAttachments(m.id), shot.hash, shot.name))).toBe(true);
+  } finally {
+    await close();
+  }
+}, 30_000);

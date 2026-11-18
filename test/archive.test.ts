@@ -228,7 +228,7 @@ test("a task restored with an empty, undescribed working copy carries on in it; 
   }
 }, 30_000);
 
-test("a task restored here writes its prompts' files again; one no online node has is logged and left out", async () => {
+test("a task restored here writes its prompts' files again; one no online node has, or not the size it says, is logged and left out", async () => {
   const { nodes, close } = await poolNodes(1);
   const A = nodes[0]!;
   try {
@@ -238,15 +238,20 @@ test("a task restored here writes its prompts' files again; one no online node h
     await promptAndWait(A, m.id, "look", [shot]);
     const dir = paths(A.cfg).taskAttachments(m.id);
     expect(existsSync(join(dir, hash, "shot.png"))).toBe(true);
-    // A prompt whose file no node has any more.
+    // A prompt whose file no node has any more, and one whose file is not the size it says.
     const lost: Attachment = { hash: "0".repeat(64), name: "lost.png", type: "image/png", size: 1 };
-    appendEvent(A.db, m.id, promptEvent({ text: "lost", attachments: [lost] }));
+    const wrong: Attachment = { ...shot, name: "wrong.png", size: size + 1 };
+    appendEvent(A.db, m.id, promptEvent({ text: "lost", attachments: [lost, wrong] }));
     await A.runner.archive(m.id);
     expect(existsSync(dir)).toBe(false);
     await A.runner.restoreHere(m.id);
     await until("the file", () => existsSync(join(dir, hash, "shot.png")), true);
     await until("the log", () => A.logs.includes(`meddle: task ${m.id}: attachment lost.png is not on any online node`), true);
     expect(existsSync(join(dir, lost.hash))).toBe(false);
+    await until("the log", () => A.logs.includes(
+      `meddle: task ${m.id}: attachment wrong.png was not written again: bad attachment: size does not match its file`,
+    ), true);
+    expect(existsSync(join(dir, hash, "wrong.png"))).toBe(false);
   } finally {
     await close();
   }
