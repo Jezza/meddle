@@ -51,7 +51,7 @@ export async function startDashboard(
     hostname: "127.0.0.1",
     port: cfg.port,
     fetch(request, server) {
-      if (!trusted(request, server.port ?? port)) return new Response("forbidden", { status: 403 });
+      if (!trusted(request, server.port ?? port)) return forbidden();
       const { pathname, searchParams } = new URL(request.url);
       if (pathname === "/" || pathname === "/index.html") {
         return new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } });
@@ -59,10 +59,8 @@ export async function startDashboard(
       if (pathname === "/main.js") {
         return new Response(script, { headers: { "content-type": "text/javascript; charset=utf-8" } });
       }
-      if (blobs !== undefined) {
-        if (pathname === "/blobs") return request.method === "PUT" ? putBlob(request, blobs) : notAllowed("PUT");
-        const blob = BLOB.exec(pathname);
-        if (blob !== null) return request.method === "GET" ? getBlob(blob[1]!, searchParams, blobs) : notAllowed("GET");
+      if (blobs !== undefined && (pathname === "/blobs" || BLOB.test(pathname))) {
+        return guarded(blobRoute(request, pathname, searchParams, blobs));
       }
       const tunnel = TUNNEL.exec(pathname);
       if (pathname === "/ws" || (tunnel !== null && pool !== undefined)) {
@@ -113,6 +111,46 @@ function notAllowed(allow: string): Response {
 }
 
 /**
+ * What every answer on `/blobs` carries, a refusal or a fault as much as a file, so that none is ever read in a way that
+ * lets it run script in the dashboard's origin, which drives the node: `nosniff` holds the browser to the type given,
+ * and `sandbox` leaves a page that shows it with no origin of its own.
+ */
+const GUARD_HEADERS = { "x-content-type-options": "nosniff", "content-security-policy": "sandbox" };
+
+/** `response` with `GUARD_HEADERS`. */
+async function guarded(response: Promise<Response> | Response): Promise<Response> {
+  const r = await response;
+  for (const [name, value] of Object.entries(GUARD_HEADERS)) r.headers.set(name, value);
+  return r;
+}
+
+/** The refusal of a request that may not reach the node, with `GUARD_HEADERS` as on any answer on `/blobs`. */
+function forbidden(): Response {
+  return new Response("forbidden", { status: 403, headers: GUARD_HEADERS });
+}
+
+/**
+ * Answers a request on `/blobs` (`PUT`, `putBlob`) or `/blobs/<x>` (`GET`, `getBlob`). Refused when the browser says
+ * another site's page sent it (`crossSite`).
+ */
+function blobRoute(request: Request, pathname: string, query: URLSearchParams, blobs: BlobFetcher): Promise<Response> | Response {
+  if (crossSite(request)) return forbidden();
+  if (pathname === "/blobs") return request.method === "PUT" ? putBlob(request, blobs) : notAllowed("PUT");
+  return request.method === "GET" ? getBlob(BLOB.exec(pathname)![1]!, query, blobs) : notAllowed("GET");
+}
+
+/**
+ * Whether the browser says the request comes from another site's page (`Sec-Fetch-Site` `cross-site` or `same-site`):
+ * an `<img>` there sends no `Origin`, so `trusted` alone would let that page find out which files this node has. A
+ * request without the header (not a browser's), from the dashboard's own page (`same-origin`) or typed in (`none`)
+ * passes.
+ */
+function crossSite(request: Request): boolean {
+  const site = request.headers.get("sec-fetch-site");
+  return site === "cross-site" || site === "same-site";
+}
+
+/**
  * Stores the request's body as a blob and answers `{ hash, size }`. A body over the 64 MB limit is refused as soon as
  * its `Content-Length` says so, unread, or when it grows past the limit; nothing is kept then. A request has no body
  * when it is empty, so that is the empty file.
@@ -133,9 +171,8 @@ async function putBlob(request: Request, blobs: BlobFetcher): Promise<Response> 
 
 /**
  * Gives out the blob with this hash, fetching it from the pool if this node lacks it. Only the four image types Claude
- * takes (`?type=`) are served as what they claim, inline; every other file is an opaque download named `?name=`. A file
- * is never served in a way that lets it run script in the dashboard's origin, which drives the node: `nosniff` holds the
- * browser to the type, and `sandbox` leaves a page that shows it with no origin of its own.
+ * takes (`?type=`) are served as what they claim, inline; every other file is an opaque download named `?name=`. Never
+ * as a page of the dashboard's origin: see `guarded`.
  */
 async function getBlob(hash: string, query: URLSearchParams, blobs: BlobFetcher): Promise<Response> {
   if (!isBlobHash(hash)) return new Response("not found", { status: 404 });
@@ -152,8 +189,6 @@ async function getBlob(hash: string, query: URLSearchParams, blobs: BlobFetcher)
     headers: {
       "content-type": inline ? type : "application/octet-stream",
       "content-disposition": inline ? "inline" : `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
-      "x-content-type-options": "nosniff",
-      "content-security-policy": "sandbox",
       "cache-control": "private, max-age=31536000, immutable",
     },
   });

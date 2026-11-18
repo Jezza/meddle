@@ -70,6 +70,7 @@ test("a download's name is encoded into its header, whatever it holds", async ()
 test("too large is 413 and leaves nothing; unknown or bad hashes are 404", async () => {
   const big = await fetch(`${url}blobs`, { method: "PUT", body: new Uint8Array(64 * 1024 * 1024 + 1) });
   expect(big.status).toBe(413);
+  expect([big.headers.get("x-content-type-options"), big.headers.get("content-security-policy")]).toEqual(["nosniff", "sandbox"]);
   expect(await big.text()).toBe("file exceeds 64 MB");
   expect(await temps()).toEqual([]);
   expect((await fetch(`${url}blobs/${"0".repeat(64)}`)).status).toBe(404);
@@ -134,6 +135,38 @@ test("another site's page cannot upload or download, nor can another name for th
   expect(own.status).toBe(200);
 });
 
+test("a request another site's page makes, which sends no Origin, is refused by what the browser says of it", async () => {
+  await fetch(`${url}blobs`, { method: "PUT", body: "hello" });
+  for (const site of ["cross-site", "same-site"]) {
+    // an <img> or a link elsewhere: the browser says where it comes from
+    expect((await fetch(`${url}blobs/${sha("hello")}?type=image/png`, { headers: { "sec-fetch-site": site } })).status).toBe(403);
+    const put = await fetch(`${url}blobs`, { method: "PUT", body: "probe", headers: { "sec-fetch-site": site } });
+    expect(put.status).toBe(403);
+    expect(await store.has(sha("probe"))).toBe(false);
+  }
+  // the dashboard's own page, an address typed in, or no browser at all
+  for (const headers of [{ "sec-fetch-site": "same-origin" }, { "sec-fetch-site": "none" }, {}] as Record<string, string>[]) {
+    expect((await fetch(`${url}blobs/${sha("hello")}`, { headers })).status).toBe(200);
+  }
+});
+
+test("every answer on /blobs is nosniff and sandboxed, refusals and faults too", async () => {
+  const answers = [
+    await fetch(`${url}blobs`, { method: "PUT", body: "hello" }),
+    await fetch(`${url}blobs/${sha("hello")}`),
+    await fetch(`${url}blobs/${"0".repeat(64)}`),
+    await fetch(`${url}blobs/..%2Fsecrets`),
+    await fetch(`${url}blobs`),
+    await fetch(`${url}blobs/${sha("hello")}`, { method: "DELETE" }),
+    await fetch(`${url}blobs/${sha("hello")}`, { headers: { "sec-fetch-site": "cross-site" } }),
+    await fetch(`${url}blobs/${sha("hello")}`, { headers: { origin: "http://evil.example" } }),
+  ];
+  expect(answers.map((r) => r.status)).toEqual([200, 200, 404, 404, 405, 405, 403, 403]);
+  for (const r of answers) {
+    expect([r.status, r.headers.get("x-content-type-options"), r.headers.get("content-security-policy")]).toEqual([r.status, "nosniff", "sandbox"]);
+  }
+});
+
 test("without a blob store the dashboard has no /blobs", async () => {
   const bare = await startDashboard({ port: 0 }, createHost({ name: "node", self: "node" }));
   try {
@@ -154,6 +187,7 @@ test("a store that cannot be read or written is a 500 with a reason", async () =
     const down = await fetch(`${broken.url}blobs/${sha("hello")}`);
     expect(down.status).toBe(500);
     expect(down.headers.get("content-type")).toStartWith("text/plain");
+    expect([down.headers.get("x-content-type-options"), down.headers.get("content-security-policy")]).toEqual(["nosniff", "sandbox"]);
     expect((await down.text()).length).toBeGreaterThan(0);
     const up = await fetch(`${broken.url}blobs`, { method: "PUT", body: "hello" });
     expect(up.status).toBe(500);
