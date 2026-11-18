@@ -111,6 +111,8 @@ test("while an update awaits confirmation, every method of NodeObject, TaskObjec
         archive: () => task.archive({}),
         restore: () => task.restore({ node: null }),
         delete: () => task.delete({}),
+        accept: () => task.accept({}),
+        unqueue: () => task.unqueue({}),
       },
       pool: {
         poolChanged: () => pool.poolChanged({}),
