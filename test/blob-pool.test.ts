@@ -6,6 +6,7 @@ import { MAX_BLOB_BYTES } from "../src/blobs/attachment";
 import { BlobFetcher, serveBlob } from "../src/blobs/pool";
 import { BlobStore } from "../src/blobs/store";
 import { writeFrame, type StreamReader } from "../src/pool/frames";
+import { shortId } from "../src/pool/ids";
 import type { PeerStream, PoolNet } from "../src/pool/net";
 import { acceptBlobStreams } from "../src/tasks/blob";
 import { twoNodes, twoPoolNodes } from "./pool-helpers";
@@ -297,6 +298,24 @@ test("a peer that lacks the blob is passed over for the next, the one preferred 
     expect(tried).toEqual(["down-2", "down-1", b.id]);
     expect(await new BlobFetcher(new BlobStore(join(sa.dir, "..", "other")), net).ensure(hash, b.id)).toBe(true);
     expect(tried).toEqual(["down-2", "down-1", b.id, b.id]);
+  } finally {
+    await close();
+  }
+});
+
+test("a moved task that cannot be imported is reset, and why is logged", async () => {
+  const { a, b, sb, close } = await pair(false);
+  try {
+    const logged: string[] = [];
+    const refusing = { importIncoming: async () => { throw new Error("task t1 is not being received from here") } };
+    const stop = acceptBlobStreams(b.net, refusing, sb, (line) => logged.push(line));
+    const s = await a.net.openStream(b.id, { stream: "blob", kind: "task", taskId: "t1" });
+    await s.stream.send.finish();
+    // no receipt: the stream ends or fails without one
+    expect(await s.reader.readLine().catch(() => null)).toBeNull();
+    await until(() => logged.length > 0);
+    expect(logged).toEqual([`meddle: move: could not import t1 from ${shortId(a.id)}: task t1 is not being received from here`]);
+    stop();
   } finally {
     await close();
   }

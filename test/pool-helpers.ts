@@ -382,8 +382,8 @@ export async function linkNodes(a: GitPoolNode, b: GitPoolNode): Promise<void> {
 /**
  * `count` whole nodes (`startPoolNode`, with `extraEnv` and the node's own `nodes[i]`), all with `POOL_SECRET`, linked
  * to each other (`linkNodes`) and all online to each other, each with the git remote helper's wrapper and the
- * pre-receive hook written, a `GitSocket` started, `acceptGitStreams` (logging to the node's `logs`) and
- * `acceptBlobStreams` registered. `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
+ * pre-receive hook written, a `GitSocket` started, `acceptGitStreams` and `acceptBlobStreams` (both logging to the
+ * node's `logs`) registered. `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
  */
 export async function poolNodes(
   count: number,
@@ -415,7 +415,7 @@ export async function poolNodes(
         });
         stops.push(async () => stopAccepting());
       }
-      const stopBlobs = acceptBlobStreams(node.net, node.runner, node.runner.blobs.store);
+      const stopBlobs = acceptBlobStreams(node.net, node.runner, node.runner.blobs.store, (line) => node.logs.push(line));
       stops.push(async () => stopBlobs());
     }
     for (const [i, a] of nodes.entries()) for (const b of nodes.slice(i + 1)) await linkNodes(a, b);
