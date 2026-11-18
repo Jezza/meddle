@@ -522,3 +522,55 @@ test("a merge task placed on another node is reached there, whatever the home's 
     await close();
   }
 }, 180_000);
+
+test("a hold that starts during a step of several turns refuses each of the rest: none sits out or counts as asked", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const before = await mainOf(n, P);
+    const described: string[] = [];
+    // Three describe turns start together; the update's hold comes as the first of them runs, so the other two are
+    // refused, the second as the hold is found and the third once the round is held up.
+    const merge = fakeMerge(n, {
+      others: async (taskId, kind) => {
+        if (kind !== "describe") return undefined;
+        if (described.length === 0) n.runner.setHolds({ turns: HELD, work: null, hosting: null });
+        described.push(taskId);
+        await jj(["describe", "-m", `Describe ${taskId}`], workspaceOf(n, taskId), n.cfg);
+        await n.runner.writeTaskLines(taskId);
+        return { kind: "done" };
+      },
+    });
+    const tasks = [
+      await taskWithWork(n, P, "x.txt", { undescribed: true }),
+      await taskWithWork(n, P, "y.txt", { undescribed: true }),
+      await taskWithWork(n, P, "z.txt", { undescribed: true }),
+    ];
+    const ids = tasks.map((t) => t.id);
+    await acceptAll(n, P, ids);
+    await waitFor("the first describe turn", () => described.length === 1);
+    await waitFor("the round to end", async () => (await liveTrains(n)).length === 0);
+    // Only the turn that ran counts as asked; the two refused ones neither sit out nor count.
+    expect(described).toHaveLength(1);
+    const state = trainState(n.db, P);
+    expect(state.paused).toBeNull();
+    expect(state.round).toEqual({ step: "describing", batch: described, mergeTask: null });
+    expect(state.queued.map((q) => q.taskId).sort()).toEqual([...ids].sort());
+    expect(state.queued.filter((q) => q.taskId !== described[0]).map((q) => q.state)).toEqual(["queued", "queued"]);
+    expect(state.queued.some((q) => q.state === "sitting out")).toBe(false);
+    expect(await n.runner.busyTasks()).toEqual([]);
+    await Bun.sleep(1500);
+    expect(described).toHaveLength(1);
+    expect(await mainOf(n, P)).toBe(before);
+
+    // The hold lifts: the round resumes by itself, the two refused tasks get their describe turns, and the batch lands.
+    n.runner.setHolds(NO_HOLDS);
+    await waitFor("main to land the batch", async () => (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!.parents.length === 3);
+    expect([...described].sort()).toEqual([...ids].sort());
+    expect(merge.tasks).toHaveLength(1);
+    await waitFor("every task archived", () => ids.every((id) => getTask(n.db, id)?.state === "archived"));
+  } finally {
+    await close();
+  }
+}, 180_000);

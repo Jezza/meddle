@@ -819,6 +819,18 @@ class Conductor {
       if (taskId !== null) round.heldTasks.add(taskId);
       throw new HeldUp(reason);
     };
+    /**
+     * Before what task `taskId`'s work would start: once the round is held up, or while a pool update holds turns here,
+     * it is refused as held, for that task (so it neither sits out nor counts as asked), whichever task of a step that
+     * starts several at once it is.
+     */
+    const startFor = (taskId: string) => {
+      live();
+      if (round.held !== null) holdUp(round.held, taskId);
+      // Held here, nothing starts anywhere: the update this node drains for waits on the round.
+      const holds = this.#runner.holds().turns;
+      if (holds !== null) holdUp(holds, taskId);
+    };
     const checkpoint = async (step: RoundStep) => {
       work();
       // Paused: nothing new starts. A merge task named as it is made is still recorded, for the round to discard.
@@ -848,7 +860,7 @@ class Conductor {
         return this.#title(project, taskId);
       },
       abandonLeftovers: async (taskId, commits) => {
-        work();
+        startFor(taskId);
         await this.#onHolder(project, taskId, round, (r) => r.abandonLeftovers(taskId, commits), (peer) => peer.abandonLeftovers({ taskId, commits }));
       },
       advance: async (old, next) => {
@@ -876,10 +888,7 @@ class Conductor {
         return this.#createMergeTask(project, input, round, checkpoint);
       },
       turn: async (taskId, kind, text) => {
-        work();
-        // Held here, no turn starts anywhere: the update this node drains for waits on the round.
-        const holds = this.#runner.holds().turns;
-        if (holds !== null) return holdUp(holds, taskId);
+        startFor(taskId);
         try {
           return await this.#onHolder(project, taskId, round, (r) => r.trainTurn(taskId, kind, text), (peer) => peer.trainTurn({ taskId, kind, text }));
         } catch (err) {
