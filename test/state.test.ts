@@ -1,5 +1,6 @@
 // test/state.test.ts
 import { test, expect } from "bun:test";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { NodeObject, ProjectObject, TaskObject, SessionObject } from "../src/state/host";
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent, listEvents } from "../src/store/events";
@@ -21,7 +22,7 @@ import { listTokens } from "../src/token";
 import { defaultBranchCommit } from "../src/projects/starts";
 import type { Notification } from "../src/state/contracts";
 import { UNQUEUED_ARCHIVED, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER } from "../src/tasks/durable";
-import { pauseTrain, trainNotices, trainState } from "../src/train/train";
+import { pauseTrain, trainNotices, trainState, trainUpdates } from "../src/train/train";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -969,9 +970,37 @@ async function taskWithWork(on: GitPoolNode, P: string, file: string, options: {
   return { id: m.id, ws, tip };
 }
 
-/** A node of `poolNodes` with a client host linked to it. */
-async function trainNode() {
-  const { nodes, close: closeNodes } = await poolNodes(1);
+/** Project `P`'s held-back entries in node `n`'s `trains` table, by task. */
+function heldOf(n: GitPoolNode, P: string): Record<string, string> {
+  const row = n.db.query<{ held: string }, [string]>("SELECT held FROM trains WHERE project = ?").get(P);
+  return row === null ? {} : (JSON.parse(row.held) as Record<string, string>);
+}
+
+/**
+ * Runs `trigger` (Resume, say) and waits for the round it starts to end: its row shows a step, then none. Waits first
+ * for any round under way to end, so the round waited for is the one `trigger` started.
+ */
+async function roundAfter(n: GitPoolNode, P: string, trigger: () => void): Promise<void> {
+  const live = async () => (await n.harness.harness.inspect(BACKGROUND_CONTEXT)).tasks.filter((t) => t.record.kind === "meddle.train");
+  await waitFor("rounds under way to end", async () => (await live()).length === 0);
+  const ended = new Promise<void>((resolve) => {
+    let started = false;
+    const stop = trainUpdates.subscribe((projectId) => {
+      if (projectId !== P) return;
+      if (trainState(n.db, P).round !== null) started = true;
+      else if (started) {
+        stop();
+        resolve();
+      }
+    });
+  });
+  trigger();
+  await ended;
+}
+
+/** A node of `poolNodes` (`extraEnv`: for its turns' stand-in) with a client host linked to it. */
+async function trainNode(extraEnv: Record<string, string> = {}) {
+  const { nodes, close: closeNodes } = await poolNodes(1, { extraEnv });
   const n = nodes[0]!;
   const { client, close: closeClient } = linkClient(n.host);
   return {
@@ -1014,17 +1043,17 @@ test("leaving the train raises a train notice, and what the user did to leave ra
   }
 }, 180_000);
 
-test("a task that sits out raises a notice with Retry, and the project's retry brings it back", async () => {
+test("a task that sits out raises a notice with Retry, and again each time it sits out anew after a Retry", async () => {
   const { n, client, P, close } = await trainNode();
   try {
     const node = await client.get(NodeObject, {});
     const project = await client.get(ProjectObject, { id: P });
     const describes: string[] = [];
-    // Its first describe turn fails; the next describes its work, as the agent would.
+    // Its first two describe turns fail; the next describes its work, as the agent would.
     n.hooks.trainTurn = async (taskId, kind, text) => {
       if (kind !== "describe") return undefined;
       describes.push(text);
-      if (describes.length === 1) return { kind: "failed", reason: "the agent gave up" };
+      if (describes.length <= 2) return { kind: "failed", reason: "the agent gave up" };
       const ws = workspaceOf(n, taskId);
       await jj(["describe", "-m", "Add x"], ws, n.cfg);
       await n.runner.writeTaskLines(taskId);
@@ -1037,12 +1066,17 @@ test("a task that sits out raises a notice with Retry, and the project's retry b
     expect(trainNotes(notes)).toEqual([{ taskId: t.id, text: "Add x.txt is sitting out: its describe turn failed: the agent gave up", action: "retry" }]);
     expect(project.train.value.queued).toEqual([{ taskId: t.id, state: "sitting out", reason: "its describe turn failed: the agent gave up" }]);
 
+    // Retry clears the entry; it sits out again, and that is a new condition: told again, the first still showing.
+    await project.retry({ taskId: t.id });
+    const again = await until(node.notifications, (ns) => trainNotes(ns).length === 2);
+    expect(trainNotes(again).map((x) => x.text)).toEqual(Array(2).fill("Add x.txt is sitting out: its describe turn failed: the agent gave up"));
+
     await project.retry({ taskId: t.id });
     await until(project.train, (s) => s.queued.length === 0);
-    expect(describes).toHaveLength(2);
+    expect(describes).toHaveLength(3);
     await waitFor("the landed task archived", () => getTask(n.db, t.id)?.state === "archived");
     // Nothing more was told: the task is a normal task again.
-    expect(trainNotes(node.notifications.value)).toHaveLength(1);
+    expect(trainNotes(node.notifications.value)).toHaveLength(2);
     project.release();
     node.release();
   } finally {
@@ -1050,10 +1084,11 @@ test("a task that sits out raises a notice with Retry, and the project's retry b
   }
 }, 180_000);
 
-test("a task held back for work that isn't queued raises its notice, once while it shows", async () => {
+test("a task held back for work that isn't queued raises its notice once, until its entry clears and the condition returns", async () => {
   const { n, client, P, close } = await trainNode();
   const heard: string[] = [];
   const stop = trainNotices.subscribe((notice) => heard.push(notice.text));
+  const TEXT = "Add b.txt includes work from Add a.txt, which isn't queued";
   try {
     const node = await client.get(NodeObject, {});
     const other = await taskWithWork(n, P, "a.txt");
@@ -1062,24 +1097,62 @@ test("a task held back for work that isn't queued raises its notice, once while 
     await n.runner.accept(mine.id);
 
     const notes = await until(node.notifications, (ns) => trainNotes(ns).length > 0);
-    expect(trainNotes(notes)).toEqual([{ taskId: mine.id, text: "Add b.txt includes work from Add a.txt, which isn't queued", action: undefined }]);
+    expect(trainNotes(notes)).toEqual([{ taskId: mine.id, text: TEXT, action: undefined }]);
     expect(notes.find((x) => x.kind === "train")).not.toHaveProperty("action");
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
 
-    // The next round holds it back again, and the notice on show stands for it.
-    pauseTrain(n.db, P, "again");
-    pauseTrain(n.db, P, null);
-    await waitFor("the second round to hold it back", () => heard.length >= 2);
-    await Bun.sleep(100);
+    // The next round holds it back again, the entry standing: nothing more is told.
+    await roundAfter(n, P, () => { pauseTrain(n.db, P, "again"); pauseTrain(n.db, P, null); });
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
     expect(trainNotes(node.notifications.value)).toHaveLength(1);
-    // Dismissed, it comes back with the next round that holds it back.
+
+    // Dismissed, it stays away while it stays held back.
     await node.dismiss({ id: node.notifications.value.find((x) => x.kind === "train")!.id });
-    pauseTrain(n.db, P, "once more");
-    pauseTrain(n.db, P, null);
-    await until(node.notifications, (ns) => trainNotes(ns).length === 1);
-    expect(heard.length).toBeGreaterThanOrEqual(3);
+    await roundAfter(n, P, () => { pauseTrain(n.db, P, "once more"); pauseTrain(n.db, P, null); });
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
+    expect(trainNotes(node.notifications.value)).toEqual([]);
+    expect(heard).toEqual([TEXT]);
+
+    // It leaves the train, which clears its entry; queued again, it is held back anew: a new condition, told.
+    await n.runner.unqueue(mine.id, UNQUEUED_BY_USER);
+    await waitFor("its entry to clear", () => Object.keys(heldOf(n, P)).length === 0);
+    await n.runner.accept(mine.id);
+    expect(trainNotes(await until(node.notifications, (ns) => trainNotes(ns).length === 1))).toEqual([{ taskId: mine.id, text: TEXT, action: undefined }]);
+    expect(heard).toEqual([TEXT, TEXT]);
     node.release();
   } finally {
     stop();
+    await close();
+  }
+}, 180_000);
+
+test("a held-back task whose entry clears while it stays queued is told again when it is held back again", async () => {
+  // Turns of tasks stall, so the other task can be busy.
+  const { n, client, P, close } = await trainNode({ MEDDLE_FIXTURE_STALL: "1" });
+  const TEXT = "Add b.txt includes work from Add a.txt, which isn't queued";
+  try {
+    const node = await client.get(NodeObject, {});
+    const other = await taskWithWork(n, P, "a.txt");
+    const mine = await taskWithWork(n, P, "b.txt", { onTopOf: other.tip });
+    await n.runner.accept(mine.id);
+    await until(node.notifications, (ns) => trainNotes(ns).some((x) => x.text === TEXT));
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
+
+    // The other task, busy with a turn, is queued: this one waits for it, no longer held back, and its entry goes.
+    await n.runner.prompt(other.id, "keep going");
+    await waitFor("the other task's turn", () => n.runner.state(other.id) === "running");
+    await n.runner.accept(other.id);
+    await waitFor("its entry to clear", () => Object.keys(heldOf(n, P)).length === 0);
+    expect(trainState(n.db, P).queued.find((q) => q.taskId === mine.id)).toEqual({ taskId: mine.id, state: "queued", reason: null });
+
+    // The other task leaves the train, and this one, still queued, is held back anew: told again.
+    await n.runner.unqueue(other.id, UNQUEUED_BY_USER);
+    await waitFor("it to be held back again", () => heldOf(n, P)[mine.id] === TEXT);
+    const notes = await until(node.notifications, (ns) => trainNotes(ns).length === 2);
+    expect(trainNotes(notes).map((x) => x.text)).toEqual([TEXT, TEXT]);
+    await n.runner.interrupt(other.id);
+    node.release();
+  } finally {
     await close();
   }
 }, 180_000);

@@ -406,12 +406,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (reason === null || UNQUEUED_AS_ASKED.has(reason)) return;
       notify(ctx, { taskId, kind: "train", text: `${getTask(db, taskId)?.title ?? taskId} left meddle's train: ${reason}`, action: "accept" });
     });
-    // A task of a train homed here that sits out, or is held back, says so. A process holds several nodes in tests and
-    // every one hears of every train, so only the home's own are raised. A task the next round holds back again keeps
-    // its notice while that shows.
+    // A task of a train homed here that sits out, or is held back, says so, once for each new condition (the conductor
+    // tells once). A process holds several nodes in tests and every one hears of every train, so only the home's own
+    // are raised.
     self.on("trainNotices", trainNotices, (n, ctx) => {
       if (getProject(db, n.projectId)?.home !== pool.identity.id) return;
-      if (notifications.value.some((x) => x.kind === "train" && x.taskId === n.taskId && x.text === n.text)) return;
       notify(ctx, { taskId: n.taskId, kind: "train", text: n.text, ...(n.kind === "sitting" ? { action: "retry" as const } : {}) });
     });
 

@@ -168,9 +168,10 @@ export const trainUpdates: Subscribable<string> = updateTopic.subscribable;
 export type TrainNotice = { projectId: string; taskId: string; kind: "sitting" | "held"; text: string };
 
 /**
- * Fires when the conductor sets a task sitting out (not for `waiting for <node>`, which ends by itself) or holds one
- * back. A task the next round holds back again is told again, and the listener keeps the notice from showing twice.
- * Fires for the trains of every node in the process, as `trainUpdates` does.
+ * Fires when an entry of a task sitting out (not `waiting for <node>`, which ends by itself) or held back first appears
+ * in the project's train row, or changes: once per condition. A round that holds the task back again, with the entry
+ * still there, does not fire it again; once the entry has gone (Retry, the work it waited for settled, the task left)
+ * and the condition comes back, it does. Fires for the trains of every node in the process, as `trainUpdates` does.
  */
 export const trainNotices: Subscribable<TrainNotice> = noticeTopic.subscribable;
 
@@ -358,12 +359,14 @@ type Ended =
 
 /**
  * What a round keeps while it runs: its `B`, whether it read its candidates yet, why a landing was refused for now, why
- * a pool update holds it up (`held`) and the tasks whose turns that refused, and the node each merge task it made (or
- * resumed) was placed on.
+ * a pool update holds it up (`held`) and the tasks whose turns that refused, the node each merge task it made (or
+ * resumed) was placed on, and the held-back entries it carried in (`carried`: those of the tasks its first `candidates`
+ * answered) with the tasks it held back (`reheld`).
  */
 type RoundRun = {
   B: string | null; first: boolean; transient: string | null;
   held: string | null; heldTasks: Set<string>; mergeNodes: Map<string, string>;
+  carried: Set<string>; reheld: Set<string>;
 };
 
 /** How one project's train runs on its home. */
@@ -762,7 +765,9 @@ class Conductor {
     }
     this.#prune(project);
     const resume = at ?? train.round ?? undefined;
-    const round: RoundRun = { B: null, first: true, transient: null, held: null, heldTasks: new Set(), mergeNodes: new Map() };
+    const round: RoundRun = {
+      B: null, first: true, transient: null, held: null, heldTasks: new Set(), mergeNodes: new Map(), carried: new Set(), reheld: new Set(),
+    };
     if (resume?.mergeTask != null && resume.mergeNode !== undefined) round.mergeNodes.set(resume.mergeTask, resume.mergeNode);
     const deps = this.#roundDeps(project, round, runtime, context, stopping);
     // Held up by a pool update: what it did is kept, but not the turns the hold refused; nothing pauses or sits out.
@@ -844,6 +849,8 @@ class Conductor {
     };
     const checkpoint = async (step: RoundStep) => {
       work();
+      // Step 1 has decided which tasks are held back: those it answered and did not hold back again no longer are.
+      if (step.step === "picking") this.#settleHeld(projectId, round);
       // Paused: nothing new starts. A merge task named as it is made is still recorded, for the round to discard.
       if (step.mergeTask === null && readTrain(this.#db, projectId).paused !== null) throw new TrainPaused();
       const kept = saved(step, step.mergeTask === null ? undefined : round.mergeNodes.get(step.mergeTask));
@@ -892,6 +899,9 @@ class Conductor {
       },
       holdBack: async (taskId, notice) => {
         live();
+        round.reheld.add(taskId);
+        // The entry a round before left, the same, stands: the notice was raised then.
+        if (readTrain(this.#db, projectId).held[taskId] === notice) return;
         updateTrain(this.#db, projectId, (t) => ({ ...t, held: { ...t.held, [taskId]: notice } }));
         noticeTopic.tell({ projectId, taskId, kind: "held", text: notice });
       },
@@ -926,8 +936,9 @@ class Conductor {
    * The eligible tasks of project `project`'s queue (`RoundDeps.candidates`): queued, not sitting out, idle on their
    * holder (this node's runner, or the holder's `trainTasks`), each tip the line's effective head as this node's repo has
    * it, caught up from the peers first when a task elsewhere is idle. A task whose holder is offline sits out, waiting
-   * for it. The tasks of the batch the round is checking or landing stay in: they are idle meanwhile. The first call of
-   * a round drops the held-back notices of the tasks it answers: each round decides that afresh.
+   * for it. The tasks of the batch the round is checking or landing stay in: they are idle meanwhile. Each round decides
+   * afresh which tasks are held back: the entries of the tasks the first call of a round answers stand until step 1 has
+   * decided (`#settleHeld`).
    */
   async #candidates(project: Project, round: RoundRun): Promise<Candidate[]> {
     const self = this.#selfId;
@@ -971,12 +982,21 @@ class Conductor {
     }
     if (round.first) {
       round.first = false;
-      const ids = new Set(out.map((c) => c.taskId));
-      if (Object.keys(readTrain(this.#db, project.id).held).some((id) => ids.has(id))) {
-        updateTrain(this.#db, project.id, (t) => ({ ...t, held: without(t.held, (id) => ids.has(id)) }));
-      }
+      const { held } = readTrain(this.#db, project.id);
+      for (const c of out) if (held[c.taskId] !== undefined) round.carried.add(c.taskId);
     }
     return out;
+  }
+
+  /**
+   * Once step 1 of a round has decided (`RoundRun.carried`, `reheld`): a task whose entry the round carried in and did not
+   * hold back again is no longer held back, and its entry goes. One held back again keeps its entry, which is how a
+   * notice already raised for it is not raised again (`holdBack`).
+   */
+  #settleHeld(projectId: string, round: RoundRun): void {
+    const gone = (id: string) => round.carried.has(id) && !round.reheld.has(id);
+    if (!Object.keys(readTrain(this.#db, projectId).held).some(gone)) return;
+    updateTrain(this.#db, projectId, (t) => ({ ...t, held: without(t.held, gone) }));
   }
 
   /** How notices name task `taskId`: its title, from here or as its holder says, else its id. */
@@ -1022,10 +1042,11 @@ class Conductor {
     updateTrain(this.#db, project.id, (t) => ({ ...t, sitting: without(t.sitting, gone), held: without(t.held, gone) }));
   }
 
-  /** Task `taskId` sits out for `reason`, while it is queued: whether it does. */
+  /** Task `taskId` sits out for `reason`, while it is queued: whether that is a new entry (not already there, the same). */
   #sitOut(project: Project, taskId: string, reason: string): boolean {
     const row = this.#ownLine(project, taskId);
     if (row === undefined || row.queuedAt === null || row.archived) return false;
+    if (readTrain(this.#db, project.id).sitting[taskId] === reason) return false;
     updateTrain(this.#db, project.id, (t) => ({ ...t, sitting: { ...t.sitting, [taskId]: reason } }));
     return true;
   }
