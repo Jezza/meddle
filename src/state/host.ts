@@ -40,6 +40,7 @@ import { taskNamespace, type ManifestProject, type Start, type TaskManifest } fr
 import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
+import { tokenUsages, type UsageReading } from "../token-usage";
 import { gated } from "../update/gate";
 import { VERSION } from "../version";
 import { AGENT_EVENT_KINDS, EMPTY_AGENT_LOG, foldAgentLog, runningCount, servedAgents } from "./agents";
@@ -300,6 +301,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const archivedIds = self.state("archivedIds", NodeStore.def.members.archivedIds, { init: () => listArchivedTasks(db).map((t) => t.id) });
     const projectIds = self.state("projectIds", NodeStore.def.members.projectIds, { init: projectIdsNow });
     const token = self.state("token", NodeStore.def.members.token, { init: () => tokenNow(cfg, db) });
+    const tokenUsage = self.state("tokenUsage", NodeStore.def.members.tokenUsage, { init: () => tokenUsages(db) });
+    const activeUsage = self.state("activeUsage", NodeStore.def.members.activeUsage, { init: () => activeUsageNow(cfg, db) });
     const metricsNow = self.state("metrics", NodeStore.def.members.metrics, { init: () => metrics.latest() });
     const hostsTasks = self.state("hostsTasks", NodeStore.def.members.hostsTasks, { init: async () => (await checkTaskRoot(cfg)).ok });
     const hostingProblem = self.state("hostingProblem", NodeStore.def.members.hostingProblem, {
@@ -328,6 +331,14 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (problem !== hostingProblem.value) hostingProblem.replace(ctx, problem);
     };
 
+    /** A reading recorded, a token picked or removed: the readings and the active token's are read again. */
+    const refreshUsage = async (ctx: Ctx) => {
+      const active = await activeUsageNow(cfg, db);
+      if (ctx.signal.aborted) return;
+      tokenUsage.replace(ctx, tokenUsages(db));
+      activeUsage.replace(ctx, active);
+    };
+
     const notify = (ctx: Ctx, n: Omit<Notification, "id" | "at">) => {
       const note = { id: crypto.randomUUID(), at: new Date().toISOString(), ...n };
       notifications.replace(ctx, [...notifications.value, note].slice(-NOTIFICATIONS_KEPT));
@@ -337,6 +348,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const m = message as Message;
       const afterNoToken = noTokenFailures.delete(taskId);
       if (tokenFaultOf(message as SDKMessage) !== null) faulted.add(taskId);
+      // The turn recorded the reading before this event went out.
+      if (m.type === "rate_limit_event") await refreshUsage(ctx);
       if (m.type === "result") {
         const error = resultError(m);
         // A turn its token failed says so in the `token_fault` that follows (or reruns with the next token): one
@@ -390,6 +403,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("samples", samples, async (sample, ctx) => {
       metricsNow.replace(ctx, sample);
       token.replace(ctx, await tokenNow(cfg, db));
+      await refreshUsage(ctx);
       await refreshHostsTasks(ctx);
     });
     // A move that failed says where and why; the task is live here again.
@@ -424,6 +438,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const next = await tokenNow(cfg, db);
       // The host may have closed while the file was read (a change as the node shuts down).
       if (!ctx.signal.aborted) token.replace(ctx, next);
+      await refreshUsage(ctx);
       await refreshHostsTasks(ctx);
     });
 
@@ -437,6 +452,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       hostingProblem,
       metrics: metricsNow,
       token,
+      tokenUsage,
+      activeUsage,
       taskIds,
       archivedIds,
       projectIds,
@@ -552,6 +569,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       hostingProblem: store.hostingProblem,
       metrics: store.metrics,
       token: store.token,
+      tokenUsage: store.tokenUsage,
+      activeUsage: store.activeUsage,
       taskIds: store.taskIds,
       archivedIds: store.archivedIds,
       projectIds: store.projectIds,
@@ -1133,6 +1152,15 @@ async function tokenNow(cfg: NodeConfig, db: Database): Promise<{ present: boole
   const picked = await pickToken(cfg, db);
   if (picked === null) return { present: false, expiresAt: null };
   return { present: true, expiresAt: listTokens(db).find((t) => t.id === picked.id)?.expiresAt ?? null };
+}
+
+/** The token this node's next turn uses, with its reading here (null: none yet); null when no token is usable. */
+async function activeUsageNow(
+  cfg: NodeConfig, db: Database,
+): Promise<{ tokenId: string; label: string; reading: UsageReading | null } | null> {
+  const picked = await pickToken(cfg, db);
+  if (picked === null) return null;
+  return { tokenId: picked.id, label: picked.label, reading: tokenUsages(db)[picked.id] ?? null };
 }
 
 function questionText(req: PendingApproval): string {

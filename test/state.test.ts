@@ -16,6 +16,7 @@ import { paths, type NodeConfig } from "../src/config";
 import { jj } from "../src/jj";
 import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
 import { ensureServiceRepo } from "../src/projects/replicas";
+import { listTokens } from "../src/token";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -48,10 +49,14 @@ test("claudeCodeVersion reads the pinned SDK's manifest", () => {
 });
 
 test("a client follows a task through a prompted turn over a link", async () => {
-  const { client, metrics, project, close } = await connect();
+  const { client, metrics, project, db, close } = await connect();
   try {
     const node = await client.get(NodeObject, {});
     expect(node.projectIds.value).toContain(project.id);
+    const token = listTokens(db)[0]!;
+    // No turn has used the token yet: it is the active one, with no reading.
+    expect(node.activeUsage.value).toEqual({ tokenId: token.id, label: token.label, reading: null });
+    expect(node.tokenUsage.value).toEqual({});
     expect(node.metrics.value).toBeNull();
     metrics.start();
     await until(node.metrics, (m) => m !== null);
@@ -78,6 +83,11 @@ test("a client follows a task through a prompted turn over a link", async () => 
     expect(session.live.value).toBeNull();
     await until(task.contextUsage, (u) => u !== null);
     expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 376 } });
+    // The turn's rate_limit_event (hello.jsonl: 27% of five hours, 33% of seven days) is the token's reading.
+    const usage = await until(node.activeUsage, (u) => u?.reading != null);
+    const read = { fiveHour: { utilization: 0.27 }, sevenDay: { utilization: 0.33 } };
+    expect(usage).toMatchObject({ tokenId: token.id, label: token.label, reading: read });
+    expect(node.tokenUsage.value[token.id]).toMatchObject(read);
     expect(task.permissionMode.value).toBe("auto");
     // none chosen: the pool's default, not the turn's
     expect(task.model.value).toBeNull();
