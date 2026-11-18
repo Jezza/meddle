@@ -3,7 +3,7 @@
 // names it on by hash; the node a prompt goes to fetches what it lacks.
 import { useEffect, useRef, useState } from "preact/hooks";
 import { type Attachment, MAX_BLOB_BYTES } from "../../blobs/attachment";
-import { blobUrl, type Draft, nameFor, shownInline, sizeText } from "./attach-model";
+import { blobUrl, type Draft, nameFor, pastedFiles, shownInline, sizeText } from "./attach-model";
 import { errorText } from "./hooks";
 import { Iconoir } from "./icons";
 
@@ -11,7 +11,6 @@ export type Drafts = {
   drafts: Draft[];
   add(files: File[]): void;
   remove(id: number): void;
-  clear(): void;
   restore(attachments: Attachment[]): void;
 };
 
@@ -21,8 +20,8 @@ function revoke(d: Draft) {
 }
 
 /**
- * The files a composer holds, each uploaded as it is added; an image previews from the file itself until it is removed,
- * cleared or the composer goes. A file with no type goes as `application/octet-stream`. `restore` puts a prompt's
+ * The files a composer holds, each uploaded as it is added; an image previews from the file itself until it is removed
+ * or the composer goes. A file with no type goes as `application/octet-stream`. `restore` puts a prompt's
  * attachments back, already uploaded.
  */
 export function useDrafts(): Drafts {
@@ -67,10 +66,6 @@ export function useDrafts(): Drafts {
       if (gone !== undefined) revoke(gone);
       setDrafts((all) => all.filter((d) => d.id !== id));
     },
-    clear() {
-      latest.current.forEach(revoke);
-      setDrafts([]);
-    },
     restore(attachments) {
       const back = attachments.map((a) =>
         draftOf({ name: a.name, type: a.type, size: a.size, preview: shownInline(a.type) ? blobUrl(a) : null, state: "done", attachment: a }));
@@ -80,9 +75,9 @@ export function useDrafts(): Drafts {
 }
 
 /**
- * Paste and drop for a composer (`on`: whether it takes files at all). A paste whose clipboard holds files, and files
- * dropped on it, go to `onFiles`; a text paste or a text dragged within it is left to the browser. `dragging`: files
- * are over it.
+ * Paste and drop for a composer (`on`: whether it takes files at all). A paste of files with no plain text beside them
+ * (`pastedFiles`), and files dropped on it, go to `onFiles`; a text paste or a text dragged within it is left to the
+ * browser. `dragging`: files are over it.
  */
 export function useFileTarget(onFiles: (files: File[]) => void, on: boolean) {
   const [over, setOver] = useState(false);
@@ -92,7 +87,8 @@ export function useFileTarget(onFiles: (files: File[]) => void, on: boolean) {
     dragging: over,
     handlers: {
       onPaste(e: ClipboardEvent) {
-        const files = Array.from(e.clipboardData?.files ?? []);
+        const clip = e.clipboardData;
+        const files = clip === null ? [] : pastedFiles({ text: clip.getData("text/plain"), files: Array.from(clip.files) });
         if (files.length === 0) return;
         e.preventDefault();
         onFiles(files);

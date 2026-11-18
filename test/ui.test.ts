@@ -13,7 +13,7 @@ import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, 
 import { composerKey } from "../src/dashboard/ui/composer-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
-import { blobUrl, type Draft, draftAttachments, nameFor, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
+import { blobUrl, type Draft, draftAttachments, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
 import type { Attachment } from "../src/blobs/attachment";
 
 test("the dashboard bundle builds", async () => {
@@ -462,4 +462,11 @@ test("draftAttachments takes the uploaded drafts' attachments; only the four ima
   const log: Attachment = { ...shot, name: "server.log", type: "application/octet-stream" };
   expect(draftAttachments([draft(), draft({ id: 2, state: "uploading", attachment: null }), draft({ id: 3, attachment: log })])).toEqual([shot, log]);
   expect(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml", ""].map(shownInline)).toEqual([true, true, true, true, false, false]);
+});
+
+test("pastedFiles takes a clipboard's files only when it holds no plain text", () => {
+  // Excel, Word and Docs put a picture of the selection beside its text: that paste is text.
+  expect(pastedFiles({ text: "a\tb", files: ["image.png"] })).toEqual([]);
+  expect(pastedFiles({ text: "", files: ["image.png", "b.log"] })).toEqual(["image.png", "b.log"]);
+  expect(pastedFiles({ text: "hello", files: [] })).toEqual([]);
 });

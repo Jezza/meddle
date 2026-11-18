@@ -44,6 +44,14 @@ export function draftAttachments(drafts: Draft[]): Attachment[] {
   return drafts.flatMap((d) => (d.state === "done" && d.attachment !== null ? [d.attachment] : []));
 }
 
+/**
+ * The files a paste attaches: the clipboard's files, but none when it also holds plain text, as Excel, Word and Docs
+ * put a picture of the selection beside its text: that paste is text, left to the browser.
+ */
+export function pastedFiles<F>(clipboard: { text: string; files: readonly F[] }): F[] {
+  return clipboard.text === "" ? [...clipboard.files] : [];
+}
+
 /** The name a picked, dropped or pasted file goes by: its own made safe, or, with none, `pasted-<time>.<ext>`. */
 export function nameFor(file: { name: string; type: string }, at: Date): string {
   return file.name === "" ? pastedName(file.type, at) : cleanName(file.name);
