@@ -5,6 +5,7 @@ import Type from "typebox";
 import type { Database } from "bun:sqlite";
 import { ChordError, createHost, forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Attachment, Prompt } from "../blobs/attachment";
 import { checkTaskRoot, type NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
 import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
@@ -174,17 +175,27 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         return row !== null && row.state !== "moved";
       },
       // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
-      createTaskAt: async ({ title, taskId, starts, prompt, nameFromPrompt, model, effort }) => {
+      createTaskAt: async ({ title, taskId, starts, prompt, attachments = [], nameFromPrompt, model, effort }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
         const manifest = await deps.runner.create({ title, taskId, starts });
         if (model !== undefined) await deps.runner.setModel(manifest.id, model);
         if (effort !== undefined) await deps.runner.setEffort(manifest.id, effort);
-        if (prompt !== null && nameFromPrompt === true) void deps.runner.nameFromPrompt(manifest.id, title, prompt);
-        if (prompt !== null) await deps.runner.prompt(manifest.id, prompt);
+        const first = firstPrompt(prompt, attachments);
+        if (first !== null && nameFromPrompt === true) void deps.runner.nameFromPrompt(manifest.id, title, first.text);
+        if (first !== null) await deps.runner.prompt(manifest.id, first.text, first.attachments);
         return { manifest };
       },
     };
   });
+}
+
+/**
+ * A new task's first prompt: `text` (absent is blank) with `attachments`; null, and no first prompt sent, for a blank
+ * text with none.
+ */
+function firstPrompt(text: string | null | undefined, attachments: Attachment[]): Prompt | null {
+  const t = text ?? "";
+  return t.trim() === "" && attachments.length === 0 ? null : { text: t, attachments };
 }
 
 /**
@@ -425,14 +436,18 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       notifications,
       efforts,
       chosenModels,
-      createTask: async ({ title: given, projects, prompt, node, model, effort }, ctx) => {
+      createTask: async ({ title: given, projects, prompt, attachments = [], node, model, effort }, ctx) => {
         // Named here, before it goes anywhere, so that a peer of any version gets a title. Untitled, it starts with a
         // made-up name, not waiting on Haiku: the node it is on names it from its prompt afterwards.
         const title = initialTitle(given);
         const nameFromPrompt = title !== given;
         const selfId = pool.identity.id;
-        const target = node === "here" ? selfId : node ?? await placeTask(projects.map((p) => p.id));
+        const withFiles = attachments.length > 0;
+        const target = node === "here" ? selfId : node ?? await placeTask(projects.map((p) => p.id), withFiles);
         if (target !== selfId && !pool.store.isMember(target)) throw new Error(`no such node: ${target}`);
+        // An older meddle would drop them: refused before anything is written.
+        const refusal = withFiles && target !== selfId ? runner.noAttachmentsOn(target) : null;
+        if (refusal !== null) throw new Error(refusal);
         // This node writes each start's line row now, before the task exists: a creation that certainly failed releases
         // them; one the target may have made all the same (its answer was lost) keeps them while the target holds the
         // task.
@@ -445,7 +460,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           releaseLineRows(db, taskId, []);
           throw err;
         }
-        const text = prompt ?? null;
+        const first = firstPrompt(prompt, attachments);
         if (target === selfId) {
           let manifest: TaskManifest;
           try {
@@ -461,12 +476,18 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
           // The pool sees the new task count now, not at the next periodic refresh.
           void pool.refresh();
-          if (text !== null && nameFromPrompt) void runner.nameFromPrompt(manifest.id, title, text);
-          if (text !== null) await runner.prompt(manifest.id, text);
+          if (first !== null && nameFromPrompt) void runner.nameFromPrompt(manifest.id, title, first.text);
+          if (first !== null) await runner.prompt(manifest.id, first.text, first.attachments);
           return { manifest, nodeId: selfId };
         }
         try {
-          return { manifest: await createOn(target, { title, taskId, starts, prompt: text, nameFromPrompt, ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) }), nodeId: target };
+          const manifest = await createOn(target, {
+            title, taskId, starts, prompt: first?.text ?? null, nameFromPrompt,
+            ...(withFiles ? { attachments } : {}),
+            ...(model === undefined ? {} : { model }),
+            ...(effort === undefined ? {} : { effort }),
+          });
+          return { manifest, nodeId: target };
         } catch (err) {
           if (err instanceof CreationSent) {
             const held = await heldOn(target, taskId);
@@ -698,7 +719,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const archivedOn = self.state("archivedOn", members.archivedOn, { init: () => archivedOnNow(id) });
     const acceptance = self.state("acceptance", members.acceptance, { init: () => runner.acceptance(id) });
     const pending = self.state("pending", members.pending, { init: () => approvals.pending(id) });
-    const queued = self.state("queued", members.queued, { init: () => runner.queued(id) });
+    const queued = self.state("queued", members.queued, { init: () => runner.queued(id).map((p) => p.text) });
+    const queuedPrompts = self.state("queuedPrompts", members.queuedPrompts, { init: () => runner.queued(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
     // Read once the object is up (`self.task` below), not before: a dashboard opens one per task it lists.
@@ -755,7 +777,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     self.on("moves", moves, (event, ctx) => { if (event.taskId === id) move.replace(ctx, event.move); });
     self.on("acceptances", acceptances, (event, ctx) => { if (event.taskId === id) acceptance.replace(ctx, runner.acceptance(id)); });
     self.on("approvals", approvalChanges, (_event, ctx) => pending.replace(ctx, approvals.pending(id)));
-    self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) queued.replace(ctx, runner.queued(id)); });
+    /** Brings `queued` and `queuedPrompts` up to the runner. */
+    const refreshQueued = (ctx: Ctx) => {
+      const now = runner.queued(id);
+      queued.replace(ctx, now.map((p) => p.text));
+      queuedPrompts.replace(ctx, now);
+    };
+    self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) refreshQueued(ctx); });
     // What changed between the cells' init and the listeners starting.
     self.task(async (ctx) => {
       state.replace(ctx, runner.state(id));
@@ -764,7 +792,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       archivedOn.replace(ctx, archivedOnNow(id));
       acceptance.replace(ctx, runner.acceptance(id));
       pending.replace(ctx, approvals.pending(id));
-      queued.replace(ctx, runner.queued(id));
+      refreshQueued(ctx);
       refreshRow(ctx);
       catchUpLog(ctx);
       await refreshChanges(ctx);
@@ -812,6 +840,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       state,
       pending,
       queued,
+      queuedPrompts,
       lastSeq: self.derive([log], (l) => l.lastSeq),
       permissionMode: self.derive([log], (l) => l.permissionMode),
       model: self.derive([store.chosenModels], (c) => c[id] ?? null),
@@ -824,7 +853,10 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       bookmarks,
       changes,
       activityAt,
-      prompt: async ({ text }) => ({ queued: (await runner.prompt(id, text)) === "queued" }),
+      prompt: async ({ text, attachments = [] }) => {
+        if (text.trim() === "" && attachments.length === 0) throw new Error("a prompt needs text or an attachment");
+        return { queued: (await runner.prompt(id, text, attachments)) === "queued" };
+      },
       rename: async ({ title }) => { await runner.rename(id, title); },
       interrupt: () => runner.interrupt(id),
       sendNow: async () => { await runner.sendNow(id); },
@@ -978,7 +1010,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
    * `CreationSent` once the request went out: the target may have made the task all the same.
    */
   async function createOn(
-    target: string, input: { title: string; taskId: string; starts: Start[]; prompt: string | null; nameFromPrompt: boolean; model?: string; effort?: string },
+    target: string,
+    input: {
+      title: string; taskId: string; starts: Start[]; prompt: string | null; attachments?: Attachment[];
+      nameFromPrompt: boolean; model?: string; effort?: string;
+    },
   ): Promise<TaskManifest> {
     const peer = await pool.peerRef(target, PeerObject);
     try {
@@ -1012,9 +1048,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     }
   }
 
-  /** The node `place` picks for a new task of `projectIds`, from the roster and this node's live numbers. */
-  async function placeTask(projectIds: string[]): Promise<string> {
-    return runner.chooseNode(projectIds);
+  /**
+   * The node `place` picks for a new task of `projectIds`, from the roster and this node's live numbers; `withFiles`
+   * (its first prompt has attachments), only a node that takes them.
+   */
+  async function placeTask(projectIds: string[], withFiles: boolean): Promise<string> {
+    return runner.chooseNode(projectIds, withFiles ? (id) => runner.noAttachmentsOn(id) === null : undefined);
   }
 
   function projectIdsNow(): string[] {

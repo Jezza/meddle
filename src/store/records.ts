@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
+import { promptOf, type Prompt } from "../blobs/attachment";
 
 export function newId(): string {
   return randomBytes(6).toString("hex");
@@ -31,7 +32,7 @@ export type TaskRow = {
   updated_at: string;
   /** `TaskSettings` as JSON, or NULL for none. */
   settings: string | null;
-  /** Prompts sent while the task was moving, as a JSON array of strings; NULL for none. */
+  /** Prompts waiting for a turn, as a JSON array of their `queueEntry`s (a text alone, or a prompt); NULL for none. */
   queued: string | null;
   /** The node a `moved` task went to. */
   moved_to: string | null;
@@ -173,7 +174,10 @@ export function deleteTask(db: Database, id: string, sessionId: string): void {
   })();
 }
 
-/** The task's queued prompts (`[]` for none). */
-export function queuedOf(row: Pick<TaskRow, "queued">): string[] {
-  return row.queued === null ? [] : (JSON.parse(row.queued) as string[]);
+/**
+ * The task's queued prompts (`[]` for none); an entry an older meddle wrote, a text alone, is that text with no
+ * attachments. Throws `bad queued prompt` for an entry that is neither.
+ */
+export function queuedOf(row: Pick<TaskRow, "queued">): Prompt[] {
+  return row.queued === null ? [] : (JSON.parse(row.queued) as unknown[]).map(promptOf);
 }

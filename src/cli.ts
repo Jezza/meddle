@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { createHost, webSocketLink, type Host } from "@earendil-works/chord";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "./config";
+import { BlobStore } from "./blobs/store";
 import { startDashboard, type Dashboard } from "./dashboard/server";
 import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { gitRemote } from "./git/remote-main";
@@ -188,6 +189,8 @@ async function serve(): Promise<number> {
     await sweepTokenValues(cfg, db);
     // And in the archives directory: a half-written archive.
     await sweepArchiveTemps(cfg);
+    // And in the blobs directory: a half-written upload.
+    await new BlobStore(paths(cfg).blobs).sweepTemps();
     // The pool and git first: the Harness reruns unfinished turns as it opens, and their turn ends push to homes.
     const pool = (node.pool = await startPool(cfg, db, {
       version: VERSION,
@@ -219,7 +222,7 @@ async function serve(): Promise<number> {
       binaryFor: (b, platform, sha) => updater.binaryFor(b, platform, sha),
     });
     node.stopAccepting = () => runner.close();
-    node.stopBlobs = acceptBlobStreams(pool.net, runner);
+    node.stopBlobs = acceptBlobStreams(pool.net, runner, runner.blobs.store);
     // Archives of tasks that moved away are kept for seven days (decision 18).
     const janitor = () => {
       runJanitor(cfg).catch((err: unknown) => console.error("meddle: archive janitor:", err));
@@ -245,7 +248,7 @@ async function serve(): Promise<number> {
     // Every project of the pool kept here, its rows applied to its service repo and view as they change.
     node.stopApplier = startApplier({ cfg, db, pool });
     node.stopTunnels = acceptDashboardStreams(pool.net, host, (id) => pool.store.isMember(id));
-    node.dashboard = await startDashboard(cfg, host, pool);
+    node.dashboard = await startDashboard(cfg, host, pool, runner.blobs);
   } catch (err) {
     await shutdown(node);
     throw err;

@@ -1,9 +1,11 @@
 // The thread a task's event log renders as: pure, so it is tested without a DOM or a link.
+import { type Attachment, attachmentProblem } from "../../blobs/attachment";
 import { isProgress, type Live } from "../../state/contracts";
 import type { DiffRow, Hunk } from "./diff-model";
 
 export type ThreadItem =
-  | { kind: "user"; text: string }
+  /** `attachments`: the files the prompt carried (the refs meddle logged beside its text). */
+  | { kind: "user"; text: string; attachments: Attachment[] }
   | { kind: "assistant"; text: string; thinking?: string }
   | {
     kind: "tool";
@@ -115,6 +117,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
 
   function addUser(m: Message, list: ThreadItem[]) {
     const content = (m.message as { content?: unknown } | undefined)?.content;
+    const attachments = attachmentsOf(m.attachments);
     const texts: string[] = typeof content === "string" ? [content] : [];
     for (const block of blocks(content)) {
       if (block.type === "tool_result") {
@@ -141,7 +144,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
     // The session sends a skill's text as though you had, marked synthetic.
     const skill = m.isSynthetic === true ? unsent.get(list)?.shift() : undefined;
     if (skill !== undefined) skill.skill = texts.join("\n");
-    else list.push({ kind: "user", text: texts.join("\n") });
+    else list.push({ kind: "user", text: texts.join("\n"), attachments });
   }
 
   function addSystem(m: Message) {
@@ -256,6 +259,12 @@ function hunks(value: unknown): Hunk[] {
 
 function blocks(content: unknown): Block[] {
   return Array.isArray(content) ? (content.filter((b) => b !== null && typeof b === "object") as Block[]) : [];
+}
+
+/** A logged prompt's attachments: each valid one as its four fields; none when the event has none. */
+function attachmentsOf(value: unknown): Attachment[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((a) => attachmentProblem(a) === null).map(({ hash, name, type, size }: Attachment) => ({ hash, name, type, size }));
 }
 
 /** A `tool_result`'s content: a string, or blocks whose text is joined (other blocks named by type). */

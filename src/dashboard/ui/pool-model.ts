@@ -50,6 +50,14 @@ export function projectChoices(nodes: readonly ProjectLister[]): ListedProject[]
 }
 
 /**
+ * Whether a node in `online` lists project `id`: one is about to report its copy. An offline node's row keeps its last
+ * summary, so a project only offline nodes list is listed, but held by no node that can be read.
+ */
+export function listedOnline(nodes: readonly Pick<ProjectLister, "nodeId" | "projects">[], online: readonly string[], id: string): boolean {
+  return nodes.some((n) => online.includes(n.nodeId) && n.projects.some((p) => p.id === id));
+}
+
+/**
  * One node's copy of a project, with its branches as that node computes them (`ProjectObject.branches`) and its graph
  * as it reads it (`ProjectObject.graph`).
  */

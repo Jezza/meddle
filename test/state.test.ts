@@ -2,9 +2,9 @@
 import { test, expect } from "bun:test";
 import { NodeObject, ProjectObject, TaskObject, SessionObject } from "../src/state/host";
 import { claudeCodeVersion } from "../src/version";
-import { appendEvent } from "../src/store/events";
+import { appendEvent, listEvents } from "../src/store/events";
 import { errorResultFixture } from "./helpers";
-import { linkClient, peerReady, startPoolNode, twoPoolNodes } from "./pool-helpers";
+import { linkClient, peerReady, startPoolNode, storedShot, twoPoolNodes } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
 import { getTask } from "../src/store/records";
 import { getProject, setDefaultBranch } from "../src/projects/project";
@@ -196,6 +196,76 @@ test("a client sees what a busy task was sent and has not started on as queued",
   } finally {
     await closeClient();
     await node0.close();
+  }
+});
+
+test("a prompt with only an attachment is taken; a blank one with none is refused", async () => {
+  const connected = await connect();
+  const { client, project, close } = connected;
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    const session = await client.get(SessionObject, { taskId: manifest.id });
+    const shot = await storedShot(connected);
+    await expect(task.prompt({ text: "  " })).rejects.toThrow("a prompt needs text or an attachment");
+    expect(await task.prompt({ text: "", attachments: [shot] })).toEqual({ queued: false });
+    const window = await until(session.window, (w) => w.some((e) => (e.message as { type?: string }).type === "result"));
+    expect(window.filter((e) => (e.message as { type?: string }).type === "user").map((e) => e.message))
+      .toEqual([expect.objectContaining({ message: { role: "user", content: "" }, attachments: [shot] })]);
+    task.release();
+    session.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("queuedPrompts shows a queued prompt's attachments; queued its text", async () => {
+  const connected = await connect();
+  const { client, project, runner, close } = connected;
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    const shot = await storedShot(connected);
+    expect(task.queuedPrompts.value).toEqual([]);
+    // A pool update's hold on new turns: the prompt waits for the next.
+    runner.setHolds({ turns: "held", work: null, hosting: null });
+    expect(await task.prompt({ text: "look", attachments: [shot] })).toEqual({ queued: true });
+    await until(task.queuedPrompts, (q) => q.length === 1);
+    await until(task.queued, (q) => q.length === 1);
+    expect(task.queued.value).toEqual(["look"]);
+    expect(task.queuedPrompts.value).toEqual([{ text: "look", attachments: [shot] }]);
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("a new task's first prompt is sent with only attachments, keeping its made-up title, and not when blank with none", async () => {
+  const connected = await connect();
+  const { client, project, db, close } = connected;
+  try {
+    const node = await client.get(NodeObject, {});
+    const shot = await storedShot(connected);
+    const blank = await node.createTask({ projects: [{ id: project.id }], prompt: "  " });
+    const { manifest } = await node.createTask({ projects: [{ id: project.id }], prompt: "", attachments: [shot] });
+    const session = await client.get(SessionObject, { taskId: manifest.id });
+    const window = await until(session.window, (w) => w.some((e) => (e.message as { type?: string }).type === "result"));
+    expect(window.filter((e) => (e.message as { type?: string }).type === "user").map((e) => e.message))
+      .toEqual([expect.objectContaining({ message: { role: "user", content: "" }, attachments: [shot] })]);
+    // A blank text names nothing: the made-up title stays.
+    expect(manifest.title).toMatch(/^[a-z]+ [a-z]+ [a-z]+$/);
+    expect(getTask(db, manifest.id)?.title).toBe(manifest.title);
+    // Blank with nothing attached: no turn, the task idle and its log empty.
+    expect(getTask(db, blank.manifest.id)?.state).toBe("idle");
+    expect(listEvents(db, blank.manifest.id)).toEqual([]);
+    session.release();
+    node.release();
+  } finally {
+    await close();
   }
 });
 

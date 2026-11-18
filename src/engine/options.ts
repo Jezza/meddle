@@ -86,6 +86,8 @@ export function buildOptions(i: EngineInput): Options {
 
   const options: Options = {
     cwd,
+    // Where a prompt's attached files are written (`materialize`): Claude Code reads them without asking.
+    additionalDirectories: [paths(i.cfg).taskAttachments(i.manifest.id)],
     settingSources,
     permissionMode: i.permissionMode ?? "auto",
     settings: composeSettings(i.contexts, i.projectSettings),

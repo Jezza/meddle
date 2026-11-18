@@ -1,12 +1,13 @@
-// The receiving end of a move's `blob` stream: the sender's task frames in, one receipt line back.
+// The accepting end of `blob` streams: a move's task frames in with one receipt line back, or a file served by its hash.
+import { reset, serveBlob } from "../blobs/pool";
+import type { BlobStore } from "../blobs/store";
 import { writeLine } from "../pool/frames";
+import { shortId } from "../pool/ids";
 import type { PeerStream, PoolNet } from "../pool/net";
 import type { TaskRunner } from "./durable";
 
-/** Resets a stream both ways: the sender's writes and its wait for a receipt fail. */
-async function reset(s: PeerStream): Promise<void> {
-  await s.stream.send.reset(0n).catch(() => {});
-  await s.stream.recv.stop(0n).catch(() => {});
+function messageOf(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
 }
 
 async function receive(s: PeerStream, runner: Pick<TaskRunner, "importIncoming">, taskId: string): Promise<void> {
@@ -16,19 +17,31 @@ async function receive(s: PeerStream, runner: Pick<TaskRunner, "importIncoming">
 }
 
 /**
- * Takes the `{ stream: "blob", kind: "task", taskId }` streams members open to this node: imports the task into the
- * row `receiveTask` made for it (only from the node it is being received from), answers with the receipt as one JSON
- * line and finishes. A refusal or a failed import resets the stream, with no receipt. Returns the unsubscribe.
+ * Takes the `blob` streams members open to this node. A `{ kind: "task", taskId }` one imports the task into the row
+ * `receiveTask` made for it (only from the node it is being received from), answers with the receipt as one JSON line
+ * and finishes. A `{ kind: "file", hash }` one is answered from `store` (`serveBlob`). A refusal, a failed import or a
+ * failed read resets the stream, with no answer; why an import was refused or failed goes to `log` (by default
+ * `console.error`), as the sender learns nothing of it. Returns the unsubscribe.
  */
-export function acceptBlobStreams(net: PoolNet, runner: Pick<TaskRunner, "importIncoming">): () => void {
+export function acceptBlobStreams(
+  net: PoolNet,
+  runner: Pick<TaskRunner, "importIncoming">,
+  store: BlobStore,
+  log: (line: string) => void = (line) => console.error(line),
+): () => void {
   return net.onStream((s) => {
     if (s.header.stream !== "blob") return false;
-    const { kind, taskId } = s.header;
-    if (kind !== "task" || typeof taskId !== "string") {
+    const { kind, taskId, hash } = s.header;
+    if (kind === "file" && typeof hash === "string") {
+      void serveBlob(s, store).catch(() => reset(s));
+    } else if (kind === "task" && typeof taskId === "string") {
+      void receive(s, runner, taskId).catch((err: unknown) => {
+        log(`meddle: move: could not import ${taskId} from ${shortId(s.peerId)}: ${messageOf(err)}`);
+        return reset(s);
+      });
+    } else {
       void reset(s);
-      return true;
     }
-    void receive(s, runner, taskId).catch(() => reset(s));
     return true;
   });
 }

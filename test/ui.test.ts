@@ -1,6 +1,6 @@
 // test/ui.test.ts
 import { test, expect } from "bun:test";
-import { branchLines, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
+import { branchLines, listedOnline, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
@@ -13,6 +13,8 @@ import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, 
 import { composerKey } from "../src/dashboard/ui/composer-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
+import { blobUrl, type Draft, draftAttachments, guardDrops, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
+import type { Attachment } from "../src/blobs/attachment";
 
 test("the dashboard bundle builds", async () => {
   const build = await Bun.build({ entrypoints: ["src/dashboard/ui/main.tsx"], target: "browser", format: "esm" });
@@ -27,6 +29,8 @@ test("viewOf and hashOf round-trip every route", () => {
     { name: "new", projectId: null },
     { name: "new", projectId: "p/1" },
     { name: "project", id: "p1" },
+    { name: "project", id: "p1", tab: "memory" },
+    { name: "project", id: "p1", tab: "tasks" },
     { name: "add-project" },
     { name: "node", nodeId: "abc" },
     { name: "settings" },
@@ -36,6 +40,10 @@ test("viewOf and hashOf round-trip every route", () => {
   expect(hashOf({ name: "task", nodeId: "abc", id: "t1", tab: "changes" })).toBe("#/task/abc/t1/changes");
   expect(viewOf("#/task/abc/t1")).not.toHaveProperty("tab");
   expect(viewOf("#/task/abc/t1/other")).toEqual({ name: "home" });
+  expect(hashOf({ name: "project", id: "p/1", tab: "memory" })).toBe("#/project/p%2F1/memory");
+  expect(viewOf("#/project/p1")).not.toHaveProperty("tab");
+  expect(viewOf("#/project/p1/graph")).toEqual({ name: "home" });
+  expect(viewOf("#/project/p1/other")).toEqual({ name: "home" });
   expect(viewOf("")).toEqual({ name: "home" });
   expect(viewOf("#/task/t1")).toEqual({ name: "home" });          // the Plan 1 shape no longer resolves
   expect(viewOf("#/pool")).toEqual({ name: "home" });             // the old pool and projects pages
@@ -106,6 +114,17 @@ test("the project page marks a conflicted branch, names its siblings as a checko
       name: "next", isDefault: false, conflicted: false, text: "still fetching eeeeeeeeeeee, aaaaaaaaaaaa, pushed elsewhere", siblings: [],
     },
   ]);
+});
+
+test("listedOnline: a project an offline node last listed is not listed online", () => {
+  const nodes = [
+    { nodeId: "a", projects: [{ id: "p", name: "faff", home: "a" }] },
+    { nodeId: "b", projects: [{ id: "q", name: "swarm", home: "b" }] },
+  ];
+  expect(listedOnline(nodes, ["a"], "p")).toBe(true);
+  expect(listedOnline(nodes, ["a"], "q")).toBe(false); // b is offline: its summary is its last
+  expect(listedOnline(nodes, ["a", "b"], "q")).toBe(true);
+  expect(listedOnline(nodes, ["a", "b"], "r")).toBe(false);
 });
 
 test("projectChoices: every project an online member lists, once, named as its home lists it", () => {
@@ -435,4 +454,82 @@ test("composerKey: Enter sends (queued while a turn runs), Ctrl or Cmd+Enter sen
   expect(composerKey(key({}), { ...desk, touch: true })).toBeNull();
   expect(composerKey(key({ ctrlKey: true }), { ...desk, touch: true })).toBe("send-now");
   expect(composerKey(key({ key: "a" }), desk)).toBeNull();
+});
+
+const shot: Attachment = { hash: "a".repeat(64), name: "shot.png", type: "image/png", size: 1000 };
+const draft = (over: Partial<Draft> = {}): Draft => ({
+  id: 1, name: shot.name, type: shot.type, size: shot.size, preview: null, state: "done", attachment: shot, error: null, ...over,
+});
+
+test("readyToSend wants text or attachments, and every upload done", () => {
+  expect(readyToSend(" ", [])).toBe(false);
+  expect(readyToSend("", [draft({ state: "done" })])).toBe(true);
+  expect(readyToSend("hi", [draft({ state: "uploading" })])).toBe(false);
+  expect(readyToSend("hi", [draft({ state: "failed" })])).toBe(false);
+});
+
+test("blobUrl, sizeText, nameFor", () => {
+  expect(blobUrl({ ...shot, name: "a b.png" })).toBe(`/blobs/${shot.hash}?type=image%2Fpng&name=a%20b.png`);
+  expect([sizeText(512), sizeText(12_300), sizeText(3_400_000)]).toEqual(["512 B", "12 KB", "3.4 MB"]);
+  expect(nameFor({ name: "", type: "image/png" }, new Date(2026, 10, 17, 9, 5, 3))).toBe("pasted-20261117-090503.png");
+  expect(nameFor({ name: "../../a.png", type: "image/png" }, new Date())).toBe("_.._a.png");
+});
+
+test("draftAttachments takes the uploaded drafts' attachments; only the four image types show inline", () => {
+  const log: Attachment = { ...shot, name: "server.log", type: "application/octet-stream" };
+  expect(draftAttachments([draft(), draft({ id: 2, state: "uploading", attachment: null }), draft({ id: 3, attachment: log })])).toEqual([shot, log]);
+  expect(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml", ""].map(shownInline)).toEqual([true, true, true, true, false, false]);
+});
+
+test("pastedFiles takes a clipboard's files when its text is nothing but their names or paths", () => {
+  const files = (...names: string[]) => names.map((name) => ({ name }));
+  // a picture alone, as a screenshot is
+  expect(pastedFiles({ text: "", files: files("image.png", "b.log") })).toEqual(files("image.png", "b.log"));
+  // Excel, Word and Docs put a picture of the selection beside its text: that paste is text
+  expect(pastedFiles({ text: "a\tb", files: files("image.png") })).toEqual([]);
+  expect(pastedFiles({ text: "Quarterly figures\n", files: files("image.png") })).toEqual([]);
+  expect(pastedFiles({ text: "hello", files: [] })).toEqual([]);
+  // Finder: the file's name as its text
+  expect(pastedFiles({ text: "report.pdf", files: files("report.pdf") })).toEqual(files("report.pdf"));
+  // a file manager's paths, one a line, or file:// URLs; Windows paths too
+  expect(pastedFiles({ text: "/home/me/a.png\n/home/me/b c.log\n", files: files("a.png", "b c.log") })).toEqual(files("a.png", "b c.log"));
+  expect(pastedFiles({ text: "file:///home/me/b%20c.log\r\nfile:///home/me/a.png", files: files("a.png", "b c.log") })).toEqual(files("a.png", "b c.log"));
+  expect(pastedFiles({ text: "C:\\Users\\me\\a.png", files: files("a.png") })).toEqual(files("a.png"));
+  // a line that is not one of them, or a name only part of a line, is text
+  expect(pastedFiles({ text: "/home/me/a.png\nsee above", files: files("a.png") })).toEqual([]);
+  expect(pastedFiles({ text: "/home/me/xa.png", files: files("a.png") })).toEqual([]);
+  expect(pastedFiles({ text: "file:///home/me/bad%zz.png", files: files("bad%zz.png") })).toEqual([]);
+});
+
+/** A drag event as the page gets it, carrying `types`. */
+function dragEvent(type: "dragover" | "drop", types: string[]): Event & { dataTransfer: { types: string[]; dropEffect: string } } {
+  const e = new Event(type, { cancelable: true });
+  Object.defineProperty(e, "dataTransfer", { value: { types, dropEffect: "copy" } });
+  return e as Event & { dataTransfer: { types: string[]; dropEffect: string } };
+}
+
+test("a file dragged or dropped off a composer never replaces the dashboard; text and a composer's own drop are left alone", () => {
+  const page = new EventTarget();
+  const stop = guardDrops(page);
+  const over = dragEvent("dragover", ["Files"]);
+  const drop = dragEvent("drop", ["Files"]);
+  page.dispatchEvent(over);
+  page.dispatchEvent(drop);
+  expect([over.defaultPrevented, over.dataTransfer.dropEffect, drop.defaultPrevented]).toEqual([true, "none", true]);
+  // a drag of text is the browser's
+  const text = dragEvent("drop", ["text/plain"]);
+  page.dispatchEvent(text);
+  expect(text.defaultPrevented).toBe(false);
+  stop();
+  const after = dragEvent("drop", ["Files"]);
+  page.dispatchEvent(after);
+  expect(after.defaultPrevented).toBe(false);
+
+  // a composer that takes files had the drag first: it stays a place to drop them
+  const withComposer = new EventTarget();
+  withComposer.addEventListener("dragover", (e) => e.preventDefault());
+  guardDrops(withComposer);
+  const onComposer = dragEvent("dragover", ["Files"]);
+  withComposer.dispatchEvent(onComposer);
+  expect([onComposer.defaultPrevented, onComposer.dataTransfer.dropEffect]).toEqual([true, "copy"]);
 });

@@ -1,6 +1,7 @@
 // The node's chord objects: what the dashboard and the CLI watch and steer over a link.
 import Type from "typebox";
 import { hostNamed, local, method, remote } from "@earendil-works/chord";
+import { AttachmentSchema, PromptSchema } from "../blobs/attachment";
 
 const Nullable = <S extends Type.TSchema>(schema: S) => Type.Union([schema, Type.Null()]);
 
@@ -151,11 +152,13 @@ const nodeMethods = {
    * Creates a task on the node `node` names: absent or null, the one placement picks (`place`); `"here"`, this node;
    * else that node id, a member of the pool. It mints the task's id, resolves each project's start here (`startAt`,
    * which writes the task's line row), and creates the task there from those starts; when a start or the creation
-   * certainly failed, the line rows already written are released. `prompt`, when given, starts its first turn there.
-   * `title` absent or blank: the task is created as two adjectives and a noun (`initialTitle`), and with a prompt the
-   * node it is on renames it to Haiku's title for the prompt, else its first line, once that answers, unless it was
-   * renamed meanwhile (`nameFromPrompt`). Answers the manifest and the node the task is on, without waiting for that
-   * title.
+   * certainly failed, the line rows already written are released. `prompt` (its text) and `attachments` start its first
+   * turn there when the text is not blank or there are attachments. With attachments, placement picks only a node that
+   * takes them, and a named node that does not is refused `<host> runs a meddle that takes no attachments` before
+   * anything is written. `title` absent or blank: the task is created as two adjectives and a noun (`initialTitle`),
+   * and with a prompt the node it is on renames it to Haiku's title for the prompt, else its first line, once that
+   * answers, unless it was renamed meanwhile (`nameFromPrompt`; a blank text names nothing). Answers the manifest and
+   * the node the task is on, without waiting for that title.
    */
   createTask: method(
     Type.Object({
@@ -172,6 +175,8 @@ const nodeMethods = {
         checkout: Type.Optional(Type.String()),
       })),
       prompt: Type.Optional(Nullable(Type.String())),
+      /** Files on the first prompt, each already in a node's blob store; none when absent. */
+      attachments: Type.Optional(Type.Array(AttachmentSchema)),
       node: Type.Optional(Nullable(Type.String())),
       /** The model and effort the task's turns use, where the user chose them; else the pool's defaults. */
       model: Type.Optional(Type.String()),
@@ -387,9 +392,12 @@ export const TaskObject = remote("meddle.task", {
         pending: Type.Array(PendingApprovalSchema),
         /**
          * What the task was sent and has not started on, oldest first: steers its running turn has not taken yet, then
-         * prompts waiting for its next turn (one turn each). A text leaves it as it enters the log.
+         * prompts waiting for its next turn (one turn each). A text leaves it as it enters the log. The texts only, for
+         * a dashboard older than `queuedPrompts`.
          */
         queued: Type.Array(Type.String()),
+        /** `queued` as the prompts themselves, each text with its attachments. */
+        queuedPrompts: Type.Array(PromptSchema),
         lastSeq: Type.Number(),
         permissionMode: Nullable(Type.String()),
         /** The model and effort chosen for the task; null where its turns take the pool's defaults. */
@@ -423,12 +431,18 @@ export const TaskObject = remote("meddle.task", {
       },
       methods: {
         /**
-         * Sends the task a text: a steer into its running turn, a prompt for its next turn when the running one can no
-         * longer take it (both `queued` until started), or a new turn when it is idle. Refused only while it is not
-         * live here (moved, archived, being received) or is being archived or restored. `queued`: the text waits to
-         * be taken (logged as a `user` event when it is) rather than starting a turn.
+         * Sends the task a prompt, its text and `attachments` (none when absent): a steer into its running turn, a
+         * prompt for its next turn when the running one can no longer take it (both `queued` until started), or a new
+         * turn when it is idle. Refused `a prompt needs text or an attachment` for a blank text with none, for an
+         * attachment as `TaskRunner.prompt` refuses it (`bad attachment: …`, `attachment <name> is not on any online
+         * node`, …), and while the task is not live here (moved, archived, being received) or is being archived or
+         * restored. `queued`: the prompt waits to be taken (logged as a `user` event when it is) rather than starting a
+         * turn.
          */
-        prompt: method(Type.Object({ text: Type.String() }), Type.Object({ queued: Type.Boolean() })),
+        prompt: method(
+          Type.Object({ text: Type.String(), attachments: Type.Optional(Type.Array(AttachmentSchema)) }),
+          Type.Object({ queued: Type.Boolean() }),
+        ),
         /** Renames the task; refused for a blank title and while it is not live here (moving, moved, archived). */
         rename: method(Type.Object({ title: Type.String() })),
         interrupt: method(Type.Object({})),
@@ -565,8 +579,9 @@ export type SessionView = Type.Static<typeof SessionViewSchema>;
 export const WireAddrSchema = Type.Object({ id: Type.String(), relay: Nullable(Type.String()), direct: Type.Array(Type.String()) });
 
 /**
- * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit` and `projects` are
- * optional: an older meddle sends none of them, and they read as 0, 0 and [] (`withSummaryDefaults`).
+ * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit`, `projects` and
+ * `attachments` are optional: an older meddle sends none of them, and they read as 0, 0, [] and false
+ * (`withSummaryDefaults`).
  */
 export const NodeSummarySchema = Type.Object({
   hostname: Type.String(),
@@ -580,6 +595,8 @@ export const NodeSummarySchema = Type.Object({
   limit: Type.Optional(Type.Number()),
   /** Every project the node holds, its own and its replicas of others'. */
   projects: Type.Optional(Type.Array(ProjectInfoSchema)),
+  /** Whether the node takes prompts with attachments. */
+  attachments: Type.Optional(Type.Boolean()),
 });
 
 /** One node of the pool's roster (`RosterRow`). */
@@ -670,6 +687,8 @@ export const PoolNodeSchema = Type.Object({
   limit: Type.Number(),
   /** Every project the node holds ([] for a node of an older meddle). */
   projects: Type.Array(ProjectInfoSchema),
+  /** Whether the node takes prompts with attachments (false for a node of an older meddle). */
+  attachments: Type.Boolean(),
   lastSeenAt: Nullable(Type.String()),
   /**
    * Not heard of (no connection, no member reporting one, no lighthouse listing) for longer than the pool's
@@ -715,10 +734,10 @@ export const PeerObject = remote("meddle.peer", {
         abandonTask: method(Type.Object({ taskId: Type.String() })),
         /**
          * Creates task `taskId` here for the caller (a member; anyone else is refused `forbidden`) from the starts the
-         * caller resolved, then starts its first turn with `prompt` when one is given. Refused like a local
-         * create: no task root, no usable token, a task `taskId` already here, …. `nameFromPrompt`: `title` is made
-         * up, and the task is renamed from `prompt` once Haiku answers, unless it was renamed meanwhile
-         * (`TaskRunner.nameFromPrompt`); a node older than this field keeps `title`.
+         * caller resolved, then starts its first turn with `prompt` and `attachments` when the text is not blank or
+         * there are attachments. Refused like a local create: no task root, no usable token, a task `taskId` already
+         * here, …. `nameFromPrompt`: `title` is made up, and the task is renamed from `prompt` once Haiku answers,
+         * unless it was renamed meanwhile (`TaskRunner.nameFromPrompt`); a node older than this field keeps `title`.
          */
         createTaskAt: method(
           Type.Object({
@@ -726,6 +745,11 @@ export const PeerObject = remote("meddle.peer", {
             taskId: Type.String(),
             starts: Type.Array(StartSchema),
             prompt: Nullable(Type.String()),
+            /**
+             * Files on the first prompt, each in a blob store of the pool (fetched from there); none when absent. A
+             * node older than this field drops them: the caller sends none to a node that does not say it takes them.
+             */
+            attachments: Type.Optional(Type.Array(AttachmentSchema)),
             nameFromPrompt: Type.Optional(Type.Boolean()),
             model: Type.Optional(Type.String()),
             effort: Type.Optional(Type.String()),

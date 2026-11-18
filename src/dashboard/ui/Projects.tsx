@@ -1,6 +1,8 @@
-// A project across the pool (its home, its graph as its online nodes read it, a conflicted or fetching branch, its
-// tasks), and adding a project on this node from a folder or an upstream URL.
+// A project across the pool (its home; its graph as its online nodes read it, with a conflicted or fetching branch; its
+// memory; its tasks; side by side, or one at a time in a narrow pane), and adding a project on this node from a folder
+// or an upstream URL.
 import type { Host, Ref } from "@earendil-works/chord";
+import type { ComponentChildren } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { NodeObject, ProjectObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
@@ -11,8 +13,8 @@ import { memorySource } from "./memory-model";
 import { PaneHead, type PoolRef, StateDot } from "./common";
 import { Graph } from "./Graph";
 import { graphRows } from "./graph-model";
-import { branchLines, mergeProjects, type HeldProject } from "./pool-model";
-import { hashOf } from "./routes";
+import { branchLines, listedOnline, mergeProjects, type HeldProject } from "./pool-model";
+import { hashOf, type ProjectTab } from "./routes";
 import { waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
 
@@ -25,7 +27,9 @@ const OLDER_MORE = 200;
 /** The most commits `olderGraph` lists (`OLDER_GRAPH_MAX`, a server module's). */
 const OLDER_CAP = 2000;
 
-export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: PoolRef; index: PoolIndex; id: string }) {
+export function ProjectPage({ hosts, pool, index, id, tab }: {
+  hosts: Hosts; pool: PoolRef; index: PoolIndex; id: string; tab: ProjectTab | undefined;
+}) {
   const nodes = useValue(pool.nodes);
   const online = nodes.filter((n) => n.nodeId === hosts.selfId || (n.status === "member" && n.online));
   const [held, setHeld] = useState<ReadonlyMap<string, Held>>(() => new Map());
@@ -75,8 +79,15 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
     const t = index.tasks.find((t) => t.id === taskId && !t.archived);
     return t === undefined ? null : { title: t.title, href: hashOf({ name: "task", nodeId: t.nodeId, id: t.id }) };
   };
+  const unheld = <p class="muted">{listedOnline(nodes, onlineIds, id) ? "Loading…" : "No online node holds this project."}</p>;
+  const shown = tab ?? "graph";
+  const column = (key: "graph" | ProjectTab) => `proj-col${shown === key ? " on" : ""}`;
+  const tabLink = (key: "graph" | ProjectTab, label: ComponentChildren) => (
+    <a class={shown === key ? "on" : ""} aria-current={shown === key ? "page" : undefined}
+      href={hashOf({ name: "project", id, ...(key === "graph" ? {} : { tab: key }) })}>{label}</a>
+  );
   return (
-    <>
+    <div class="project">
       {online.map((row) => {
         const host = hosts.for(row.nodeId);
         return host === undefined ? null : <ProjectSource key={row.nodeId} host={host} nodeId={row.nodeId} id={id} report={report} />;
@@ -85,59 +96,76 @@ export function ProjectPage({ hosts, pool, index, id }: { hosts: Hosts; pool: Po
         <span class="folder">▸</span>
         <strong>{project?.name ?? listed?.name ?? id}</strong>
         <span class="muted id">{id}</span>
+        {project !== undefined && <span class="muted proj-home" title={project.home}>· home {nameOf(project.home)}</span>}
         <span class="bar-gap" />
-        <a class="button" href={hashOf({ name: "new", projectId: id })}>New task</a>
+        {/* A narrow pane shows one column at a time, chosen here. */}
+        <nav class="task-tabs proj-tabs" aria-label="Project view">
+          {tabLink("graph", <>Graph{branches.some((b) => b.conflicted) && <span class="flag" title="A branch is conflicted"> ●</span>}</>)}
+          {tabLink("memory", "Memory")}
+          {tabLink("tasks", "Tasks")}
+        </nav>
       </PaneHead>
-      <div class="page">
-        {project === undefined ? <p class="muted">{listed === undefined ? "No online node holds this project." : "Loading…"}</p> : (
-          <>
-            <dl>
-              <dt>Home</dt><dd title={project.home}>{nameOf(project.home)}</dd>
-            </dl>
-            {rows.length > 0 && <>
-              <h3>Graph</h3>
-              <Graph rows={rows} defaultBranch={project.defaultBranch} nodeName={nameOf} taskOf={taskOf} older={readOlder}
-                contextFailed={new Set(failed.map((h) => h.nodeId))} />
-            </>}
-            {failed.filter((h) => !labelled.has(h.nodeId)).map((h) => (
-              <p key={h.nodeId} class="error">{nameOf(h.nodeId)} context failed to load</p>
-            ))}
-            {branches.length > 0 && <>
-              <h3>Branches</h3>
+      <div class="proj-cols">
+        <section class={column("graph")}>
+          <div class="col-head"><h3>Graph</h3></div>
+          <div class="col-body">
+            {project === undefined ? unheld : (
+              <>
+                {branches.length > 0 && (
+                  <ul class="plain proj-branches">
+                    {branches.map((b) => (
+                      <li key={b.name} class={b.conflicted ? "flag" : ""}>
+                        <code>{b.name}</code> {b.isDefault && <span class="muted">(default) </span>}<code>{b.text}</code>
+                        {b.conflicted && (
+                          <div class="muted">
+                            Its siblings, in a checkout: {b.siblings.map((s, i) => <span key={s}>{i > 0 && ", "}<code>{s}</code></span>)}.
+                            Push a merge of them, or drop one with <code>git push meddle :refs/heads/meddle/conflict/{b.name}/&lt;id&gt;</code>;
+                            to keep your own work: <code>jj bookmark set {b.name} -r &lt;your commit&gt;</code>.
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {failed.filter((h) => !labelled.has(h.nodeId)).map((h) => (
+                  <p key={h.nodeId} class="error">{nameOf(h.nodeId)} context failed to load</p>
+                ))}
+                {rows.length > 0 && (
+                  <Graph rows={rows} defaultBranch={project.defaultBranch} nodeName={nameOf} taskOf={taskOf} older={readOlder}
+                    contextFailed={new Set(failed.map((h) => h.nodeId))} />
+                )}
+              </>
+            )}
+          </div>
+        </section>
+        <section class={column("memory")}>
+          {memory === null
+            ? <><div class="col-head"><h3>Memory</h3></div><div class="col-body">{unheld}</div></>
+            : <Memory key={memory.nodeId} hosts={hosts} nodeId={memory.nodeId} editable={memory.editable} id={id} tasks={index.tasks} nodeName={nodeName} />}
+        </section>
+        <section class={column("tasks")}>
+          <div class="col-head">
+            <h3>Tasks</h3>
+            <span class="muted">{tasks.length}</span>
+            <span class="bar-gap" />
+            <a class="button" href={hashOf({ name: "new", projectId: id })}>New task</a>
+          </div>
+          <div class="col-body">
+            {tasks.length === 0 ? <p class="muted">No tasks in this project.</p> : (
               <ul class="plain">
-                {branches.map((b) => (
-                  <li key={b.name} class={b.conflicted ? "flag" : ""}>
-                    <code>{b.name}</code> {b.isDefault && <span class="muted">(default) </span>}<code>{b.text}</code>
-                    {b.conflicted && (
-                      <div class="muted">
-                        Its siblings, in a checkout: {b.siblings.map((s, i) => <span key={s}>{i > 0 && ", "}<code>{s}</code></span>)}.
-                        Push a merge of them, or drop one with <code>git push meddle :refs/heads/meddle/conflict/{b.name}/&lt;id&gt;</code>;
-                        to keep your own work: <code>jj bookmark set {b.name} -r &lt;your commit&gt;</code>.
-                      </div>
-                    )}
+                {tasks.map((t) => (
+                  <li key={`${t.nodeId}/${t.id}`}>
+                    <StateDot state={t.state} waiting={waitsOnYou(t)} />{" "}
+                    <a href={hashOf({ name: "task", nodeId: t.nodeId, id: t.id })}>{t.title}</a>{" "}
+                    <span class="muted">{nameOf(t.nodeId)}{t.projects.length > 1 && ` · with ${t.projects.filter((p) => p.id !== id).map((p) => p.name).join(", ")}`}</span>
                   </li>
                 ))}
               </ul>
-            </>}
-            {memory !== null && (
-              <Memory key={memory.nodeId} hosts={hosts} nodeId={memory.nodeId} editable={memory.editable} id={id} tasks={index.tasks} nodeName={nodeName} />
             )}
-          </>
-        )}
-        <h3>Tasks</h3>
-        {tasks.length === 0 ? <p class="muted">No tasks in this project.</p> : (
-          <ul class="plain">
-            {tasks.map((t) => (
-              <li key={`${t.nodeId}/${t.id}`}>
-                <StateDot state={t.state} waiting={waitsOnYou(t)} />{" "}
-                <a href={hashOf({ name: "task", nodeId: t.nodeId, id: t.id })}>{t.title}</a>{" "}
-                <span class="muted">{nameOf(t.nodeId)}{t.projects.length > 1 && ` · with ${t.projects.filter((p) => p.id !== id).map((p) => p.name).join(", ")}`}</span>
-              </li>
-            ))}
-          </ul>
-        )}
+          </div>
+        </section>
       </div>
-    </>
+    </div>
   );
 }
 

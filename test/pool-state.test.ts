@@ -110,7 +110,7 @@ test("PoolObject shows a pool of one, and a linked node that proved the secret a
     expect(poolA.nodes.value).toEqual([{
       nodeId: A.id, hostname: hostname(), status: "member", online: true, version: VERSION, claudeCodeVersion: "2.1.314",
       hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [{ id: A.project.id, name: "a", home: A.id, defaultBranch: "main" }],
-      lastSeenAt: expect.any(String), gone: false, link: null,
+      attachments: true, lastSeenAt: expect.any(String), gone: false, link: null,
     }]);
     const nodeA = await a!.client.get(NodeObject, {});
     expect(nodeA.nodeId.value).toBe(A.identity.id);
@@ -125,6 +125,8 @@ test("PoolObject shows a pool of one, and a linked node that proved the secret a
     // Each learnt the other's hostname from the row it sends of itself.
     await until(poolA.nodes, (rows) => rows.some((r) => r.nodeId === B.id && r.hostname === hostname() && r.status === "member"));
     expect(A.store.row(B.id)).toMatchObject({ addedBy: B.id });
+    // B's own word about itself says it takes attachments.
+    await until(poolA.nodes, (rows) => rows.some((r) => r.nodeId === B.id && r.attachments));
     expect(poolA.mixedVersions.value).toBe(false);
     // A healthy pool logs nothing.
     expect([...A.logs, ...B.logs]).toEqual([]);

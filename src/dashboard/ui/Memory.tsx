@@ -1,6 +1,8 @@
-// A project's memory on the Project page: its entries (read, edited, added, deleted on the home) and the history of
-// changes under `memory`, each opening to its diff. Read from the home while it is online, else read-only from a holder.
+// A project's memory, a column of the Project page (its head and body): its entries (read, edited, added, deleted on the
+// home) and the history of changes under `memory`, each opening to its diff. Read from the home while it is online, else
+// read-only from a holder.
 import type { Host, Ref } from "@earendil-works/chord";
+import type { ComponentChildren } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { ProjectObject } from "../../state/contracts";
 import { isMemoryPath } from "../../projects/memory-names";
@@ -26,13 +28,18 @@ export function Memory({ hosts, nodeId, editable, id, tasks, nodeName }: {
   hosts: Hosts; nodeId: string; editable: boolean; id: string; tasks: readonly ListedTask[]; nodeName(short: string): string;
 }) {
   const host = hosts.for(nodeId);
-  return host === undefined ? null : <MemoryOn host={host} editable={editable} id={id} context={{ tasks, nodeName }} />;
+  return host === undefined ? <Column /> : <MemoryOn host={host} editable={editable} id={id} context={{ tasks, nodeName }} />;
+}
+
+/** The column with only its title in the head: while the memory loads, or when it cannot be read. */
+function Column({ children }: { children?: ComponentChildren }) {
+  return <><div class="col-head"><h3>Memory</h3></div><div class="col-body">{children}</div></>;
 }
 
 function MemoryOn({ host, editable, id, context }: { host: Host; editable: boolean; id: string; context: Context }) {
   const project = useObject(host, ProjectObject, { id });
-  if (project.error !== undefined) return <p class="error">{project.error}</p>;
-  return project.ref === undefined ? null : <MemoryLoaded project={project.ref} editable={editable} context={context} />;
+  if (project.error !== undefined) return <Column><p class="error">{project.error}</p></Column>;
+  return project.ref === undefined ? <Column /> : <MemoryLoaded project={project.ref} editable={editable} context={context} />;
 }
 
 function MemoryLoaded({ project, editable, context }: { project: ProjectRef; editable: boolean; context: Context }) {
@@ -87,43 +94,45 @@ function MemoryLoaded({ project, editable, context }: { project: ProjectRef; edi
     }
   };
 
-  if (noRepo) return null;
+  if (noRepo) return <Column><p class="muted">No memory for this project.</p></Column>;
   return (
     <>
-      <div class="sec">
+      <div class="col-head">
         <h3>Memory</h3>
         {entries !== null && <span class="muted">{entries.length}</span>}
         {!editable && <span class="flag">offline</span>}
         <span class="bar-gap" />
         {editable && !creating && <button type="button" onClick={() => setCreating(true)}>New</button>}
       </div>
-      {error !== null && <p class="error">{error}</p>}
-      {creating && (
-        <div class="mem-entry">
-          <Editor project={project} path={null} initial="" base={null} listed={entries?.map((e) => e.path) ?? []} reload={load}
-            onSaved={(path) => { setCreating(false); toggle(path, true); }} onCancel={() => setCreating(false)} />
-        </div>
-      )}
-      {entries !== null && (
-        <div class="mem-list" onClick={follow}>
-          {entries.map((entry) => (
-            <Entry key={entry.path} project={project} entry={entry} editable={editable} open={opened.has(entry.path)}
-              onToggle={() => toggle(entry.path)} onHistory={() => showHistory(entry.path)} reload={load} context={context} />
-          ))}
-        </div>
-      )}
-      <div class="sec" ref={historyRef}>
-        <h3><button type="button" class="sec-toggle" onClick={() => setHistoryOpen(!historyOpen)}>
-          <span class="caret">{historyOpen ? "▾" : "▸"}</span> History
-        </button></h3>
-        {historyOpen && filter !== null && (
-          <>
-            <code>{filter}</code>
-            <button type="button" class="icon" onClick={() => setFilter(null)}>×</button>
-          </>
+      <div class="col-body">
+        {error !== null && <p class="error">{error}</p>}
+        {creating && (
+          <div class="mem-entry">
+            <Editor project={project} path={null} initial="" base={null} listed={entries?.map((e) => e.path) ?? []} reload={load}
+              onSaved={(path) => { setCreating(false); toggle(path, true); }} onCancel={() => setCreating(false)} />
+          </div>
         )}
+        {entries !== null && (
+          <div class="mem-list" onClick={follow}>
+            {entries.map((entry) => (
+              <Entry key={entry.path} project={project} entry={entry} editable={editable} open={opened.has(entry.path)}
+                onToggle={() => toggle(entry.path)} onHistory={() => showHistory(entry.path)} reload={load} context={context} />
+            ))}
+          </div>
+        )}
+        <div class="sec" ref={historyRef}>
+          <h3><button type="button" class="sec-toggle" onClick={() => setHistoryOpen(!historyOpen)}>
+            <span class="caret">{historyOpen ? "▾" : "▸"}</span> History
+          </button></h3>
+          {historyOpen && filter !== null && (
+            <>
+              <code>{filter}</code>
+              <button type="button" class="icon" onClick={() => setFilter(null)}>×</button>
+            </>
+          )}
+        </div>
+        {historyOpen && <History project={project} head={head} path={filter} context={context} />}
       </div>
-      {historyOpen && <History project={project} head={head} path={filter} context={context} />}
     </>
   );
 }

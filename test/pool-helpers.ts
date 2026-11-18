@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import type { Database } from "bun:sqlite";
 import { SecretKey, type Connection, type Endpoint } from "@number0/iroh";
 import { createHost, memoryLinkPair, type Host, type Subscribable } from "@earendil-works/chord";
+import type { Attachment } from "../src/blobs/attachment";
 import { checkTaskRoot, ensureDataDirs, loadConfig, paths, type NodeConfig } from "../src/config";
 import { writeHelperWrapper, writePreReceiveHook } from "../src/git/scripts";
 import { acceptGitStreams } from "../src/git/serve";
@@ -25,7 +26,7 @@ import { createNodeHost } from "../src/state/host";
 import { openDb } from "../src/store/db";
 import { listProjects } from "../src/projects/project";
 import { countRunningTasks, listLiveTasks } from "../src/store/records";
-import type { RunnerHooks } from "../src/tasks/durable";
+import type { RunnerHooks, TaskRunner } from "../src/tasks/durable";
 import { VERSION, claudeCodeVersion } from "../src/version";
 import { setupNode } from "./helpers";
 
@@ -125,7 +126,7 @@ async function poolNode(
   const store = new PoolStore(db);
   const identity = freshIdentity();
   const id = identity.id;
-  const summary: NodeSummary = { hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [] };
+  const summary: NodeSummary = { hostname: `host-${shortId(id)}`, version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [], attachments: true };
   store.setSecret({ nodeId: id, hostname: summary.hostname }, DEFAULT_POOL_NAME, POOL_SECRET);
   const endpoint = await openEndpoint(cfg, identity);
   const errors: unknown[] = [];
@@ -381,8 +382,8 @@ export async function linkNodes(a: GitPoolNode, b: GitPoolNode): Promise<void> {
 /**
  * `count` whole nodes (`startPoolNode`, with `extraEnv` and the node's own `nodes[i]`), all with `POOL_SECRET`, linked
  * to each other (`linkNodes`) and all online to each other, each with the git remote helper's wrapper and the
- * pre-receive hook written, a `GitSocket` started, `acceptGitStreams` (logging to the node's `logs`) and
- * `acceptBlobStreams` registered. `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
+ * pre-receive hook written, a `GitSocket` started, `acceptGitStreams` and `acceptBlobStreams` (both logging to the
+ * node's `logs`) registered. `close()` stops the acceptors, the sockets and the nodes, and removes the homes.
  */
 export async function poolNodes(
   count: number,
@@ -414,7 +415,7 @@ export async function poolNodes(
         });
         stops.push(async () => stopAccepting());
       }
-      const stopBlobs = acceptBlobStreams(node.net, node.runner);
+      const stopBlobs = acceptBlobStreams(node.net, node.runner, node.runner.blobs.store, (line) => node.logs.push(line));
       stops.push(async () => stopBlobs());
     }
     for (const [i, a] of nodes.entries()) for (const b of nodes.slice(i + 1)) await linkNodes(a, b);
@@ -459,4 +460,10 @@ export async function peerReady(from: GitPoolNode, to: GitPoolNode): Promise<voi
     if (Date.now() > deadline) throw new Error(`no PeerObject of ${shortId(to.id)}: ${String(last)}`);
     await Bun.sleep(20);
   }
+}
+
+/** Puts a few bytes into `node`'s blob store; answers them as an attachment named `shot.png`. */
+export async function storedShot(node: { runner: TaskRunner }): Promise<Attachment> {
+  const { hash, size } = await node.runner.blobs.store.write((async function* () { yield new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]); })());
+  return { hash, name: "shot.png", type: "image/png", size };
 }

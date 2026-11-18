@@ -118,12 +118,22 @@ test("nodeOf defaults an older peer's summary the same way", () => {
   expect(nodeOf(row(A, older), A, live, [])).toMatchObject({ nodeId: A, running: 1, limit: 2, projects: [{ id: "q", name: "q", home: A }] });
 });
 
-test("a roster row merged from an older peer reads back with running 0, limit 0 and no projects", async () => {
+test("a node says it takes attachments; an older summary reads as not", () => {
+  const older = { hostname: "b", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 4 };
+  const live = { summary: { ...older, hostname: "a", attachments: true }, at: "t" };
+  expect(nodeOf(row(B, { ...older, attachments: true }), A, live, [B]).attachments).toBe(true);
+  expect(nodeOf(row(B, older), A, live, [B]).attachments).toBe(false);
+  expect(nodeOf(row(C, null), A, live, []).attachments).toBe(false);
+  // This node shows its live summary, not its row.
+  expect(nodeOf(row(A, older), A, live, []).attachments).toBe(true);
+});
+
+test("a roster row merged from an older peer reads back with running 0, limit 0, no projects and no attachments", async () => {
   const { PoolStore } = await import("../src/pool/store");
   const { openDb } = await import("../src/store/db");
   const store = new PoolStore(openDb(":memory:"));
   store.ensurePool({ nodeId: A, hostname: "a" });
   const older = { hostname: "b", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 4 };
   store.merge([row(B, older)]);
-  expect(store.row(B)?.summary).toEqual({ ...older, running: 0, limit: 0, projects: [] });
+  expect(store.row(B)?.summary).toEqual({ ...older, running: 0, limit: 0, projects: [], attachments: false });
 });

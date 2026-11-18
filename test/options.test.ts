@@ -3,6 +3,7 @@ import { test, expect } from "bun:test";
 import { buildEnv, buildOptions } from "../src/engine/options";
 import { DEFAULT_CONTEXT } from "../src/projects/context";
 import { loadConfig } from "../src/config";
+import { paths } from "../src/paths";
 test("options match the spec", () => {
   const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
   const manifest = { id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: "p1", createdAt: "", projects: [{ id: "p1", name: "a", replica: "/r/a", workspace: "a", parent: "root()", base: ["0000000000000000000000000000000000000000"], context: null }] };
@@ -30,6 +31,14 @@ test("options match the spec", () => {
   const none: any = buildOptions({ ...common, contexts: [DEFAULT_CONTEXT], resume: false });
   expect(none.systemPrompt).toEqual({ type: "preset", preset: "claude_code" });
   expect(none.systemPrompt).not.toHaveProperty("append");
+});
+
+test("Claude Code may read the task's attachments directory without asking", () => {
+  const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
+  const manifest = { id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: null, createdAt: "", projects: [] };
+  const o = buildOptions({ cfg, manifest, contexts: [], projectSettings: [], token: "tok", prompt: (async function*(){})(), canUseTool: async () => ({ behavior: "deny" as const, message: "x" }), onPermissionDenied: () => {}, sessionStore: {} as any, resume: false });
+  expect(o.additionalDirectories).toEqual([paths(cfg).taskAttachments(manifest.id)]);
+  expect(o.additionalDirectories).toEqual(["/t/abc/.meddle/attachments"]);
 });
 
 test("with onFilesChanged, a PostToolUse hook for Edit, Write and Bash calls it and lets the agent go on; without, there is none", async () => {

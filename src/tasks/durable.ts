@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { PermissionMode, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -7,6 +7,10 @@ import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
+import { attachmentProblem, promptOf, queueEntry, type Attachment, type Prompt } from "../blobs/attachment";
+import { materialize, promptContent } from "../blobs/content";
+import { BlobFetcher } from "../blobs/pool";
+import { BlobStore } from "../blobs/store";
 import { Approvals } from "../engine/approvals";
 import { InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
@@ -28,7 +32,7 @@ import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRow
 import { branchChanges, lineChanges, listLineRows, mergeLineRows, writeLineRow, type LineRow } from "../pool/rows";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
-import { appendEvent, latestEventOfType, listEventsTail, type EventRecord } from "../store/events";
+import { appendEvent, latestEventOfType, listEventsTail, listPromptAttachments, type EventRecord } from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
   clearTaskLog,
@@ -58,10 +62,11 @@ import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
 export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" | "moved" | "archived";
 
 /**
- * One turn's input. `freshAfter` (the first turn of a task received from another node): the cut-off check looks only at
- * events after this seq, so a turn the sender ended (by moving the task) is never taken for one this node must carry on.
+ * One turn's input: its prompt's text and attachments (an input stored by an older meddle has no `attachments`: none).
+ * `freshAfter` (the first turn of a task received from another node): the cut-off check looks only at events after
+ * this seq, so a turn the sender ended (by moving the task) is never taken for one this node must carry on.
  */
-type TurnInput = { taskId: string; prompt: string; freshAfter?: number };
+type TurnInput = { taskId: string; prompt: string; attachments?: Attachment[]; freshAfter?: number };
 /**
  * Where a turn is. `tokenRetries`: how often `run` was entered again after the turn's token failed it (at most once). A
  * checkpoint stored by an older meddle has none: read it as 0.
@@ -89,6 +94,8 @@ export type RunnerHooks = {
   afterEnterMove?(taskId: string, signal: AbortSignal): void | Promise<void>;
   /** Called once a turn's `token_fault` with `rerun: true` is in the log, before the `run` phase enters itself again. */
   afterTokenFault?(taskId: string): void | Promise<void>;
+  /** Called once what a steer sends Claude Code is made, before the steer goes into the turn's input. */
+  afterSteerContent?(taskId: string): void | Promise<void>;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
   callMs?: number;
 };
@@ -223,6 +230,8 @@ function messageOf(err: unknown): string {
 /** Creates tasks and drives their turns as durable `meddle.turn` tasks on one Harness. */
 export class TaskRunner {
   readonly approvals = new Approvals();
+  /** This node's files (the ones attached to prompts), and the way to fetch those it lacks from its pool, once it has one. */
+  readonly blobs: BlobFetcher;
   #cfg: NodeConfig;
   #db: Database;
   #harness: Harness;
@@ -299,6 +308,7 @@ export class TaskRunner {
     this.#harness = harness;
     this.#deps = deps;
     this.#pool = deps.pool;
+    this.blobs = new BlobFetcher(new BlobStore(paths(cfg).blobs), () => this.#pool?.net ?? null);
     const sink = deps.log ?? ((line: string) => console.error(line));
     this.#log = dedupe((line) => sink(line));
     this.#sessionStore = new SqliteSessionStore(db);
@@ -452,65 +462,126 @@ export class TaskRunner {
   }
 
   /**
-   * Steers the live turn, or starts a new durable turn when the task is idle; a busy task is never refused a prompt.
+   * Steers the live turn with the prompt of `text` and `attachments`, or starts a new durable turn with it when the
+   * task is idle; a busy task is never refused a prompt. A task's prompts are taken one at a time, in the order they
+   * were sent: one waits for any earlier one's files to be fetched or written, so a prompt never overtakes another.
+   * First every attachment must be valid (else `bad attachment: <why>`), its file here, fetched from the pool when it
+   * is not (else `attachment <name> is not on any online node`), and the size it says (else `bad attachment: size does
+   * not match its file`): a prompt refused for one queues nothing, and the next is taken as usual. Only an
+   * attachment's `hash`, `name`, `type` and `size` are kept. A prompt sent while the task waits to move travels with
+   * it, so one with attachments is refused when the node it goes to does not take them (`<host> runs a meddle that
+   * takes no attachments`).
    * A steer goes into the turn's input, for Claude Code to take into the running turn at its next chance (or as a
    * turn of its own once that one ends), and is `queued` until it does. A prompt the live turn can no longer take (its
    * input closed with its `result`), or for a turn that is being created, resumed by the Harness or retried after it
    * was parked (which this retries), is queued for the task's next turn. A task left `running` with no turn here or in
-   * the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the text started a turn, `"queued"`
-   * when it waits to be taken (a steer, or a prompt for a later turn).
+   * the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the prompt started a turn,
+   * `"queued"` when it waits to be taken (a steer, or a prompt for a later turn).
    */
-  async prompt(taskId: string, text: string): Promise<"turn" | "queued"> {
-    const row = this.#row(taskId);
-    if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
-    if (this.#archiving.has(taskId)) throw new Error("task is being archived");
-    refuseReceiving(row);
-    refuseMoved(row);
-    if (this.#isMoving(row)) {
-      // A restore-move sends the archive's row, which has no queue: nothing sent meanwhile would travel.
-      if (row.archived_on !== null) throw new Error("task is being restored; send it again once it has arrived");
-      // Queued prompts travel with the task, and its export reads them once the handoff has begun: one sent after that
-      // would be left behind.
-      if (this.#moving.get(taskId)?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
-      this.#enqueue(taskId, text);
+  prompt(taskId: string, text: string, attachments: Attachment[] = []): Promise<"turn" | "queued"> {
+    // A chain of its own: never behind the task's receive, import or activation (`taskKey`).
+    return serialised(`prompt\0${taskId}`, () => this.#prompt(taskId, text, attachments));
+  }
+
+  async #prompt(taskId: string, text: string, attachments: Attachment[]): Promise<"turn" | "queued"> {
+    await this.#ensureAttachments(attachments);
+    // Whatever else a caller put on an attachment never reaches meddle's records (the queue, a turn's input, the log).
+    const refs = attachments.map(({ hash, name, type, size }) => ({ hash, name, type, size }));
+    const p: Prompt = { text, attachments: refs };
+    if (this.#refusePrompt(taskId, p) === "travels") {
+      this.#enqueue(taskId, p);
       return "queued";
     }
+    const row = this.#row(taskId);
     let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
-      if (live !== undefined) {
-        // After the turn's `result` its input is closed while the turn is still live: the prompt waits for the next.
-        if (live.queue.ended) return this.#enqueueNext(taskId, text);
-        this.#send(taskId, live.queue, text);
-        return "queued";
-      }
+      if (live !== undefined) return this.#send(taskId, live.queue, p);
       const turn = await this.#durableTurn(taskId);
       // Held: a parked turn waits for the hold to lift (retrying it would start it).
       if (turn !== undefined && isParked(turn) && this.#holds.turns === null) await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
-      if (turn !== undefined) return this.#enqueueNext(taskId, text);
+      if (turn !== undefined) return this.#enqueueNext(taskId, p);
       stale = true;
     }
     // Prompts queued while the task moved run first, one turn each; this one waits its turn behind them.
     if (queuedOf(this.#row(taskId)).length > 0) {
       if (stale) this.#setState(taskId, "idle");
-      return this.#enqueueNext(taskId, text);
+      return this.#enqueueNext(taskId, p);
     }
-    // Reserved before the first await, so a concurrent prompt cannot create a second turn: it waits for the next.
-    if (this.#pending.has(taskId)) return this.#enqueueNext(taskId, text);
+    // Reserved before the next await and until the turn runs, so neither a later prompt nor `startQueued` creates a
+    // second turn meanwhile: a prompt waits for the next.
+    if (this.#pending.has(taskId)) return this.#enqueueNext(taskId, p);
     // A pool update holds new turns: the prompt queues, and runs once the hold lifts.
     if (this.#holds.turns !== null) {
       if (stale) this.#setState(taskId, "idle");
-      return this.#enqueueNext(taskId, text);
+      return this.#enqueueNext(taskId, p);
     }
     this.#pending.add(taskId);
     try {
       if (stale) this.#setState(taskId, "idle");
-      await this.#createTurn({ taskId, prompt: text });
+      await this.#createTurn({ taskId, prompt: text, attachments: refs });
     } catch (err) {
       this.#pending.delete(taskId);
       throw err;
     }
     return "turn";
+  }
+
+  /**
+   * Throws why the task takes no prompt now (see `prompt`): it is archived or being archived, being received, moved
+   * away, being restored, moving past the point where its queue travels with it, or moving to a node that takes no
+   * attachments when `p` has some. `"travels"`: it is moving, and `p` may only join the queue that goes with it.
+   */
+  #refusePrompt(taskId: string, p: Prompt): "here" | "travels" {
+    const row = this.#row(taskId);
+    if (row.state === "archived") throw new Error(`task is archived: ${taskId}`);
+    if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+    refuseReceiving(row);
+    refuseMoved(row);
+    if (!this.#isMoving(row)) return "here";
+    // A restore-move sends the archive's row, which has no queue: nothing sent meanwhile would travel.
+    if (row.archived_on !== null) throw new Error("task is being restored; send it again once it has arrived");
+    // Queued prompts travel with the task, and its export reads them once the handoff has begun: one sent after that
+    // would be left behind.
+    const move = this.#moving.get(taskId);
+    if (move?.phase !== "prepare") throw new Error("task is moving; send it again once it has arrived");
+    // It travels with the task: never to a node that would drop its attachments.
+    if (p.attachments.length > 0) {
+      const refusal = this.noAttachmentsOn(move.to);
+      if (refusal !== null) throw new Error(refusal);
+    }
+    return "travels";
+  }
+
+  /**
+   * Refuses a prompt unless every attachment is valid, then each one's file is here (fetched from the pool when it is
+   * not), then each file is the size its attachment says, which is what decides whether it goes inline. See `prompt`.
+   */
+  async #ensureAttachments(attachments: readonly Attachment[]): Promise<void> {
+    for (const a of attachments) {
+      const problem = attachmentProblem(a);
+      if (problem !== null) throw new Error(`bad attachment: ${problem}`);
+    }
+    for (const a of attachments) {
+      if (!(await this.blobs.ensure(a.hash))) throw new Error(`attachment ${a.name} is not on any online node`);
+    }
+    for (const a of attachments) await this.#checkSize(a);
+  }
+
+  /** Throws `bad attachment: size does not match its file` unless the stored file is the size `a` says. */
+  async #checkSize(a: Attachment): Promise<void> {
+    const { size } = await stat(this.blobs.store.path(a.hash));
+    if (size !== a.size) throw new Error("bad attachment: size does not match its file");
+  }
+
+  /**
+   * Why node `to` must not be given prompts with attachments (its summary does not say it takes them, as an older
+   * meddle's does not), or null: what a move and a new task's placement check.
+   */
+  noAttachmentsOn(to: string): string | null {
+    const summary = this.#pool?.store.row(to)?.summary ?? null;
+    if (summary?.attachments === true) return null;
+    return `${summary?.hostname ?? shortId(to)} runs a meddle that takes no attachments`;
   }
 
   /** Creates the task's next `meddle.turn`; the caller has reserved it in `#pending`. */
@@ -520,8 +591,8 @@ export class TaskRunner {
   }
 
   /**
-   * Starts the task's next turn from its queued prompts (decision 13 as amended: one turn per text, in order) when it
-   * is idle with a prompt queued and no turn pending or live; otherwise does nothing. The text leaves `queued` only
+   * Starts the task's next turn from its queued prompts (decision 13 as amended: one turn per prompt, in order) when it
+   * is idle with a prompt queued and no turn pending or live; otherwise does nothing. The prompt leaves `queued` only
    * once its turn is created, so a crash never loses it; a crash in the moment between the two runs it twice.
    * `completeTurn` calls this after every turn, so the queue drains turn by turn. A moving task's queue waits for the
    * node it goes to. `freshAfter`: see `TurnInput`.
@@ -534,25 +605,28 @@ export class TaskRunner {
     if (head === undefined) return;
     this.#pending.add(taskId);
     try {
-      await this.#createTurn({ taskId, prompt: head, ...(options.freshAfter === undefined ? {} : { freshAfter: options.freshAfter }) });
+      await this.#createTurn({
+        taskId, prompt: head.text, attachments: head.attachments,
+        ...(options.freshAfter === undefined ? {} : { freshAfter: options.freshAfter }),
+      });
     } catch (err) {
       this.#pending.delete(taskId);
       throw err;
     }
     // This is the one taker, kept single by `#pending`; meanwhile a prompt may join the tail, or the steers a turn
-    // ended without the front, so the first copy of the text goes.
+    // ended without the front, so the first prompt equal to it (text and attachments) goes.
     this.#db.transaction(() => {
       const queued = queuedOf(this.#row(taskId));
-      const at = queued.indexOf(head);
+      const at = queued.findIndex((q) => Bun.deepEquals(q, head));
       const rest = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
-      updateTask(this.#db, taskId, { queued: rest.length === 0 ? null : JSON.stringify(rest) });
+      updateTask(this.#db, taskId, { queued: queuedColumn(rest) });
     })();
     this.#emitQueued(taskId);
   }
 
   /** What the task has been sent and not started on, oldest first: its live turn's untaken steers, then its queue. */
-  queued(taskId: string): string[] {
-    const live = this.#live.get(taskId)?.queue.untaken().map((u) => u.text) ?? [];
+  queued(taskId: string): Prompt[] {
+    const live = this.#live.get(taskId)?.queue.untaken().map((u) => u.prompt) ?? [];
     return [...live, ...queuedOf(this.#row(taskId))];
   }
 
@@ -571,33 +645,49 @@ export class TaskRunner {
     notify(this.#queuedListeners, (cb) => cb(taskId));
   }
 
-  /** Appends `text` to the task's queued prompts. */
-  #enqueue(taskId: string, text: string): void {
+  /** Appends prompt `p` to the task's queued prompts. */
+  #enqueue(taskId: string, p: Prompt): void {
     this.#db.transaction(() => {
-      updateTask(this.#db, taskId, { queued: JSON.stringify([...queuedOf(this.#row(taskId)), text]) });
+      updateTask(this.#db, taskId, { queued: queuedColumn([...queuedOf(this.#row(taskId)), p]) });
     })();
     this.#emitQueued(taskId);
   }
 
-  /** Queues `text` for the task's next turn, which starts now if the task is idle meanwhile. */
-  async #enqueueNext(taskId: string, text: string): Promise<"queued"> {
-    this.#enqueue(taskId, text);
+  /** Queues prompt `p` for the task's next turn, which starts now if the task is idle meanwhile. */
+  async #enqueueNext(taskId: string, p: Prompt): Promise<"queued"> {
+    this.#enqueue(taskId, p);
     await this.startQueued(taskId);
     return "queued";
   }
 
-  /** Puts the texts a turn ended without taking ahead of the task's queued prompts, which came after them. */
-  #requeueFront(taskId: string, texts: string[]): void {
-    if (texts.length === 0) return;
+  /** Puts the prompts a turn ended without taking ahead of the task's queued prompts, which came after them. */
+  #requeueFront(taskId: string, prompts: Prompt[]): void {
+    if (prompts.length === 0) return;
     this.#db.transaction(() => {
-      updateTask(this.#db, taskId, { queued: JSON.stringify([...texts, ...queuedOf(this.#row(taskId))]) });
+      updateTask(this.#db, taskId, { queued: queuedColumn([...prompts, ...queuedOf(this.#row(taskId))]) });
     })();
   }
 
-  /** Sends `text` into a live turn's input, for Claude Code to take at its next chance; it is logged when taken. */
-  #send(taskId: string, queue: InputQueue, text: string): void {
-    queue.push(text, "next");
+  /**
+   * Sends prompt `p` into a live turn's input, for Claude Code to take at its next chance; it is logged when taken.
+   * What Claude Code is sent for it (its images inline, its files written under the task) is made first; a prompt the
+   * turn can no longer take by then (its input closed with its `result` while it is still live, or it has ended) waits
+   * for the task's next turn instead, unless the task has meanwhile come to take no prompt (`#refusePrompt`): then it
+   * is refused as `prompt` would refuse it, rather than queued where nothing would take it.
+   */
+  async #send(taskId: string, queue: InputQueue, p: Prompt): Promise<"queued"> {
+    const content = await promptContent(this.blobs.store, paths(this.#cfg).taskAttachments(taskId), p);
+    await this.#deps.hooks?.afterSteerContent?.(taskId);
+    if (queue.ended || this.#live.get(taskId)?.queue !== queue) {
+      if (this.#refusePrompt(taskId, p) === "travels") {
+        this.#enqueue(taskId, p);
+        return "queued";
+      }
+      return this.#enqueueNext(taskId, p);
+    }
+    queue.push(p, "next", content);
     this.#emitQueued(taskId);
+    return "queued";
   }
 
   /** Appends an event to the task's log and tells the listeners. */
@@ -770,7 +860,9 @@ export class TaskRunner {
   /**
    * The `run` phase of `meddle.turn`: drives the turn to its end with the first usable token. A rerun that resumes the
    * session sends `CARRY_ON_PROMPT` (the turn was cut off) or `TOKEN_RETRY_PROMPT` (its token failed it) instead of the
-   * prompt. When the turn's token hit a limit or was refused, the token is marked for the pool. When the turn also ended
+   * prompt; otherwise Claude Code is sent the prompt with its images inline and its files' paths (`promptContent`).
+   * Steers the turn ends without taking are queued, with their attachments, ahead of the task's queued prompts. When
+   * the turn's token hit a limit or was refused, the token is marked for the pool. When the turn also ended
    * with an error, a `token_fault` is logged, and `"rerun"` is returned when this was the turn's first try
    * (`tokenRetries` 0, and this run is not already the rerun) and another token is usable now, so the phase enters
    * itself again. A turn that succeeded all the same is done.
@@ -805,12 +897,20 @@ export class TaskRunner {
         this.#record(taskId, tokenFaultEvent(null, { kind: "none" }, false));
         throw new Error("no usable token");
       }
+      // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
+      const prompt: Prompt = resume && cutOff === "token" ? { text: TOKEN_RETRY_PROMPT, attachments: [] }
+        : resume && cutOff === "restart" ? { text: CARRY_ON_PROMPT, attachments: [] }
+        : { text: input.prompt, attachments: input.attachments ?? [] };
+      // Claude Code is given the task's attachments folder as an additional directory, so it exists for every turn.
+      const attachmentsDir = paths(this.#cfg).taskAttachments(taskId);
+      await mkdir(attachmentsDir, { recursive: true });
+      const content = await promptContent(this.blobs.store, attachmentsDir, prompt);
       const queue = new InputQueue();
       let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
       const { query, done, sendNow } = runTurn({
         input: await this.#engineInput(taskId, manifest, resume, picked.value),
-        // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
-        prompt: resume && cutOff === "token" ? TOKEN_RETRY_PROMPT : resume && cutOff === "restart" ? CARRY_ON_PROMPT : input.prompt,
+        prompt,
+        content,
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -833,7 +933,7 @@ export class TaskRunner {
       } finally {
         // Steers Claude Code did not take wait for the next turn. The task stays in `#primaries` until `finish` has
         // synced its memory.
-        this.#requeueFront(taskId, queue.untaken().map((u) => u.text));
+        this.#requeueFront(taskId, queue.untaken().map((u) => u.prompt));
         this.#live.delete(taskId);
         this.#emitQueued(taskId);
       }
@@ -1066,19 +1166,26 @@ export class TaskRunner {
 
   /**
    * Imports the task `from` sends over a `blob` stream into its `receiving` row (what an earlier attempt imported is
-   * replaced), keeping its settings, queued prompts and turn count. Refused `forbidden` unless the task is being
-   * received from `from`.
+   * replaced), keeping its settings, queued prompts and turn count. Every file its queued prompts name is fetched (from
+   * `from` first) before it answers: one no member gives (`attachment <name> could not be fetched from <short id>`),
+   * or one that is not the size its attachment says (`bad attachment: size does not match its file`), fails the
+   * import. Refused `forbidden` unless the task is being received from `from`.
    */
   async importIncoming(taskId: string, from: string, reader: StreamReader): Promise<Receipt> {
     return serialised(taskKey(taskId), async () => {
       const row = this.#receivingFrom(taskId, from);
       clearTaskLog(this.#db, taskId, row.session_id);
       const got = await importTask(this.#cfg, this.#db, reader, { taskId });
+      const queued = got.queued.map(promptOf);
+      for (const a of queued.flatMap((p) => p.attachments)) {
+        if (!(await this.blobs.ensure(a.hash, from))) throw new Error(`attachment ${a.name} could not be fetched from ${shortId(from)}`);
+        await this.#checkSize(a);
+      }
       // The manifest checked as the task was received, not the stream's copy.
       await adoptTranscriptSlot(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest);
       updateTask(this.#db, taskId, {
         settings: got.settings === null ? null : JSON.stringify(got.settings),
-        queued: got.queued.length === 0 ? null : JSON.stringify(got.queued),
+        queued: queuedColumn(queued),
         turns: got.turns,
       });
       notify(this.#settingsListeners, (cb) => cb(taskId));
@@ -1089,11 +1196,12 @@ export class TaskRunner {
   /**
    * Makes a task received from `from` live here (`idle`); a follow-up joins the front of its queued prompts, which
    * then run one turn each, in order (`startQueued`), and its lines' rows are this node's, one epoch up
-   * (`holdLineRows`, in the same transaction as the row's state: a failure to hold them is no activation). A task
-   * already activated is a no-op: the sender's commit ran again, also when this node has moved the task on since. Refused `forbidden` when this node has no copy of the
-   * task or is receiving it from another node. Every answer is definite, so the sender can tell it from a lost one:
-   * `ok: true` when this node activated the task, `ok: false` when activating it failed and it did not (its received
-   * copy stays, for the sender to abandon).
+   * (`holdLineRows`, in the same transaction as the row's state: a failure to hold them is no activation). The files of
+   * its earlier prompts are then written under the task again, without waiting (`#rewriteAttachments`, from `from`
+   * first). A task already activated is a no-op: the sender's commit ran again, also when this node has moved the
+   * task on since. Refused `forbidden` when this node has no copy of the task or is receiving it from another node.
+   * Every answer is definite, so the sender can tell it from a lost one: `ok: true` when this node activated the task,
+   * `ok: false` when activating it failed and it did not (its received copy stays, for the sender to abandon).
    */
   async activateTask(taskId: string, from: string, followUp: string | null): Promise<{ ok: boolean }> {
     return serialised(taskKey(taskId), async () => {
@@ -1107,11 +1215,11 @@ export class TaskRunner {
         await this.#deps.hooks?.beforeActivate?.(taskId);
         if (activated()) return { ok: true };
         const row = this.#receivingFrom(taskId, from);
-        const queued = [...(followUp === null ? [] : [followUp]), ...queuedOf(row)];
+        const queued = [...(followUp === null ? [] : [{ text: followUp, attachments: [] }]), ...queuedOf(row)];
         const pool = this.#pool;
         // One transaction: an activation holds the task's lines, or did not happen (and the sender rolls back).
         this.#db.transaction(() => {
-          updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: queued.length === 0 ? null : JSON.stringify(queued) });
+          updateTask(this.#db, taskId, { state: "idle", receiving_from: null, queued: queuedColumn(queued) });
           // Its lines are this node's from now on: once its row says `moved`, the sender never writes them again.
           if (pool !== undefined) holdLineRows(this.#db, pool.identity.id, taskId);
         }).immediate();
@@ -1129,9 +1237,48 @@ export class TaskRunner {
         // The task is here now; its prompts stay queued, and the next prompt starts them.
         this.#log(`meddle: move: task ${taskId} is here, but its queued prompts did not start a turn: ${messageOf(err)}`);
       }
+      void this.#rewriteAttachments(taskId, from);
       await this.#deps.hooks?.afterActivate?.(taskId);
       return { ok: true };
     });
+  }
+
+  /**
+   * Writes the files of the task's logged prompts under it again (`materialize`), so that the paths Claude Code was
+   * given in earlier turns still work after a move or a restore. Best effort: each file is fetched when it is not here
+   * (from `prefer` first); one no online node has is logged (`meddle: task <id>: attachment <name> is not on any online
+   * node`) and left out, as is one that is not the size its attachment says or cannot be written. Stops once the task
+   * leaves (moving, archived, moved), so that nothing is written into a folder taken off this node. Never rejects.
+   */
+  async #rewriteAttachments(taskId: string, prefer?: string): Promise<void> {
+    const here = () => {
+      const row = getTask(this.#db, taskId);
+      return row !== null && (row.state === "idle" || row.state === "running" || row.state === "waiting")
+        && !this.#isMoving(row) && !this.#archiving.has(taskId);
+    };
+    try {
+      const dir = paths(this.#cfg).taskAttachments(taskId);
+      const done = new Set<string>();
+      for (const a of listPromptAttachments(this.#db, taskId)) {
+        // A file sent with several prompts is fetched, or found missing, once.
+        if (done.has(`${a.hash}/${a.name}`)) continue;
+        done.add(`${a.hash}/${a.name}`);
+        if (!here()) return;
+        try {
+          if (!(await this.blobs.ensure(a.hash, prefer))) {
+            this.#log(`meddle: task ${taskId}: attachment ${a.name} is not on any online node`);
+            continue;
+          }
+          await this.#checkSize(a);
+          if (!here()) return;
+          await materialize(this.blobs.store, dir, a);
+        } catch (err) {
+          this.#log(`meddle: task ${taskId}: attachment ${a.name} was not written again: ${messageOf(err)}`);
+        }
+      }
+    } catch (err) {
+      this.#log(`meddle: task ${taskId}: the files of its prompts were not written again: ${messageOf(err)}`);
+    }
   }
 
   /**
@@ -1353,7 +1500,8 @@ export class TaskRunner {
    * (`#takeLines`), and each project's workspace starts on its project's line; the folder is provisioned from the
    * manifest and the archive's files are unpacked into it (a task without a project's transcript into this node's
    * slot). The row is `idle` again, no longer archived, its lines' rows live again (`holdLineRows`, then applied here),
-   * and the archive is deleted. No other node is asked anything. On failure, what it made is taken off again and the
+   * and the archive is deleted. No other node is asked anything but for the files of its prompts, which are written
+   * under the task again without waiting (`#rewriteAttachments`). On failure, what it made is taken off again and the
    * task stays archived. While it runs, another restore of the task is refused (`task is being restored`).
    */
   async restoreHere(taskId: string): Promise<TaskManifest> {
@@ -1407,6 +1555,7 @@ export class TaskRunner {
       await this.#applyProjects(deps, this.#row(taskId), "was restored");
       await rm(file, { force: true });
       this.#emitState(taskId, "idle");
+      void this.#rewriteAttachments(taskId);
       return restored;
     });
   }
@@ -1796,7 +1945,8 @@ export class TaskRunner {
   /**
    * Throws why task `row` cannot move to `to` (decision 16): it is not live here (received, moved, archived) or is
    * already moving (unless `own`: the move's own steps check again), there is no pool, `to` is this node, not a
-   * member, offline or hosts no tasks, or the two report different or unknown Claude Code versions. With
+   * member, offline or hosts no tasks, the two report different or unknown Claude Code versions, or the task has a
+   * prompt with attachments queued and `to` does not say it takes them (an older meddle would drop them). With
    * `fromArchive` (a restore-move) it is the other way round: the task must be archived here, or (`own`, a rerun of
    * `prepare`) moving with its row still naming this node as where it is archived.
    */
@@ -1834,6 +1984,10 @@ export class TaskRunner {
     const ours = claudeCodeVersion();
     const theirs = summary.claudeCodeVersion;
     if (ours !== theirs || ours === "unknown" || theirs === "unknown") throw new Error(`claude code ${ours} here, ${theirs} there`);
+    if (this.queued(row.id).some((p) => p.attachments.length > 0)) {
+      const refusal = this.noAttachmentsOn(to);
+      if (refusal !== null) throw new Error(refusal);
+    }
   }
 
   onMove(cb: (taskId: string, move: MoveState | null) => void): () => void {
@@ -2232,6 +2386,11 @@ function manifestNames(row: TaskRow, projectId: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** The `tasks.queued` value that holds `prompts`: null for none, else each one's `queueEntry`. */
+function queuedColumn(prompts: Prompt[]): string | null {
+  return prompts.length === 0 ? null : JSON.stringify(prompts.map(queueEntry));
 }
 
 /** Refuses a task that is still being received. */

@@ -30,7 +30,7 @@ test("while turns are held a prompt queues, and it runs once the hold lifts", as
   expect(await runner.prompt(m.id, "Reply with the single word ok.")).toBe("queued");
   await Bun.sleep(200);
   expect(runner.state(m.id)).toBe("idle");
-  expect(queuedOf(getTask(db, m.id)!)).toEqual(["Reply with the single word ok."]);
+  expect(queuedOf(getTask(db, m.id)!)).toEqual([{ text: "Reply with the single word ok.", attachments: [] }]);
   expect(await runner.busyTasks()).toEqual([]);
   runner.setHolds({ turns: null, work: null, hosting: null });
   await eventually(() => listEvents(db, m.id).some((e) => (e.message as { type?: string }).type === "result"), () => runner.state(m.id));

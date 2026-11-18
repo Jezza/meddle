@@ -269,6 +269,12 @@ to a busy task is queued, never refused: Claude takes it at its next step, or ru
 Ctrl+Enter sends it now instead, as in Claude Code ([README](../README.md#projects-and-tasks)).
 `meddle task list` lists every task of the pool with its state and node.
 
+**Attaching files.** Paste a screenshot into the dashboard's composer (or the New task form), drop files on it, or
+pick them with the paperclip. Images up to 5 MiB once base64, 10 MiB of them a prompt, go into the message; every file
+also lands at `<task>/.meddle/attachments/<hash>/<name>` for Claude to open. Files are kept by SHA-256 at
+`<data>/blobs/<hash>`, at most 64 MB each, never deleted, and a node fetches one it lacks from the pool
+([Attachments](../README.md#attachments)).
+
 **Watching.** Any node's dashboard shows the whole pool: a sidebar of projects and their tasks (each with its state,
 what waits on you and the node it runs on), the nodes with their load at its foot, every task's thread wherever it
 runs, and notices for a failed turn, a login out of tokens or a move that rolled back. A node's own tasks and another node's open the same way; the page's node relays the other's over the

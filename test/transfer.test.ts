@@ -4,9 +4,10 @@ import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { SendStream } from "@number0/iroh";
+import type { Attachment } from "../src/blobs/attachment";
 import { paths, type NodeConfig } from "../src/config";
 import { ALPN_POOL, StreamReader, writeFrame } from "../src/pool/frames";
-import { getTask } from "../src/store/records";
+import { getTask, updateTask } from "../src/store/records";
 import { SqliteSessionStore } from "../src/store/session-store";
 import type { TaskManifest } from "../src/tasks/manifest";
 import { exportTask, importTask, receiptsMatch, type TransferFrame } from "../src/tasks/transfer";
@@ -122,6 +123,38 @@ test("a task's rows and files round-trip, receipts match", async () => {
     for (const [k, v] of sentFiles) expect(gotFiles.get(k)!.equals(v)).toBe(true);
     expect(sentFiles.has(`${m.primaryProjectId}/${m.sessionId}.jsonl`)).toBe(true);
     expect(sentFiles.has(`${m.primaryProjectId}/${m.sessionId}/subagents/agent-x.meta.json`)).toBe(true);
+  } finally {
+    await pair.close();
+    await closeNodes(S, R);
+  }
+}, 15_000);
+
+test("queued prompts with attachments travel, and a bad entry is refused", async () => {
+  const { node: S, m } = await turnedNode();
+  const R = await setupNode();
+  const pair = await endpointPair();
+  try {
+    const shot: Attachment = { hash: "a".repeat(64), name: "shot.png", type: "image/png", size: 7 };
+    await mkdir(paths(R.cfg).taskConfig(m.id), { recursive: true });
+    const { a, b } = await pair.connect(ALPN_POOL);
+    /** Sends the task as S's row has it now; what R's import makes of it, or why it refused. */
+    const transfer = async () => {
+      const out = await a.openBi();
+      const exporting = exportTask(S.cfg, S.db, m.id, out.send);
+      const reader = new StreamReader((await b.acceptBi()).recv);
+      const [got] = await Promise.all([importTask(R.cfg, R.db, reader, { taskId: m.id }), exporting]);
+      return got;
+    };
+
+    // An older meddle's string entry, and a prompt whose attachment carries a field no meddle keeps.
+    updateTask(S.db, m.id, { queued: JSON.stringify(["old", { text: "new", attachments: [{ ...shot, data: "AAAA" }] }]) });
+    expect((await transfer()).queued).toEqual(["old", { text: "new", attachments: [shot] }]);
+
+    // Refused at the manifest: nothing of the task is written.
+    R.db.query("DELETE FROM events WHERE task_id = ?").run(m.id);
+    updateTask(S.db, m.id, { queued: JSON.stringify(["old", { text: 1 }]) });
+    await expect(transfer()).rejects.toThrow("bad queued prompt in transfer");
+    expect(eventRows(R.db, m.id)).toEqual([]);
   } finally {
     await pair.close();
     await closeNodes(S, R);

@@ -24,6 +24,8 @@ export function paths(cfg: NodeConfig) {
     taskMeta: (taskId: string) => join(task(taskId), ".meddle"),
     taskConfig: (taskId: string) => join(task(taskId), ".meddle", "claude"),
     taskManifest: (taskId: string) => join(task(taskId), ".meddle", "task.json"),
+    /** Where the files attached to a task's prompts are put for its agent to read (they live on in `blobs`). */
+    taskAttachments: (taskId: string) => join(task(taskId), ".meddle", "attachments"),
     /** Prepended to `PATH` for every jj meddle runs (never an agent's): it holds the git remote helper. */
     bin,
     binHelper: join(bin, "git-remote-meddle"),
@@ -34,6 +36,8 @@ export function paths(cfg: NodeConfig) {
     /** The archives of tasks archived here, kept until the task is restored or deleted: mode 700, each archive 600. */
     archives: join(data, "archives"),
     archiveFile: (taskId: string) => join(data, "archives", `${taskId}.json.gz`),
+    /** The files uploaded to this node, each named by the SHA-256 of its bytes and never deleted: mode 700, each file 600. */
+    blobs: join(data, "blobs"),
     /** What a task that moved away left here (decision 18), kept seven days: mode 700, each file 600. */
     moved: join(data, "moved"),
     movedFile: (taskId: string) => join(data, "moved", `${taskId}.json.gz`),
