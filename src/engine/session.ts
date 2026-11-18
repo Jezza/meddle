@@ -28,6 +28,12 @@ export type MeddleEvent =
   | { type: "meddle"; subtype: "train_decline"; reason: string }
   /** The merge agent called meddle's `blame` tool, naming the task responsible. */
   | { type: "meddle"; subtype: "train_blame"; task: string; reason: string }
+  /**
+   * The train took the task off its queue for `reason`, its own (a commit not the task's to change, work another task
+   * built on): logged on the task's holder as it leaves, so that the reason stays in its conversation. A decline is
+   * `train_decline`, and what the user did to leave is logged as none.
+   */
+  | { type: "meddle"; subtype: "train_left"; reason: string }
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
   | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput }
@@ -47,9 +53,10 @@ export type MeddleEvent =
     retried?: true;
   };
 
-/** Whether `m` is one of the train's events (`train_turn`, `train_decline`, `train_blame`): none ends a turn. */
+/** Whether `m` is one of the train's events (`train_turn`, `train_decline`, `train_blame`, `train_left`): none ends a turn. */
 export function isTrainEvent(m: { type?: unknown; subtype?: unknown }): boolean {
-  return m.type === "meddle" && (m.subtype === "train_turn" || m.subtype === "train_decline" || m.subtype === "train_blame");
+  return m.type === "meddle"
+    && (m.subtype === "train_turn" || m.subtype === "train_decline" || m.subtype === "train_blame" || m.subtype === "train_left");
 }
 
 /**

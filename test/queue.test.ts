@@ -12,6 +12,7 @@ import { TaskObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
 import { getTask, updateTask } from "../src/store/records";
 import { pauseTrain } from "../src/train/train";
+import { UNQUEUED_ARCHIVED, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER } from "../src/tasks/durable";
 import { createTask } from "./helpers";
 import { linkClient, poolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -397,6 +398,31 @@ test("archiving unqueues, and so does deleting what an archive left queued", asy
     await A.runner.deleteTask(m.id);
     expect(listLineRows(A.db, P.id, m.id).map((r) => `${r.name} ${r.commit} ${r.queuedAt}`)).toEqual(["a null null"]);
     expect(events).toEqual(["left: archived", "left: archived"]);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("a task the train takes off keeps the reason in its conversation; what the user did to leave logs nothing", async () => {
+  const { nodes, close } = await queueNodes(1);
+  const A = nodes[0]!;
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    await withWork(A, m.id);
+    const lines = () => listEvents(A.db, m.id).map((e) => e.message as { type?: string; subtype?: string; reason?: string }).filter((e) => e.subtype === "train_left");
+    for (const reason of [UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]) {
+      await A.runner.accept(m.id);
+      await A.runner.unqueue(m.id, reason);
+    }
+    expect(lines()).toEqual([]);
+
+    const frozen = "another task builds on this work, so it can't rebase";
+    await A.runner.accept(m.id);
+    await A.runner.unqueue(m.id, frozen);
+    // Off the queue already: nothing leaves again.
+    await A.runner.unqueue(m.id, frozen);
+    expect(A.runner.queue(m.id)).toBeNull();
+    expect(lines()).toEqual([{ type: "meddle", subtype: "train_left", reason: frozen }]);
   } finally {
     await close();
   }

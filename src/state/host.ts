@@ -33,7 +33,7 @@ import {
   type EventRecord,
 } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
-import { TurnsHeld, UNQUEUED_ARCHIVED, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER, type MoveState, type TaskRunner, type TaskState } from "../tasks/durable";
+import { TurnsHeld, UNQUEUED_AS_ASKED, UNQUEUED_BY_USER, type MoveState, type TaskRunner, type TaskState } from "../tasks/durable";
 import {
   ChangesError, changeDiff, changeFile, changesProbe, taskChanges, workspaceFile, type ChangesProbe, type ProjectChanges,
 } from "../tasks/changes";
@@ -98,8 +98,6 @@ const NOTIFICATIONS_KEPT = 50;
 const NO_TRAIN: TrainState = { paused: null, round: null, queued: [] };
 /** What the user's own Pause says it is for, given none. */
 const PAUSED_BY_USER = "you paused it";
-/** Why a task leaves the train when the user took it off: no news to tell. */
-const UNQUEUED_AS_ASKED: ReadonlySet<string> = new Set([UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]);
 /**
  * How often an object re-reads what can change without an event telling it (a peer's push, the user's git or jj): a
  * project's graph, branches and memory, a task's lines.

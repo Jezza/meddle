@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { paths } from "../src/config";
 import { buildOptions } from "../src/engine/options";
-import type { MeddleEvent } from "../src/engine/session";
+import { isTrainEvent, type MeddleEvent } from "../src/engine/session";
 import { listLineRows } from "../src/pool/rows";
 import { DESCRIBE_PROMPT } from "../src/pool/settings";
 import { PeerObject } from "../src/state/contracts";
@@ -152,6 +152,11 @@ test("the tools record their calls, and a train turn's outcome is read from what
   expect(trainOutcome([...start, { type: "meddle", subtype: "turn_aborted", at: "" }])).toEqual({ kind: "failed", reason: "the turn was aborted" });
   expect(trainOutcome([...start, recorded[0], { type: "meddle", subtype: "turn_failed", at: "", error: "Error: boom" }])).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
   expect(trainOutcome([...start])).toEqual({ kind: "failed", reason: "the turn ended without a result" });
+  // The train's events end no turn; a task it took off meanwhile changes nothing of how the turn went.
+  const left = { type: "meddle", subtype: "train_left", reason: "another task builds on this work, so it can't rebase" };
+  for (const e of [start[1]!, recorded[0]!, recorded[1]!, left]) expect(isTrainEvent(e)).toBe(true);
+  expect(isTrainEvent({ type: "meddle", subtype: "turn_failed" })).toBe(false);
+  expect(trainOutcome([...start, left, success])).toEqual({ kind: "done" });
   // A rerun after a restart carries on: the cut-off attempt's abort is not how the turn ended.
   const rerun = [{ type: "meddle", subtype: "turn_started", at: "", resume: true }, { type: "meddle", subtype: "train_turn", kind: "rebase", text: CARRY_ON_PROMPT }];
   expect(trainOutcome([...start, { type: "meddle", subtype: "turn_aborted", at: "" }, ...rerun, success])).toEqual({ kind: "done" });

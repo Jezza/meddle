@@ -62,6 +62,13 @@ test("the train's prompt shows as a prompt marked as meddle's; its tools' calls 
   ]);
 });
 
+test("a task the train took off says why in its conversation", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "meddle", subtype: "train_left", reason: "another task builds on this work, so it can't rebase" } },
+  ]);
+  expect(items).toEqual([{ kind: "status", text: "Left meddle's train: another task builds on this work, so it can't rebase" }]);
+});
+
 test("a prompt meddle recorded keeps its attachments, and drops a bad one", () => {
   const items = buildThread([{ seq: 1, message: { type: "user", message: { role: "user", content: "look" }, parent_tool_use_id: null,
     attachments: [shot, { ...shot, name: "../x" }] } }]);

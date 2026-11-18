@@ -157,6 +157,8 @@ export type TrainTaskStatus = { taskId: string; state: "idle" | "busy" | "train"
 export const UNQUEUED_BY_USER = "you unqueued it";
 export const UNQUEUED_BY_INPUT = "you sent it a prompt";
 export const UNQUEUED_ARCHIVED = "archived";
+/** Why a task leaves the queue when the user took it off: no news to tell, and nothing for its conversation to keep. */
+export const UNQUEUED_AS_ASKED: ReadonlySet<string> = new Set([UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]);
 
 export type RunnerDeps = {
   claudePath?: string;
@@ -2240,12 +2242,15 @@ export class TaskRunner {
 
   /**
    * Takes task `taskId` off its project's train for `reason` (what `onQueue` tells, and the dashboard shows): its line
-   * row says it is not queued. A task not queued stays as it is. Refused while the task is not live here (moved,
+   * row says it is not queued. A reason of the train's (any but `UNQUEUED_AS_ASKED`) stays in the task's conversation
+   * too, as a `train_left` event. A task not queued stays as it is. Refused while the task is not live here (moved,
    * archived, being received) or is moving.
    */
   async unqueue(taskId: string, reason: string): Promise<void> {
     this.#refuseElsewhere(taskId);
-    this.#unqueue(taskId, reason);
+    if (this.#unqueue(taskId, reason) && !UNQUEUED_AS_ASKED.has(reason)) {
+      this.#record(taskId, { type: "meddle", subtype: "train_left", reason });
+    }
   }
 
   /** Where task `taskId` is queued (when, and the project's id), as its line row says; null when it is not, or not held here. */
@@ -2275,16 +2280,22 @@ export class TaskRunner {
     return line !== undefined && line.holder === self ? line : null;
   }
 
-  /** Takes the task off the queue, if it is on it, and tells the listeners. A task without a project has no queue. */
-  #unqueue(taskId: string, reason: string): void {
+  /**
+   * Takes the task off the queue, if it is on it, and tells the listeners: whether it was. A task without a project has
+   * no queue.
+   */
+  #unqueue(taskId: string, reason: string): boolean {
     const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
-    if (row === null) return;
+    if (row === null) return false;
+    let left = false;
     for (const p of queueProjects(row)) {
       const line = this.#ownLine(taskId, p);
       if (line === null || line.queuedAt === null) continue;
       setQueued(this.#db, p.id, taskId, p.name, null);
+      left = true;
       notify(this.#queueListeners, (cb) => cb(taskId, null, reason));
     }
+    return left;
   }
 
   /** `#unqueue` for what must go on whether or not it works: a failure is logged (`meddle: queue: …`), never thrown. */

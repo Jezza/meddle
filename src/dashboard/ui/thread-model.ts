@@ -288,6 +288,9 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
       case "train_blame":
         top.push({ kind: "status", text: `Blamed ${str(m.task)}: ${str(m.reason)}` });
         return;
+      case "train_left":
+        top.push({ kind: "status", text: `Left meddle's train: ${str(m.reason)}` });
+        return;
       case "permission_denied_hook": {
         const input = (m.input ?? {}) as { tool_use_id?: unknown; tool_name?: unknown; reason?: unknown };
         addDenied(input.tool_use_id, str(input.tool_name), input.reason, undefined, false);
