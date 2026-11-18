@@ -331,6 +331,34 @@ const GROUPS: Group[] = [
         details: "A turn that crashed the node several times is parked rather than started again; this releases it. On an idle task it starts a new turn that carries on from where the last one stopped, e.g. after you interrupted it.",
       },
       {
+        name: "task accept",
+        usage: ["task accept <task-id>..."],
+        summary: "Queue tasks on their project's merge train, which lands their work on the project's default branch.",
+        details:
+          "Takes any number of task ids (or unique prefixes), from any node, and prints `queued <id> on <project>'s " +
+          "train` for each; accepting a task that is queued changes nothing. The train runs on the project's home: it " +
+          "has each task's revisions described and merging cleanly with the default branch (a task that doesn't gets a " +
+          "turn of its own to describe or rebase them), has tasks that land together checked by a merge task, and then " +
+          "moves the default branch to the result, which archives the tasks. A running task can be accepted; its turn " +
+          "goes on. A task leaves the train again when you unqueue it, send it a prompt (or steer or retry it) or " +
+          "archive it, or when the train gives up on it; the dashboard then says why. Watch the train with `train`. " +
+          "Each task is tried on its own: one that is refused (`send or clear the waiting prompts first`, `accept " +
+          "handles one project for now; push to land the rest` for a task of several projects, `nothing to land: the " +
+          "task's work is already on <branch>`, or `<node> runs an older meddle` for a task on a node older than the " +
+          "train) is reported on stderr, with its id when there are several, and the exit status is 1 once any was. " +
+          "Needs the node running.",
+      },
+      {
+        name: "task unqueue",
+        usage: ["task unqueue <task-id>..."],
+        summary: "Take tasks off their project's merge train.",
+        details:
+          "Takes any number of task ids (or unique prefixes), from any node, and prints `unqueued <id>` for each that was " +
+          "queued, `<id> is not queued` for one that was not. When the task is in the batch the train is working on, " +
+          "the round starts over without it. A prompt you send to a queued task (or a steer, Send now or retry) takes it " +
+          "off the same way. Needs the node running.",
+      },
+      {
         name: "task move",
         usage: ["task move <id> <node> [--now]", "task move <id> --now", "task move <id> --cancel"],
         summary: "Move a task, with its workspaces and conversation, to another node; or hurry or cancel its move.",
@@ -366,6 +394,29 @@ const GROUPS: Group[] = [
         details:
           "Refused for any other task. An archived task's lines are released, so their commits stay only where a " +
           "branch or another line holds them; a moved task's lines stay with the node that has it.",
+      },
+    ],
+  },
+  {
+    title: "Merge train",
+    commands: [
+      {
+        name: "train",
+        usage: ["train [<project>] [--follow]", "train pause [<project>]", "train resume [<project>]"],
+        summary: "Show a project's merge train, or pause or resume it.",
+        details:
+          "Prints why the train is paused (`paused: <reason>`), the queue in the order tasks were accepted (`task " +
+          "accept`) with each task's state (`queued`, `turn running`, `describing`, `rebasing onto main`, `in the " +
+          "batch`, `sitting out`, `waiting for <node>`) and, for one that sits out or is held back, why; then the round " +
+          "under way: its step (describing, picking, checking, landing or rebasing), its batch and the merge task " +
+          "checking it. With --follow it prints again each time something changes and ends once the queue is empty. " +
+          "<project> is an id or a name; without one it is the project of the checkout you are in, or else the pool's " +
+          "only project (a project named pause or resume is given by its id). `train pause` stops the train: a round " +
+          "under way lets its running turns finish, but nothing lands and no new round starts, until `train resume`, " +
+          "which also takes up a train paused by the merge agent's trouble (its reason shows as `paused: <reason>`). " +
+          "The train runs on the project's home, and these commands talk to it there: when the home is offline they say " +
+          "so, and the train waits for it. Watching it works while a pool update awaits confirmation; pausing and " +
+          "resuming do not. Needs the node running.",
       },
     ],
   },

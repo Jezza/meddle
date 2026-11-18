@@ -214,3 +214,47 @@ test("update says how a build is rolled out, refused and rolled back; status and
   const readme = await Bun.file(`${import.meta.dir}/../README.md`).text();
   for (const part of ["## Updating the pool", "`update.within`", "`update.health`", "bun run build --all"]) expect(readme).toContain(part);
 });
+
+test("task accept, task unqueue and train say what they do and take; the usage text and the overview list them", async () => {
+  expect(usageFor(["task", "accept"])).toBe("usage: meddle task accept <task-id>...\n\nmeddle help task accept says more.");
+  expect(usageFor(["task", "unqueue", "a", "b"])).toBe("usage: meddle task unqueue <task-id>...\n\nmeddle help task unqueue says more.");
+  // `train` has three forms; one with bad arguments narrows to its own.
+  expect(usageFor(["train", "pause", "a", "b"])).toBe("usage: meddle train pause [<project>]\n\nmeddle help train pause says more.");
+  expect(usageFor(["train", "--frob"])).toBe(
+    "usage: meddle train [<project>] [--follow]\n       meddle train pause [<project>]\n       meddle train resume [<project>]\n\nmeddle help train says more.",
+  );
+
+  const accept = await meddle(["help", "task", "accept"], await env());
+  expect(accept.code).toBe(0);
+  expect(accept.stdout).toStartWith("usage: meddle task accept <task-id>...\n");
+  const text = accept.stdout.replace(/\s+/g, " ");
+  for (const part of [
+    "queued <id> on <project>'s train", "default branch", "send or clear the waiting prompts first",
+    "accept handles one project for now; push to land the rest", "<node> runs an older meddle", "Watch the train with `train`",
+  ]) {
+    expect(text).toContain(part);
+  }
+  const unqueue = await meddle(["task", "unqueue", "--help"], await env());
+  expect(unqueue.stdout).toStartWith("usage: meddle task unqueue <task-id>...\n");
+  expect(unqueue.stdout.replace(/\s+/g, " ")).toContain("A prompt you send to a queued task");
+
+  // Any of its three forms asks for the train's help, which lists them all and says what each does.
+  const forms = "usage: meddle train [<project>] [--follow]\n       meddle train pause [<project>]\n       meddle train resume [<project>]\n";
+  const train = await meddle(["help", "train"], await env());
+  expect(train.code).toBe(0);
+  expect(train.stdout).toStartWith(forms);
+  expect((await meddle(["train", "resume", "--help"], await env())).stdout).toBe(train.stdout);
+  const about = train.stdout.replace(/\s+/g, " ");
+  for (const part of ["--follow", "once the queue is empty", "`paused: <reason>`", "the project's home", "offline", "round", "batch", "merge task"]) {
+    expect(about).toContain(part);
+  }
+
+  const all = await meddle(["help"], await env());
+  for (const form of ["task accept <task-id>...", "task unqueue <task-id>...", "train [<project>] [--follow]", "train pause [<project>]", "train resume [<project>]"]) {
+    expect(all.stdout).toContain(`  meddle ${form}\n`);
+  }
+  const usage = await meddle(["frob"], await env());
+  for (const form of ["task accept <task-id>...", "task unqueue <task-id>...", "train [<project>] [--follow]", "train pause|resume [<project>]"]) {
+    expect(usage.stderr).toContain(`meddle ${form}`);
+  }
+});
