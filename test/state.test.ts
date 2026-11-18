@@ -83,6 +83,8 @@ test("a client follows a task through a prompted turn over a link", async () => 
     expect(session.live.value).toBeNull();
     await until(task.contextUsage, (u) => u !== null);
     expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 376 } });
+    await until(task.context, (c) => c !== null);
+    expect(task.context.value).toEqual({ tokens: 376, model: "claude-haiku-5-5" });
     // The turn's rate_limit_event (hello.jsonl: 27% of five hours, 33% of seven days) is the token's reading.
     const usage = await until(node.activeUsage, (u) => u?.reading != null);
     const read = { fiveHour: { utilization: 0.27 }, sevenDay: { utilization: 0.33 } };
@@ -364,12 +366,20 @@ test("a task's activation reads its log summary from the newest events, and its 
     appendEvent(db, id, { type: "system", subtype: "status", permissionMode: "plan" });
     // A later status without a mode (a compaction notice) must not hide the mode change.
     appendEvent(db, id, { type: "system", subtype: "status", status: "compacting" });
-    for (let i = 0; i < 249; i++) appendEvent(db, id, { type: "assistant", n: i });
+    // The context is the newest main-thread call's: not a subagent's, nor a synthetic message's, nor one without usage.
+    appendEvent(db, id, {
+      type: "assistant", parent_tool_use_id: null,
+      message: { model: "claude-opus-5-5", usage: { input_tokens: 2, cache_read_input_tokens: 1000, cache_creation_input_tokens: 10 } },
+    });
+    appendEvent(db, id, { type: "assistant", parent_tool_use_id: "tu1", message: { model: "claude-haiku-5-5", usage: { input_tokens: 5 } } });
+    appendEvent(db, id, { type: "assistant", parent_tool_use_id: null, message: { model: "<synthetic>", usage: { input_tokens: 0 } } });
+    for (let i = 0; i < 246; i++) appendEvent(db, id, { type: "assistant", n: i });
     appendEvent(db, id, { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } } });
     const task = await client.get(TaskObject, { id });
     expect(task.lastSeq.value).toBe(255);
     expect(task.permissionMode.value).toBe("plan");
     expect(task.contextUsage.value).toMatchObject({ usage: { input_tokens: 1 } });
+    expect(task.context.value).toEqual({ tokens: 1012, model: "claude-opus-5-5" });
     const session = await client.get(SessionObject, { taskId: id });
     expect(session.window.value).toHaveLength(200);
     expect(session.window.value.at(-1)!.seq).toBe(254);

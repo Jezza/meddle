@@ -29,7 +29,8 @@ import {
   type Project,
 } from "../projects/project";
 import {
-  latestEventOfType, latestEventWithField, listEvents, listEventsOfKinds, listEventsTail, type EventRecord,
+  latestEventOfType, latestEventWithField, latestMainAssistant, listEvents, listEventsOfKinds, listEventsTail,
+  type EventRecord,
 } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
@@ -892,6 +893,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       agents,
       // Chord pushes a derived value only when it differs, so a progress frame leaves this alone for the sidebars.
       agentsRunning: self.derive([agents], (list) => runningCount(list)),
+      context: self.derive([log], (l) => l.context),
       move,
       movedTo,
       archivedOn,
@@ -1139,6 +1141,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       latestEventOfType(db, taskId, "system", "init"),
       latestEventWithField(db, taskId, "system", "status", "permissionMode"),
       latestEventOfType(db, taskId, "result"),
+      latestMainAssistant(db, taskId),
     ].filter((e) => e !== null).sort((a, b) => a.seq - b.seq);
     const log = foldTaskLog(EMPTY_TASK_LOG, latest);
     return { ...log, lastSeq: listEventsTail(db, taskId, { limit: 1 })[0]?.seq ?? 0 };
@@ -1171,9 +1174,12 @@ function questionText(req: PendingApproval): string {
 
 // ─── folding the event log into a task's log summary and a session's view ───
 
-const EMPTY_TASK_LOG: TaskLog = { lastSeq: 0, permissionMode: null, contextUsage: null };
+const EMPTY_TASK_LOG: TaskLog = { lastSeq: 0, permissionMode: null, contextUsage: null, context: null };
 
-/** `permissionMode` from the latest `system` `init` or `status`; `contextUsage` from the latest `result`. */
+/**
+ * `permissionMode` from the latest `system` `init` or `status`; `contextUsage` from the latest `result`; `context` from
+ * the latest main-thread assistant message with usage that Claude Code did not make up (`latestMainAssistant`).
+ */
 function foldTaskLog(log: TaskLog, events: EventRecord[]): TaskLog {
   const next = { ...log };
   for (const { seq, message } of events) {
@@ -1183,9 +1189,27 @@ function foldTaskLog(log: TaskLog, events: EventRecord[]): TaskLog {
       if (typeof m.permissionMode === "string") next.permissionMode = m.permissionMode;
     } else if (m.type === "result") {
       next.contextUsage = { usage: m.usage ?? null, modelUsage: m.modelUsage ?? null };
+    } else if (m.type === "assistant") {
+      const context = contextOf(m);
+      if (context !== null) next.context = context;
     }
   }
   return next;
+}
+
+type Usage = { input_tokens?: unknown; cache_read_input_tokens?: unknown; cache_creation_input_tokens?: unknown };
+
+/** The context a main-thread assistant message's call sent, or null for a subagent's, a synthetic one or no usage. */
+function contextOf(m: Message): TaskLog["context"] {
+  if (m.parent_tool_use_id != null) return null;
+  const message = m.message as { model?: unknown; usage?: Usage | null } | undefined;
+  const usage = message?.usage;
+  if (usage === undefined || usage === null || message?.model === "<synthetic>") return null;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  return {
+    tokens: n(usage.input_tokens) + n(usage.cache_read_input_tokens) + n(usage.cache_creation_input_tokens),
+    model: typeof message?.model === "string" ? message.model : null,
+  };
 }
 
 const EMPTY_SESSION: SessionView = { lastSeq: 0, window: [], live: null };
