@@ -565,6 +565,55 @@ export const TaskLogSchema = Type.Object({
 });
 export type TaskLog = Type.Static<typeof TaskLogSchema>;
 
+/**
+ * One sub-agent of a task, as served on its `TaskObject` (`servedAgents`). `id` is the `local_agent` task id and
+ * `toolUseId` the call that first started it; `seq` is that `task_started`'s, how far back the thread must load to
+ * show the agent's row. `startedAt` is when the current piece of work began (first start or follow-up). `commands` is
+ * the agent's own live background commands. `orphaned`: stopped by the stopped rule (no live turn to run it), not by a
+ * notice.
+ */
+export const AgentEntrySchema = Type.Object({
+  id: Type.String(),
+  toolUseId: Type.String(),
+  seq: Type.Number(),
+  description: Type.String(),
+  agentType: Nullable(Type.String()),
+  background: Type.Boolean(),
+  parent: Nullable(Type.String()),
+  state: Type.Union([Type.Literal("running"), Type.Literal("completed"), Type.Literal("failed"), Type.Literal("stopped")]),
+  orphaned: Type.Boolean(),
+  /** While running: the latest step, or "Waiting on N commands". */
+  doing: Nullable(Type.String()),
+  commands: Type.Number(),
+  tools: Type.Number(),
+  tokens: Type.Number(),
+  ms: Type.Number(),
+  startedAt: Type.String(),
+  endedAt: Nullable(Type.String()),
+});
+export type AgentEntry = Type.Static<typeof AgentEntrySchema>;
+
+/**
+ * An agent as the log has it: no `orphaned` or `commands` (served ones work those out), and `state` is the last
+ * notice's. `runSeq` is the seq of its latest `task_started`, wakes included.
+ */
+export const AgentRecordSchema = Type.Object({
+  ...Type.Omit(AgentEntrySchema, ["orphaned", "commands"]).properties,
+  runSeq: Type.Number(),
+});
+export type AgentRecord = Type.Static<typeof AgentRecordSchema>;
+
+/**
+ * What a `TaskObject` keeps of its task's agents from its event log: the seq of the latest `turn_started`, every
+ * agent, and the live background commands of each agent by its id.
+ */
+export const AgentLogSchema = Type.Object({
+  turnSeq: Type.Number(),
+  agents: Type.Array(AgentRecordSchema),
+  commands: Type.Record(Type.String(), Type.Number()),
+});
+export type AgentLog = Type.Static<typeof AgentLogSchema>;
+
 /** What a `SessionObject` keeps from its task's event log; `lastSeq` counts `stream_event`s too. */
 export const SessionViewSchema = Type.Object({
   lastSeq: Type.Number(),

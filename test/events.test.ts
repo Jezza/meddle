@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import type { Attachment } from "../src/blobs/attachment";
 import { promptEvent } from "../src/engine/session";
 import { openDb } from "../src/store/db";
-import { appendEvent, latestEventOfType, latestEventWithField, listEvents, listEventsTail, listPromptAttachments } from "../src/store/events";
+import { appendEvent, latestEventOfType, latestEventWithField, listEvents, listEventsOfKinds, listEventsTail, listPromptAttachments } from "../src/store/events";
 test("unknown message shapes are stored verbatim with sequence numbers", () => {
   const db = openDb(":memory:");
   expect(appendEvent(db, "t", { type: "assistant", uuid: "u1" })).toBe(1);
@@ -103,4 +103,15 @@ test("listPromptAttachments lists the task's own prompts' valid refs oldest firs
   appendEvent(db, "t", { type: "user", message: { content: "c" }, attachments: "none" });
   expect(listPromptAttachments(db, "t")).toEqual([log, shot]);
   expect(listPromptAttachments(db, "none")).toEqual([]);
+});
+
+test("listEventsOfKinds returns only the task's events of those type:subtype kinds, oldest first", () => {
+  const db = openDb(":memory:");
+  for (const m of [
+    { type: "system", subtype: "task_started" }, { type: "stream_event" }, { type: "meddle", subtype: "turn_started" },
+    { type: "system", subtype: "init" }, { type: "system", subtype: "task_started" },
+  ]) appendEvent(db, "t", m);
+  appendEvent(db, "u", { type: "system", subtype: "task_started" });
+  expect(listEventsOfKinds(db, "t", ["system:task_started", "meddle:turn_started"]).map((e) => e.seq)).toEqual([1, 3, 5]);
+  expect(listEventsOfKinds(db, "t", [])).toEqual([]);
 });

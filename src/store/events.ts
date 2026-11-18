@@ -80,6 +80,26 @@ export function listEventsTail(
   return rows.reverse().map((row) => ({ seq: row.seq, message: JSON.parse(row.json), at: row.at }));
 }
 
+/**
+ * The task's events of any of `kinds`, oldest first; a kind is `type:subtype`. One indexed read (`events_type`), so a
+ * long log of other events costs nothing. No kinds, no events.
+ */
+export function listEventsOfKinds(db: Database, taskId: string, kinds: readonly string[]): EventRecord[] {
+  if (kinds.length === 0) return [];
+  const params: string[] = [taskId];
+  const any = kinds.map((kind) => {
+    const at = kind.indexOf(":");
+    params.push(kind.slice(0, at), kind.slice(at + 1));
+    return "(type = ? AND subtype = ?)";
+  });
+  const rows = db
+    .query<{ seq: number; at: string; json: string }, string[]>(
+      `SELECT seq, at, json FROM events WHERE task_id = ? AND (${any.join(" OR ")}) ORDER BY seq`,
+    )
+    .all(...params);
+  return rows.map((row) => ({ seq: row.seq, message: JSON.parse(row.json), at: row.at }));
+}
+
 /** The task's newest event of `type` (and `subtype`, when given), or null. */
 export function latestEventOfType(db: Database, taskId: string, type: string, subtype?: string): EventRecord | null {
   const row = subtype === undefined
