@@ -1,5 +1,6 @@
 // One task: its head (title, state, actions), the thread from the session's event log with what waits on you inline,
-// the composer, and the bar beneath (each project with its line, the latest turn's tokens; the node, model and effort).
+// the composer, and the bar beneath (each project with its line, the latest turn's tokens; the node, permission mode, model and effort).
+import type { PermissionMode } from "@anthropic-ai/claude-agent-sdk";
 import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
 import { createContext, type RefObject } from "preact";
@@ -867,19 +868,34 @@ function Revision({ line }: { line: ProjectLine }) {
   );
 }
 
-/** The task's model and effort (the pool's defaults where it chose none). */
+const PERMISSION_MODES: readonly PermissionMode[] = ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"];
+
+/** The task's permission mode, then its model and effort (the pool's defaults where it chose none). */
 function Settings({ task, node, pool, disabled }: { task: TaskRef; node: NodeRef; pool: PoolRef; disabled: boolean }) {
   const models = useValue(node.models);
   const defaults = useValue(pool.defaults);
+  const permissionMode = useValue(task.permissionMode);
   const model = useValue(task.model);
   const effort = useValue(task.effort);
   const action = useAction();
   /** The model and the effort just picked, each shown until its change lands (or fails), so the pill does not snap back. */
   const [pickedModel, setPickedModel] = useState<string | null>(null);
   const [pickedEffort, setPickedEffort] = useState<string | null>(null);
+  /** The mode just picked, shown until the session reports a mode (an idle task only takes it at its next turn). */
+  const [pickedMode, setPickedMode] = useState<PermissionMode | null>(null);
+  useEffect(() => setPickedMode(null), [permissionMode]);
+  const mode = pickedMode ?? permissionMode;
   return (
     <>
       {action.error !== null && <span class="error" title={action.error}>!</span>}
+      <select class="pill" title="Permission mode" disabled={disabled} value={mode ?? ""} onChange={(e) => {
+        const next = e.currentTarget.value as PermissionMode;
+        setPickedMode(next);
+        void action.run(() => task.setPermissionMode({ mode: next })).then((ok) => { if (!ok) setPickedMode(null); });
+      }}>
+        {mode === null && <option value="">mode</option>}
+        {PERMISSION_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+      </select>
       <ModelPicker models={models} model={pickedModel ?? model ?? defaults.model} effort={pickedEffort ?? effort ?? defaults.effort}
         disabled={disabled}
         onModel={(next) => {
