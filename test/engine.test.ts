@@ -268,6 +268,56 @@ test("send now is refused by a Claude Code that does not offer it", async () => 
   await turn.done;
   expect(await sent).toBe("this Claude Code cannot send now");
 }, 15_000);
+test("take back withdraws a steer Claude Code holds, attachments and all: it is never logged, and the turn goes on without it", async () => {
+  const { db, input, fixture } = await setup();
+  const queue = new InputQueue();
+  const steer: Prompt = { text: STEER, attachments: [att] };
+  let taken: Promise<Prompt[]> | undefined;
+  const turn = runTurn({
+    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_STALL: "1" } }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(), queue,
+    // written first, so Claude Code holds it and only it can give it back
+    onMessage: (m) => { if (m.type === "assistant" && taken === undefined) { queue.push(steer); taken = queue.written().then(() => turn.takeBack()); } },
+  });
+  while (taken === undefined) await Bun.sleep(10);
+  expect(await taken).toEqual([steer]);
+  expect(queue.untaken()).toEqual([]);
+  await turn.query.interrupt();
+  expect(await turn.done).toMatchObject({ subtype: "error_during_execution" });
+  expect(listEvents(db, "abc").map(e => e.message as any).filter(m => m.type === "user").map(m => m.message.content)).toEqual(["Reply with the single word ok."]);
+}, 15_000);
+test("a steer Claude Code already took is not taken back", async () => {
+  const { db, input, fixture } = await setup();
+  const queue = new InputQueue();
+  let steer: string | undefined;
+  let taken: Promise<Prompt[]> | undefined;
+  const turn = runTurn({
+    input: { ...input, extraEnv: fixture("steer-fold") }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(), queue,
+    onMessage: (m) => {
+      if (m.type === "assistant" && steer === undefined) steer = queue.push({ text: STEER, attachments: [] });
+      if (m.type === "user" && (m as any).message.content === STEER && taken === undefined) taken = turn.takeBack();
+    },
+  });
+  expect(await turn.done).toMatchObject({ subtype: "success", result: "done\n\nPINEAPPLE" });
+  expect(await taken).toEqual([]);
+  expect(listEvents(db, "abc").map(e => e.message as any).filter(m => m.type === "user" && m.message.content === STEER)).toHaveLength(1);
+}, 15_000);
+test("taking back the steer a finished turn waits on ends the turn at once", async () => {
+  const { input, db, fixture } = await setup();
+  const queue = new InputQueue();
+  let taken: Promise<Prompt[]> | undefined;
+  let resultAt = 0;
+  const turn = runTurn({
+    input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(), queue,
+    onMessage: (m) => {
+      if (m.type === "assistant" && taken === undefined) queue.push({ text: STEER, attachments: [] });
+      if (m.type === "result" && taken === undefined) { resultAt = Date.now(); taken = turn.takeBack(); }
+    },
+  });
+  expect(await turn.done).toMatchObject({ result: "ok" });
+  expect(Date.now() - resultAt).toBeLessThan(2_000); // not the 5 s grace an untaken steer gets
+  expect(await taken).toEqual([{ text: STEER, attachments: [] }]);
+  expect(queue.untaken()).toEqual([]);
+}, 15_000);
 test("input queue: every prompt pushed is untaken, in order, until taken by its uuid; taken ones are told once", () => {
   const q = new InputQueue();
   const p = (text: string): Prompt => ({ text, attachments: [] });
@@ -335,6 +385,28 @@ test("input queue: written does not wait once there is no more input", async () 
   const written = q.written();
   await it.next();
   q.end(); // the turn is over while the reader still has "one"
+  expect(await settles(written)).toBe(true);
+});
+test("input queue: drop removes an unread prompt, and tells a read one from one that is gone", async () => {
+  const q = new InputQueue();
+  const p = (text: string): Prompt => ({ text, attachments: [] });
+  const a = q.push(p("a")), b = q.push(p("b"));
+  expect(q.drop(b)).toBe("dropped");
+  expect(q.untaken()).toEqual([{ uuid: a, prompt: p("a") }]);
+  const it = q[Symbol.asyncIterator]();
+  expect((await it.next()).value.uuid).toBe(a);
+  expect(q.drop(a)).toBe("written");
+  expect(q.drop(b)).toBe("gone");
+  q.take(a);
+  expect(q.drop(a)).toBe("gone");
+});
+test("input queue: dropping the last unread prompt tells written", async () => {
+  const q = new InputQueue();
+  const one = q.push({ text: "one", attachments: [] }), two = q.push({ text: "two", attachments: [] });
+  const written = q.written();
+  q.drop(one);
+  expect(await settles(written)).toBe(false); // "two" is still unread
+  q.drop(two);
   expect(await settles(written)).toBe(true);
 });
 test("approvals: pending until answered, unknown ids refused, listeners told", async () => {

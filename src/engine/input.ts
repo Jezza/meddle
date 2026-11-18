@@ -41,6 +41,21 @@ export class InputQueue implements AsyncIterable<SDKUserMessage> {
     return prompt;
   }
 
+  /**
+   * Withdraws the prompt sent as `uuid`: `"dropped"` when the reader had not read it yet, so it is gone from the input;
+   * `"written"` when it is untaken but already read (only Claude Code can give it back now); `"gone"` when it is not
+   * untaken (taken, dropped, or never sent here).
+   */
+  drop(uuid: string): "dropped" | "written" | "gone" {
+    if (!this.#untaken.has(uuid)) return "gone";
+    const at = this.#items.findIndex((item) => item.uuid === uuid);
+    if (at === -1) return "written";
+    this.#items.splice(at, 1);
+    this.#untaken.delete(uuid);
+    this.#tellWritten();
+    return "dropped";
+  }
+
   /** The prompts pushed and not taken, oldest first. */
   untaken(): Untaken[] {
     return [...this.#untaken].map(([uuid, prompt]) => ({ uuid, prompt }));

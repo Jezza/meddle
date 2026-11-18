@@ -170,7 +170,12 @@ export type RunTurnArgs = {
  * the running turn when Claude Code can fit them in, or else it cuts the turn short and runs them next. A steer pushed
  * just before is among them. Answers what Claude Code says it did; rejects for a Claude Code that does not offer it.
  */
-export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKResultMessage>; sendNow: () => Promise<SendNowOutcome | undefined> } {
+export function runTurn(args: RunTurnArgs): {
+  query: Query;
+  done: Promise<SDKResultMessage>;
+  sendNow: () => Promise<SendNowOutcome | undefined>;
+  takeBack: () => Promise<Prompt[]>;
+} {
   const { input } = args;
   const taskId = input.manifest.id;
   const record = recorder(args);
@@ -216,7 +221,8 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
       console.error(`meddle: the token fault of task ${taskId}'s turn could not be handled:`, err);
     }
   };
-  const done = drive(q, queue, uuid, args.signal, record, watch).then(
+  const ending: Ending = { recheck: () => {} };
+  const done = drive(q, queue, uuid, args.signal, record, watch, ending).then(
     (result) => { tell(); return result; },
     (err: unknown) => {
       if (!(err instanceof DOMException && err.name === "AbortError")) tell();
@@ -230,7 +236,22 @@ export function runTurn(args: RunTurnArgs): { query: Query; done: Promise<SDKRes
     const reply = await (q as unknown as ControlRequests).request({ subtype: "interrupt", send_now: true });
     return reply.response?.send_now;
   };
-  return { query: q, done, sendNow };
+  const takeBack = async (): Promise<Prompt[]> => {
+    const back: Prompt[] = [];
+    for (const { uuid, prompt } of queue.untaken()) {
+      const dropped = queue.drop(uuid);
+      if (dropped === "dropped") back.push(prompt);
+      if (dropped !== "written") continue;
+      // Claude Code can give back only what it has read: the steers pushed so far go to it first.
+      await queue.written();
+      const reply = await (q as unknown as ControlRequests).request({ subtype: "cancel_async_message", message_uuid: uuid }).catch(() => undefined);
+      // Not cancelled: Claude Code took it meanwhile (it is logged as taken), or cannot give it back.
+      if (reply?.response?.cancelled === true && queue.take(uuid) !== null) back.push(prompt);
+    }
+    ending.recheck();
+    return back;
+  };
+  return { query: q, done, sendNow, takeBack };
 }
 
 /** What Claude Code says a send now did: put what waits into the running turn, cut the turn for it, or found nothing. */
@@ -240,12 +261,17 @@ export type SendNowOutcome = "delivering" | "stopped" | "nothing_waiting";
 const SEND_NOW = "interrupt_send_now_v1";
 
 /**
- * How the SDK's Query sends a control request, which its types leave out: `interrupt()` cannot ask for `send_now`.
- * meddle pins the SDK and the Claude Code it carries (package.json), so both work as read here.
+ * How the SDK's Query sends a control request, which its types leave out: `interrupt()` cannot ask for `send_now`, and
+ * there is no method for `cancel_async_message` (Claude Code answers `cancelled: true` only when it dropped the message
+ * from its queue). meddle pins the SDK and the Claude Code it carries (package.json), so both work as read here.
  */
 type ControlRequests = {
   request(request: { subtype: "interrupt"; send_now: true }): Promise<{ response?: { send_now?: SendNowOutcome } }>;
+  request(request: { subtype: "cancel_async_message"; message_uuid: string }): Promise<{ response?: { cancelled?: boolean } }>;
 };
+
+/** Set by `drive`: ends the input when the turn has its `result` and nothing is left to keep it open (a take-back). */
+type Ending = { recheck: () => void };
 
 /** Appends an event to the task's log, then tells `onMessage`. */
 function recorder(args: RunTurnArgs): (m: SDKMessage | MeddleEvent) => void {
@@ -262,6 +288,7 @@ async function drive(
   signal: AbortSignal | undefined,
   record: (m: SDKMessage | MeddleEvent) => void,
   watch: (m: SDKMessage) => void,
+  ending: Ending,
 ): Promise<SDKResultMessage> {
   const it = q[Symbol.asyncIterator]();
 
@@ -287,6 +314,18 @@ async function drive(
     clearTimeout(graceTimer);
     graceOver = undefined;
   };
+  /** With the `result` in, every steer taken (or taken back) and no background work, the input closes: the child goes. */
+  const endIfDone = (): boolean => {
+    if (result === undefined || queue.untaken().length > 0 || background > 0) return false;
+    queue.end();
+    return true;
+  };
+  // A take-back can leave a finished turn with nothing to wait for. A steer Claude Code read after the `result` keeps
+  // the SDK from closing its input (it waits for that steer's turn, which a cancelled one never gets), so the turn ends
+  // now, as when the grace is over.
+  let cutShort = () => {};
+  const takenBackAll = new Promise<"grace">((resolve) => { cutShort = () => resolve("grace"); });
+  ending.recheck = () => { if (endIfDone()) cutShort(); };
   /** After a `result`, the grace runs while no background work is live. */
   const settle = () => {
     if (result === undefined) return;
@@ -302,7 +341,7 @@ async function drive(
     for (;;) {
       let step: IteratorResult<SDKMessage> | "aborted" | "grace";
       try {
-        step = await Promise.race([it.next(), aborted, ...(graceOver ? [graceOver] : [])]);
+        step = await Promise.race([it.next(), aborted, takenBackAll, ...(graceOver ? [graceOver] : [])]);
       } catch (err) {
         if (result !== undefined) return result; // shutdown noise after the result
         if (!signal?.aborted) throw err;
@@ -340,7 +379,7 @@ async function drive(
         // With every steer taken and no background work the input closes, so the child goes. An untaken steer keeps it
         // open for Claude Code, and so does background work, which Claude Code wakes for when it ends: then the input
         // stays open after it too, until the `result` of that wake.
-        if (queue.untaken().length === 0 && background === 0) queue.end();
+        endIfDone();
         settle();
       }
     }
