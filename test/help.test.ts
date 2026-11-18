@@ -230,7 +230,8 @@ test("task accept, task unqueue and train say what they do and take; the usage t
   const text = accept.stdout.replace(/\s+/g, " ");
   for (const part of [
     "queued <id> on <project>'s train", "default branch", "send or clear the waiting prompts first",
-    "accept handles one project for now; push to land the rest", "<node> runs an older meddle", "Watch the train with `train`",
+    "accept handles one project for now; push to land the rest",
+    "no such task: <id> (<node> runs an older meddle: its tasks are not listed)", "Watch the train with `train`",
   ]) {
     expect(text).toContain(part);
   }

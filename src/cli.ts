@@ -1267,21 +1267,13 @@ function runsOlder(nodes: readonly { nodeId: string; hostname: string }[], id: s
   return new Error(`${nodes.find((n) => n.nodeId === id)?.hostname || shortId(id)} runs an older meddle`);
 }
 
-/** `withTask` for a call of the train's: a task whose node is older than the train fails `<node> runs an older meddle`. */
-function withTrainTask(text: string, use: Parameters<typeof withTask>[1]): Promise<number> {
-  return withTask(text, async (client, socket, id, holder, pt) => {
-    try {
-      return await use(client, socket, id, holder, pt);
-    } catch (err) {
-      if (olderHolder(err)) throw runsOlder(pt.nodes, holder);
-      throw err;
-    }
-  });
-}
-
-/** Queues each task on its project's train, on the node holding it; prints `queued <id> on <project>'s train`. */
+/**
+ * Queues each task on its project's train, on the node holding it; prints `queued <id> on <project>'s train`. A task on a
+ * node older than the train is not found at all (`collectTasks`: chord refuses to bind that node's tasks), so the refusal
+ * is `no such task: <id> (<node> runs an older meddle: its tasks are not listed)`.
+ */
 function taskAccept(texts: string[]): Promise<number> {
-  return eachTask(texts, (text) => withTrainTask(text, async (client, _socket, id) => {
+  return eachTask(texts, (text) => withTask(text, async (client, _socket, id) => {
     const task = await client.get(TaskObject, { id });
     try {
       await task.accept({});
@@ -1296,7 +1288,7 @@ function taskAccept(texts: string[]): Promise<number> {
 
 /** Takes each task off its project's train, on the node holding it; prints `unqueued <id>`, or `<id> is not queued`. */
 function taskUnqueue(texts: string[]): Promise<number> {
-  return eachTask(texts, (text) => withTrainTask(text, async (client, _socket, id) => {
+  return eachTask(texts, (text) => withTask(text, async (client, _socket, id) => {
     const task = await client.get(TaskObject, { id });
     try {
       const queued = task.queue.value !== null;

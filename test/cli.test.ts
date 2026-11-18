@@ -862,6 +862,82 @@ test("train says when the project's home is offline: its train waits for it, and
   }
 }, 60_000);
 
+/**
+ * What a node of a meddle older than the train serves of `TaskObject` (no `queue`, `accept` or `unqueue`) and of
+ * `ProjectObject` (no `train`, `pause`, `resume` or `retry`), with the node's own `NodeObject` listing `taskIds`: a host
+ * that stands for B at the end of A's tunnel. Chord refuses to bind a client built with the train's members to it before
+ * anything is served, so the two older objects have no factory worth running.
+ */
+async function olderNodeHost(taskIds: string[]) {
+  const { createHost, remote } = await import("@earendil-works/chord");
+  const { NodeObject, ProjectObject, TaskObject } = await import("../src/state/contracts");
+  const { Value } = await import("typebox/value");
+  const without = <T extends Record<string, unknown>>(members: T, names: string[]) =>
+    Object.fromEntries(Object.entries(members).filter(([name]) => !names.includes(name)));
+  const task = TaskObject.def.variants.default;
+  const project = ProjectObject.def.variants.default;
+  const OlderTask = remote("meddle.task", {
+    ...TaskObject.def, variants: { default: { state: without(task.state, ["queue"]), methods: without(task.methods, ["accept", "unqueue"]) } },
+  } as never);
+  const OlderProject = remote("meddle.project", {
+    ...ProjectObject.def, variants: { default: { state: without(project.state, ["train"]), methods: without(project.methods, ["pause", "resume", "retry"]) } },
+  } as never);
+  const host = createHost({ name: "node", self: "node" });
+  // The node's own object, as it is: every state member a value its schema takes, `taskIds` the ones given.
+  host.serve(NodeObject, (_input, _principal, self) => ({
+    variant: "default",
+    ...Object.fromEntries(Object.entries(NodeObject.def.variants.default.state).map(([name, schema]) => [
+      name, self.state(name, schema as never, { init: () => (name === "taskIds" ? taskIds : Value.Create(schema as never)) as never }),
+    ])),
+    ...Object.fromEntries(Object.keys(NodeObject.def.variants.default.methods).map((name) => [name, () => { throw new Error(name); }])),
+  }) as never);
+  const never = () => { throw new Error("not bound"); };
+  host.serve(OlderTask, never as never);
+  host.serve(OlderProject, never as never);
+  return host;
+}
+
+test("a task on a node older than the train is not found, and the refusal names that node; train at an older home says so", async () => {
+  const { acceptDashboardStreams } = await import("../src/dashboard/tunnel");
+  const { A, B, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  const onB = await createTask(B, { title: "Add c.txt", projectIds: [B.project.id] });
+  const older = await olderNodeHost([onB.id]);
+  // B's tunnel is served by what an older B would serve.
+  const stopTunnels = acceptDashboardStreams(B.net, older, (id) => B.store.isMember(id));
+  try {
+    await peerReady(A, B);
+    const env = { HOME: A.home, MEDDLE_DATA_DIR: A.cfg.dataDir, MEDDLE_PORT: new URL(dashboard.url).port };
+    const label = `${shortId(B.id)} (${A.store.row(B.id)!.hostname})`;
+    const unlisted = `${label} runs an older meddle: its tasks are not listed`;
+    for (const verb of ["accept", "unqueue"]) {
+      expect(await meddle(["task", verb, onB.id], env)).toEqual({ stdout: "", stderr: `meddle: no such task: ${onB.id} (${unlisted})\n`, code: 1 });
+    }
+    // With several, the task it is for goes before it, as for any refusal; a task here is still taken.
+    const here = await createTask(A, { title: "Add a.txt", projectIds: [A.project.id] });
+    await withFile(A, here.id, "a.txt");
+    pauseTrain(A.db, A.project.id, "held by the test");
+    expect(await meddle(["task", "accept", onB.id, here.id], env)).toEqual({
+      stdout: `queued ${here.id} on a's train\n`, stderr: `meddle: ${onB.id}: no such task: ${onB.id} (${unlisted})\n`, code: 1,
+    });
+    // `task list` says the same of that node, and lists the others'.
+    const list = await meddle(["task", "list"], env);
+    expect(list.stderr).toBe(`${unlisted}\n`);
+    expect(list.stdout).toContain(here.id);
+
+    // Its project's train cannot be asked of it either: the home is named, by its hostname.
+    expect(await meddle(["train", B.project.id], env)).toEqual({
+      stdout: "", stderr: `meddle: ${A.store.row(B.id)!.hostname} runs an older meddle\n`, code: 1,
+    });
+    expect(await meddle(["train", "pause", B.project.id], env)).toMatchObject({ stdout: "", code: 1 });
+  } finally {
+    stopTunnels();
+    await older.close();
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);
+
 test("train --follow prints the train as it changes and ends once its queue is empty; with nothing queued it ends at once", async () => {
   const { nodes, close } = await poolNodes(1);
   const A = nodes[0]!;

@@ -343,10 +343,11 @@ const GROUPS: Group[] = [
           "goes on. A task leaves the train again when you unqueue it, send it a prompt (or steer or retry it) or " +
           "archive it, or when the train gives up on it; the dashboard then says why. Watch the train with `train`. " +
           "Each task is tried on its own: one that is refused (`send or clear the waiting prompts first`, `accept " +
-          "handles one project for now; push to land the rest` for a task of several projects, `nothing to land: the " +
-          "task's work is already on <branch>`, or `<node> runs an older meddle` for a task on a node older than the " +
-          "train) is reported on stderr, with its id when there are several, and the exit status is 1 once any was. " +
-          "Needs the node running.",
+          "handles one project for now; push to land the rest` for a task of several projects, or `nothing to land: the " +
+          "task's work is already on <branch>`) is reported on stderr, with its id when there are several, and the exit " +
+          "status is 1 once any was. A task on a node older than the train is not found at all: that node's tasks " +
+          "cannot be listed, and the refusal is `no such task: <id> (<node> runs an older meddle: its tasks are not " +
+          "listed)`. Needs the node running.",
       },
       {
         name: "task unqueue",
@@ -356,7 +357,8 @@ const GROUPS: Group[] = [
           "Takes any number of task ids (or unique prefixes), from any node, and prints `unqueued <id>` for each that was " +
           "queued, `<id> is not queued` for one that was not. When the task is in the batch the train is working on, " +
           "the round starts over without it. A prompt you send to a queued task (or a steer, Send now or retry) takes it " +
-          "off the same way. Needs the node running.",
+          "off the same way. A task on a node older than the train is refused as `task accept` refuses it. Needs the node " +
+          "running.",
       },
       {
         name: "task move",
@@ -415,7 +417,7 @@ const GROUPS: Group[] = [
           "under way lets its running turns finish, but nothing lands and no new round starts, until `train resume`, " +
           "which also takes up a train paused by the merge agent's trouble (its reason shows as `paused: <reason>`). " +
           "The train runs on the project's home, and these commands talk to it there: when the home is offline they say " +
-          "so, and the train waits for it. Watching it works while a pool update awaits confirmation; pausing and " +
+          "so, and the train waits for it; when it runs a meddle older than the train, `<node> runs an older meddle`. Watching it works while a pool update awaits confirmation; pausing and " +
           "resuming do not. Needs the node running.",
       },
     ],
