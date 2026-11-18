@@ -16,7 +16,7 @@ import { paths } from "../paths";
 import { shortId } from "../pool/ids";
 import { remoteReason } from "../pool/object";
 import { dedupe } from "../pool/report";
-import { branchChanges, lineChanges, listLineRows, type LineRow } from "../pool/rows";
+import { branchChanges, lineChanges, listLineRows, topic, type LineRow } from "../pool/rows";
 import type { PoolRuntime } from "../pool/runtime";
 import { advanceBranch } from "../projects/advance";
 import { catchUp } from "../projects/applier";
@@ -147,9 +147,38 @@ function readTrain(db: Database, projectId: string): TrainRow {
   return { paused: r.paused, sitting: parsed(r.sitting, {}), held: parsed(r.held, {}), round: parsed<SavedStep | null>(r.round, null) };
 }
 
+const changeTopic = topic<string>();
+const updateTopic = topic<string>();
+const noticeTopic = topic<TrainNotice>();
+
+/** Fires with a project's id when its train was paused or resumed, or a task of it retried, on this node. */
+export const trainChanges: Subscribable<string> = changeTopic.subscribable;
+
+/**
+ * Fires with a project's id whenever its train's row changed on this node: what `trainChanges` tells, and a round's
+ * step or end, a task sitting out, held back or let go. The train's state (`trainState`) may differ then. Fires for the
+ * trains of every node in the process, so a listener checks that the project's home is its own node.
+ */
+export const trainUpdates: Subscribable<string> = updateTopic.subscribable;
+
+/**
+ * A task the train left for the user to see to: it sits out (`sitting`: Retry brings it back) or is held back for work
+ * that isn't queued (`held`). `text` is what the dashboard's notice says.
+ */
+export type TrainNotice = { projectId: string; taskId: string; kind: "sitting" | "held"; text: string };
+
+/**
+ * Fires when the conductor sets a task sitting out (not for `waiting for <node>`, which ends by itself) or holds one
+ * back. A task the next round holds back again is told again, and the listener keeps the notice from showing twice.
+ * Fires for the trains of every node in the process, as `trainUpdates` does.
+ */
+export const trainNotices: Subscribable<TrainNotice> = noticeTopic.subscribable;
+
+const tell = changeTopic.tell;
+
 /** Changes project `projectId`'s train row as `change` says, in one transaction (made when it has none). */
 function updateTrain(db: Database, projectId: string, change: (t: TrainRow) => TrainRow): TrainRow {
-  return db.transaction(() => {
+  const t = db.transaction(() => {
     const t = change(readTrain(db, projectId));
     db.query(
       `INSERT INTO trains (project, paused, sitting, held, round) VALUES (?, ?, ?, ?, ?)
@@ -158,30 +187,12 @@ function updateTrain(db: Database, projectId: string, change: (t: TrainRow) => T
     ).run(projectId, t.paused, JSON.stringify(t.sitting), JSON.stringify(t.held), t.round === null ? null : JSON.stringify(t.round));
     return t;
   }).immediate();
+  updateTopic.tell(projectId);
+  return t;
 }
 
 function without(entries: Record<string, string>, drop: (taskId: string) => boolean): Record<string, string> {
   return Object.fromEntries(Object.entries(entries).filter(([taskId]) => !drop(taskId)));
-}
-
-const trainListeners = new Set<(projectId: string) => void>();
-
-/** Fires with a project's id when its train was paused or resumed, or a task of it retried, on this node. */
-export const trainChanges: Subscribable<string> = {
-  subscribe(cb) {
-    trainListeners.add(cb);
-    return () => { trainListeners.delete(cb); };
-  },
-};
-
-function tell(projectId: string): void {
-  for (const cb of [...trainListeners]) {
-    try {
-      cb(projectId);
-    } catch {
-      // A listener's failure is its own.
-    }
-  }
 }
 
 /**
@@ -873,12 +884,16 @@ class Conductor {
       },
       sitOut: async (taskId, reason) => {
         live();
+        const title = await this.#title(project, taskId);
+        live();
         // A turn the hold refused is no failure of the task's.
-        if (!round.heldTasks.has(taskId)) this.#sitOut(project, taskId, reason);
+        if (round.heldTasks.has(taskId) || !this.#sitOut(project, taskId, reason)) return;
+        noticeTopic.tell({ projectId, taskId, kind: "sitting", text: `${title} is sitting out: ${reason}` });
       },
       holdBack: async (taskId, notice) => {
         live();
         updateTrain(this.#db, projectId, (t) => ({ ...t, held: { ...t.held, [taskId]: notice } }));
+        noticeTopic.tell({ projectId, taskId, kind: "held", text: notice });
       },
       checkpoint,
       createMergeTask: async (input) => {
@@ -1007,11 +1022,12 @@ class Conductor {
     updateTrain(this.#db, project.id, (t) => ({ ...t, sitting: without(t.sitting, gone), held: without(t.held, gone) }));
   }
 
-  /** Task `taskId` sits out for `reason`, while it is queued. */
-  #sitOut(project: Project, taskId: string, reason: string): void {
+  /** Task `taskId` sits out for `reason`, while it is queued: whether it does. */
+  #sitOut(project: Project, taskId: string, reason: string): boolean {
     const row = this.#ownLine(project, taskId);
-    if (row === undefined || row.queuedAt === null || row.archived) return;
+    if (row === undefined || row.queuedAt === null || row.archived) return false;
     updateTrain(this.#db, project.id, (t) => ({ ...t, sitting: { ...t.sitting, [taskId]: reason } }));
+    return true;
   }
 
   /**

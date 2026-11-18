@@ -114,12 +114,22 @@ export const ModelSchema = Type.Object({
   efforts: Type.Array(Type.String()),
 });
 
+/**
+ * A notice of the node (`NodeObject.notifications`). `train` is the merge train telling of a task: it left the train, sits
+ * out of it or is held back. `action` is what the notice offers beside opening the task: `accept` (Accept again, a task
+ * that left), `retry` (the project's Retry of a task sitting out, called on the node showing the notice, which runs the
+ * train); none for a task held back, which accepting the task it includes work from, or unqueuing it, settles.
+ */
 export const NotificationSchema = Type.Object({
   id: Type.String(),
   at: Type.String(),
   taskId: Type.String(),
-  kind: Type.Union([Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed"), Type.Literal("move"), Type.Literal("token")]),
+  kind: Type.Union([
+    Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed"), Type.Literal("move"),
+    Type.Literal("token"), Type.Literal("train"),
+  ]),
   text: Type.String(),
+  action: Type.Optional(Type.Union([Type.Literal("accept"), Type.Literal("retry")])),
 });
 export type Notification = Type.Static<typeof NotificationSchema>;
 
@@ -326,6 +336,23 @@ export const MemoryEntrySchema = Type.Object({
   last: Nullable(MemoryChangeSchema),
 });
 
+/**
+ * A project's merge train (`TrainState`): why it is paused (null: it runs), where its round is (null when none is under
+ * way or left unfinished), and its queue in the order tasks were accepted. A queued task's `state` is `queued`, `turn
+ * running`, `describing`, `rebasing onto main`, `in the batch`, `sitting out` or `waiting for <node>`; its `reason` is why
+ * it sits out (or waits for its node), or, for a task `queued` that is held back, the notice that says so.
+ */
+export const TrainStateSchema = Type.Object({
+  paused: Nullable(Type.String()),
+  round: Nullable(Type.Object({
+    step: Type.Union([Type.Literal("describing"), Type.Literal("picking"), Type.Literal("checking"), Type.Literal("landing"), Type.Literal("rebasing")]),
+    batch: Type.Array(Type.String()),
+    /** The merge task checking the batch, once made. */
+    mergeTask: Nullable(Type.String()),
+  })),
+  queued: Type.Array(Type.Object({ taskId: Type.String(), state: Type.String(), reason: Nullable(Type.String()) })),
+});
+
 export const ProjectObject = remote("meddle.project", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
@@ -354,6 +381,13 @@ export const ProjectObject = remote("meddle.project", {
          * memory again, not a change id.
          */
         memoryHead: Nullable(Type.String()),
+        /**
+         * The project's merge train, as its home runs it (`trainState`): re-read when the train's row changes, a task
+         * of the project changes state, and when the project's rows change. Meaningful on the project's home only: any
+         * other node serves it empty (`{ paused: null, round: null, queued: [] }`), so read the home's copy. A node
+         * older than the train serves no `train`: read a missing member as empty.
+         */
+        train: TrainStateSchema,
       },
       methods: {
         // The reads of the project's memory work on any node holding its memory repo (refused without one); a path
@@ -383,6 +417,16 @@ export const ProjectObject = remote("meddle.project", {
          */
         writeMemory: method(Type.Object({ path: Type.String(), text: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
         deleteMemory: method(Type.Object({ path: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
+        // The train's calls work on the project's home only, which runs it (refused `not-home: …` elsewhere).
+        /**
+         * Pauses the project's train for `reason` (default `you paused it`): a round under way lets its running turns
+         * finish, but nothing lands and no new round starts, until Resume. Pausing a paused train changes its reason.
+         */
+        pause: method(Type.Object({ reason: Type.Optional(Type.String()) })),
+        /** Lets a paused train run: Resume, and Retry of a train the merge agent's trouble paused. */
+        resume: method(Type.Object({})),
+        /** Brings task `taskId` back from sitting out: it is eligible again, and a round starts. */
+        retry: method(Type.Object({ taskId: Type.String() })),
       },
     },
   },

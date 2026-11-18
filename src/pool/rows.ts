@@ -51,7 +51,7 @@ export const rowChanges: Subscribable<string> = {
 };
 
 /** A Subscribable of `T` and the call that tells its listeners, each failure of one its own. */
-function topic<T>(): { subscribable: Subscribable<T>; tell(value: T): void } {
+export function topic<T>(): { subscribable: Subscribable<T>; tell(value: T): void } {
   const subscribers = new Set<(value: T) => void>();
   return {
     subscribable: {

@@ -33,13 +33,13 @@ import {
   type EventRecord,
 } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
-import { TurnsHeld, UNQUEUED_BY_USER, type MoveState, type TaskRunner, type TaskState } from "../tasks/durable";
+import { TurnsHeld, UNQUEUED_ARCHIVED, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER, type MoveState, type TaskRunner, type TaskState } from "../tasks/durable";
 import {
   ChangesError, changeDiff, changeFile, changesProbe, taskChanges, workspaceFile, type ChangesProbe, type ProjectChanges,
 } from "../tasks/changes";
 import { taskNamespace, type ManifestProject, type Start, type TaskManifest } from "../tasks/manifest";
 import { initialTitle } from "../tasks/names";
-import { startTrains, TURNS_HELD } from "../train/train";
+import { pauseTrain, retryTask, startTrains, trainNotices, trainState, trainUpdates, TURNS_HELD, type TrainState } from "../train/train";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { activeUsage as activeUsageNow, tokenUsages } from "../token-usage";
@@ -94,6 +94,12 @@ type ChangesProbes = {
 };
 
 const NOTIFICATIONS_KEPT = 50;
+/** A project's train as a node that does not run it serves it. */
+const NO_TRAIN: TrainState = { paused: null, round: null, queued: [] };
+/** What the user's own Pause says it is for, given none. */
+const PAUSED_BY_USER = "you paused it";
+/** Why a task leaves the train when the user took it off: no news to tell. */
+const UNQUEUED_AS_ASKED: ReadonlySet<string> = new Set([UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]);
 /**
  * How often an object re-reads what can change without an event telling it (a peer's push, the user's git or jj): a
  * project's graph, branches and memory, a task's lines.
@@ -111,6 +117,11 @@ const OLDER_GRAPH_MAX = 2000;
  */
 function memoryRefusal(code: string, message: string): ChordError {
   return new ChordError("unavailable", `${code}: ${message}`);
+}
+
+/** A refusal of a train call made where the train does not run: the project's home does. */
+function notHome(project: Pick<Project, "name" | "home">): ChordError {
+  return new ChordError("unavailable", `not-home: the train of ${project.name} runs on its home ${shortId(project.home)}`);
 }
 
 export type PeerObjectDeps = {
@@ -389,6 +400,20 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const note = { id: crypto.randomUUID(), at: new Date().toISOString(), ...n };
       notifications.replace(ctx, [...notifications.value, note].slice(-NOTIFICATIONS_KEPT));
     };
+
+    // A task the train took off its queue says so; one the user took off (Unqueue, a prompt, an archive) is no news.
+    self.on("trainLeaves", queueChanges, ({ taskId, reason }, ctx) => {
+      if (reason === null || UNQUEUED_AS_ASKED.has(reason)) return;
+      notify(ctx, { taskId, kind: "train", text: `${getTask(db, taskId)?.title ?? taskId} left meddle's train: ${reason}`, action: "accept" });
+    });
+    // A task of a train homed here that sits out, or is held back, says so. A process holds several nodes in tests and
+    // every one hears of every train, so only the home's own are raised. A task the next round holds back again keeps
+    // its notice while that shows.
+    self.on("trainNotices", trainNotices, (n, ctx) => {
+      if (getProject(db, n.projectId)?.home !== pool.identity.id) return;
+      if (notifications.value.some((x) => x.kind === "train" && x.taskId === n.taskId && x.text === n.text)) return;
+      notify(ctx, { taskId: n.taskId, kind: "train", text: n.text, ...(n.kind === "sitting" ? { action: "retry" as const } : {}) });
+    });
 
     self.on("events", events, async ({ taskId, message }, ctx) => {
       const m = message as Message;
@@ -670,11 +695,29 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     };
     const graph = self.state("graph", ProjectObject.def.variants.default.state.graph, { init: graphNow });
     const refreshGraph = latest(graphNow, graph);
-    self.on("projects", projectChanges, (_event, ctx) => refreshGraph(ctx));
+    /**
+     * The project's train: the home's own (`trainState`), and on any other node empty, as the train runs on the home
+     * only and its rows are not kept elsewhere.
+     */
+    const trainNow = (): TrainState => (getProject(db, id)?.home === pool.identity.id ? trainState(db, id) : NO_TRAIN);
+    const train = self.state("train", ProjectObject.def.variants.default.state.train, { init: trainNow });
+    const refreshTrain = (ctx: Ctx) => {
+      const now = trainNow();
+      if (JSON.stringify(now) !== JSON.stringify(train.value)) train.replace(ctx, now);
+    };
+    self.on("projects", projectChanges, (_event, ctx) => {
+      refreshTrain(ctx);
+      return refreshGraph(ctx);
+    });
     // A task of this project changed state: a turn's end moved (and pushed) its line, or a move fetched or forgot one.
     self.on("taskStates", states, ({ taskId }, ctx) => {
-      if (taskHasProject(taskId, id)) return refreshGraph(ctx);
+      if (!taskHasProject(taskId, id)) return;
+      refreshTrain(ctx);
+      return refreshGraph(ctx);
     });
+    self.on("trainUpdates", trainUpdates, (projectId, ctx) => { if (projectId === id) refreshTrain(ctx); });
+    // What changed between the cell's init and the listeners starting.
+    self.task(async (ctx) => refreshTrain(ctx));
     // Bookmarks a peer pushes into the replica's `.git`, or the user's git, tell nothing: a slow re-read (which imports
     // the git refs first) catches them.
     self.on("ticks", slowTicks, (_event, ctx) => refreshGraph(ctx));
@@ -692,6 +735,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     // An archive flips a line row: its line leaves the graph.
     self.on("rows", rowChanges, async (projectId, ctx) => {
       if (projectId !== id) return;
+      // A task queued or unqueued is a row change.
+      refreshTrain(ctx);
       await refreshBranches(ctx);
       await refreshGraph(ctx);
     });
@@ -748,6 +793,14 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       }
     };
 
+    /** The project's, on whose home its train runs: the train's calls are refused elsewhere. */
+    const homeTrain = (): Project => {
+      const found = getProject(db, id);
+      if (found === null) throw new ChordError("unavailable", `unknown: no project ${id}`);
+      if (found.home !== pool.identity.id) throw notHome(found);
+      return found;
+    };
+
     return {
       variant: "default",
       id: self.derive([project], (p) => p.id),
@@ -760,6 +813,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       graph,
       branches,
       memoryHead,
+      train,
       memoryEntries: async () => memoryEntries(cfg, await readable()),
       memoryFile: async ({ path, change }) => memoryFile(cfg, await readable(), memoryPath(path), change),
       memoryHistory: async ({ before, limit, path }) => memoryHistory(cfg, await readable(), {
@@ -777,6 +831,18 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       ...gated({
         writeMemory: ({ path, text, base }: { path: string; text: string; base: string | null }) => write(path, text, base),
         deleteMemory: ({ path, base }: { path: string; base: string | null }) => write(path, null, base),
+        pause: ({ reason }: { reason?: string }) => {
+          homeTrain();
+          pauseTrain(db, id, reason?.trim() || PAUSED_BY_USER);
+        },
+        resume: () => {
+          homeTrain();
+          pauseTrain(db, id, null);
+        },
+        retry: ({ taskId }: { taskId: string }) => {
+          homeTrain();
+          retryTask(db, id, taskId);
+        },
       }, deps.inputHold),
     };
   });
