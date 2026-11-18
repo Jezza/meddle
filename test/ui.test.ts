@@ -13,7 +13,7 @@ import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, 
 import { composerKey } from "../src/dashboard/ui/composer-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
-import { blobUrl, type Draft, draftAttachments, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
+import { blobUrl, type Draft, draftAttachments, guardDrops, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
 import type { Attachment } from "../src/blobs/attachment";
 
 test("the dashboard bundle builds", async () => {
@@ -469,4 +469,37 @@ test("pastedFiles takes a clipboard's files only when it holds no plain text", (
   expect(pastedFiles({ text: "a\tb", files: ["image.png"] })).toEqual([]);
   expect(pastedFiles({ text: "", files: ["image.png", "b.log"] })).toEqual(["image.png", "b.log"]);
   expect(pastedFiles({ text: "hello", files: [] })).toEqual([]);
+});
+
+/** A drag event as the page gets it, carrying `types`. */
+function dragEvent(type: "dragover" | "drop", types: string[]): Event & { dataTransfer: { types: string[]; dropEffect: string } } {
+  const e = new Event(type, { cancelable: true });
+  Object.defineProperty(e, "dataTransfer", { value: { types, dropEffect: "copy" } });
+  return e as Event & { dataTransfer: { types: string[]; dropEffect: string } };
+}
+
+test("a file dragged or dropped off a composer never replaces the dashboard; text and a composer's own drop are left alone", () => {
+  const page = new EventTarget();
+  const stop = guardDrops(page);
+  const over = dragEvent("dragover", ["Files"]);
+  const drop = dragEvent("drop", ["Files"]);
+  page.dispatchEvent(over);
+  page.dispatchEvent(drop);
+  expect([over.defaultPrevented, over.dataTransfer.dropEffect, drop.defaultPrevented]).toEqual([true, "none", true]);
+  // a drag of text is the browser's
+  const text = dragEvent("drop", ["text/plain"]);
+  page.dispatchEvent(text);
+  expect(text.defaultPrevented).toBe(false);
+  stop();
+  const after = dragEvent("drop", ["Files"]);
+  page.dispatchEvent(after);
+  expect(after.defaultPrevented).toBe(false);
+
+  // a composer that takes files had the drag first: it stays a place to drop them
+  const withComposer = new EventTarget();
+  withComposer.addEventListener("dragover", (e) => e.preventDefault());
+  guardDrops(withComposer);
+  const onComposer = dragEvent("dragover", ["Files"]);
+  withComposer.dispatchEvent(onComposer);
+  expect([onComposer.defaultPrevented, onComposer.dataTransfer.dropEffect]).toEqual([true, "copy"]);
 });

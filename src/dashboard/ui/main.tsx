@@ -17,9 +17,13 @@ import { type NodeRef, type PoolIndex, usePoolIndex } from "./sources";
 import { TaskView } from "./Task";
 import { Blind, UpdateBar, useUpdate } from "./Update";
 import { buildAlerts, type UpdateView } from "./update-model";
+import { guardDrops } from "./attach-model";
 import { shortId } from "../../pool/ids";
 
 const NO_ALERTS: ReadonlyMap<string, string> = new Map();
+
+// A file dropped beside a composer (or on one that takes none) would otherwise replace the dashboard with it.
+guardDrops(document);
 
 const socket = nodeSocket("/ws");
 // This node's own server changed its link protocol (it was upgraded): a reload picks up its new bundle.

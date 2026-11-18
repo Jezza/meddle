@@ -3,7 +3,7 @@
 // names it on by hash; the node a prompt goes to fetches what it lacks.
 import { useEffect, useRef, useState } from "preact/hooks";
 import { type Attachment, MAX_BLOB_BYTES } from "../../blobs/attachment";
-import { blobUrl, type Draft, nameFor, pastedFiles, shownInline, sizeText } from "./attach-model";
+import { blobUrl, carriesFiles, type Draft, nameFor, pastedFiles, shownInline, sizeText } from "./attach-model";
 import { errorText } from "./hooks";
 import { Iconoir } from "./icons";
 
@@ -75,13 +75,12 @@ export function useDrafts(): Drafts {
 }
 
 /**
- * Paste and drop for a composer (`on`: whether it takes files at all). A paste of files with no plain text beside them
- * (`pastedFiles`), and files dropped on it, go to `onFiles`; a text paste or a text dragged within it is left to the
- * browser. `dragging`: files are over it.
+ * Paste and drop for a composer (`on`: whether it takes files at all). A paste of files (`pastedFiles`), and files
+ * dropped on it, go to `onFiles`; a text paste or a text dragged within it is left to the browser. `dragging`: files are
+ * over it. Files dropped anywhere else, this composer when it takes none included, the page refuses (`guardDrops`).
  */
 export function useFileTarget(onFiles: (files: File[]) => void, on: boolean) {
   const [over, setOver] = useState(false);
-  const carriesFiles = (e: DragEvent) => e.dataTransfer?.types.includes("Files") === true;
   if (!on) return { dragging: false, handlers: {} };
   return {
     dragging: over,

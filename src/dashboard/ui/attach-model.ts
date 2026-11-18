@@ -52,6 +52,34 @@ export function pastedFiles<F>(clipboard: { text: string; files: readonly F[] })
   return clipboard.text === "" ? [...clipboard.files] : [];
 }
 
+/** Whether a drag carries files (from outside the page), not text or a link. */
+export function carriesFiles(e: { dataTransfer: DataTransfer | null }): boolean {
+  return e.dataTransfer?.types.includes("Files") === true;
+}
+
+/**
+ * Keeps files dropped anywhere on `page` but on a composer that takes them from replacing the dashboard, as the browser
+ * would open them in its tab: elsewhere a drag of files shows it cannot drop, and a drop does nothing. A composer's own
+ * handlers come first and are left as they are; a drag of text is the browser's. Returns the removal.
+ */
+export function guardDrops(page: EventTarget): () => void {
+  const over = (e: Event) => {
+    const drag = e as DragEvent;
+    if (drag.defaultPrevented || !carriesFiles(drag)) return;
+    drag.preventDefault();
+    drag.dataTransfer!.dropEffect = "none";
+  };
+  const drop = (e: Event) => {
+    if (carriesFiles(e as DragEvent)) e.preventDefault();
+  };
+  page.addEventListener("dragover", over);
+  page.addEventListener("drop", drop);
+  return () => {
+    page.removeEventListener("dragover", over);
+    page.removeEventListener("drop", drop);
+  };
+}
+
 /** The name a picked, dropped or pasted file goes by: its own made safe, or, with none, `pasted-<time>.<ext>`. */
 export function nameFor(file: { name: string; type: string }, at: Date): string {
   return file.name === "" ? pastedName(file.type, at) : cleanName(file.name);
