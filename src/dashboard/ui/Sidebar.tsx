@@ -133,7 +133,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
         {task.agents > 0 && (
           <span class="agent-count" title={`${task.agents} ${task.agents === 1 ? "agent" : "agents"} running`}><Glyph name="agent" />{task.agents}</span>
         )}
-        {others !== null && <span class="chip">{others}</span>}
+        {others !== null && <span class="tag">{others}</span>}
         <span class={`where${moving ? " moving" : ""}`}>{where}</span>
         <button class="more" title="Actions" onClick={openMenu}>⋯</button>
       </a>

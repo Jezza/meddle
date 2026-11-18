@@ -875,7 +875,7 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
       <h4>Claude asks</h4>
       {questions.map((q) => (
         <div class="question" key={q.question}>
-          <div class="question-head"><span class="chip">{q.header}</span> {q.question}</div>
+          <div class="question-head"><span class="tag">{q.header}</span> {q.question}</div>
           {q.options.map((o) => (
             <label key={o.label} class="option">
               <input
@@ -916,7 +916,7 @@ function Queued({ prompt }: { prompt: Prompt }) {
   return (
     <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one; Ctrl+Enter in an empty box sends it now; ↑ or Esc in the box takes it back to edit">
       <PromptBody text={prompt.text} attachments={prompt.attachments} />
-      <span class="chip">queued</span>
+      <span class="tag">queued</span>
     </div>
   );
 }
