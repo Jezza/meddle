@@ -202,7 +202,13 @@ export const MeddleTurn = defineTask<TurnInput, TurnCheckpoint, null, MeddleHook
   },
 });
 
-type LiveTurn = { query: Query; queue: InputQueue; sendNow: () => Promise<SendNowOutcome | undefined>; state: "running" | "waiting" };
+type LiveTurn = {
+  query: Query;
+  queue: InputQueue;
+  sendNow: () => Promise<SendNowOutcome | undefined>;
+  takeBack: () => Promise<Prompt[]>;
+  state: "running" | "waiting";
+};
 
 /** How long a turn interrupted by a "move now" has to end before it is closed. */
 const INTERRUPT_GRACE_MS = 15_000;
@@ -737,6 +743,32 @@ export class TaskRunner {
     return live.sendNow();
   }
 
+  /**
+   * Takes back what the task has been sent and not started on, as `queued` lists it: the live turn's steers Claude Code
+   * has not taken (one it takes meanwhile stays taken), then the prompts queued for later turns, each with its
+   * attachments. It waits for the task's prompts sent before it (see `prompt`), so it takes those back too. A prompt
+   * whose turn is being started stays, so it never both runs and comes back. Answers the prompts taken back, oldest
+   * first; refused while the task is not live here (its queue travels with a move).
+   */
+  takeBackQueued(taskId: string): Promise<Prompt[]> {
+    return serialised(`prompt\0${taskId}`, () => this.#takeBackQueued(taskId));
+  }
+
+  async #takeBackQueued(taskId: string): Promise<Prompt[]> {
+    this.#refuseElsewhere(taskId);
+    const live = await this.#live.get(taskId)?.takeBack() ?? [];
+    // `startQueued` takes the first prompt once its turn exists: while one is pending, the first may be starting.
+    const keep = this.#pending.has(taskId) ? 1 : 0;
+    let later: Prompt[] = [];
+    this.#db.transaction(() => {
+      const queued = queuedOf(this.#row(taskId));
+      later = queued.slice(keep);
+      updateTask(this.#db, taskId, { queued: queuedColumn(queued.slice(0, keep)) });
+    })();
+    this.#emitQueued(taskId);
+    return [...live, ...later];
+  }
+
   /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
     this.#refuseElsewhere(taskId);
@@ -918,7 +950,7 @@ export class TaskRunner {
       const content = await promptContent(this.blobs.store, attachmentsDir, prompt);
       const queue = new InputQueue();
       let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
-      const { query, done, sendNow } = runTurn({
+      const { query, done, sendNow, takeBack } = runTurn({
         input: await this.#engineInput(taskId, manifest, resume, picked.value),
         prompt,
         content,
@@ -933,7 +965,7 @@ export class TaskRunner {
         },
         onTokenFault: (f) => { fault = f; },
       });
-      this.#live.set(taskId, { query, queue, sendNow, state: "running" });
+      this.#live.set(taskId, { query, queue, sendNow, takeBack, state: "running" });
       notify(this.#liveListeners, (cb) => cb(taskId));
       let result: Awaited<typeof done>;
       try {

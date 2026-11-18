@@ -360,6 +360,50 @@ test("send now cuts a running task's turn short for the steer Claude Code has no
   expect(prompts()).toEqual(["Reply with the single word ok.", STEER]);
   await stalling.h.close();
 }, 30_000);
+test("take back answers a task's queued prompts, the live turn's steers first, and leaves nothing queued", async () => {
+  const { db, h, m, open } = await setup();
+  await h.close();
+  const stalling = await open({ MEDDLE_FIXTURE_STALL: "1" });
+  const { runner } = stalling;
+  const STEER = "Stop that, and say why instead.";
+  const prompts = () => listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  const told: Prompt[][] = [];
+  runner.onQueued((tid) => { if (tid === m.id) told.push(runner.queued(m.id)); });
+  let steered: Promise<unknown> | undefined;
+  runner.onEvent((tid, _s, msg: any) => { if (tid === m.id && msg.type === "assistant" && steered === undefined) steered = runner.prompt(m.id, STEER); });
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await eventually(() => steered !== undefined, () => "no reply to steer");
+  expect(await steered).toBe("queued");
+  const later = { text: "later", attachments: [{ hash: "b".repeat(64), name: "notes.txt", type: "text/plain", size: 5 }] };
+  updateTask(db, m.id, { queued: JSON.stringify([later]) });
+  expect(await runner.takeBackQueued(m.id)).toEqual([{ text: STEER, attachments: [] }, later]);
+  expect(runner.queued(m.id)).toEqual([]);
+  expect(told.at(-1)).toEqual([]);
+  const end = turnEnd(runner, m.id);
+  await runner.interrupt(m.id);
+  await end.idle;
+  expect(runner.queued(m.id)).toEqual([]);
+  expect(prompts()).toEqual(["Reply with the single word ok."]);
+  expect(listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started")).toHaveLength(1);
+  await stalling.h.close();
+}, 30_000);
+test("take back on an idle task with nothing queued answers []", async () => {
+  const { h, runner, m } = await setup();
+  expect(await runner.takeBackQueued(m.id)).toEqual([]);
+  await h.close();
+});
+test("a prompt whose turn is starting stays", async () => {
+  const { db, h, runner, m } = await setup();
+  const prompts = () => listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  updateTask(db, m.id, { queued: JSON.stringify(["a", "b"]) });
+  const starting = runner.startQueued(m.id);
+  expect(await runner.takeBackQueued(m.id)).toEqual([{ text: "b", attachments: [] }]);
+  await starting;
+  await eventually(() => prompts().includes("a"), () => JSON.stringify(prompts()));
+  expect(runner.queued(m.id)).toEqual([]);
+  expect(prompts()).not.toContain("b");
+  await h.close();
+});
 test("a prompt to a task whose turn is parked retries the turn and queues the message for after it", async () => {
   const { insertTask } = await import("../src/store/records");
   const home = await mkdtemp("/tmp/meddle-dur-");

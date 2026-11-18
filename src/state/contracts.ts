@@ -492,6 +492,12 @@ export const TaskObject = remote("meddle.task", {
          * running turn; refused while the task is not live here.
          */
         sendNow: method(Type.Object({})),
+        /**
+         * Takes back what the task has been sent and not started on (`queuedPrompts`), for the composer to edit: answers
+         * the prompts it withdrew, oldest first, each with its attachments. One Claude Code takes meanwhile, or whose
+         * turn is starting, stays. Refused while the task is not live here.
+         */
+        takeBackQueued: method(Type.Object({}), Type.Object({ prompts: Type.Array(PromptSchema) })),
         /** Runs the task's turn again after repeated crashes parked it, or, for an idle task that has had a turn, starts one that carries on from it (after an interrupt or a failure); rejects otherwise. */
         retry: method(Type.Object({})),
         approve: method(Type.Object({ requestId: Type.String(), updatedInput: Type.Optional(Type.Record(Type.String(), Type.Unknown())) })),

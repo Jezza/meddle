@@ -887,6 +887,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       rename: async ({ title }) => { await runner.rename(id, title); },
       interrupt: () => runner.interrupt(id),
       sendNow: async () => { await runner.sendNow(id); },
+      takeBackQueued: async () => ({ prompts: await runner.takeBackQueued(id) }),
       retry: () => runner.retry(id),
       approve: async ({ requestId, updatedInput }) => {
         answer(requestId, (req) => ({ behavior: "allow", updatedInput: updatedInput ?? req.input }));
