@@ -22,8 +22,8 @@ import { PeerObject } from "../state/contracts";
 import { computeBranch, type Graph, type ProjectBranch } from "./branches";
 import { getProject, listProjects, type Project } from "./project";
 import { ensureServiceRepo, ensureServiceRepos, meddleUrl, rosterProjectIds, type ReplicaDeps } from "./replicas";
+import { VIEW } from "./view";
 
-const VIEW = "refs/namespaces/view/";
 const HEADS = "refs/heads/";
 const LINES = "refs/remotes/meddle/";
 const FETCHED = "refs/meddle/fetched/";
