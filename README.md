@@ -964,8 +964,8 @@ A move waits for a running turn to end: `task move` then says `moving <id> to <n
 dashboard `Moving to <host> once the current turn ends`. "Move now" (`--now`) interrupts the turn instead, and closes
 it if it has not ended 15 seconds later. A move already waiting can be hurried the same way: `task move <id> --now`,
 or Move now in the dashboard's banner. Background shells and subagents that the turn started stop and do not travel; the dashboard
-warns of this but cannot list them (the Agent SDK has no way to). When a turn was cut short, the task's first turn
-on the target starts with:
+warns of this, and its agent list shows the task's subagents (it does not list background shells). When a turn was
+cut short, the task's first turn on the target starts with:
 
 > The previous turn was interrupted to move this task to another machine. Background shells and subagents that were
 > running were stopped and did not travel. Carry on from where you were; do not redo work that is already done.
@@ -1099,7 +1099,8 @@ other node is asked anything.
 - The single binary runs on one platform; each platform needs its own build. It downloads Claude Code (about 140 MB)
   on the first start of each version, so that start needs the npm registry or a mirror, unless it was built with
   `--embed-claude` (about 450 MB).
-- Background shells and subagents do not travel on "move now", and the dashboard cannot list them.
+- Background shells and subagents do not travel on "move now". The dashboard lists a task's subagents, not its
+  background shells.
 - When a node restarts in the middle of a turn, the turn's rerun resumes the session and tells Claude to carry on;
   text you sent into that turn that Claude Code had not yet written to its transcript is not sent again.
 - Every node of a pool must be upgraded together: the nodes' peer interface gained calls without a new version, so a
@@ -1142,7 +1143,8 @@ The dashboard of any node shows the whole pool. Its sidebar lists the pool's pro
 in it alone and a New task row; then Tasks, the tasks with no project or several (each marked with how many); then
 Archived, collapsed, every online node's archived tasks; and at its foot Nodes, every member with what runs on it and
 its load, or since when it has been offline. A task's row shows its state (a dot: running, waiting on you, idle), how
-many approvals and questions wait on you, and the node it runs on (`from → to` while it moves); its ⋯ menu (or a
+many approvals and questions wait on you, how many of its subagents are running (a purple count after its title), and
+the node it runs on (`from → to` while it moves); its ⋯ menu (or a
 right click) renames it, moves it, archives it, or for an archived task restores or deletes it. Within a project,
 tasks are listed by latest activity. The sidebar hides (◧), and on a narrow screen it is a drawer. Opening the
 dashboard shows the task that waits on you most recently, else a new task. Failed turns, moves and token trouble show
@@ -1152,13 +1154,17 @@ versions in the Nodes header.
 A task opens beside the sidebar: its title (✎ renames it), state and actions (Interrupt, Retry, Archive; Restore and
 Delete for an archived one), its thread with the assistant's text as Markdown and each run of tool calls folded into
 one line, what waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
-was sent and has not taken yet (`queued`), the composer (Queue while a turn runs, Send otherwise),
+was sent and has not taken yet (`queued`), its subagents (below), the composer (Queue while a turn runs, Send otherwise),
 and a bar with its projects, its node, its bookmark, the latest turn's tokens, its permission mode, and its model and
 effort as one pill (the pool's defaults where it chose none) that opens the node's models and the efforts the picked
 one takes. The node in the bar opens the move menu: every other member, those that cannot take the task greyed with why,
 and whether the move waits for the running turn or interrupts it (see [Moving a task](#moving-a-task)); a task that
-moved is followed to its new node. New task opens an empty composer: its projects (the one it was opened under, more
-added with ＋ project), the node (Automatic, the default, or a chosen online node that hosts tasks; see
+moved is followed to its new node. A subagent's work stays inside its row in the thread: the row spins until the agent
+is done and ends with its report. Above the composer, while the task has subagents, a list shows each: the running
+ones first with their current step, then how the others ended (done, stopped or failed), each with its tools, tokens
+and time. The list folds to one line, which the browser remembers; picking an agent opens its row in the thread,
+loading earlier events first when the row is not loaded yet. New task opens an empty composer: its projects (the one
+it was opened under, more added with ＋ project), the node (Automatic, the default, or a chosen online node that hosts tasks; see
 [Where a new task runs](#where-a-new-task-runs)), its model and effort (the pool's defaults until changed) and its
 first prompt; Start creates it and opens it. A project's page
 (its name in the sidebar) shows its home; its branches, the default one marked, each at its commit, a conflicted one

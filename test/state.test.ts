@@ -373,6 +373,105 @@ test("a task's activation reads its log summary from the newest events, and its 
   }
 });
 
+test("a task's agents come from its log, and one left running with no live turn shows stopped", async () => {
+  const { client, db, project, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { id } = (await node.createTask({ title: "t", projects: [{ id: project.id }] })).manifest;
+    appendEvent(db, id, { type: "meddle", subtype: "turn_started", at: "2026-11-17T19:00:00.000Z", resume: false });
+    appendEvent(db, id, { type: "system", subtype: "task_started", task_id: "a1", tool_use_id: "tA", task_type: "local_agent", is_backgrounded: true, description: "Implement Task 3" });
+    appendEvent(db, id, { type: "system", subtype: "task_started", task_id: "a2", tool_use_id: "tB", task_type: "local_agent", is_backgrounded: true, description: "Review Task 2" });
+    appendEvent(db, id, { type: "system", subtype: "task_notification", task_id: "a2", tool_use_id: "tB", status: "completed", summary: "" });
+    for (let i = 0; i < 300; i++) appendEvent(db, id, { type: "stream_event", event: {} });
+    const task = await client.get(TaskObject, { id });
+    expect(task.agents.value.map((a) => [a.id, a.state, a.orphaned]).sort()).toEqual([["a1", "stopped", true], ["a2", "completed", false]]);
+    expect(task.agentsRunning.value).toBe(0);
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+/** A node whose turns replay `background-agent.jsonl` (a background agent, its step, then its notice), with `env`. */
+async function agentNode(env: Record<string, string>) {
+  const node0 = await startPoolNode("background-agent.jsonl", env);
+  const { client, close: closeClient } = linkClient(node0.host);
+  const node = await client.get(NodeObject, {});
+  const { manifest } = await node.createTask({ title: "t", projects: [{ id: node0.project.id }] });
+  const task = await client.get(TaskObject, { id: manifest.id });
+  const session = await client.get(SessionObject, { taskId: manifest.id });
+  const close = async () => {
+    task.release();
+    session.release();
+    node.release();
+    await closeClient();
+    await node0.close();
+  };
+  return { task, session, close };
+}
+
+const kindOf = (e: { message: unknown }) => {
+  const m = e.message as { type?: string; subtype?: string };
+  return m.subtype === undefined ? m.type : `${m.type}/${m.subtype}`;
+};
+
+test("a task's agent runs while its turn is live and its notice is held back, then is done", async () => {
+  // The agent's notice comes 1.5 s after the turn's first result: the turn stays live, waiting on it.
+  const { task, session, close } = await agentNode({ MEDDLE_FIXTURE_BACKGROUND_MS: "1500" });
+  try {
+    expect(task.agents.value).toEqual([]);
+    expect(task.agentsRunning.value).toBe(0);
+    await task.prompt({ text: "Review the suite in the background." });
+    await until(session.window, (w) => w.some((e) => kindOf(e) === "result/success"));
+    await until(task.agents, (a) => a[0]?.doing === "Running bun test");
+    await until(task.agentsRunning, (n) => n === 1);
+    expect(session.window.value.map(kindOf)).not.toContain("system/task_notification");
+    expect(task.state.value).toBe("running");
+    expect(task.agents.value).toEqual([expect.objectContaining({
+      id: "agent01", toolUseId: "toolu_agent", description: "Review the suite", background: true, state: "running", orphaned: false,
+      doing: "Running bun test", tools: 3, tokens: 12000, ms: 4000, endedAt: null,
+    })]);
+
+    const [done] = await until(task.agents, (a) => a[0]?.state === "completed");
+    expect(done).toMatchObject({ orphaned: false, doing: null, tools: 5, tokens: 15000, ms: 7000 });
+    expect(done!.endedAt).not.toBeNull();
+    await until(task.agentsRunning, (n) => n === 0);
+    // The turn ends with the result of Claude Code's wake for the agent; its end leaves a done agent done.
+    await until(task.state, (s) => s === "idle");
+    expect(task.agents.value.map((a) => [a.id, a.state, a.orphaned])).toEqual([["agent01", "completed", false]]);
+    expect(task.agentsRunning.value).toBe(0);
+  } finally {
+    await close();
+  }
+}, 20_000);
+
+test("a task's agent left running when its turn's process goes is stopped and orphaned", async () => {
+  // The turn stalls before its result, the agent running, until it is interrupted: then the process ends, no notice.
+  const { task, session, close } = await agentNode({ MEDDLE_FIXTURE_STALL: "1" });
+  try {
+    await task.prompt({ text: "Review the suite in the background." });
+    await until(task.agents, (a) => a[0]?.doing === "Running bun test");
+    await until(task.agentsRunning, (n) => n === 1);
+    expect(task.agents.value[0]).toMatchObject({ state: "running", orphaned: false });
+
+    // The task's state when the agent stopped: the process goes before the turn's finish makes the task idle.
+    let stateAtStop: string | undefined;
+    const off = task.agents.subscribe((a) => { if (a[0]?.state === "stopped") stateAtStop ??= task.state.value; });
+    await task.interrupt({});
+    const [stopped] = await until(task.agents, (a) => a[0]?.state === "stopped");
+    off();
+    expect(stopped).toMatchObject({ id: "agent01", orphaned: true, doing: null, tools: 3 });
+    expect(stateAtStop).toBe("running");
+    await until(task.agentsRunning, (n) => n === 0);
+    await until(task.state, (s) => s === "idle");
+    expect(session.window.value.map(kindOf)).not.toContain("system/task_notification");
+    expect(task.agents.value.map((a) => [a.state, a.orphaned])).toEqual([["stopped", true]]);
+  } finally {
+    await close();
+  }
+}, 20_000);
+
 test("a project's graph shows a task's line and follows a turn's end", async () => {
   const { client, project, close } = await connect();
   try {

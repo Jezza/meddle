@@ -306,6 +306,17 @@ test("a prompt sent once the turn's input has closed waits, queued, and runs as 
   expect(runner.queued(m.id)).toEqual([]);
   await h.close();
 });
+test("the runner says when a turn's process comes and goes, the process gone by the time it says so", async () => {
+  const { runner, h, m, settled } = await setup();
+  const told: boolean[] = [];
+  runner.onLive((tid) => { if (tid === m.id) told.push(runner.liveQuery(m.id) !== null); });
+  const over = settled(runner);
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await over;
+  expect(told).toEqual([true, false]);
+  expect(runner.liveQuery(m.id)).toBeNull();
+  await h.close();
+});
 test("a steer Claude Code folds into the running turn is queued until it takes it, then logged there", async () => {
   const { db, h, runner, m, open } = await setup();
   await h.close();

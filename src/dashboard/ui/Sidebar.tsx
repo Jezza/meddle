@@ -1,31 +1,17 @@
 // The sidebar: projects with their tasks, the tasks with no project or several, the archived tasks (collapsed), and
-// the pool's nodes at the foot. Each task row carries its state, what waits on you, and the node it runs on.
+// the pool's nodes at the foot. Each task row carries its state, what waits on you, how many of its agents run, and the
+// node it runs on.
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
-import { useAction, useValue } from "./hooks";
+import { store, stored, useAction, useValue } from "./hooks";
 import { type Anchor, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
+import { Glyph } from "./icons";
 import { projectChoices } from "./pool-model";
 import { hashOf, type View } from "./routes";
 import { groupTasks, nodeLineText, waitsOnYou } from "./sidebar-model";
 import type { ListedTask, PoolIndex } from "./sources";
 
 const ARCHIVED_OPEN_KEY = "meddle.sidebar.archived";
-
-function stored(key: string): boolean {
-  try {
-    return localStorage.getItem(key) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function store(key: string, on: boolean): void {
-  try {
-    localStorage.setItem(key, on ? "1" : "0");
-  } catch {
-    // a private window: remembered for this page only
-  }
-}
 
 export function Sidebar({ pool, index, view, selfId, alerts, onHide, onNavigate }: {
   pool: PoolRef; index: PoolIndex; view: View; selfId: string;
@@ -115,7 +101,10 @@ function NodeLoad({ row, node }: { row: PoolNode; node: NonNullable<ReturnType<P
 
 type Menu = { kind: "actions" | "move" | "restore"; anchor: Anchor };
 
-/** A task's row: its state, title, what waits on you and its node; ⋯ (or a right click) opens its actions. */
+/**
+ * A task's row: its state, title, what waits on you, how many of its agents run, and its node; ⋯ (or a right click)
+ * opens its actions.
+ */
 function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
   task: ListedTask; nodes: readonly PoolNode[]; nameOf(nodeId: string): string; indent: boolean; selected: boolean; onNavigate(): void;
 }) {
@@ -141,6 +130,9 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
           ? <RenameInput value={task.title} onDone={() => setRenaming(false)} onSave={(title) => action.run(() => task.ref.rename({ title }))} />
           : <span class="title">{task.title}</span>}
         {task.pending > 0 && <span class="badge">{task.pending}</span>}
+        {task.agents > 0 && (
+          <span class="agent-count" title={`${task.agents} ${task.agents === 1 ? "agent" : "agents"} running`}><Glyph name="agent" />{task.agents}</span>
+        )}
         {others !== null && <span class="chip">{others}</span>}
         <span class={`where${moving ? " moving" : ""}`}>{where}</span>
         <button class="more" title="Actions" onClick={openMenu}>⋯</button>

@@ -2,6 +2,8 @@
 import { test, expect } from "bun:test";
 import { branchLines, listedOnline, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
+import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/dashboard/ui/agents-model";
+import type { AgentEntry } from "../src/state/contracts";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
@@ -145,7 +147,7 @@ test("projectChoices: every project an online member lists, once, named as its h
 /** A task entry with defaults for what a test does not care about. */
 function entry(id: string, over: Partial<TaskEntry> = {}): TaskEntry {
   return {
-    nodeId: "n1", id, title: id, projects: [], state: "idle", pending: 0,
+    nodeId: "n1", id, title: id, projects: [], state: "idle", pending: 0, agents: 0,
     activityAt: "2026-11-01T00:00:00.000Z", createdAt: "2026-11-01T00:00:00.000Z", moveTo: null, archived: false, ...over,
   };
 }
@@ -532,4 +534,72 @@ test("a file dragged or dropped off a composer never replaces the dashboard; tex
   const onComposer = dragEvent("dragover", ["Files"]);
   withComposer.dispatchEvent(onComposer);
   expect([onComposer.defaultPrevented, onComposer.dataTransfer.dropEffect]).toEqual([true, "copy"]);
+});
+
+const NOW = Date.parse("2026-11-17T19:40:00.000Z");
+const agentEntry = (description: string, over: Partial<AgentEntry> = {}): AgentEntry => ({
+  id: description, toolUseId: `t-${description}`, seq: 1, description, agentType: "general-purpose", background: true, parent: null,
+  state: "running", orphaned: false, doing: null, commands: 0, tools: 0, tokens: 0, ms: 0,
+  startedAt: "2026-11-17T19:36:35.000Z", endedAt: null, ...over,
+});
+
+test("agentCounts says how many run, are done, stopped and failed, leaving out the noughts", () => {
+  expect(agentCounts([agentEntry("a"), agentEntry("b"), agentEntry("c", { state: "completed" }), agentEntry("d", { state: "stopped" })]))
+    .toBe("2 running · 1 done · 1 stopped");
+  expect(agentCounts([agentEntry("a", { state: "failed" })])).toBe("1 failed");
+  expect(agentCounts([])).toBe("");
+});
+
+test("panelRows: running agents with their step and numbers, then the newest finished, the rest counted", () => {
+  const finished = (n: number, over: Partial<AgentEntry> = {}) =>
+    agentEntry(`f${n}`, { state: "completed", endedAt: "2026-11-17T19:36:00.000Z", tools: 14, tokens: 37314, ms: 82000, ...over });
+  const list = [
+    agentEntry("Implement Task 3: blobs between nodes", { doing: "Running bun test", tools: 31, tokens: 79502 }),
+    agentEntry("Review Task 2"),
+    finished(1), finished(2, { state: "stopped", orphaned: true }), finished(3, { state: "failed", tools: 1 }), finished(4, { state: "stopped" }), finished(5),
+  ];
+  const { rows, earlier } = panelRows(list, NOW, false);
+  expect(rows.map((r) => [r.agent.description, r.doing, r.nums])).toEqual([
+    ["Implement Task 3: blobs between nodes", "Running bun test", "31 tools · 80k · 3m 25s"],
+    ["Review Task 2", "Working", "0 tools · 0 · 3m 25s"],
+    ["f1", "done 4m ago", "14 tools · 37k · 1m 22s"],
+    ["f2", "stopped with the session", "14 tools · 37k · 1m 22s"],
+    ["f3", "failed", "1 tool · 37k · 1m 22s"],
+  ]);
+  expect(earlier).toBe("2 earlier: 1 stopped, 1 done");
+  expect(panelRows(list, NOW, true)).toMatchObject({ earlier: null });
+  expect(panelRows(list, NOW, true).rows).toHaveLength(7);
+  const many = Array.from({ length: 30 }, (_, i) => finished(i));
+  expect(panelRows(many, NOW, false)).toMatchObject({ earlier: "27 earlier: 27 done" });
+  expect(panelRows(many, NOW, false).rows).toHaveLength(3);
+  expect(panelRows([], NOW, false)).toEqual({ rows: [], earlier: null });
+});
+
+test("toolCount says how many tools, one tool in the singular", () => {
+  expect([0, 1, 2, 44].map(toolCount)).toEqual(["0 tools", "1 tool", "2 tools", "44 tools"]);
+});
+
+test("rootOf follows an agent's parents up to the outermost listed one", () => {
+  const outer = agentEntry("outer", { seq: 10 });
+  const middle = agentEntry("middle", { seq: 40, parent: "outer" });
+  const inner = agentEntry("inner", { seq: 90, parent: "middle" });
+  const list = [inner, middle, outer];
+  expect(rootOf(inner, list)).toBe(outer);
+  expect(rootOf(outer, list)).toBe(outer);
+  // A parent the list does not hold (a background command's id, say) ends the climb.
+  expect(rootOf(agentEntry("lost", { parent: "gone" }), list).description).toBe("lost");
+  // Parents in a loop end too.
+  const a = agentEntry("a", { parent: "b" });
+  const b = agentEntry("b", { parent: "a" });
+  expect([a, b]).toContain(rootOf(a, [a, b]));
+});
+
+test("foldedLine: the running agents with their times, then the rest; or that all are finished", () => {
+  const list = [
+    agentEntry("Implement Task 3"), agentEntry("Review Task 2", { startedAt: "2026-11-17T19:39:19.000Z" }),
+    agentEntry("x", { state: "completed" }), agentEntry("y", { state: "stopped" }),
+  ];
+  expect(foldedLine(list, NOW)).toBe("2 agents running: Implement Task 3 (3m 25s), Review Task 2 (41s) · 1 done · 1 stopped");
+  expect(foldedLine([agentEntry("a")], NOW)).toBe("1 agent running: a (3m 25s)");
+  expect(foldedLine([agentEntry("x", { state: "completed" }), agentEntry("y", { state: "completed" })], NOW)).toBe("2 agents, all finished");
 });

@@ -380,6 +380,34 @@ export const ProjectChangesSchema = Type.Object({
   changes: Type.Array(TaskChangeSchema),
 });
 
+/**
+ * One sub-agent of a task, as served on its `TaskObject` (`servedAgents`). `id` is the `local_agent` task id and
+ * `toolUseId` the call that first started it; `seq` is that `task_started`'s, how far back the thread must load to
+ * show the agent's row. `startedAt` is when the current piece of work began (first start or follow-up). `commands` is
+ * the agent's own live background commands. `orphaned`: stopped because its Claude Code process went (no live turn to
+ * run it, or a later turn's process started), not by a notice.
+ */
+export const AgentEntrySchema = Type.Object({
+  id: Type.String(),
+  toolUseId: Type.String(),
+  seq: Type.Number(),
+  description: Type.String(),
+  agentType: Nullable(Type.String()),
+  background: Type.Boolean(),
+  parent: Nullable(Type.String()),
+  state: Type.Union([Type.Literal("running"), Type.Literal("completed"), Type.Literal("failed"), Type.Literal("stopped")]),
+  orphaned: Type.Boolean(),
+  /** While running: the latest step, or "Waiting on N commands". */
+  doing: Nullable(Type.String()),
+  commands: Type.Number(),
+  tools: Type.Number(),
+  tokens: Type.Number(),
+  ms: Type.Number(),
+  startedAt: Type.String(),
+  endedAt: Nullable(Type.String()),
+});
+export type AgentEntry = Type.Static<typeof AgentEntrySchema>;
+
 export const TaskObject = remote("meddle.task", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
@@ -405,6 +433,18 @@ export const TaskObject = remote("meddle.task", {
         effort: Nullable(Type.String()),
         /** `usage` and `modelUsage` of the latest `result`. */
         contextUsage: Type.Unknown(),
+        /**
+         * The task's sub-agents, running ones first (newest first), then the rest (last ended first). One the log leaves
+         * running is served `stopped` once the task has no live turn. A node older than this serves no `agents`: read a
+         * missing member as an empty list.
+         */
+        agents: Type.Array(AgentEntrySchema),
+        /**
+         * How many of `agents` run. Its own member so that the sidebar, reading only this, does not re-render at every
+         * progress frame; its reference to the task is still sent `agents`' deltas. A node older than this serves no
+         * `agentsRunning`: read a missing member as 0.
+         */
+        agentsRunning: Type.Number(),
         /** The task's move in progress: to which node, the step it is at, and the error failing it (if any). */
         move: Nullable(Type.Object({ to: Type.String(), phase: Type.String(), error: Nullable(Type.String()) })),
         /** The node a `moved` task went to. */
@@ -564,6 +604,28 @@ export const TaskLogSchema = Type.Object({
   contextUsage: Type.Unknown(),
 });
 export type TaskLog = Type.Static<typeof TaskLogSchema>;
+
+/**
+ * An agent as the log has it: no `commands` (served ones work those out), and `state` is the last notice's, or
+ * `stopped` and `orphaned` when a later turn started while it ran or waited on its own commands (a new process: the
+ * old one's are gone). `runSeq` is the seq of its latest `task_started`, wakes included.
+ */
+export const AgentRecordSchema = Type.Object({
+  ...Type.Omit(AgentEntrySchema, ["commands"]).properties,
+  runSeq: Type.Number(),
+});
+export type AgentRecord = Type.Static<typeof AgentRecordSchema>;
+
+/**
+ * What a `TaskObject` keeps of its task's agents from its event log: the seq of the latest `turn_started`, every
+ * agent, and the live background commands of each agent by its id (since that turn started: its process's).
+ */
+export const AgentLogSchema = Type.Object({
+  turnSeq: Type.Number(),
+  agents: Type.Array(AgentRecordSchema),
+  commands: Type.Record(Type.String(), Type.Number()),
+});
+export type AgentLog = Type.Static<typeof AgentLogSchema>;
 
 /** What a `SessionObject` keeps from its task's event log; `lastSeq` counts `stream_event`s too. */
 export const SessionViewSchema = Type.Object({
