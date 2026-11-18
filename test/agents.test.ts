@@ -65,13 +65,33 @@ test("an agent left running is stopped once no turn is live, or once a later tur
   expect(servedAgents(log, false)[0]).toMatchObject({ state: "stopped", orphaned: true, doing: null });
   // The node restarted and resumed the turn: a new process, the agent's run older than it.
   const resumed = foldAgentLog(log, [turn(4, 59)]);
-  expect(servedAgents(resumed, true)[0]).toMatchObject({ state: "stopped", orphaned: true });
-  expect(servedAgents(foldAgentLog(resumed, [notice(5, 59, "stopped")]), true)[0]).toMatchObject({ state: "stopped", orphaned: false });
+  expect(servedAgents(resumed, true)[0]).toMatchObject({ state: "stopped", orphaned: true, endedAt: null });
+  // Claude Code's own stop notice for it at the new process's start changes nothing visible.
+  const told = foldAgentLog(resumed, [notice(5, 59, "stopped", { reason: "worker_restart" })]);
+  expect(servedAgents(told, true)).toEqual(servedAgents(resumed, true));
+  expect(servedAgents(told, false)).toEqual(servedAgents(resumed, true));
 });
 
 test("an agent waiting on its commands when the session dies is stopped", () => {
   const log = foldAgentLog(EMPTY_AGENT_LOG, [turn(1, 0), started(2, 1), live(3, 2, [command("c1")]), notice(4, 3, "completed")]);
   expect(servedAgents(log, false)[0]).toMatchObject({ state: "stopped", orphaned: true, commands: 1 });
+});
+
+test("an agent waiting on its commands when a new process starts stays stopped, whatever that process says of its own", () => {
+  const log = foldAgentLog(EMPTY_AGENT_LOG, [turn(1, 0), started(2, 1), live(3, 2, [command("c1")]), notice(4, 3, "completed")]);
+  const next = foldAgentLog(log, [turn(5, 59)]);
+  expect(next.commands).toEqual({});
+  const stopped = { state: "stopped", orphaned: true, commands: 0, doing: null, endedAt: at(3) };
+  expect(servedAgents(next, true)[0]).toMatchObject(stopped);
+  // The new process's own background work, none of it the agent's; then its stop notice for the agent.
+  const later = foldAgentLog(next, [live(6, 59, [command("c9", { parent_task_id: null })]), live(7, 59, []), notice(8, 59, "stopped")]);
+  expect(servedAgents(later, true)[0]).toMatchObject(stopped);
+});
+
+test("an agent stopped with its process runs again on a follow-up, no longer orphaned", () => {
+  const log = foldAgentLog(EMPTY_AGENT_LOG, [turn(1, 0), started(2, 1), turn(3, 50), started(4, 51, { tool_use_id: "tu-send", prompt: "Carry on" })]);
+  expect(servedAgents(log, true)[0]).toMatchObject({ state: "running", orphaned: false, startedAt: at(51) });
+  expect(servedAgents(foldAgentLog(log, [notice(5, 52, "stopped")]), true)[0]).toMatchObject({ state: "stopped", orphaned: false, endedAt: at(52) });
 });
 
 test("running agents come first, newest first, then finished ones, last ended first", () => {

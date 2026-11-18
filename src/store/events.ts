@@ -81,8 +81,9 @@ export function listEventsTail(
 }
 
 /**
- * The task's events of any of `kinds`, oldest first; a kind is `type:subtype`. One indexed read (`events_type`), so a
- * long log of other events costs nothing. No kinds, no events.
+ * The task's events of any of `kinds`, oldest first; a kind is `type:subtype`. One read that parses only the matching
+ * rows, but it does not narrow by the `events_type` index: SQLite scans the task's rows and filters them, about 5 to
+ * 13 ms on the largest log. No kinds, no events.
  */
 export function listEventsOfKinds(db: Database, taskId: string, kinds: readonly string[]): EventRecord[] {
   if (kinds.length === 0) return [];

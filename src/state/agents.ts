@@ -57,7 +57,14 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
     const m = obj(message);
     if (m === null) continue;
     if (m.type === "meddle" && m.subtype === "turn_started") {
+      // A new Claude Code process: none of the last one's agents or their commands run on in it.
       turnSeq = seq;
+      for (const agent of agents) {
+        if (agent.state === "running" || (agent.state === "completed" && (commands[agent.id] ?? 0) > 0)) {
+          update(agent.id, { state: "stopped", orphaned: true, doing: null });
+        }
+      }
+      if (Object.keys(commands).length > 0) commands = {};
       continue;
     }
     if (m.type !== "system") continue;
@@ -71,7 +78,7 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
           agents = [...agents, {
             id, toolUseId: str(m.tool_use_id) ?? "", seq, description: str(m.description) ?? "",
             agentType: str(m.subagent_type), background: background ?? false,
-            parent: str(m.parent_task_id), state: "running", doing: null, tools: 0, tokens: 0, ms: 0,
+            parent: str(m.parent_task_id), state: "running", orphaned: false, doing: null, tools: 0, tokens: 0, ms: 0,
             startedAt: at, endedAt: null, runSeq: seq,
           }];
           break;
@@ -80,7 +87,7 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
         // part of the run it continues; anything else is a follow-up, timed from itself.
         const wake = str(m.prompt)?.startsWith("<task-notification>") === true;
         update(id, {
-          state: "running", endedAt: null, doing: null, runSeq: seq,
+          state: "running", orphaned: false, endedAt: null, doing: null, runSeq: seq,
           ...(wake ? {} : { startedAt: at }),
           ...(background === null ? {} : { background }),
         });
@@ -100,7 +107,9 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
       case "task_notification": {
         const status = m.status;
         if (id === null || (status !== "completed" && status !== "failed" && status !== "stopped")) break;
-        update(id, { state: status, endedAt: at, doing: null, ...usageOf(m.usage) });
+        // Claude Code's own stop notice for an agent stopped with its process (at the next one's start) adds nothing.
+        if (status === "stopped" && agents.some((agent) => agent.id === id && agent.orphaned)) break;
+        update(id, { state: status, orphaned: false, endedAt: at, doing: null, ...usageOf(m.usage) });
         break;
       }
       case "background_tasks_changed": {
@@ -123,19 +132,22 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
 /**
  * The log's agents as the task serves them, running ones first (newest first), then the rest (last ended first).
  * An agent the log has `completed` while its own commands live is still running, waiting on them. One running with
- * no live turn, or since a later turn started, has no process left to run it: it is `stopped` and `orphaned`.
+ * no live turn, or since a later turn started, has no process left to run it: it is `stopped` and `orphaned`, as is
+ * one the log stopped for that when a later turn started.
  */
 export function servedAgents(log: AgentLog, liveTurn: boolean): AgentEntry[] {
   const served = log.agents.map(({ runSeq, ...agent }): AgentEntry => {
     const commands = log.commands[agent.id] ?? 0;
-    let { state, endedAt, doing } = agent;
+    let { state, endedAt, doing, orphaned } = agent;
     if (state === "completed" && commands > 0) {
       state = "running";
       endedAt = null;
       doing = `Waiting on ${commands} command${commands === 1 ? "" : "s"}`;
     }
-    const orphaned = state === "running" && (!liveTurn || runSeq < log.turnSeq);
-    if (orphaned) state = "stopped";
+    if (state === "running" && (!liveTurn || runSeq < log.turnSeq)) {
+      state = "stopped";
+      orphaned = true;
+    }
     return { ...agent, state, orphaned, doing: state === "running" ? doing : null, commands, endedAt };
   });
   // Newest first: by when it began (running) or ended (the rest), then by seq for equal times.
