@@ -12,7 +12,7 @@ import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, 
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "../src/dashboard/ui/changes-model";
-import { composerKey } from "../src/dashboard/ui/composer-model";
+import { composerKey, withTakenBack } from "../src/dashboard/ui/composer-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
 import { blobUrl, type Draft, draftAttachments, guardDrops, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
@@ -440,7 +440,7 @@ test("changeLabel names the working copy, else the description, else the short i
 
 test("composerKey: Enter sends (queued while a turn runs), Ctrl or Cmd+Enter sends now, Shift+Enter and touch keyboards make a new line", () => {
   const key = (k: Partial<Parameters<typeof composerKey>[0]>) => ({ key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, isComposing: false, keyCode: 13, ...k });
-  const desk = { running: true, touch: false };
+  const desk = { running: true, touch: false, anyQueued: false, value: "", caret: 0 };
   expect(composerKey(key({}), desk)).toBe("send");
   expect(composerKey(key({}), { ...desk, running: false })).toBe("send");
   expect(composerKey(key({ ctrlKey: true }), desk)).toBe("send-now");
@@ -602,4 +602,21 @@ test("foldedLine: the running agents with their times, then the rest; or that al
   expect(foldedLine(list, NOW)).toBe("2 agents running: Implement Task 3 (3m 25s), Review Task 2 (41s) · 1 done · 1 stopped");
   expect(foldedLine([agentEntry("a")], NOW)).toBe("1 agent running: a (3m 25s)");
   expect(foldedLine([agentEntry("x", { state: "completed" }), agentEntry("y", { state: "completed" })], NOW)).toBe("2 agents, all finished");
+});
+test("composerKey: ↑ on the box's first line, or Esc, takes queued messages back; otherwise they are the box's", () => {
+  const key = (k: Partial<Parameters<typeof composerKey>[0]>) => ({ key: "ArrowUp", shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, isComposing: false, keyCode: 38, ...k });
+  const q = { running: true, touch: false, anyQueued: true, value: "one\ntwo", caret: 2 };
+  expect(composerKey(key({}), q)).toBe("take-back");
+  expect(composerKey(key({ key: "Escape", keyCode: 27 }), { ...q, caret: 6 })).toBe("take-back");
+  expect(composerKey(key({}), { ...q, caret: 6 })).toBeNull(); // second line
+  expect(composerKey(key({}), { ...q, caret: 3 })).toBe("take-back"); // end of the first line
+  expect(composerKey(key({}), { ...q, anyQueued: false })).toBeNull();
+  expect(composerKey(key({ key: "Escape", keyCode: 27 }), { ...q, anyQueued: false })).toBeNull();
+  expect(composerKey(key({ shiftKey: true }), q)).toBeNull();
+  expect(composerKey(key({ isComposing: true }), q)).toBeNull();
+});
+test("withTakenBack: the texts, oldest first, above what the box held; the caret keeps its place in it", () => {
+  expect(withTakenBack(["a", "b"], "", 0)).toEqual({ text: "a\nb", caret: 3 });
+  expect(withTakenBack(["a", "b"], "xyz", 1)).toEqual({ text: "a\nb\nxyz", caret: 5 });
+  expect(withTakenBack([], "xyz", 1)).toEqual({ text: "xyz", caret: 1 });
 });

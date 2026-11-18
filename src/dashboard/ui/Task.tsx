@@ -16,7 +16,7 @@ import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFileTarget } from "./Attachments";
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
-import { composerKey } from "./composer-model";
+import { composerKey, withTakenBack } from "./composer-model";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Chevron, Icon, Iconoir } from "./icons";
@@ -912,7 +912,7 @@ function PromptBody({ text, attachments }: { text: string; attachments: Attachme
 /** A prompt the task was sent and has not started on: it joins the thread where Claude takes it. */
 function Queued({ prompt }: { prompt: Prompt }) {
   return (
-    <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one; Ctrl+Enter in an empty box sends it now">
+    <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one; Ctrl+Enter in an empty box sends it now; ↑ or Esc in the box takes it back to edit">
       <PromptBody text={prompt.text} attachments={prompt.attachments} />
       <span class="chip">queued</span>
     </div>
@@ -945,7 +945,7 @@ function FailedMessage({ task, failed, disabled, onSent, onEdit }: {
 
 function Composer({ task, running, anyQueued, disabled, text, setText, drafts, box, onFailed }: {
   task: TaskRef; running: boolean;
-  /** The task has prompts it has not started on: Ctrl+Enter in an empty box sends them now. */
+  /** The task has prompts it has not started on: Ctrl+Enter in an empty box sends them now, ↑ or Esc takes them back. */
   anyQueued: boolean;
   disabled: boolean;
   text: string; setText: Dispatch<StateUpdater<string>>; drafts: Drafts; box: RefObject<HTMLTextAreaElement | null>;
@@ -953,6 +953,10 @@ function Composer({ task, running, anyQueued, disabled, text, setText, drafts, b
 }) {
   const [busy, setBusy] = useState(false);
   const [nowError, setNowError] = useState<string | null>(null);
+  const [takingBack, setTakingBack] = useState(false);
+  const [takeBackError, setTakeBackError] = useState<string | null>(null);
+  /** Where the caret goes once the box shows what was taken back. */
+  const caretAfter = useRef<number | null>(null);
   // A phone's keyboard has no Shift for a new line: there Enter makes one, and the button sends.
   const touch = matchMedia("(pointer: coarse)").matches;
   const files = useFileTarget(drafts.add, !disabled);
@@ -991,6 +995,37 @@ function Composer({ task, running, anyQueued, disabled, text, setText, drafts, b
       setBusy(false);
     }
   };
+  // Takes back what the task has not started on into the box, as Claude Code does: the texts above what is there, the
+  // files beside its own. Only what the node says it withdrew comes back (a prompt Claude took meanwhile stays sent).
+  const takeBack = async () => {
+    if (disabled || takingBack) return;
+    setTakingBack(true);
+    setTakeBackError(null);
+    try {
+      const { prompts } = await task.takeBackQueued({});
+      const texts = prompts.map((p) => p.text).filter((t) => t !== "");
+      if (texts.length > 0) {
+        const caret = box.current?.selectionStart ?? 0;
+        setText((t) => {
+          const merged = withTakenBack(texts, t, Math.min(caret, t.length));
+          caretAfter.current = merged.caret;
+          return merged.text;
+        });
+      }
+      drafts.restore(prompts.flatMap((p) => p.attachments));
+    } catch (err) {
+      setTakeBackError(errorText(err));
+    } finally {
+      setTakingBack(false);
+    }
+  };
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (el == null || caretAfter.current === null) return;
+    el.focus();
+    el.setSelectionRange(caretAfter.current, caretAfter.current);
+    caretAfter.current = null;
+  }, [text]);
   // The button takes the accent only once there is something to send, every file uploaded.
   const ready = !disabled && readyToSend(text, drafts.drafts);
   const verb = running ? "Queue" : "Send";
@@ -1004,13 +1039,15 @@ function Composer({ task, running, anyQueued, disabled, text, setText, drafts, b
           rows={1}
           disabled={disabled}
           value={text}
-          placeholder={disabled ? "Moving: prompts wait until it lands" : running ? `Message Claude: it takes it at its next step${touch ? "" : " · Ctrl+Enter sends now"}…` : "Reply…"}
+          placeholder={disabled ? "Moving: prompts wait until it lands" : anyQueued && !touch ? "↑ to edit queued messages" : running ? `Message Claude: it takes it at its next step${touch ? "" : " · Ctrl+Enter sends now"}…` : "Reply…"}
           onInput={(e) => setText(e.currentTarget.value)}
           onKeyDown={(e) => {
-            const action = composerKey(e, { running, touch });
+            const field = e.currentTarget;
+            const action = composerKey(e, { running, touch, anyQueued, value: field.value, caret: field.selectionStart });
             if (action === null) return;
             e.preventDefault();
-            void send(action === "send-now");
+            if (action === "take-back") void takeBack();
+            else void send(action === "send-now");
           }}
         />
         <AttachButton onFiles={drafts.add} disabled={disabled} />
@@ -1018,6 +1055,8 @@ function Composer({ task, running, anyQueued, disabled, text, setText, drafts, b
           <Iconoir name="send" />
         </button>
       </div>
+      {takingBack && <div class="composer-row">Taking your messages back…</div>}
+      {takeBackError !== null && <div class="composer-row error">Not taken back: {takeBackError}</div>}
       {nowError !== null && <div class="composer-row error">Not sent now: {nowError}</div>}
     </div>
   );
