@@ -113,6 +113,12 @@ test("classify flags another task's work as foreign", async () => {
   expect((await classify(cfg, repo, B, c, new Set(["t1", "t2"]), lines)).foreign).toEqual([{ taskId: "t2", queued: true }]);
   expect((await classify(cfg, repo, B, c, new Set(["t1"]), lines)).foreign).toEqual([{ taskId: "t2", queued: false }]);
   expect((await classify(cfg, repo, B, { ...c, workspace: null }, new Set(["t1"]), lines)).foreign).toEqual([{ taskId: "t2", queued: false }]);
+  // t2 is the contained side: t1's line has all of t2's work in it, and it is still t2's own, so it holds nothing foreign.
+  const contained = candidate("t2", theirs, { workspace: t2.workspace });
+  const clean = { leftovers: [], toFix: [], conflicted: [], foreign: [], unfixable: [] };
+  expect(await classify(cfg, repo, B, contained, new Set(["t2"]), lines)).toEqual(clean);
+  expect(await classify(cfg, repo, B, contained, new Set(["t1", "t2"]), lines)).toEqual(clean);
+  expect(await classify(cfg, repo, B, { ...contained, workspace: null }, new Set(["t2"]), lines)).toEqual(clean);
   // A task released or archived is no one's work to wait for.
   expect((await classify(cfg, repo, B, c, new Set(["t1"]), [t1.row, { ...t2.row, archived: true }])).foreign).toEqual([]);
   // Nor is a line whose commit this repo lacks (not fetched yet): it names no commits.
@@ -131,6 +137,48 @@ test("classify flags another task's work as foreign", async () => {
   const t5 = await task("t5", draft);
   const result = await classify(cfg, repo, B, candidate("t4", uses, { workspace: t4.workspace }), new Set(["t4"]), [t4.row, t5.row]);
   expect(result).toEqual({ leftovers: [], toFix: [], conflicted: [], foreign: [{ taskId: "t5", queued: false }], unfixable: [] });
+});
+
+test("classify keeps a contained task's own commits its own", async () => {
+  const { repo, cfg, B, on, task, candidate } = await fixture();
+  const mine = await on(B, "mine", { "g.txt": "mine\n" });
+  // L's `draft` is undescribed, and U merged L's line.
+  const draft = await on(B, "", { "h.txt": "draft\n" });
+  const merged = await on(`${mine} | ${draft}`, "merge a draft");
+  const U = await task("tu", merged);
+  const L = await task("tl", draft);
+  const lines = [U.row, L.row];
+  const contained = candidate("tl", draft, { workspace: L.workspace });
+  const containing = candidate("tu", merged, { workspace: U.workspace });
+
+  // L owns `draft`, but U's line has built on it, so it is frozen in L's workspace: the task can't fix it, and it is
+  // never nobody's. L has nothing of U's, whether or not U is queued.
+  const unfixable = [{ commit: draft, reason: expect.stringContaining("no description") }];
+  for (const queued of [new Set(["tl"]), new Set(["tu", "tl"])]) {
+    const expected = { leftovers: [], toFix: [], conflicted: [], foreign: [], unfixable };
+    expect(await classify(cfg, repo, B, contained, queued, lines)).toEqual(expected);
+    expect(await classify(cfg, repo, B, { ...contained, workspace: null }, queued, lines)).toEqual(expected);
+  }
+  // U reports L as foreign (queued or not), and leaves `draft` to L.
+  const stacked = (queued: boolean) => ({ leftovers: [], toFix: [], conflicted: [], foreign: [{ taskId: "tl", queued }], unfixable: [] });
+  expect(await classify(cfg, repo, B, containing, new Set(["tu", "tl"]), lines)).toEqual(stacked(true));
+  expect(await classify(cfg, repo, B, containing, new Set(["tu"]), lines)).toEqual(stacked(false));
+  expect(await classify(cfg, repo, B, { ...containing, workspace: null }, new Set(["tu"]), lines)).toEqual(stacked(false));
+});
+
+test("classify keeps what a contained task made after it was merged", async () => {
+  const { repo, cfg, B, on, task, candidate } = await fixture();
+  const first = await on(B, "first", { "g.txt": "first\n" });
+  const mine = await on(B, "mine", { "h.txt": "mine\n" });
+  const merged = await on(`${mine} | ${first}`, "merge first");
+  // L moved on after U merged its line, with a commit of its own that no description has yet.
+  const newer = await on(first, "", { "i.txt": "newer\n" });
+  const U = await task("tu", merged);
+  const L = await task("tl", newer);
+  const result = await classify(cfg, repo, B, candidate("tl", newer, { workspace: L.workspace }), new Set(["tl"]), [U.row, L.row]);
+  // `first` is in both lines, and which task made it can't be told from the graph: U is held to account for it. `newer`
+  // is in U's line not at all, and L's to fix.
+  expect(result).toEqual({ leftovers: [], toFix: [newer], conflicted: [], foreign: [{ taskId: "tu", queued: false }], unfixable: [] });
 });
 
 test("classify reports frozen undescribed commits as unfixable", async () => {

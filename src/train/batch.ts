@@ -53,22 +53,27 @@ async function landingCommits(cfg: NodeConfig, repo: string, c: Candidate, landi
 /**
  * The commits of `landing` that belong to the other tasks' lines (a commit belongs to a line when it is in
  * `::line.commit ~ ::line.base`), by task, in the order the tasks' rows come. A line released, archived (an archived
- * row can briefly still be queued) or whose commit this repo lacks names nothing. One query when there are none, the
+ * row can briefly still be queued) or whose commit this repo lacks names nothing, and neither does one that has `c`'s
+ * tip in it: that task is stacked on `c` (it merged `c`'s line, or started on it), so `c`'s commits in it are still
+ * `c`'s own, and the stacked task is the one that reports `c` as foreign. One query when there is nothing foreign, the
  * usual case.
+ *
+ * Which of two tasks made a commit that is in both lines can't be told from the graph when neither contains the other
+ * (one merged the other's line, and that one has moved on since): each reports the other as foreign for it, which
+ * holds a task back with a notice rather than land work that may not be its own.
  */
 async function foreignWork(cfg: NodeConfig, repo: string, c: Candidate, landing: string, lines: readonly LineRow[]): Promise<Map<string, Set<string>>> {
-  const sets = new Map<string, string[]>();
-  for (const l of lines) {
-    if (l.task === c.taskId || l.archived || l.commit === null) continue;
-    const set = `(::present(${l.commit}) ~ ${below(l.base)})`;
-    sets.set(l.task, [...(sets.get(l.task) ?? []), set]);
-  }
+  const others = lines.filter((l) => l.task !== c.taskId && !l.archived && l.commit !== null);
   const work = new Map<string, Set<string>>();
-  if (sets.size === 0) return work;
-  const any = [...sets.values()].flat().join(" | ");
-  if ((await changesIn(repo, `(${landing}) & (${any})`, cfg)).length === 0) return work;
-  for (const [task, set] of sets) {
-    const found = await changesIn(repo, `(${landing}) & (${set.join(" | ")})`, cfg);
+  if (others.length === 0) return work;
+  const set = (l: LineRow) => `(::present(${l.commit}) ~ ${below(l.base)})`;
+  if ((await changesIn(repo, `(${landing}) & (${others.map(set).join(" | ")})`, cfg)).length === 0) return work;
+
+  const stacked = new Set((await changesIn(repo, `${c.tip}:: & (${others.map((l) => `present(${l.commit})`).join(" | ")})`, cfg)).map((k) => k.commitId));
+  const sets = new Map<string, string[]>();
+  for (const l of others) if (!stacked.has(l.commit!)) sets.set(l.task, [...(sets.get(l.task) ?? []), set(l)]);
+  for (const [task, taskSets] of sets) {
+    const found = await changesIn(repo, `(${landing}) & (${taskSets.join(" | ")})`, cfg);
     if (found.length > 0) work.set(task, new Set(found.map((k) => k.commitId)));
   }
   return work;
@@ -81,7 +86,8 @@ async function foreignWork(cfg: NodeConfig, repo: string, c: Candidate, landing:
  *   task may change it (it is mutable in the task's workspace) it is `toFix`, or, an empty undescribed non-merge
  *   commit, a leftover to abandon. When it may not, it is `unfixable`: the commits below `c.base` are that, since a
  *   workspace never changes its base, and so is anything another task has built on.
- * - A commit that is in another task's line is that task's work: `foreign`, and left alone otherwise.
+ * - A commit that is in another task's line is that task's work: `foreign`, and left alone otherwise (but not when that
+ *   task is stacked on this one: see `foreignWork`; the commits are this task's, and frozen in its workspace by the other's line).
  * A merge is told from a leftover by its parents and its conflicts, never by `empty`: jj calls a merge it has left
  * conflicted empty.
  */
