@@ -3,7 +3,7 @@ import { test, expect } from "bun:test";
 import { NodeObject, ProjectObject, TaskObject, SessionObject } from "../src/state/host";
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent, listEvents } from "../src/store/events";
-import { errorResultFixture } from "./helpers";
+import { errorResultFixture, sideAssistantsFixture } from "./helpers";
 import { linkClient, peerReady, startPoolNode, storedShot, twoPoolNodes } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
 import { getTask } from "../src/store/records";
@@ -113,6 +113,40 @@ test("a client follows a task through a prompted turn over a link", async () => 
     await until(task.effort, (e) => e === "low");
     task.release();
     session.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("a turn's subagent and synthetic messages leave the task's context at its main thread's", async () => {
+  const { client, project, close } = await connect(await sideAssistantsFixture());
+  try {
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await task.prompt({ text: "Reply with the single word ok." });
+    await until(task.contextUsage, (u) => u !== null);
+    expect(task.context.value).toEqual({ tokens: 376, model: "claude-haiku-5-5" });
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
+test("a plan-usage reading that cannot be written does not fail the turn", async () => {
+  const { client, project, db, close } = await connect();
+  try {
+    // Every write of a reading fails (as a busy or full database would); reading them still works.
+    db.run("CREATE TRIGGER no_usage BEFORE INSERT ON token_usage BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+    const node = await client.get(NodeObject, {});
+    const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });
+    const task = await client.get(TaskObject, { id: manifest.id });
+    await task.prompt({ text: "Reply with the single word ok." });
+    const notes = await until(node.notifications, (n) => n.some((x) => x.taskId === manifest.id && x.kind !== "approval"));
+    expect(notes.filter((x) => x.taskId === manifest.id).map((x) => x.kind)).toEqual(["finished"]);
+    task.release();
     node.release();
   } finally {
     await close();

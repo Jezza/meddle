@@ -3,7 +3,8 @@
 // status, and its `rate_limit_info.unifiedWindows` (not in the SDK's types) carries both windows. Readings live in the
 // `token_usage` table, are never replicated, and are only read joined to the tokens not removed.
 import type { Database } from "bun:sqlite";
-import { TOKEN_ID } from "./token";
+import type { NodeConfig } from "./config";
+import { listTokens, pickToken, TOKEN_ID } from "./token";
 
 /** One limit window: the share of it used (0–1, as the API sends it, so it may pass 1) and when it resets (ISO). */
 export type UsageWindow = { utilization: number; resetsAt: string | null };
@@ -66,4 +67,16 @@ export function tokenUsages(db: Database): Record<string, UsageReading> {
     sevenDay: win(r.seven_day_utilization, r.seven_day_resets_at),
     readAt: r.read_at,
   }]));
+}
+
+/**
+ * The token this node's next turn uses (`pickToken`), with its reading here (null: none yet). With none usable, the
+ * first in order, so that what ran out still shows until it resets; null when there is no token at all.
+ */
+export async function activeUsage(
+  cfg: NodeConfig, db: Database,
+): Promise<{ tokenId: string; label: string; reading: UsageReading | null } | null> {
+  const token = (await pickToken(cfg, db)) ?? listTokens(db)[0] ?? null;
+  if (token === null) return null;
+  return { tokenId: token.id, label: token.label, reading: tokenUsages(db)[token.id] ?? null };
 }

@@ -41,7 +41,7 @@ import { taskNamespace, type ManifestProject, type Start, type TaskManifest } fr
 import { initialTitle } from "../tasks/names";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
-import { tokenUsages, type UsageReading } from "../token-usage";
+import { activeUsage as activeUsageNow, tokenUsages } from "../token-usage";
 import { gated } from "../update/gate";
 import { VERSION } from "../version";
 import { AGENT_EVENT_KINDS, EMPTY_AGENT_LOG, foldAgentLog, runningCount, servedAgents } from "./agents";
@@ -1155,15 +1155,6 @@ async function tokenNow(cfg: NodeConfig, db: Database): Promise<{ present: boole
   const picked = await pickToken(cfg, db);
   if (picked === null) return { present: false, expiresAt: null };
   return { present: true, expiresAt: listTokens(db).find((t) => t.id === picked.id)?.expiresAt ?? null };
-}
-
-/** The token this node's next turn uses, with its reading here (null: none yet); null when no token is usable. */
-async function activeUsageNow(
-  cfg: NodeConfig, db: Database,
-): Promise<{ tokenId: string; label: string; reading: UsageReading | null } | null> {
-  const picked = await pickToken(cfg, db);
-  if (picked === null) return null;
-  return { tokenId: picked.id, label: picked.label, reading: tokenUsages(db)[picked.id] ?? null };
 }
 
 function questionText(req: PendingApproval): string {

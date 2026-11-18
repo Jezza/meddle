@@ -93,6 +93,29 @@ export async function errorResultFixture(subtype = "error_during_execution"): Pr
   return file;
 }
 
+/**
+ * `hello.jsonl` with, after its main-thread assistant message, a subagent's (`parent_tool_use_id` set, 5 tokens) and a
+ * synthetic one (`<synthetic>`, no tokens), as Claude Code sends: neither is the task's context.
+ */
+export async function sideAssistantsFixture(): Promise<string> {
+  const lines = (await readFile(`${import.meta.dir}/fixtures/hello.jsonl`, "utf8")).split("\n").filter(Boolean).flatMap((l) => {
+    const entry = JSON.parse(l) as { dir: string; line?: string };
+    if (entry.dir !== "out" || entry.line === undefined) return [l];
+    const frame = JSON.parse(entry.line) as { type?: string; message?: Record<string, unknown> };
+    if (frame.type !== "assistant") return [l];
+    const side = (over: Record<string, unknown>, message: Record<string, unknown>) =>
+      JSON.stringify({ ...entry, line: JSON.stringify({ ...frame, ...over, uuid: crypto.randomUUID(), message: { ...frame.message, ...message } }) });
+    return [
+      l,
+      side({ parent_tool_use_id: "toolu_side" }, { usage: { input_tokens: 5, output_tokens: 1 } }),
+      side({}, { model: "<synthetic>", usage: { input_tokens: 0, output_tokens: 0 } }),
+    ];
+  });
+  const file = `${await mkdtemp("/tmp/meddle-fixture-")}/side.jsonl`;
+  await writeFile(file, `${lines.join("\n")}\n`);
+  return file;
+}
+
 export const repoRoot = `${import.meta.dir}/..`;
 
 /**

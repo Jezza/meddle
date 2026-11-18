@@ -3,8 +3,8 @@ import { test, expect } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { ensureDataDirs, loadConfig, paths } from "../src/config";
 import { openDb } from "../src/store/db";
-import { addToken, removeToken } from "../src/token";
-import { recordUsage, tokenUsages, usageReadingOf, type UsageReading } from "../src/token-usage";
+import { addToken, markToken, removeToken } from "../src/token";
+import { activeUsage, recordUsage, tokenUsages, usageReadingOf, type UsageReading } from "../src/token-usage";
 
 const T0 = "2026-11-18T10:00:00.000Z";
 const T1 = "2026-11-18T10:05:00.000Z";
@@ -87,4 +87,23 @@ test("a removed token's reading is not listed, and comes back with the token", a
 test("recordUsage refuses an id that is not a token id", async () => {
   const { db } = await node();
   expect(() => recordUsage(db, "nope", reading(T0))).toThrow("invalid token id");
+});
+
+test("activeUsage is the token the next turn uses, with its reading or none", async () => {
+  const { cfg, db } = await node();
+  expect(await activeUsage(cfg, db)).toBeNull();
+  const a = await addToken(cfg, db, "value-a", { label: "a", setBy: null });
+  const b = await addToken(cfg, db, "value-b", { label: "b", setBy: null });
+  expect(await activeUsage(cfg, db)).toEqual({ tokenId: a.id, label: "a", reading: null });
+  recordUsage(db, a.id, reading(T0, 1));
+  markToken(db, a.id, "exhausted", "2099-01-01T00:00:00.000Z", "five_hour");
+  expect(await activeUsage(cfg, db)).toEqual({ tokenId: b.id, label: "b", reading: null });
+});
+
+test("with no token usable, activeUsage is the first one's, so the bar still shows the limit it ran out of", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "value-a", { label: "a", setBy: null });
+  recordUsage(db, a.id, reading(T0, 1));
+  markToken(db, a.id, "exhausted", "2099-01-01T00:00:00.000Z", "five_hour");
+  expect(await activeUsage(cfg, db)).toEqual({ tokenId: a.id, label: "a", reading: reading(T0, 1) });
 });

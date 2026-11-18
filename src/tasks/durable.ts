@@ -968,9 +968,13 @@ export class TaskRunner {
         ...(context.abortSignal !== undefined ? { signal: context.abortSignal } : {}),
         onMessage: (m, seq) => {
           if (m.type === "meddle" && m.subtype === "turn_failed") failureLogged = true;
-          // Recorded before the event goes out, so a listener reads it.
+          // Recorded before the event goes out, so a listener reads it; a reading that cannot be kept never fails the turn.
           const reading = usageReadingOf(m, new Date().toISOString());
-          if (reading !== null) recordUsage(this.#db, picked.id, reading);
+          try {
+            if (reading !== null) recordUsage(this.#db, picked.id, reading);
+          } catch (err) {
+            this.#log(`meddle: tokens: could not keep token ${picked.id}'s usage reading: ${messageOf(err)}`);
+          }
           notify(this.#eventListeners, (cb) => cb(taskId, seq, m));
           if (m.type === "user") this.#emitQueued(taskId); // a steer it took is logged
         },

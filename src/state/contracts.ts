@@ -150,7 +150,7 @@ const nodeState = {
   token: Type.Object({ present: Type.Boolean(), expiresAt: Nullable(Type.String()) }),
   /** This node's latest plan-usage reading of each token not removed, by token id (`tokenUsages`). */
   tokenUsage: Type.Record(Type.String(), UsageReadingSchema),
-  /** The token this node's next turn uses (`pickToken`) with its reading here (null: none yet); null with no token. */
+  /** The token this node's next turn uses, else its first (`activeUsage`), with its reading here; null with no token. */
   activeUsage: Nullable(Type.Object({ tokenId: Type.String(), label: Type.String(), reading: Nullable(UsageReadingSchema) })),
   /** The tasks that live on this node (archived, moved and received-but-not-yet-active ones left out). */
   taskIds: Type.Array(Type.String()),
