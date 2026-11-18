@@ -100,9 +100,17 @@ test("a file of the limit's size is taken", async () => {
   expect((await up.json() as { size: number }).size).toBe(MAX_BLOB_BYTES);
 }, 30_000);
 
-test("an upload with no body is 400", async () => {
-  expect((await fetch(`${url}blobs`, { method: "PUT" })).status).toBe(400);
-  expect((await fetch(`${url}blobs`, { method: "PUT", body: new Uint8Array(0) })).status).toBe(400);
+test("an empty upload is the empty file", async () => {
+  const empty = { hash: sha(""), size: 0 };
+  for (const init of [{ method: "PUT" }, { method: "PUT", body: new Uint8Array(0) }, { method: "PUT", body: new Blob([]) }]) {
+    const up = await fetch(`${url}blobs`, init);
+    expect(up.status).toBe(200);
+    expect(await up.json()).toEqual(empty);
+  }
+  const down = await fetch(`${url}blobs/${empty.hash}?type=text/plain&name=empty.txt`);
+  expect(down.status).toBe(200);
+  expect(await down.text()).toBe("");
+  expect(await temps()).toEqual([]);
 });
 
 test("only PUT on /blobs and GET on /blobs/<hash>", async () => {

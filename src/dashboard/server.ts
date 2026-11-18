@@ -105,21 +105,23 @@ export async function startDashboard(
 
 const CAP_MESSAGE = "file exceeds 64 MB";
 
+/** No bytes at all: what an empty file's upload has in place of a body. */
+async function* noBytes(): AsyncGenerator<Uint8Array> {}
+
 function notAllowed(allow: string): Response {
   return new Response("method not allowed", { status: 405, headers: { allow } });
 }
 
 /**
  * Stores the request's body as a blob and answers `{ hash, size }`. A body over the 64 MB limit is refused as soon as
- * its `Content-Length` says so, unread, or when it grows past the limit; nothing is kept then. No body, which an empty
- * one is too, is a 400.
+ * its `Content-Length` says so, unread, or when it grows past the limit; nothing is kept then. A request has no body
+ * when it is empty, so that is the empty file.
  */
 async function putBlob(request: Request, blobs: BlobFetcher): Promise<Response> {
   const announced = request.headers.get("content-length");
   if (announced !== null && Number(announced) > MAX_BLOB_BYTES) return new Response(CAP_MESSAGE, { status: 413 });
-  if (request.body === null) return new Response("expected a file in the body", { status: 400 });
   try {
-    return Response.json(await blobs.store.write(request.body, { maxBytes: MAX_BLOB_BYTES }));
+    return Response.json(await blobs.store.write(request.body ?? noBytes(), { maxBytes: MAX_BLOB_BYTES }));
   } catch (err) {
     if (err instanceof Error && err.message === `blob exceeds ${MAX_BLOB_BYTES} bytes`) {
       return new Response(CAP_MESSAGE, { status: 413 });
