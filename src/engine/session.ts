@@ -238,6 +238,7 @@ export function runTurn(args: RunTurnArgs): {
   };
   const takeBack = async (): Promise<Prompt[]> => {
     const back: Prompt[] = [];
+    let cancelled = false; // Claude Code gave back a steer it had read
     for (const { uuid, prompt } of queue.untaken()) {
       const dropped = queue.drop(uuid);
       if (dropped === "dropped") back.push(prompt);
@@ -246,9 +247,12 @@ export function runTurn(args: RunTurnArgs): {
       await queue.written();
       const reply = await (q as unknown as ControlRequests).request({ subtype: "cancel_async_message", message_uuid: uuid }).catch(() => undefined);
       // Not cancelled: Claude Code took it meanwhile (it is logged as taken), or cannot give it back.
-      if (reply?.response?.cancelled === true && queue.take(uuid) !== null) back.push(prompt);
+      if (reply?.response?.cancelled === true && queue.take(uuid) !== null) {
+        back.push(prompt);
+        cancelled = true;
+      }
     }
-    ending.recheck();
+    if (cancelled) ending.recheck();
     return back;
   };
   return { query: q, done, sendNow, takeBack };
@@ -270,7 +274,10 @@ type ControlRequests = {
   request(request: { subtype: "cancel_async_message"; message_uuid: string }): Promise<{ response?: { cancelled?: boolean } }>;
 };
 
-/** Set by `drive`: ends the input when the turn has its `result` and nothing is left to keep it open (a take-back). */
+/**
+ * Set by `drive`, called once a take-back had Claude Code give back a steer it had read: ends the turn when it has its
+ * `result` and nothing is left to keep it open.
+ */
 type Ending = { recheck: () => void };
 
 /** Appends an event to the task's log, then tells `onMessage`. */
@@ -322,7 +329,7 @@ async function drive(
   };
   // A take-back can leave a finished turn with nothing to wait for. A steer Claude Code read after the `result` keeps
   // the SDK from closing its input (it waits for that steer's turn, which a cancelled one never gets), so the turn ends
-  // now, as when the grace is over.
+  // now, as when the grace is over. Called only for such a steer: a turn whose input closed on its own exits on its own.
   let cutShort = () => {};
   const takenBackAll = new Promise<"grace">((resolve) => { cutShort = () => resolve("grace"); });
   ending.recheck = () => { if (endIfDone()) cutShort(); };

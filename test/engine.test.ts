@@ -318,6 +318,21 @@ test("taking back the steer a finished turn waits on ends the turn at once", asy
   expect(await taken).toEqual([{ text: STEER, attachments: [] }]);
   expect(queue.untaken()).toEqual([]);
 }, 15_000);
+test("a take-back with nothing to withdraw leaves a finished turn's child to exit on its own", async () => {
+  const { input, db, fixture } = await setup();
+  let taken: Promise<Prompt[]> | undefined;
+  const turn = runTurn({
+    input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "Reply with the single word ok.", attachments: [] }, db, approvals: new Approvals(),
+    // a tick later: once the turn has its result and its input has closed, while the child exits
+    onMessage: (m) => { if (m.type === "result" && taken === undefined) taken = Bun.sleep(0).then(() => turn.takeBack()); },
+  });
+  let closed = false;
+  const close = turn.query.close.bind(turn.query);
+  turn.query.close = () => { closed = true; close(); };
+  expect(await turn.done).toMatchObject({ result: "ok" });
+  expect(await taken).toEqual([]);
+  expect(closed).toBe(false);
+}, 15_000);
 test("input queue: every prompt pushed is untaken, in order, until taken by its uuid; taken ones are told once", () => {
   const q = new InputQueue();
   const p = (text: string): Prompt => ({ text, attachments: [] });

@@ -253,6 +253,8 @@ export class TaskRunner {
   #log: (line: string) => void;
   /** Tasks whose new `meddle.turn` is being created or has not started running yet. */
   #pending = new Set<string>();
+  /** The queued prompt `startQueued` is starting a task's turn with, until it has left `queued`. */
+  #starting = new Map<string, Prompt>();
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
   #stateListeners = new Set<(taskId: string, state: TaskState) => void>();
   #queuedListeners = new Set<(taskId: string) => void>();
@@ -611,6 +613,7 @@ export class TaskRunner {
     const [head] = queuedOf(row);
     if (head === undefined) return;
     this.#pending.add(taskId);
+    this.#starting.set(taskId, head);
     try {
       await this.#createTurn({
         taskId, prompt: head.text, attachments: head.attachments,
@@ -618,6 +621,7 @@ export class TaskRunner {
       });
     } catch (err) {
       this.#pending.delete(taskId);
+      this.#starting.delete(taskId);
       throw err;
     }
     // This is the one taker, kept single by `#pending`; meanwhile a prompt may join the tail, or the steers a turn
@@ -628,6 +632,7 @@ export class TaskRunner {
       const rest = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
       updateTask(this.#db, taskId, { queued: queuedColumn(rest) });
     })();
+    this.#starting.delete(taskId);
     this.#emitQueued(taskId);
   }
 
@@ -757,13 +762,15 @@ export class TaskRunner {
   async #takeBackQueued(taskId: string): Promise<Prompt[]> {
     this.#refuseElsewhere(taskId);
     const live = await this.#live.get(taskId)?.takeBack() ?? [];
-    // `startQueued` takes the first prompt once its turn exists: while one is pending, the first may be starting.
-    const keep = this.#pending.has(taskId) ? 1 : 0;
+    // `startQueued` takes the prompt it starts out of `queued` once its turn exists: until then it stays there.
+    const starting = this.#starting.get(taskId);
     let later: Prompt[] = [];
     this.#db.transaction(() => {
       const queued = queuedOf(this.#row(taskId));
-      later = queued.slice(keep);
-      updateTask(this.#db, taskId, { queued: queuedColumn(queued.slice(0, keep)) });
+      // as `startQueued` does, the first prompt equal to the one starting (text and attachments) stays
+      const at = starting === undefined ? -1 : queued.findIndex((q) => Bun.deepEquals(q, starting));
+      later = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
+      updateTask(this.#db, taskId, { queued: queuedColumn(at === -1 ? [] : [queued[at]!]) });
     })();
     this.#emitQueued(taskId);
     return [...live, ...later];

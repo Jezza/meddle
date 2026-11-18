@@ -404,6 +404,19 @@ test("a prompt whose turn is starting stays", async () => {
   expect(prompts()).not.toContain("b");
   await h.close();
 });
+test("take back while a prompt's own turn is being created takes the text queued behind it", async () => {
+  const { db, h, runner, m, settled } = await setup();
+  const prompts = () => listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
+  const done = settled(runner);
+  const first = runner.prompt(m.id, "Reply with the single word ok.");
+  expect(await runner.prompt(m.id, "behind it")).toBe("queued");
+  expect(await runner.takeBackQueued(m.id)).toEqual([{ text: "behind it", attachments: [] }]);
+  await first;
+  await done;
+  expect(runner.queued(m.id)).toEqual([]);
+  expect(prompts()).toEqual(["Reply with the single word ok."]);
+  await h.close();
+});
 test("a prompt to a task whose turn is parked retries the turn and queues the message for after it", async () => {
   const { insertTask } = await import("../src/store/records");
   const home = await mkdtemp("/tmp/meddle-dur-");
