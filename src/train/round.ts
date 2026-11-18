@@ -98,8 +98,10 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  *    queued is held back; a task holding a queued task's work goes only with it.
  * 2. A batch is picked (`pickBatch`); a task that doesn't merge cleanly with `B` is to rebase.
  * 3. A batch with two heads or more is checked by a merge task (`checkBatch`; never for one head). A task it blames
- *    leaves the batch, with the tasks holding its work, for a fix turn, and a fresh merge task checks the rest. A stuck
- *    check pauses the train.
+ *    leaves the batch, with the tasks holding its work, for a fix turn, and a fresh merge task checks the rest. A batch
+ *    that doesn't merge cleanly after all (jj's merge isn't git's trial merge) puts its smallest task back, with the
+ *    tasks holding its work, for a later round, and the rest is checked again; when that would leave nothing, the tasks
+ *    left are to rebase instead. A stuck check pauses the train.
  * 4. Unless a task of the batch (or one whose work it holds) left or changed meanwhile (then the round starts over:
  *    `again`), the branch is moved from `B` to the merge, or to the single head (`advance`). When that is refused, the
  *    merge task is discarded. If the branch has moved since `B`, the round starts over against it (`again`); nothing
@@ -108,7 +110,8 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  *    after step 5, rather than check the same batch again and again.
  * 5. After landing (or straight away, if nothing landed), each task to rebase gets a rebase turn onto the branch's new
  *    commit, and each blamed task a fix turn opening with the merge agent's report, all at once. A task whose own commits
- *    another task has built on can't rebase, and leaves. A rebase turn must leave the work merging cleanly.
+ *    another task has built on can't rebase, and leaves. A rebase turn must leave the work merging cleanly, and, for a
+ *    task whose merge only jj found unclean (git can't tell), on the branch's commit.
  *
  * A train turn that fails (or can't be run) or ends without doing its job sits its task out (`waiting for <node>` when
  * the node is offline); a decline makes it leave. The round's tasks are those of its first `candidates`: a task queued
@@ -133,7 +136,7 @@ export async function runRound(deps: RoundDeps, cfg: NodeConfig, repo: string, p
   if (picked.later.length > 0) round.again = true;
 
   const blamed: Blamed[] = [];
-  const landing = await round.land(picked.batch, blamed);
+  const landing = await round.land(picked.batch, blamed, picked.rebase);
   if (landing === "again") return { landed: null, again: true, paused: null };
   if ("paused" in landing) return { landed: null, again: false, paused: landing.paused };
   if ("refused" in landing) {
@@ -172,6 +175,8 @@ class Round {
   readonly #needs = new Map<string, string[]>();
   /** The tasks that left the queue in this round. */
   readonly #left = new Set<string>();
+  /** The tasks to rebase because jj's merge of their work with `B` isn't clean, though git's trial merge is. */
+  readonly #unclean = new Set<string>();
   #lines: LineRow[] = [];
   readonly #graph: Graph;
 
@@ -322,8 +327,13 @@ class Round {
     }
   }
 
-  /** Steps 3 and 4: checks `batch` (a task blamed goes to `blamed`) and lands what passes, as `runRound` says. */
-  async land(batch: Candidate[], blamed: Blamed[]): Promise<{ landed: string | null } | { paused: string } | { refused: string } | "again"> {
+  /**
+   * Steps 3 and 4: checks `batch` (a task blamed goes to `blamed`, one whose merge isn't clean after all may go to
+   * `rebase`) and lands what passes, as `runRound` says.
+   */
+  async land(
+    batch: Candidate[], blamed: Blamed[], rebase: Candidate[],
+  ): Promise<{ landed: string | null } | { paused: string } | { refused: string } | "again"> {
     let rest = batch;
     while (rest.length > 0) {
       const ids = rest.map((c) => c.taskId);
@@ -334,6 +344,18 @@ class Round {
         await this.deps.checkpoint({ step: "checking", batch: ids, mergeTask: null });
         const verdict = await this.#check(rest);
         if (verdict.kind === "stuck") return { paused: verdict.reason };
+        if (verdict.kind === "unclean") {
+          // The batch is the biggest first: the smallest task waits for a later round, unless nothing would be left.
+          const others = this.#without(rest, rest.at(-1)!.taskId);
+          if (others.length === 0) {
+            for (const c of rest) this.#unclean.add(c.taskId);
+            rebase.push(...rest);
+            return { landed: null };
+          }
+          this.again = true;
+          rest = others;
+          continue;
+        }
         if (verdict.kind === "blamed") {
           const culprit = rest.find((c) => c.taskId === verdict.task)!;
           blamed.push({ c: culprit, report: verdict.reason });
@@ -437,7 +459,9 @@ class Round {
     for (const [i, t] of turns.entries()) {
       const c = now.get(t.c.taskId);
       if (!ended[i] || c === undefined) continue;
-      if (t.kind === "rebase" && (await this.#conflicts(main, c.tip))) await this.#sitOut(c.taskId, STILL_CONFLICTS);
+      const still = t.kind === "rebase"
+        && ((await this.#conflicts(main, c.tip)) || (this.#unclean.has(c.taskId) && !(await this.#graph.isAncestor(main, c.tip))));
+      if (still) await this.#sitOut(c.taskId, STILL_CONFLICTS);
       else this.again = true;
     }
   }

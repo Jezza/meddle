@@ -1,6 +1,6 @@
 // test/train-merge.test.ts
 import { expect, test } from "bun:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { loadConfig } from "../src/config";
 import { bookmarkSet, commitOf, commitsIn, initColocated, jj } from "../src/jj";
 import { checkBatch, type MergeDeps } from "../src/train/merge";
@@ -204,14 +204,39 @@ test("a failed turn is stuck with its reason, and a decline too", async () => {
   }
 });
 
-test("a batch that doesn't merge cleanly is stuck, with no merge task made", async () => {
+test("a batch that doesn't merge cleanly is unclean, with no merge task made", async () => {
   const { repo, B, batch, created, run } = await fixture();
   const clash = await commitOfClash(repo, B);
   const clashing: Candidate = { taskId: "t3", title: "Clash", tip: clash, base: [B], workspace: null, size: 1 };
 
-  const verdict = await run({ batch: [...batch, clashing] });
-  expect(verdict).toEqual({ kind: "stuck", reason: expect.stringContaining("f.txt"), mergeTask: null });
+  expect(await run({ batch: [...batch, clashing] })).toEqual({ kind: "unclean" });
   expect(created).toEqual([]);
+});
+
+test("a batch git merges cleanly but jj doesn't (a rename) is unclean: its merge task is discarded before any turn", async () => {
+  const { repo, B, batch, created, discarded, turns, run } = await fixture();
+  // One task renames f.txt, the other edits it: git applies the edit to the renamed file, jj's merge conflicts.
+  await jj(["new", B], repo);
+  await rm(`${repo}/f.txt`);
+  await Bun.write(`${repo}/h.txt`, LINES.join(""));
+  await jj(["commit", "-m", "rename f"], repo);
+  const renamed: Candidate = { taskId: "t3", title: "Rename f", tip: await commitOf(repo, "@-"), base: [B], workspace: null, size: 3 };
+
+  expect(await run({ batch: [renamed, batch[1]!] })).toEqual({ kind: "unclean" });
+  expect(created).toHaveLength(1);
+  expect(turns).toEqual([]);
+  expect(discarded).toEqual(["m1"]);
+});
+
+test("a merge task that starts on other files than the trial merge's is unclean too", async () => {
+  const { cfg, repo, B, deps, created, discarded, turns, run } = await fixture();
+  // jj's merge came out clean, but not as git's did.
+  deps.head = async () => (await commitsIn(repo, B, cfg))[0]!;
+
+  expect(await run()).toEqual({ kind: "unclean" });
+  expect(created).toHaveLength(1);
+  expect(turns).toEqual([]);
+  expect(discarded).toEqual(["m1"]);
 });
 
 test("a batch with one head is no merge", async () => {

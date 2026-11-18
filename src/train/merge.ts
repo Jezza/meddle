@@ -27,6 +27,9 @@ export type MergeDeps = {
  * How checking a batch ended:
  * - `ready`: `mergeTask`'s line head `L` (a commit id) is the merge, described, with no conflicts and no file changed;
  * - `blamed`: the merge agent blamed the batch's task `task` (its id) for a failure, and the merge task is discarded;
+ * - `unclean`: the batch doesn't merge cleanly after all: git's trial merge of its heads conflicts, or jj's merge, the
+ *   one the merge task started on, has conflicts or other files than git's (git and jj can disagree, over a rename for
+ *   one). No merge task is left: it is discarded before its first turn;
  * - `stuck`: the batch can't be checked, or the merge agent didn't get a verdict right (its turn failed, or follow-ups
  *   didn't put it right), and the train pauses for `reason`. The merge task made is left alive, for the user to open and
  *   for Retry to carry on with, and `mergeTask` is its id (the caller discards it when it unqueues a task or the branch
@@ -35,6 +38,7 @@ export type MergeDeps = {
 export type MergeVerdict =
   | { kind: "ready"; mergeTask: string; L: string }
   | { kind: "blamed"; task: string; reason: string }
+  | { kind: "unclean" }
   | { kind: "stuck"; reason: string; mergeTask: string | null };
 
 /** The follow-up turns the merge agent gets to put its result right, before the train gives up on it (Global Constraints). */
@@ -53,9 +57,10 @@ type Problem = { what: string; fix: string };
  * its tree has to be the clean trial merge's tree (`trialMerge`): the agent changed no file. If not, the agent gets a
  * follow-up turn that names what is wrong, up to three, and then the verdict is `stuck`, as it is when a turn fails.
  *
- * There is nothing to merge when the parents are fewer than two (the caller lands that one head as it is), and the
- * batch is known to merge cleanly, so a trial merge that doesn't is `stuck` too, before any task is made. A failure of
- * `deps` itself rejects.
+ * There is nothing to merge when the parents are fewer than two (the caller lands that one head as it is): `stuck`,
+ * before any task is made. A trial merge that conflicts is `unclean`, before any task is made too, and so is a merge
+ * task whose start, read before its first turn, has conflicts or other files than the trial merge: it is discarded. A
+ * failure of `deps` itself rejects.
  */
 export async function checkBatch(
   deps: MergeDeps, cfg: NodeConfig, repo: string, input: { projectId: string; B: string; batch: Candidate[]; prompt: string },
@@ -68,7 +73,7 @@ export async function checkBatch(
   let tree: string;
   try {
     const trial = await trialMerge(cfg, repo, parents);
-    if (trial.tree === null) return stuck(`the batch doesn't merge cleanly after all: conflicts in ${trial.conflicts.join(", ")}`);
+    if (trial.tree === null) return { kind: "unclean" };
     tree = trial.tree;
   } catch (err) {
     return stuck(`the batch could not be trial merged: ${err instanceof Error ? err.message : String(err)}`);
@@ -77,8 +82,13 @@ export async function checkBatch(
   const { taskId } = await deps.createMergeTask({
     projectId: input.projectId, parents, title: mergeTitle(batch.map((c) => c.title)), batch: batch.map((c) => c.taskId),
   });
-  // The merge as the task started on it: a head that is no other change.
-  const change = (await deps.head(taskId)).changeId;
+  // The merge as the task started on it: a head that is no other change. jj made it, and it must be git's clean merge.
+  const start = await deps.head(taskId);
+  if (start.conflict || (await treeOf(cfg, repo, start.commitId)) !== tree) {
+    await deps.discard(taskId);
+    return { kind: "unclean" };
+  }
+  const change = start.changeId;
   const tasks = batch.map(label);
   let text = mergePrompt(tasks, change, input.prompt);
 

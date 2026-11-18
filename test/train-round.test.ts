@@ -1,6 +1,6 @@
 // test/train-round.test.ts
 import { expect, test } from "bun:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { loadConfig } from "../src/config";
 import { abandon, bookmarkSet, commitOf, commitsIn, initColocated, jj } from "../src/jj";
 import type { LineRow } from "../src/pool/rows";
@@ -555,6 +555,62 @@ test("blaming a contained task drops the task holding its work too", async () =>
   // tl can't rebase what tu has built on: it leaves rather than get its fix turn.
   expect(left).toEqual([["tl", "another task builds on this work, so it can't rebase"]]);
   expect(turns.map((t) => t.taskId)).toEqual(["m1"]);
+});
+
+/** A commit on `parent` that renames f.txt to h.txt: git merges it cleanly with an edit of f.txt, jj conflicts. */
+async function renameOf(f: Awaited<ReturnType<typeof fixture>>, parent: string): Promise<string> {
+  await jj(["new", parent], f.repo);
+  await rm(`${f.repo}/f.txt`);
+  await Bun.write(`${f.repo}/h.txt`, LINES.join(""));
+  await jj(["commit", "-m", "rename f"], f.repo);
+  return commitOf(f.repo, "@-");
+}
+
+test("a batch whose real merge conflicts puts its smallest task back, and that one rebases when it is all that's left", async () => {
+  const f = await fixture();
+  const { repo, B, on, task, line, run, created, discarded, advances, turns, satOut, steps, act } = f;
+  const renamed = await renameOf(f, B);
+  const edit = await on(B, "fix seven", { "f.txt": edited(7, "SEVEN") });
+  await task("t1", renamed, { size: 3 });
+  await task("t2", edit);
+
+  // git says the pair merges cleanly, jj's merge conflicts: m1 is discarded before its first turn, t2 waits, t1 lands.
+  expect(await run()).toEqual({ landed: renamed, again: true, paused: null });
+  expect(created.map((c) => c.batch)).toEqual([["t1", "t2"]]);
+  expect(discarded).toEqual(["m1"]);
+  expect(advances).toEqual([[B, renamed]]);
+  expect(turns).toEqual([]);
+
+  // Alone against main, t2's real merge still conflicts: no pause, a rebase turn.
+  let rebased = "";
+  act("t2", async () => {
+    rebased = await on(renamed, "fix seven, rebased", { "h.txt": edited(7, "SEVEN") });
+    await bookmarkSet(repo, line("t2"), rebased);
+  });
+  expect(await run()).toEqual({ landed: null, again: true, paused: null });
+  expect(created.map((c) => c.batch)).toEqual([["t1", "t2"], ["t2"]]);
+  expect(discarded).toEqual(["m1", "m2"]);
+  expect(turns).toEqual([{ taskId: "t2", kind: "rebase", text: rebasePrompt(renamed) }]);
+  expect(steps.at(-1)).toEqual({ step: "rebasing", batch: ["t2"], mergeTask: null });
+
+  expect(await run()).toEqual({ landed: rebased, again: false, paused: null });
+  expect(advances).toEqual([[B, renamed], [renamed, rebased]]);
+  expect(satOut).toEqual([]);
+});
+
+test("a task whose real merge conflicts, and that isn't on main after its rebase turn, sits out", async () => {
+  const f = await fixture();
+  const { B, on, task, run, discarded, turns, satOut, advances } = f;
+  const renamed = await renameOf(f, B);
+  await bookmarkSet(f.repo, "main", renamed);
+  // The agent leaves its work as it was: git still merges it cleanly with main.
+  await task("t1", await on(B, "fix seven", { "f.txt": edited(7, "SEVEN") }));
+
+  expect(await run()).toEqual({ landed: null, again: false, paused: null });
+  expect(discarded).toEqual(["m1"]);
+  expect(turns).toEqual([{ taskId: "t1", kind: "rebase", text: rebasePrompt(renamed) }]);
+  expect(satOut).toEqual([["t1", expect.stringContaining("still doesn't merge cleanly")]]);
+  expect(advances).toEqual([]);
 });
 
 test("a lasting refusal pauses the train, after the turns the round owes", async () => {
