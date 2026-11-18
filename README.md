@@ -806,6 +806,7 @@ is queued changes nothing. Accept is refused for a task that:
 - is archived (`task is archived: <id>`) or moving (`task is moving`);
 - has prompts waiting, queued or steered into the running turn: `send or clear the waiting prompts first`, so that
   nothing newer than what you accepted runs after it;
+- has no project: `nothing to land: the task has no project` (the dashboard offers no Accept on such a task);
 - works in more than one project: `accept handles one project for now; push to land the rest`;
 - is a merge task (the train's own, see below): `a merge task lands with its train`.
 
@@ -819,7 +820,8 @@ A task **leaves the queue** when:
 
 - you take it off: Unqueue in the dashboard (its header, its ⋯ menu, or its row on the train page), or `task unqueue
   <task-id>...`, which prints `unqueued <id>`, or `<id> is not queued` for a task that was not. Unqueueing a task of
-  the batch the train is checking discards the merge task that checks it, and the round starts over without it;
+  the batch the train is checking doesn't stop the check: once the merge task's turn ends, the train discards the merge
+  task and the round starts over without it;
 - you archive it;
 - anything of yours runs in it after you accepted: a new prompt, a message steered into the turn that was running when
   you pressed Accept, Send now, or Retry. Its work is about to change, and you accepted the version before. Answering
@@ -827,8 +829,10 @@ A task **leaves the queue** when:
 - the train gives up on it: its agent declines, or a commit that would land can't be made pushable by the task
   (below).
 
-A task the train took off shows why as a notice in the dashboard (see [Dashboard](#dashboard)), and can be accepted
-again. A task you go on working in is off the train, so work you did not accept never lands through it.
+A task the train took off shows why as a notice in the dashboard (see [Dashboard](#dashboard)) and as a line in its
+conversation (`Declined: <reason>` when its agent declined, `Left meddle's train: <reason>` otherwise), and can be
+accepted again, also while the turn its agent declined in is still finishing. A task you go on working in is off the
+train, so work you did not accept never lands through it.
 
 You can take a task's work yourself instead, by pushing. A push from a checkout accepts tasks as it always has, whether
 or not they are queued:
@@ -905,6 +909,11 @@ five steps. Its **eligible** tasks are the queued ones that are idle, on an onli
      merge task. Otherwise the train checks that the merge task's head is the merge itself, with a description, no
      conflicts and the tree of the clean merge (no file changed). If not, the agent gets a follow-up turn naming what
      is wrong, up to three, and then the train pauses.
+   - The merge task's start is jj's merge, which can differ from git's trial merge (a file one task renamed and
+     another edited, say). Before its first turn the train reads it: with conflicts, or files other than the trial
+     merge's, the batch doesn't merge cleanly after all, and nothing pauses. The merge task is discarded, the batch's
+     smallest task (with any task holding its work) waits for a later round, and the rest is checked again; when no
+     task would be left, the tasks are marked to rebase (step 5).
 4. **Landing.** The branch moves from `B` to the merge (or to the single head) through the checks and the record of
    a push to the node (a conflicted branch, a branch behind its rows, or a node that takes no input refuses it), and
    only as a fast-forward. If someone pushed since `B`, the move is refused, the round starts over against the new
@@ -915,9 +924,10 @@ five steps. Its **eligible** tasks are the queued ones that are idle, on an onli
    tests your changes affect (not the full suite), and keep each revision described. If your change no longer makes
    sense on main, because something it relies on is gone or has changed meaning, call decline with the reason.` A
    task the merge agent blamed gets the same turn, opening with what the agent reported. A task rebases only its own
-   revisions: when another task has built on them it leaves the queue saying so. `decline(reason)` is a tool only these
-   turns have; calling it takes the task off the queue, with the reason shown. When a train turn ends the task is
-   eligible again, and the next round starts.
+   revisions: when another task has built on them it leaves the queue saying so. A task marked to rebase because only
+   jj's merge conflicts (step 3) must end its turn with its work on `<commit>`. `decline(reason)` is a tool every train
+   turn of a task has (describing, rebasing, fixing), and the merge task's turns don't; calling it takes the task off
+   the queue, with the reason shown. When a train turn ends the task is eligible again, and the next round starts.
 
 Every train turn runs in `auto` permission mode, whatever the task's own mode is; the task's own mode is untouched for
 your turns. `decline` and `blame` need no approval. A train turn shows in the task's conversation like any prompt, marked
@@ -926,17 +936,25 @@ send into it; the message runs when the train lets go, and takes the task off th
 batch being checked is not held: a message to it runs, which takes it off the queue and starts the round over without it.
 
 **Sitting out.** A task whose train turn fails (after meddle's own reruns for tokens), or ends without doing its job
-(revisions still undescribed or conflicted, or still not merging cleanly with the branch after the rebase), stays
-queued but is not eligible: it sits out. The train page shows it as `sitting out`, and a notice gives the reason, with
-Retry (also on its row). Only Retry brings it back (Unqueue takes it off the train instead), so the train never sends
-the same prompt round after round. A task whose node is offline sits out too, as `waiting for <node>`, and comes back
-by itself when the node does.
+(revisions still undescribed or conflicted, or still not merging cleanly with the branch after the rebase, or not on
+it when only jj's merge conflicted), stays queued but is not eligible: it sits out. The train page shows it as
+`sitting out`, and a notice gives the reason, with Retry (also on its row). Only Retry brings it back (Unqueue takes
+it off the train instead), so the train never sends the same prompt round after round. A task whose node is offline
+sits out too, as `waiting for <node>`, and comes back by itself when the node does.
 
-**Pausing.** When the merge agent gets stuck (follow-ups that gave no verdict), its turn fails, or the branch refuses
-the landing for a reason that outlasts the round (conflicted, or behind its rows), the train pauses with `Paused:
-<reason>`, which the dashboard shows with Retry; the merge task is left for you to open. Retry or `train resume`
-carries on, and checks again with a fresh merge task. A refusal that passes by itself (the node taking no input while an update awaits confirmation, a branch it
-is still fetching) lifts its pause after 30 seconds. You can pause the train yourself, for "I'm about to push to main
+**Pausing.** The train pauses with `Paused: <reason>`, which the dashboard shows with Retry, when:
+
+- the merge agent gets stuck (`the merge agent did not put the merge right after 3 follow-ups: <what is wrong>`) or
+  its turn fails (`the merge agent's turn failed: <why>`): the merge task is left for you to open;
+- the branch refuses the landing for a reason that outlasts the round (`landing was refused: <refusal>`: conflicted,
+  or behind its rows): the merge task is discarded;
+- git can't trial merge the batch at all (`the batch could not be trial merged: <error>`), or the check itself fails
+  (`the batch's check failed: <error>`): no merge task is left;
+- restarts keep cutting its round off (`its round was cut off by restarts too often`).
+
+Retry or `train resume` carries on, and checks again with a fresh merge task (one left for you is discarded first). A
+refusal that passes by itself (the node taking no input while an update awaits confirmation, a branch it is still
+fetching) lifts its pause after 30 seconds. You can pause the train yourself, for "I'm about to push to main
 myself; hold off": train turns already running finish, since no agent is cut off mid-work, but nothing lands and no new
 round starts, until `train resume` or Resume, across restarts. The round then looks at the branch again first, in
 case it moved meanwhile. A pool update holds the train as it holds turns ([Queued and
@@ -1329,10 +1347,11 @@ a new task. Failed turns, moves and token trouble show as notices in the top rig
 train's, for a task that needs you: `<task> left meddle's train: <reason>` (Open task, and Accept again; a task you
 took off yourself is no news), `<task> is sitting out: <reason>` (Open task, and Retry) and `<task> includes work from
 <other task>, which isn't queued` (Open task). Each is raised once for its condition, and dismissing a notice only
-clears the notice. A task that left the train is a normal task again, with Accept back in its header and menu. A task
-that sits out, or is held back, is still queued (its header offers Unqueue): Retry brings back one that sits out, and
-a held-back one is settled by accepting the other task or unqueueing this one. It flags a pool whose members run
-different meddle or Claude Code versions in the Nodes header.
+clears the notice. A task that left the train is a normal task again, with the reason a line in its conversation and
+Accept back in its header and menu (a task with no project has no train, and offers no Accept). A task that sits out,
+or is held back, is still queued (its header offers Unqueue): Retry brings back one that sits out, and a held-back one
+is settled by accepting the other task or unqueueing this one. It flags a pool whose members run different meddle or
+Claude Code versions in the Nodes header.
 
 A task opens beside the sidebar: its title (✎ renames it), state (a queued task says `🚂 queued` beside it, as a
 partly accepted one says so; the 🚂 links to the train page) and actions (Interrupt, Retry, Archive, then Accept, or
@@ -1366,14 +1385,14 @@ it is online, and what the roster last recorded of it (and when it was last seen
 A project's train page (the 🚂 Train entry under the project in the sidebar, or a queued task's 🚂, which highlights
 that task's row) shows what is live of its train, as its home, which runs it, has it, in two columns. It is for
 watching: you accept on the task, where you have just looked at its work. **Queued** lists the tasks in the order they
-were accepted, each with its state as `train` prints it, Retry on one that sits out, and Unqueue. **This round** shows
-the steps (describing, picking, checking, landing, and rebasing when tasks were sent to rebase after the landing); the
-merge task as a card of its own, with what it is doing (starting, running its checks, waiting on you, verifying,
-landing) and Open; and the batch's tasks under it, each with Unqueue (a batch of one head has no merge task). The page's
-head names the branch the train lands on (`<project> → <branch>`) and has Pause, or while the train is paused
-`Paused: <reason>` with Resume (after your own Pause) or Retry (after the train's own). While the project's home is
-offline it says `waiting for <node>` and lists the tasks the pool knows are queued. There is no history: what landed is
-on the branch, and its tasks are archived.
+were accepted, each with its state as `train` prints it, Retry on one that sits out, and Unqueue; a task `in the
+batch` is not among them but under This round. **This round** shows the steps (describing, picking, checking,
+landing, and rebasing when tasks were sent to rebase after the landing); the merge task as a card of its own, with
+what it is doing (starting, running its checks, waiting on you, verifying, landing) and Open; and the batch's tasks
+under it, each with Unqueue (a batch of one head has no merge task). The page's head names the branch the train lands
+on (`<project> → <branch>`) and has Pause, or while the train is paused `Paused: <reason>` with Resume (after your own
+Pause) or Retry (after the train's own). While the project's home is offline it says `waiting for <node>` and lists the
+tasks the pool knows are queued. There is no history: what landed is on the branch, and its tasks are archived.
 
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an
