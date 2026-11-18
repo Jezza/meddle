@@ -45,11 +45,28 @@ export function draftAttachments(drafts: Draft[]): Attachment[] {
 }
 
 /**
- * The files a paste attaches: the clipboard's files, but none when it also holds plain text, as Excel, Word and Docs
- * put a picture of the selection beside its text: that paste is text, left to the browser.
+ * The files a paste attaches: the clipboard's files, when its plain text is nothing but them, each non-empty line one
+ * file's name or a path (or `file://` URL) ending in one, as a file manager copies files. Any other text wins: Excel,
+ * Word and Docs put a picture of the selection beside its text, and that paste is text, left to the browser.
  */
-export function pastedFiles<F>(clipboard: { text: string; files: readonly F[] }): F[] {
-  return clipboard.text === "" ? [...clipboard.files] : [];
+export function pastedFiles<F extends { name: string }>(clipboard: { text: string; files: readonly F[] }): F[] {
+  const names = clipboard.files.map((f) => f.name).filter((name) => name !== "");
+  const lines = clipboard.text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== "");
+  return lines.every((line) => names.some((name) => namesFile(line, name))) ? [...clipboard.files] : [];
+}
+
+/** Whether a line of pasted text is the file `name`: the name itself, or a path or `file://` URL that ends in it. */
+function namesFile(line: string, name: string): boolean {
+  if (line === name) return true;
+  let path = line;
+  if (/^file:\/\//i.test(line)) {
+    try {
+      path = decodeURIComponent(new URL(line).pathname);
+    } catch {
+      return false;
+    }
+  }
+  return path.endsWith(`/${name}`) || path.endsWith(`\\${name}`);
 }
 
 /** Whether a drag carries files (from outside the page), not text or a link. */

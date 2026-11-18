@@ -464,11 +464,24 @@ test("draftAttachments takes the uploaded drafts' attachments; only the four ima
   expect(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml", ""].map(shownInline)).toEqual([true, true, true, true, false, false]);
 });
 
-test("pastedFiles takes a clipboard's files only when it holds no plain text", () => {
-  // Excel, Word and Docs put a picture of the selection beside its text: that paste is text.
-  expect(pastedFiles({ text: "a\tb", files: ["image.png"] })).toEqual([]);
-  expect(pastedFiles({ text: "", files: ["image.png", "b.log"] })).toEqual(["image.png", "b.log"]);
+test("pastedFiles takes a clipboard's files when its text is nothing but their names or paths", () => {
+  const files = (...names: string[]) => names.map((name) => ({ name }));
+  // a picture alone, as a screenshot is
+  expect(pastedFiles({ text: "", files: files("image.png", "b.log") })).toEqual(files("image.png", "b.log"));
+  // Excel, Word and Docs put a picture of the selection beside its text: that paste is text
+  expect(pastedFiles({ text: "a\tb", files: files("image.png") })).toEqual([]);
+  expect(pastedFiles({ text: "Quarterly figures\n", files: files("image.png") })).toEqual([]);
   expect(pastedFiles({ text: "hello", files: [] })).toEqual([]);
+  // Finder: the file's name as its text
+  expect(pastedFiles({ text: "report.pdf", files: files("report.pdf") })).toEqual(files("report.pdf"));
+  // a file manager's paths, one a line, or file:// URLs; Windows paths too
+  expect(pastedFiles({ text: "/home/me/a.png\n/home/me/b c.log\n", files: files("a.png", "b c.log") })).toEqual(files("a.png", "b c.log"));
+  expect(pastedFiles({ text: "file:///home/me/b%20c.log\r\nfile:///home/me/a.png", files: files("a.png", "b c.log") })).toEqual(files("a.png", "b c.log"));
+  expect(pastedFiles({ text: "C:\\Users\\me\\a.png", files: files("a.png") })).toEqual(files("a.png"));
+  // a line that is not one of them, or a name only part of a line, is text
+  expect(pastedFiles({ text: "/home/me/a.png\nsee above", files: files("a.png") })).toEqual([]);
+  expect(pastedFiles({ text: "/home/me/xa.png", files: files("a.png") })).toEqual([]);
+  expect(pastedFiles({ text: "file:///home/me/bad%zz.png", files: files("bad%zz.png") })).toEqual([]);
 });
 
 /** A drag event as the page gets it, carrying `types`. */
