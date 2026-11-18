@@ -250,6 +250,7 @@ export class TaskRunner {
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
   #stateListeners = new Set<(taskId: string, state: TaskState) => void>();
   #queuedListeners = new Set<(taskId: string) => void>();
+  #liveListeners = new Set<(taskId: string) => void>();
   /** Per task, the `queued` its listeners were last told (JSON); none told means `[]`. */
   #toldQueued = new Map<string, string>();
   /**
@@ -849,6 +850,16 @@ export class TaskRunner {
     return () => { this.#stateListeners.delete(cb); };
   }
 
+  /**
+   * Told when a task's turn gains or loses its Claude Code process: right after `liveQuery` becomes non-null, and right
+   * after it is null again. The state does not say so: a turn's `idle` comes later, after its finish, and not at all
+   * while the task moves.
+   */
+  onLive(cb: (taskId: string) => void): () => void {
+    this.#liveListeners.add(cb);
+    return () => { this.#liveListeners.delete(cb); };
+  }
+
   state(taskId: string): TaskState {
     return this.#row(taskId).state as TaskState;
   }
@@ -923,6 +934,7 @@ export class TaskRunner {
         onTokenFault: (f) => { fault = f; },
       });
       this.#live.set(taskId, { query, queue, sendNow, state: "running" });
+      notify(this.#liveListeners, (cb) => cb(taskId));
       let result: Awaited<typeof done>;
       try {
         result = await done;
@@ -935,6 +947,7 @@ export class TaskRunner {
         // synced its memory.
         this.#requeueFront(taskId, queue.untaken().map((u) => u.prompt));
         this.#live.delete(taskId);
+        notify(this.#liveListeners, (cb) => cb(taskId));
         this.#emitQueued(taskId);
       }
       if (fault === null) return "done";

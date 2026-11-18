@@ -245,6 +245,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   const states: Subscribable<{ taskId: string; state: TaskState }> = {
     subscribe: (cb) => runner.onState((taskId, state) => cb({ taskId, state })),
   };
+  const lives: Subscribable<{ taskId: string }> = {
+    subscribe: (cb) => runner.onLive((taskId) => cb({ taskId })),
+  };
   const manifests: Subscribable<{ taskId: string }> = {
     subscribe: (cb) => runner.onManifest((taskId) => cb({ taskId })),
   };
@@ -803,12 +806,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       queued.replace(ctx, now.map((p) => p.text));
       queuedPrompts.replace(ctx, now);
     };
-    self.on("queued", queuedChanges, (event, ctx) => {
-      if (event.taskId !== id) return;
-      refreshQueued(ctx);
-      // The runner tells the queue right after it drops the turn's process, ahead of the idle state: agents stop running now.
-      refreshLiveTurn(ctx);
-    });
+    self.on("queued", queuedChanges, (event, ctx) => { if (event.taskId === id) refreshQueued(ctx); });
+    self.on("lives", lives, (event, ctx) => { if (event.taskId === id) refreshLiveTurn(ctx); });
     // What changed between the cells' init and the listeners starting.
     self.task(async (ctx) => {
       state.replace(ctx, runner.state(id));

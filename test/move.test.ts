@@ -917,6 +917,30 @@ test("a move waiting for the turn is cancelled: the task stays here, its turn un
   }
 }, 20_000);
 
+test("a turn that ends while its task moves still tells the runner's live listeners, though the state says nothing", async () => {
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ fixture: "approval.jsonl" }, {}] });
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    await peerReady(A, B);
+    const told: Array<{ live: boolean; row: string }> = [];
+    A.runner.onLive((id) => { if (id === m.id) told.push({ live: A.runner.liveQuery(id) !== null, row: getTask(A.db, id)!.state }); });
+    const waiting = stateOn(A, m.id, "waiting");
+    await A.runner.prompt(m.id, "Run: echo hi");
+    await waiting;
+    await A.runner.moveTo(m.id, B.id, false);
+    await until("A's row", () => getTask(A.db, m.id)!.state, "moving");
+    expect(told).toEqual([{ live: true, row: "running" }]);
+    const states = statesOf(A, m.id);
+    for (const q of A.runner.approvals.pending(m.id)) A.runner.approvals.answer(q.requestId, { behavior: "allow", updatedInput: q.input });
+    await moveSettled(A.harness.harness);
+    // The process was gone while the row still said `moving`, and before the move's own `moved`.
+    expect(told).toEqual([{ live: true, row: "running" }, { live: false, row: "moving" }]);
+    expect(states).toEqual(["moved"]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
 test("a move waiting for the turn is told to move now: it interrupts the turn and the target carries on", async () => {
   const { A, B, close } = await twoPoolNodes({ nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }, {}] });
   try {
