@@ -33,13 +33,13 @@ import {
   type EventRecord,
 } from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
-import { UNQUEUED_BY_USER, type MoveState, type TaskRunner, type TaskState } from "../tasks/durable";
+import { TurnsHeld, UNQUEUED_BY_USER, type MoveState, type TaskRunner, type TaskState } from "../tasks/durable";
 import {
   ChangesError, changeDiff, changeFile, changesProbe, taskChanges, workspaceFile, type ChangesProbe, type ProjectChanges,
 } from "../tasks/changes";
 import { taskNamespace, type ManifestProject, type Start, type TaskManifest } from "../tasks/manifest";
 import { initialTitle } from "../tasks/names";
-import { startTrains } from "../train/train";
+import { startTrains, TURNS_HELD } from "../train/train";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { activeUsage as activeUsageNow, tokenUsages } from "../token-usage";
@@ -190,9 +190,15 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         const row = getTask(db, id);
         return row !== null && row.state !== "moved";
       },
-      trainTurn: ({ taskId, kind, text }) => {
+      trainTurn: async ({ taskId, kind, text }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
-        return deps.runner.trainTurn(taskId, kind, text);
+        try {
+          return await deps.runner.trainTurn(taskId, kind, text);
+        } catch (err) {
+          // Held by a pool update here: said so, for the conductor to wait for the hold rather than count it against the task.
+          if (err instanceof TurnsHeld) throw new ChordError("unavailable", err.message, { reason: TURNS_HELD });
+          throw err;
+        }
       },
       trainTasks: ({ taskIds }) => {
         if (!deps.isMember(from)) throw forbidden("members only");

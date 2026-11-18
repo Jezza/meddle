@@ -7,7 +7,7 @@
 // and to its holder over the pool otherwise.
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
-import type { Ref, Subscribable } from "@earendil-works/chord";
+import { isChordError, type Ref, type Subscribable } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, withAbortSignal, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
@@ -27,7 +27,7 @@ import { defaultBranchCommit, mergeStartAt, type StartDeps } from "../projects/s
 import { PeerObject } from "../state/contracts";
 import { getTask, listTasks, newId } from "../store/records";
 import { containedIn, effectiveHead } from "../tasks/accept";
-import type { MeddleHooks, TaskRunner, TrainTaskStatus } from "../tasks/durable";
+import { TurnsHeld, type MeddleHooks, type RunnerHolds, type TaskRunner, type TrainTaskStatus } from "../tasks/durable";
 import type { TaskManifest } from "../tasks/manifest";
 import { sizeOf, type Candidate } from "./batch";
 import { NodeOffline, runRound, TaskGone, waitingFor, type RoundDeps, type RoundResult, type RoundStep } from "./round";
@@ -36,10 +36,16 @@ import { NodeOffline, runRound, TaskGone, waitingFor, type RoundDeps, type Round
 export type TrainInput = { projectId: string };
 
 /**
- * Where a round is, as its `meddle.train` checkpoints it: `idle` before it starts, then the round's own steps
- * (`RoundStep`). pi-durable names a task's phases by `phase`; a round has one.
+ * A round's step as the conductor keeps it: the `RoundStep`, and the node its merge task was placed on (`mergeNode`),
+ * so that calls for that task reach it even before its holder's line row has come back here, a resumed round's too.
  */
-export type TrainCheckpoint = { phase: "round" } & (RoundStep | { step: "idle" });
+export type SavedStep = RoundStep & { mergeNode?: string };
+
+/**
+ * Where a round is, as its `meddle.train` checkpoints it: `idle` before it starts, then the round's own steps
+ * (`SavedStep`). pi-durable names a task's phases by `phase`; a round has one.
+ */
+export type TrainCheckpoint = { phase: "round" } & (SavedStep | { step: "idle" });
 
 type TrainRuntime = TaskRuntime<TrainInput, TrainCheckpoint, null, MeddleHooks>;
 type PeerRef = Extract<Ref<typeof PeerObject>, { variant: "peer" }>;
@@ -85,6 +91,9 @@ const AUTO_RETRY_MS = 30_000;
 const LOOK_MS = 20_000;
 /** How long catching up on a project's rows and commits from the peers may take, for a round. */
 const CATCH_UP_MS = 5000;
+/** How long reading a merge task's head waits for its holder's row of it to come here, and how often it looks. */
+const HEAD_WAIT_MS = 10_000;
+const HEAD_POLL_MS = 250;
 /** Why a train pauses whose round the restart limit parked. */
 const PARKED = "its round was cut off by restarts too often";
 
@@ -100,10 +109,27 @@ class TrainPaused extends Error {
   }
 }
 
+/**
+ * The `reason` of the `ChordError` a holder refuses a train turn with while a pool update holds its turns
+ * (`PeerObject.trainTurn`).
+ */
+export const TURNS_HELD = "held";
+
+/**
+ * A pool update holds turns, here or on the task's holder: the round starts nothing more and winds down, nothing sits
+ * out or pauses for it, and a round starts again once the hold lifts.
+ */
+class HeldUp extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "HeldUp";
+  }
+}
+
 // ─── the trains table ───
 
 /** A project's train as the `trains` table keeps it. */
-type TrainRow = { paused: string | null; sitting: Record<string, string>; held: Record<string, string>; round: RoundStep | null };
+type TrainRow = { paused: string | null; sitting: Record<string, string>; held: Record<string, string>; round: SavedStep | null };
 type TrainRecord = { paused: string | null; sitting: string; held: string; round: string | null };
 
 function parsed<T>(text: string | null, fallback: T): T {
@@ -118,7 +144,7 @@ function parsed<T>(text: string | null, fallback: T): T {
 function readTrain(db: Database, projectId: string): TrainRow {
   const r = db.query<TrainRecord, [string]>("SELECT paused, sitting, held, round FROM trains WHERE project = ?").get(projectId);
   if (r === null) return { paused: null, sitting: {}, held: {}, round: null };
-  return { paused: r.paused, sitting: parsed(r.sitting, {}), held: parsed(r.held, {}), round: parsed<RoundStep | null>(r.round, null) };
+  return { paused: r.paused, sitting: parsed(r.sitting, {}), held: parsed(r.held, {}), round: parsed<SavedStep | null>(r.round, null) };
 }
 
 /** Changes project `projectId`'s train row as `change` says, in one transaction (made when it has none). */
@@ -189,7 +215,7 @@ function queueOf(db: Database, project: Pick<Project, "id" | "name">): LineRow[]
 export function trainState(db: Database, projectId: string): TrainState {
   const train = readTrain(db, projectId);
   const project = getProject(db, projectId);
-  const { round } = train;
+  const round: RoundStep | null = train.round === null ? null : { step: train.round.step, batch: train.round.batch, mergeTask: train.round.mergeTask };
   const queued = project === null ? [] : queueOf(db, project).map((r): TrainState["queued"][number] => {
     const sitting = train.sitting[r.task];
     if (sitting !== undefined) {
@@ -258,9 +284,28 @@ function isParked(t: TaskInspection): boolean {
 }
 
 /** The round step of a checkpoint past `idle`. */
-function stepOf(checkpoint: TrainCheckpoint): RoundStep | null {
+function stepOf(checkpoint: TrainCheckpoint): SavedStep | null {
   if (checkpoint.step === "idle") return null;
-  return { step: checkpoint.step, batch: [...checkpoint.batch], mergeTask: checkpoint.mergeTask };
+  return saved(checkpoint, checkpoint.mergeNode);
+}
+
+/** `step` as kept, with `mergeNode` when it is known. */
+function saved(step: RoundStep, mergeNode: string | undefined): SavedStep {
+  return { step: step.step, batch: [...step.batch], mergeTask: step.mergeTask, ...(mergeNode === undefined ? {} : { mergeNode }) };
+}
+
+/**
+ * What a round held up by a pool update keeps of `step`, for the next round to resume from: a describe or rebase step
+ * without the tasks whose turns the hold refused (they never had them, so they don't count as asked), a step naming a
+ * merge task (to discard it); nothing else, nor a describe or rebase step with no task left.
+ */
+function afterHold(step: SavedStep | null, held: ReadonlySet<string>): SavedStep | null {
+  if (step === null) return null;
+  if (step.step === "describing" || step.step === "rebasing") {
+    const batch = step.batch.filter((id) => !held.has(id));
+    return batch.length === 0 ? null : { ...step, batch };
+  }
+  return step.mergeTask === null ? null : step;
 }
 
 /**
@@ -290,16 +335,25 @@ export const MeddleTrain = defineTask<TrainInput, TrainCheckpoint, null, MeddleH
 
 /**
  * How a round ended, for what comes next: it ran (`result`; `transient`, the reason it paused when that passes by
- * itself), the user paused the train under it (`held`), it failed (`error`), or no round ran (`skipped`).
+ * itself), the user paused the train under it (`held`), a pool update's hold on turns stopped it (`heldUp`), it failed
+ * (`error`), or no round ran (`skipped`).
  */
 type Ended =
   | { kind: "round"; result: RoundResult; transient: string | null }
   | { kind: "held" }
+  | { kind: "heldUp" }
   | { kind: "failed"; error: unknown }
   | { kind: "skipped" };
 
-/** What a round keeps while it runs: its `B`, whether it read its candidates yet, and why a landing was refused for now. */
-type RoundRun = { B: string | null; first: boolean; transient: string | null };
+/**
+ * What a round keeps while it runs: its `B`, whether it read its candidates yet, why a landing was refused for now, why
+ * a pool update holds it up (`held`) and the tasks whose turns that refused, and the node each merge task it made (or
+ * resumed) was placed on.
+ */
+type RoundRun = {
+  B: string | null; first: boolean; transient: string | null;
+  held: string | null; heldTasks: Set<string>; mergeNodes: Map<string, string>;
+};
 
 /** How one project's train runs on its home. */
 type ProjectTrain = {
@@ -325,6 +379,11 @@ function closed(signal: AbortSignal): Promise<never> {
     if (signal.aborted) stop();
     else signal.addEventListener("abort", stop, { once: true });
   });
+}
+
+/** Whether a pool update holds turns or work here: no round starts meanwhile. */
+function held(holds: RunnerHolds): boolean {
+  return holds.turns !== null || holds.work !== null;
 }
 
 function pace(streak: number): number {
@@ -396,6 +455,7 @@ class Conductor {
       projectChanges.subscribe(() => later(() => { for (const p of this.#homeProjects()) this.#kick(p.id); })),
       this.#runner.onState((taskId, state) => { if (state === "idle") later(() => this.#taskIdle(taskId)); }),
       this.#pool.net.onPeer((nodeId, online) => { if (online) later(() => this.#nodeBack(nodeId)); }),
+      this.#runner.onHolds((holds) => { if (!held(holds)) later(() => this.#holdsLifted()); }),
     );
     this.#looker = setInterval(() => later(() => this.#look()), LOOK_MS);
     this.#looker.unref?.();
@@ -521,8 +581,7 @@ class Conductor {
     }
     const train = readTrain(this.#db, projectId);
     if (train.paused !== null) return;
-    const holds = this.#runner.holds();
-    if (holds.turns !== null || holds.work !== null) {
+    if (held(this.#runner.holds())) {
       t.heldUp = true;
       return;
     }
@@ -547,6 +606,17 @@ class Conductor {
     const t = this.#train(projectId);
     t.running = false;
     if (this.#stopped) return;
+    if (ended.kind === "heldUp") {
+      // Held here: started again as the hold lifts (`#holdsLifted`). Held on another node only: tried again, paced.
+      t.heldUp = true;
+      t.pending = false;
+      if (!held(this.#runner.holds())) {
+        t.streak += 1;
+        t.notBefore = Date.now() + pace(t.streak);
+        this.#kick(projectId);
+      }
+      return;
+    }
     if (ended.kind === "round" && ended.result.paused !== null && ended.transient !== null) this.#retryLater(projectId, ended.transient);
     const again = ended.kind === "failed" || (ended.kind === "round" && ended.result.again);
     if (!again && !t.pending) {
@@ -594,6 +664,11 @@ class Conductor {
     for (const r of listLineRows(this.#db, undefined, taskId)) {
       if (r.queuedAt !== null && !r.archived && r.holder === this.#selfId) this.#kick(r.project);
     }
+  }
+
+  /** A pool update's hold here lifted: each train a hold kept from a round, or held up mid-round, starts one. */
+  #holdsLifted(): void {
+    for (const p of this.#homeProjects()) if (this.#train(p.id).heldUp) this.#kick(p.id);
   }
 
   /** Node `nodeId` is back: its tasks no longer sit out waiting for it. */
@@ -675,22 +750,32 @@ class Conductor {
       return end({ kind: "skipped" });
     }
     this.#prune(project);
-    const round: RoundRun = { B: null, first: true, transient: null };
+    const resume = at ?? train.round ?? undefined;
+    const round: RoundRun = { B: null, first: true, transient: null, held: null, heldTasks: new Set(), mergeNodes: new Map() };
+    if (resume?.mergeTask != null && resume.mergeNode !== undefined) round.mergeNodes.set(resume.mergeTask, resume.mergeNode);
     const deps = this.#roundDeps(project, round, runtime, context, stopping);
+    // Held up by a pool update: what it did is kept, but not the turns the hold refused; nothing pauses or sits out.
+    const heldUp = () => {
+      updateTrain(this.#db, projectId, (t) => ({ ...t, round: afterHold(t.round, round.heldTasks) }));
+      return end({ kind: "heldUp" });
+    };
     let result: RoundResult;
     try {
-      const running = runRound(deps, this.#cfg, project.replica, this.#pool.settings.describePrompt(), at ?? train.round ?? undefined);
+      const running = runRound(deps, this.#cfg, project.replica, this.#pool.settings.describePrompt(), resume);
       // The Harness closing ends the phase at once (a turn the round waits for may take long); what the round does
       // after that is refused (`deps`), and it settles unheard.
       running.catch(() => {});
       result = await Promise.race([running, closed(runtime.signal)]);
     } catch (err) {
       if (stopping()) return this.#halt(runtime);
+      if (round.held !== null) return heldUp();
       if (err instanceof TrainPaused) return end({ kind: "held" });
       this.#log(`meddle: train: a round of ${project.name} failed: ${messageOf(err)}`);
       return end({ kind: "failed", error: err });
     }
     if (stopping()) return this.#halt(runtime);
+    // A check the hold stopped reads as stuck, and a turn it refused as failed: neither is.
+    if (round.held !== null) return heldUp();
     const paused = result.paused;
     if (paused !== null) {
       updateTrain(this.#db, projectId, (t) => ({ ...t, paused: t.paused ?? paused }));
@@ -711,32 +796,47 @@ class Conductor {
 
   /**
    * What a round of project `project`'s train asks of the world (`RoundDeps`), from here: a task this node holds through
-   * the runner, one held elsewhere through its holder's `PeerObject` (an offline holder is `NodeOffline`). Every call
-   * is refused once the node stops.
+   * the runner, one held elsewhere through its holder's `PeerObject` (an offline holder is `NodeOffline`); a merge task
+   * the round made on the node it placed it on. Every call is refused once the node stops.
+   *
+   * While a pool update holds turns here, no turn and no merge task starts (`HeldUp`), and neither does one a holder
+   * refuses for its own hold; from then on the round starts nothing more (only cleaning up, and recording what has
+   * happened, go on), a task whose turn the hold refused does not sit out, and the round ends held up.
    */
   #roundDeps(project: Project, round: RoundRun, runtime: TrainRuntime, context: Context, stopping: () => boolean): RoundDeps {
     const projectId = project.id;
     const live = () => {
       if (stopping()) throw new Error("the round stops with the node");
     };
-    const checkpoint = async (step: RoundStep) => {
+    /** `live`, and nothing new starts once the round is held up. */
+    const work = () => {
       live();
+      if (round.held !== null) throw new HeldUp(round.held);
+    };
+    /** Held up by a pool update (refusing `taskId`'s turn, if any): thrown. */
+    const holdUp = (reason: string, taskId: string | null): never => {
+      round.held ??= reason;
+      if (taskId !== null) round.heldTasks.add(taskId);
+      throw new HeldUp(reason);
+    };
+    const checkpoint = async (step: RoundStep) => {
+      work();
       // Paused: nothing new starts. A merge task named as it is made is still recorded, for the round to discard.
       if (step.mergeTask === null && readTrain(this.#db, projectId).paused !== null) throw new TrainPaused();
-      await runtime.commit(() => ({ status: "running", checkpoint: { phase: "round", ...step } }), context);
-      const kept: RoundStep = { step: step.step, batch: [...step.batch], mergeTask: step.mergeTask };
+      const kept = saved(step, step.mergeTask === null ? undefined : round.mergeNodes.get(step.mergeTask));
+      await runtime.commit(() => ({ status: "running", checkpoint: { phase: "round", ...kept } }), context);
       updateTrain(this.#db, projectId, (t) => ({ ...t, round: kept }));
     };
     return {
       projectId,
       branch: async () => {
-        live();
+        work();
         const B = await defaultBranchCommit(this.#startDeps(), getProject(this.#db, projectId) ?? project);
         round.B ??= B;
         return B;
       },
       candidates: async () => {
-        live();
+        work();
         return this.#candidates(project, round);
       },
       lines: async () => {
@@ -748,11 +848,11 @@ class Conductor {
         return this.#title(project, taskId);
       },
       abandonLeftovers: async (taskId, commits) => {
-        live();
-        await this.#onHolder(project, taskId, (r) => r.abandonLeftovers(taskId, commits), (peer) => peer.abandonLeftovers({ taskId, commits }));
+        work();
+        await this.#onHolder(project, taskId, round, (r) => r.abandonLeftovers(taskId, commits), (peer) => peer.abandonLeftovers({ taskId, commits }));
       },
       advance: async (old, next) => {
-        live();
+        work();
         await this.#advance(project, round, old, next);
       },
       leave: async (taskId, reason) => {
@@ -761,7 +861,8 @@ class Conductor {
       },
       sitOut: async (taskId, reason) => {
         live();
-        this.#sitOut(project, taskId, reason);
+        // A turn the hold refused is no failure of the task's.
+        if (!round.heldTasks.has(taskId)) this.#sitOut(project, taskId, reason);
       },
       holdBack: async (taskId, notice) => {
         live();
@@ -769,20 +870,30 @@ class Conductor {
       },
       checkpoint,
       createMergeTask: async (input) => {
-        live();
-        return this.#createMergeTask(project, input, checkpoint);
+        work();
+        const holds = this.#runner.holds().turns;
+        if (holds !== null) return holdUp(holds, null);
+        return this.#createMergeTask(project, input, round, checkpoint);
       },
       turn: async (taskId, kind, text) => {
-        live();
-        return this.#onHolder(project, taskId, (r) => r.trainTurn(taskId, kind, text), (peer) => peer.trainTurn({ taskId, kind, text }));
+        work();
+        // Held here, no turn starts anywhere: the update this node drains for waits on the round.
+        const holds = this.#runner.holds().turns;
+        if (holds !== null) return holdUp(holds, taskId);
+        try {
+          return await this.#onHolder(project, taskId, round, (r) => r.trainTurn(taskId, kind, text), (peer) => peer.trainTurn({ taskId, kind, text }));
+        } catch (err) {
+          if (err instanceof TurnsHeld || err instanceof HeldUp) return holdUp(err.message, taskId);
+          throw err;
+        }
       },
       head: async (taskId) => {
-        live();
-        return this.#head(project, taskId);
+        work();
+        return this.#head(project, taskId, round);
       },
       discard: async (taskId) => {
         live();
-        await this.#discard(project, taskId);
+        await this.#discard(project, taskId, round);
       },
     };
   }
@@ -850,7 +961,7 @@ class Conductor {
     if (row !== null) return row.title;
     const known = this.#titles.get(taskId);
     if (known !== undefined) return known;
-    const holder = this.#holderOf(project, taskId);
+    const holder = this.#holderOf(project, taskId, null);
     if (holder === null || holder === this.#selfId) return taskId;
     const [s] = await this.#callPeer(holder, (peer) => peer.trainTasks({ taskIds: [taskId] })).catch(() => []);
     if (s?.title != null) this.#titles.set(taskId, s.title);
@@ -879,7 +990,7 @@ class Conductor {
   /** Task `taskId` leaves the queue for `reason`, on its holder (a decline has done so there already); a failure is logged. */
   async #leave(project: Project, taskId: string, reason: string): Promise<void> {
     try {
-      await this.#onHolder(project, taskId, (r) => r.unqueue(taskId, reason), (peer) => peer.unqueueTask({ taskId, reason }));
+      await this.#onHolder(project, taskId, null, (r) => r.unqueue(taskId, reason), (peer) => peer.unqueueTask({ taskId, reason }));
     } catch (err) {
       this.#log(`meddle: train: ${taskId} did not leave the queue of ${project.name} (${reason}): ${messageOf(err)}`);
     }
@@ -897,14 +1008,17 @@ class Conductor {
   /**
    * Makes a merge task (`MergeDeps.createMergeTask`): placed like a new task (the home first, when it hosts tasks; never
    * a node that starts no task on a merge), on a start on `parents` (`mergeStartAt`), its manifest naming the batch. Its
-   * id is checkpointed before anything is made, so a round cut off meanwhile discards what was made of it.
+   * id and the node it goes to are checkpointed before anything is made, so a round cut off meanwhile discards what was
+   * made of it, there; until then the round reaches it on that node (`round.mergeNodes`), whatever this node's rows say.
    */
   async #createMergeTask(
-    project: Project, input: { projectId: string; parents: string[]; title: string; batch: string[] }, checkpoint: (step: RoundStep) => Promise<void>,
+    project: Project, input: { projectId: string; parents: string[]; title: string; batch: string[] }, round: RoundRun,
+    checkpoint: (step: RoundStep) => Promise<void>,
   ): Promise<{ taskId: string; nodeId: string }> {
     const taskId = newId();
-    await checkpoint({ step: "checking", batch: input.batch, mergeTask: taskId });
     const target = await this.#runner.chooseNode([input.projectId], (id) => this.#runner.noMergeStartsOn(id) === null);
+    round.mergeNodes.set(taskId, target);
+    await checkpoint({ step: "checking", batch: input.batch, mergeTask: taskId });
     const start = await mergeStartAt(this.#startDeps(), { projectId: input.projectId, taskId, parents: input.parents });
     const merge = { project: input.projectId, batch: [...input.batch] };
     try {
@@ -924,16 +1038,19 @@ class Conductor {
   }
 
   /**
-   * The head of merge task `taskId`'s line as this node's repo has it (`MergeDeps.head`): its line written again from
-   * its workspace when it is here, caught up from its holder otherwise, through `effectiveHead`. `TaskGone` only when it
-   * is known to be gone: its line archived or released, its row here deleted or archived, its holder removed from the
-   * pool. `NodeOffline` when its holder is offline.
+   * The head of merge task `taskId`'s line as this node's repo has it (`MergeDeps.head`), from the node holding it
+   * (`#holderOf`): its line written again from its workspace when it is here; caught up from its holder otherwise,
+   * until this node has the holder's own row of it (one just made there may not have come back yet), for up to
+   * `HEAD_WAIT_MS`. Then through `effectiveHead`. `TaskGone` only when it is known to be gone: its line archived or
+   * released, its row here deleted or archived, its holder removed from the pool or saying it has no such task.
+   * `NodeOffline` when its holder is offline.
    */
-  async #head(project: Project, taskId: string): Promise<CommitInfo> {
+  async #head(project: Project, taskId: string, round: RoundRun): Promise<CommitInfo> {
     const gone = () => new TaskGone(taskId);
+    const holder = this.#holderOf(project, taskId, round);
     let row = this.#ownLine(project, taskId);
-    if (row === undefined || row.commit === null || row.archived) throw gone();
-    if (row.holder === this.#selfId) {
+    if (holder === null || row === undefined || row.commit === null || row.archived) throw gone();
+    if (holder === this.#selfId) {
       const task = getTask(this.#db, taskId);
       if (task === null || task.state === "archived") {
         // A start written here for a task never made (or made elsewhere, which then holds its line one epoch up).
@@ -942,9 +1059,23 @@ class Conductor {
       }
       await this.#runner.writeTaskLines(taskId);
     } else {
-      if (this.#pool.store.row(row.holder)?.status !== "member") throw gone();
-      if (!this.#pool.net.isOnline(row.holder)) throw new NodeOffline(this.#nodeName(row.holder));
-      await catchUp(this.#replicaDeps(), project.id, CATCH_UP_MS);
+      if (this.#pool.store.row(holder)?.status !== "member") throw gone();
+      if (!this.#pool.net.isOnline(holder)) throw new NodeOffline(this.#nodeName(holder));
+      const deadline = Date.now() + HEAD_WAIT_MS;
+      for (;;) {
+        await catchUp(this.#replicaDeps(), project.id, CATCH_UP_MS);
+        row = this.#ownLine(project, taskId);
+        if (row === undefined || row.commit === null || row.archived) throw gone();
+        if (row.holder !== this.#selfId) break;
+        // Still only the start this node wrote: the holder's row has not come back yet, or the task was never made.
+        const has = await this.#heldOn(holder, taskId);
+        if (has === false) {
+          releaseLineRows(this.#db, taskId, [], project.id);
+          throw gone();
+        }
+        if (Date.now() > deadline) throw new Error(`the line of ${taskId} has not come here from ${this.#nodeName(holder)} yet`);
+        await Bun.sleep(HEAD_POLL_MS);
+      }
     }
     row = this.#ownLine(project, taskId);
     if (row === undefined || row.commit === null || row.archived) throw gone();
@@ -960,8 +1091,8 @@ class Conductor {
    * One whose holder was removed from the pool is gone already. A start written here for a task never made here is
    * released.
    */
-  async #discard(project: Project, taskId: string): Promise<void> {
-    const holder = this.#holderOf(project, taskId) ?? this.#selfId;
+  async #discard(project: Project, taskId: string, round: RoundRun): Promise<void> {
+    const holder = this.#holderOf(project, taskId, round) ?? this.#selfId;
     if (holder === this.#selfId) await this.#runner.discardMergeTask(taskId);
     else if (this.#pool.store.row(holder)?.status === "member") await this.#callPeer(holder, (peer) => peer.discardTask({ taskId }));
     const left = this.#ownLine(project, taskId);
@@ -975,17 +1106,26 @@ class Conductor {
     return listLineRows(this.#db, project.id, taskId).find((r) => r.name === project.name);
   }
 
-  /** The node holding task `taskId`: its own line's holder, else this node when it has the task live; null otherwise. */
-  #holderOf(project: Project, taskId: string): string | null {
+  /**
+   * The node holding task `taskId`: its own line's holder when that is another node (whose row it is); else, for a
+   * merge task `round` placed, the node it placed it on (this node's row of it is only the start it wrote, until the
+   * holder's comes back); else this node's own row's holder, or this node when it has the task live; null otherwise.
+   */
+  #holderOf(project: Project, taskId: string, round: RoundRun | null): string | null {
     const row = this.#ownLine(project, taskId);
+    if (row !== undefined && row.holder !== this.#selfId) return row.holder;
+    const placed = round?.mergeNodes.get(taskId);
+    if (placed !== undefined) return placed;
     if (row !== undefined) return row.holder;
     const task = getTask(this.#db, taskId);
     return task !== null && task.state !== "moved" && task.state !== "archived" ? this.#selfId : null;
   }
 
   /** Runs `local` with this node's runner when it holds task `taskId`, else `remote` on its holder (`#callPeer`). */
-  async #onHolder<T>(project: Project, taskId: string, local: (runner: TaskRunner) => Promise<T>, remote: (peer: PeerRef) => Promise<T>): Promise<T> {
-    const holder = this.#holderOf(project, taskId);
+  async #onHolder<T>(
+    project: Project, taskId: string, round: RoundRun | null, local: (runner: TaskRunner) => Promise<T>, remote: (peer: PeerRef) => Promise<T>,
+  ): Promise<T> {
+    const holder = this.#holderOf(project, taskId, round);
     if (holder === null) throw new Error(`no node holds task ${taskId}`);
     return holder === this.#selfId ? local(this.#runner) : this.#callPeer(holder, remote);
   }
@@ -1009,6 +1149,7 @@ class Conductor {
       return await call(ref);
     } catch (err) {
       if (!this.#pool.net.isOnline(nodeId)) throw offline();
+      if (isChordError(err) && err.reason === TURNS_HELD) throw new HeldUp(remoteReason(err));
       throw new Error(remoteReason(err));
     } finally {
       ref.release();

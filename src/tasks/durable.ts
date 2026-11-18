@@ -129,6 +129,17 @@ export type RunnerHooks = {
  */
 export type RunnerHolds = { turns: string | null; work: string | null; hosting: string | null };
 
+/**
+ * A train turn refused because a pool update holds turns here (`trainTurn`): the message is the hold's reason. The
+ * merge train waits for the hold to lift rather than count it against the task.
+ */
+export class TurnsHeld extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "TurnsHeld";
+  }
+}
+
 /** A move of a task in progress here: where to, the step it is at, and the error that is failing it (if any). */
 export type MoveState = { to: string; phase: string; error: string | null };
 
@@ -331,6 +342,7 @@ export class TaskRunner {
   #acceptRetries = new Map<string, ReturnType<typeof setTimeout>>();
   #acceptanceListeners = new Set<(taskId: string, acceptance: Acceptance) => void>();
   #queueListeners = new Set<(taskId: string, queue: TaskQueue | null, reason: string | null) => void>();
+  #holdsListeners = new Set<(holds: RunnerHolds) => void>();
   /** Per task, the accepted idle task waiting for its turn to leave the Harness (`#awaitTurnGone`). */
   #acceptTurnWaits = new Set<string>();
   /** Tasks whose check lacked a commit a row names, and those whose lack is logged already (once per task). */
@@ -399,6 +411,13 @@ export class TaskRunner {
       }
     }
     if (was.work !== null && holds.work === null) for (const row of listLiveTasks(this.#db)) this.#checkAcceptance(row.id);
+    notify(this.#holdsListeners, (cb) => cb({ ...this.#holds }));
+  }
+
+  /** Called with what is held here whenever `setHolds` sets it. */
+  onHolds(cb: (holds: RunnerHolds) => void): () => void {
+    this.#holdsListeners.add(cb);
+    return () => { this.#holdsListeners.delete(cb); };
   }
 
   /** Why a task may not move to member `to` (set by the node: builds that differ); null when it may. */
@@ -672,7 +691,7 @@ export class TaskRunner {
    * train turn of `kind` already running (one a restart cut off from the call that started it) is joined, whatever its
    * text; a train turn the restart limit parked has failed. Refused, before anything starts, as `#refuseElsewhere`
    * refuses, while the task is being archived, while it runs another turn (`task is running`: the user's, or the
-   * train's of another kind) or has prompts waiting, and while a pool update holds turns.
+   * train's of another kind) or has prompts waiting, and while a pool update holds turns (`TurnsHeld`).
    *
    * The agent's `decline` takes the task off its queue here, its holder, with the agent's reason, as it is logged
    * (`#engineInput`), whether or not a call waits for the turn: a call cut off by a restart, or one that never comes,
@@ -732,7 +751,7 @@ export class TaskRunner {
     const busy = running !== undefined || this.#live.has(taskId) || this.#pending.has(taskId) || this.#row(taskId).state !== "idle";
     if (busy) throw new Error("task is running");
     if (this.queued(taskId).length > 0) throw new Error("task has prompts waiting");
-    if (this.#holds.turns !== null) throw new Error(this.#holds.turns);
+    if (this.#holds.turns !== null) throw new TurnsHeld(this.#holds.turns);
     const after = lastSeq(this.#db, taskId);
     const started = this.#turnEnd(taskId);
     this.#pending.add(taskId);

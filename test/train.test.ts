@@ -4,12 +4,13 @@
 // over against the new main; Retry brings a task that sat out back. The agents' turns are faked through the runner's
 // `trainTurn` hook (the stand-in Claude Code runs no tools); everything the conductor does around them is real.
 import { expect, test } from "bun:test";
+import { rm } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { paths } from "../src/config";
 import { commitOf, commitsIn, jj } from "../src/jj";
-import { listBranchRows } from "../src/pool/rows";
+import { lineChanges, listBranchRows, listLineRows } from "../src/pool/rows";
 import { makeCheckout } from "../src/projects/checkouts";
 import { getProject } from "../src/projects/project";
 import { defaultBranchCommit } from "../src/projects/starts";
@@ -70,10 +71,14 @@ function liveMergeTasks(n: GitPoolNode): string[] {
 /**
  * Fakes the merge agent on node `n` (through the runner's `trainTurn` hook): it describes the merge in the merge task's
  * workspace and writes the task's lines, as a turn end would. With `stall`, the first merge turn waits for `release()`
- * once it has `reached` that point. Records each merge task it ran for (`tasks`), its merge's parents (`parents`), and
- * the merge tasks live on `n` as it ran (`alive`). Turns of other kinds go to `others` (else the real turn runs).
+ * once it has `reached` that point; with `blame`, the first merge turn blames that task. Records each merge task it ran
+ * for (`tasks`), its merge's parents (`parents`), and the merge tasks live on `n` as it ran (`alive`). Turns of other
+ * kinds go to `others` (else the real turn runs).
  */
-function fakeMerge(n: GitPoolNode, options: { stall?: boolean; others?: (taskId: string, kind: TrainTurnKind, text: string) => Promise<TrainTurnOutcome | undefined> } = {}) {
+function fakeMerge(
+  n: GitPoolNode,
+  options: { stall?: boolean; blame?: string; others?: (taskId: string, kind: TrainTurnKind, text: string) => Promise<TrainTurnOutcome | undefined> } = {},
+) {
   const reached = Promise.withResolvers<void>();
   const gate = Promise.withResolvers<void>();
   const tasks: string[] = [];
@@ -87,6 +92,7 @@ function fakeMerge(n: GitPoolNode, options: { stall?: boolean; others?: (taskId:
       reached.resolve();
       await gate.promise;
     }
+    if (options.blame !== undefined && tasks.length === 1) return { kind: "blamed", task: options.blame, reason: "its test fails" };
     // A merge task discarded meanwhile (its node restarted under it) has nothing left to describe.
     if (getTask(n.db, taskId)?.state !== "idle") return { kind: "failed", reason: "the merge task is gone" };
     const ws = workspaceOf(n, taskId);
@@ -141,13 +147,21 @@ async function liveTrains(n: GitPoolNode): Promise<unknown[]> {
   return tasks.filter((t) => t.record.kind === "meddle.train").map((t) => t.record.input);
 }
 
+/**
+ * Starts each node's applier, as `serve` runs it: a node admits another's row for main once it has its commit, and its
+ * acceptance sees the branch move. Started once the tests' tasks have their work (jj in their workspaces then never
+ * runs alongside an apply of their project's repo). Returns the stops.
+ */
+function appliers(...nodes: GitPoolNode[]): Array<() => void> {
+  return nodes.map((n) => startApplier({ cfg: n.cfg, db: n.db, pool: n.pool, log: (line) => n.logs.push(line) }));
+}
+
 /** `PATH` with this node's `<data>/bin` first: what `makeCheckout` checks for the helper. */
 const helperEnv = (n: GitPoolNode) => ({ PATH: `${paths(n.cfg).bin}${delimiter}${process.env.PATH}` });
 
 test("a queued task triggers a round on the home only", async () => {
   const { A, B, close } = await twoPoolNodes();
-  // As `serve` runs it: B admits A's row for main once it has its commit, and its acceptance sees the branch move.
-  const stops = [A, B].map((n) => startApplier({ cfg: n.cfg, db: n.db, pool: n.pool, log: (line) => n.logs.push(line) }));
+  const stops: Array<() => void> = [];
   try {
     await peerReady(A, B);
     await peerReady(B, A);
@@ -156,6 +170,7 @@ test("a queued task triggers a round on the home only", async () => {
     // A task on B, of A's project: B holds its line and its queue, A runs the train.
     const t = await taskWithWork(B, P, "x.txt");
     await B.runner.accept(t.id);
+    stops.push(...appliers(A, B));
     await waitFor("A to move main onto the task's work", async () => (await mainOf(A, P)) === t.tip);
     // The branch row is A's; B, the task's holder, archives the task once its work is on main.
     expect(listBranchRows(A.db, P, "main").map((r) => r.node)).toEqual([A.id]);
@@ -214,7 +229,7 @@ test("pause holds landing and survives a restart", async () => {
   }
 }, 180_000);
 
-test("a restart mid-round resumes without a second merge task", async () => {
+test("a restart mid-round leaves at most one live merge task", async () => {
   const { nodes, close } = await poolNodes(1);
   const n = nodes[0]!;
   const merge = fakeMerge(n, { stall: true });
@@ -235,9 +250,10 @@ test("a restart mid-round resumes without a second merge task", async () => {
     // The node restarts while the merge agent checks the batch.
     await restart(n);
     await waitFor("main to land the merge", async () => (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!.parents.length === 2);
-    // The round resumed from its checkpoint: the merge task cut off was discarded before a fresh one checked the batch,
-    // so there never were two.
+    // The round resumed from its checkpoint: it discarded the merge task the restart cut off, then a fresh one checked
+    // the batch. Two were made over time, never two alive at once.
     expect(merge.tasks).toHaveLength(2);
+    expect(merge.tasks[1]).not.toBe(first);
     expect(merge.alive[1]).toEqual([merge.tasks[1]!]);
     expect(getTask(n.db, first)).toBeNull();
     await waitFor("both tasks and the merge task archived", () =>
@@ -323,6 +339,186 @@ test("retry brings a sitting-out task back", async () => {
     await waitFor("the task archived", () => getTask(n.db, t.id)?.state === "archived");
     expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [] });
   } finally {
+    await close();
+  }
+}, 180_000);
+
+const HELD = "update in progress (build 1ee71ee71ee7)";
+const NO_HOLDS = { turns: null, work: null, hosting: null };
+
+test("a pool update that holds turns before the merge turn holds the round up: no pause, no merge task, until it lifts", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const before = await mainOf(n, P);
+    const described = Promise.withResolvers<void>();
+    // The update's hold comes while t2's describe turn runs: the merge task and its turn would be next.
+    const merge = fakeMerge(n, {
+      others: async (taskId, kind) => {
+        if (kind !== "describe") return undefined;
+        n.runner.setHolds({ turns: HELD, work: null, hosting: null });
+        await jj(["describe", "-m", "Add y"], workspaceOf(n, taskId), n.cfg);
+        await n.runner.writeTaskLines(taskId);
+        described.resolve();
+        return { kind: "done" };
+      },
+    });
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt", { undescribed: true });
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await described.promise;
+    await waitFor("the round to end", async () => (await liveTrains(n)).length === 0);
+    // Held up: not paused, nothing sitting out, no merge task made, and nothing keeps the update's drain waiting.
+    expect(trainState(n.db, P)).toEqual({
+      paused: null, round: null,
+      queued: [{ taskId: t1.id, state: "queued", reason: null }, { taskId: t2.id, state: "queued", reason: null }],
+    });
+    expect(merge.tasks).toEqual([]);
+    expect(liveMergeTasks(n)).toEqual([]);
+    expect(await n.runner.busyTasks()).toEqual([]);
+    // No round starts while the hold lasts.
+    await Bun.sleep(1500);
+    expect(await liveTrains(n)).toEqual([]);
+    expect(await mainOf(n, P)).toBe(before);
+
+    // The hold lifts: a round starts by itself, checks the batch and lands it.
+    n.runner.setHolds(NO_HOLDS);
+    await waitFor("main to land the merge", async () => (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!.parents.length === 2);
+    expect(merge.tasks).toHaveLength(1);
+    await waitFor("both tasks archived", () => [t1.id, t2.id].every((id) => getTask(n.db, id)?.state === "archived"));
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a turn a pool update's hold refuses sits no task out, and the round carries on by itself once it lifts", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    const others: string[] = [];
+    // The merge agent blames t1, which gets a fix turn after t2 lands; the update's hold comes during the check.
+    const merge = fakeMerge(n, { stall: true, blame: t1.id, others: async (_id, kind) => { others.push(kind); return { kind: "done" }; } });
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await merge.reached;
+    n.runner.setHolds({ turns: HELD, work: null, hosting: null });
+    merge.release();
+    await waitFor("t2 to land alone", async () => (await mainOf(n, P)) === t2.tip);
+    await waitFor("the round to end", async () => (await liveTrains(n)).length === 0);
+    // Only the update's turns are held: acceptance still archives what landed.
+    await waitFor("t2 archived", () => getTask(n.db, t2.id)?.state === "archived");
+    // t1's fix turn was refused by the hold: it never ran, and t1 does not sit out for it; nothing is paused.
+    expect(others).toEqual([]);
+    expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [{ taskId: t1.id, state: "queued", reason: null }] });
+    expect(liveMergeTasks(n)).toEqual([]);
+    expect(await n.runner.busyTasks()).toEqual([]);
+
+    // The hold lifts: t1 is checked against main and lands, without a Retry.
+    n.runner.setHolds(NO_HOLDS);
+    await waitFor("main to land t1", async () => (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!.parents.sort().join() === [t1.tip, t2.tip].sort().join());
+    await waitFor("t1 archived", () => getTask(n.db, t1.id)?.state === "archived");
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a holder whose turns a pool update holds refuses the train's turn as held: the task does not sit out, and the round comes back", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const stops: Array<() => void> = [];
+  try {
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const P = A.project.id;
+    await waitFor("A's project in B's roster", () => B.store.row(A.id)?.summary?.projects?.some((p) => p.id === P) === true);
+    let asked = 0;
+    // B's describe turns describe the work, once B no longer holds turns; meanwhile the real `trainTurn` refuses.
+    B.hooks.trainTurn = async (taskId, kind) => {
+      if (kind !== "describe") return undefined;
+      asked += 1;
+      if (B.runner.holds().turns !== null) return undefined;
+      await jj(["describe", "-m", "Add x"], workspaceOf(B, taskId), B.cfg);
+      await B.runner.writeTaskLines(taskId);
+      return { kind: "done" };
+    };
+    const t = await taskWithWork(B, P, "x.txt", { undescribed: true });
+    B.runner.setHolds({ turns: HELD, work: null, hosting: null });
+    await B.runner.accept(t.id);
+    stops.push(...appliers(A, B));
+    // A's rounds ask, are refused as held, and ask again by themselves (paced): t never sits out.
+    await waitFor("A to ask B twice", () => asked >= 2);
+    expect(trainState(A.db, P)).toMatchObject({ paused: null, queued: [{ taskId: t.id, state: "queued", reason: null }] });
+
+    B.runner.setHolds(NO_HOLDS);
+    await waitFor("main to move onto t's work", async () => (await commitsIn(A.project.replica, await mainOf(A, P), A.cfg))[0]!.description === "Add x\n");
+    await waitFor("B to archive t", () => getTask(B.db, t.id)?.state === "archived");
+  } finally {
+    for (const stop of stops) stop();
+    await close();
+  }
+}, 180_000);
+
+test("a merge task placed on another node is reached there, whatever the home's rows of it say, a resumed round's too", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const stops: Array<() => void> = [];
+  const offLines: Array<() => void> = [];
+  try {
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const P = A.project.id;
+    await waitFor("A's project in B's roster", () => B.store.row(A.id)?.summary?.projects?.some((p) => p.id === P) === true);
+    // The home hosts no tasks: its merge tasks go to B.
+    await rm(A.cfg.taskRoot, { recursive: true, force: true });
+    pauseTrain(A.db, P, "accepting");
+    const t1 = await taskWithWork(B, P, "x.txt");
+    const t2 = await taskWithWork(B, P, "y.txt");
+    await B.runner.accept(t1.id);
+    await B.runner.accept(t2.id);
+    stops.push(...appliers(A, B));
+    await waitFor("both queued on A", () => trainState(A.db, P).queued.length === 2);
+    const merge = fakeMerge(B);
+
+    // B's rows of the first merge task never reach A: A's only row of it is the start A wrote, held by A.
+    let first: string | null = null;
+    const block = (taskId: string) => {
+      for (const op of ["INSERT", "UPDATE"]) {
+        A.db.exec(`CREATE TEMP TRIGGER hold_${op.toLowerCase()} BEFORE ${op} ON line_rows WHEN NEW.task = '${taskId}' AND NEW.holder = '${B.id}' BEGIN SELECT RAISE(IGNORE); END`);
+      }
+    };
+    offLines.push(lineChanges.subscribe(({ project, task }) => {
+      if (first !== null || project !== P || task === t1.id || task === t2.id) return;
+      if (!listLineRows(A.db, P, task).some((r) => r.holder === A.id && r.epoch === 0)) return;
+      first = task;
+      block(task);
+    }));
+    pauseTrain(A.db, P, null);
+    // The round cannot read the merge's head (its line never comes), so it discards the merge task, on B, and pauses.
+    await waitFor("the train to pause", () => trainState(A.db, P).paused !== null);
+    expect(trainState(A.db, P).paused).toStartWith("the batch's check failed: ");
+    expect(first).not.toBeNull();
+    expect(listLineRows(A.db, P, first!).map((r) => r.holder)).toEqual([A.id]);
+    await waitFor("B to drop the merge task", () => getTask(B.db, first!) === null);
+    expect(liveMergeTasks(B)).toEqual([]);
+    // Where the round is says where its merge task went, for a round resumed after a restart of the home too.
+    expect(trainState(A.db, P).round).toEqual({ step: "checking", batch: expect.any(Array), mergeTask: first });
+    const kept = A.db.query<{ round: string }, [string]>("SELECT round FROM trains WHERE project = ?").get(P)!;
+    expect(JSON.parse(kept.round)).toMatchObject({ mergeTask: first, mergeNode: B.id });
+
+    // Its rows come through again; Retry: the round resumes, a fresh merge task on B checks the batch, and it lands.
+    A.db.exec("DROP TRIGGER hold_insert");
+    A.db.exec("DROP TRIGGER hold_update");
+    pauseTrain(A.db, P, null);
+    await waitFor("main to land the merge", async () => (await commitsIn(A.project.replica, await mainOf(A, P), A.cfg))[0]!.parents.length === 2);
+    expect(merge.tasks).toHaveLength(1);
+    expect(merge.tasks[0]).not.toBe(first);
+    expect(getTask(A.db, merge.tasks[0]!)).toBeNull();
+    await waitFor("B to archive both tasks and the merge task", () =>
+      [t1.id, t2.id, merge.tasks[0]!].every((id) => getTask(B.db, id)?.state === "archived"));
+  } finally {
+    for (const off of offLines) off();
+    for (const stop of stops) stop();
     await close();
   }
 }, 180_000);
