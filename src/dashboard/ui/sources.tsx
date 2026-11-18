@@ -1,13 +1,14 @@
 // Gathers what the sidebar lists from every online node: its `NodeObject` (metrics, notifications) and each of its
 // tasks, live and archived. The sources render nothing; they report up while their objects are reachable.
-import type { Host, Ref } from "@earendil-works/chord";
+import type { Host, Readable, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
-import { NodeObject, TaskObject } from "../../state/contracts";
+import { NodeObject, type ProjectObject, TaskObject } from "../../state/contracts";
 import { type Hosts, useObject, useValue } from "./hooks";
 import type { PoolRef, TaskRef } from "./common";
 import type { TaskEntry } from "./sidebar-model";
 
 export type NodeRef = Ref<typeof NodeObject>;
+export type ProjectRef = Ref<typeof ProjectObject>;
 /** A listed task with the reference to act on it. */
 export type ListedTask = TaskEntry & { ref: TaskRef };
 
@@ -89,6 +90,8 @@ function TaskSourceLoaded({ task, nodeId, id, archived, report }: { task: TaskRe
   const activityAt = useOptionalValue(task, "activityAt") ?? "";
   // Likewise `agentsRunning`: such a node's tasks run no agents.
   const agents = useOptionalValue(task, "agentsRunning") ?? 0;
+  // And `queue`: such a node's tasks are not queued.
+  const queued = (useOptionalValue(task, "queue") ?? null) !== null;
   useEffect(() => {
     const key = `${nodeId}/${archived ? "archived/" : ""}${id}`;
     report(key, {
@@ -101,20 +104,41 @@ function TaskSourceLoaded({ task, nodeId, id, archived, report }: { task: TaskRe
       activityAt,
       createdAt: manifest.createdAt,
       moveTo: move?.to ?? null,
+      queued,
+      merge: manifest.merge !== undefined,
     });
     return () => report(key, null);
-  }, [task, nodeId, id, archived, manifest, state, pending, move, agents, activityAt, report]);
+  }, [task, nodeId, id, archived, manifest, state, pending, move, agents, activityAt, queued, report]);
   return null;
 }
 
-/** A state member a node of an older meddle may not have: its value, or undefined there. */
-export function useOptionalValue<M extends "activityAt" | "agents" | "agentsRunning">(task: TaskRef, member: M): TaskRef[M]["value"] | undefined {
-  const readable = (task as unknown as Record<string, unknown>)[member] as TaskRef[M] | undefined;
+/** A state member of `owner` a node of an older meddle may not have: its value, or undefined there. */
+function useOptional<T>(owner: object, member: string): T | undefined {
+  const readable = (owner as Record<string, unknown>)[member] as Readable<T> | undefined;
   const [, tick] = useState(0);
   useEffect(() => readable?.subscribe(() => tick((n) => n + 1)), [readable]);
   try {
     return readable?.value;
   } catch {
     return undefined;
+  }
+}
+
+/** A state member a node of an older meddle may not have: its value, or undefined there. */
+export function useOptionalValue<M extends "activityAt" | "agents" | "agentsRunning" | "queue">(task: TaskRef, member: M): TaskRef[M]["value"] | undefined {
+  return useOptional<TaskRef[M]["value"]>(task, member);
+}
+
+/** A project's train as its node serves it: undefined from one of an older meddle, which has none. */
+export function useOptionalTrain(project: ProjectRef): ProjectRef["train"]["value"] | undefined {
+  return useOptional<ProjectRef["train"]["value"]>(project, "train");
+}
+
+/** Whether the task's node serves a queue (`queue`, and with it `accept` and `unqueue`): one of an older meddle does not. */
+export function queueable(task: TaskRef): boolean {
+  try {
+    return (task as unknown as { queue?: Readable<unknown> }).queue?.value !== undefined;
+  } catch {
+    return false;
   }
 }

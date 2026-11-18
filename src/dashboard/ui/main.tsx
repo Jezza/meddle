@@ -15,6 +15,7 @@ import { Sidebar } from "./Sidebar";
 import { homeTask } from "./sidebar-model";
 import { type NodeRef, type PoolIndex, usePoolIndex } from "./sources";
 import { TaskView } from "./Task";
+import { TrainPage } from "./Train";
 import { Blind, UpdateBar, useUpdate } from "./Update";
 import { buildAlerts, type UpdateView } from "./update-model";
 import { guardDrops } from "./attach-model";
@@ -122,6 +123,7 @@ function Body({ hosts, pool, node, index, view, open, update }: {
     case "project": return <ProjectPage key={view.id} hosts={hosts} pool={pool} index={index} id={view.id} tab={view.tab} />;
     case "add-project": return <AddProject node={node} />;
     case "node": return <NodePage key={view.nodeId} hosts={hosts} pool={pool} index={index} nodeId={view.nodeId} update={update} />;
+    case "train": return <TrainPage key={view.projectId} hosts={hosts} pool={pool} index={index} projectId={view.projectId} highlight={view.task} />;
     case "settings": return <Settings pool={pool} node={node} />;
   }
 }

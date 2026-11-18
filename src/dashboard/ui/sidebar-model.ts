@@ -19,9 +19,19 @@ export type TaskEntry = {
   moveTo: string | null;
   /** Listed among the node's archived tasks. */
   archived: boolean;
+  /** Accepted and waiting on its project's train; false from a node that does not say. */
+  queued: boolean;
+  /** A merge task of the train (`TaskManifest.merge`): it checks a batch, and is not accepted itself. */
+  merge: boolean;
 };
 
-export type SidebarProject<T extends TaskEntry = TaskEntry> = { id: string; name: string; tasks: T[] };
+export type SidebarProject<T extends TaskEntry = TaskEntry> = {
+  id: string;
+  name: string;
+  tasks: T[];
+  /** How many of its tasks are queued on its train. */
+  queued: number;
+};
 
 export type SidebarGroups<T extends TaskEntry = TaskEntry> = {
   /** Every project, by name, each with its tasks that work in it alone. */
@@ -48,7 +58,7 @@ export function groupTasks<T extends TaskEntry>(projects: readonly ListedProject
     const known = byId.get(t.id);
     if (known === undefined || (known.archived && !t.archived)) byId.set(t.id, t);
   }
-  const groups = new Map<string, SidebarProject<T>>(projects.map((p) => [p.id, { id: p.id, name: p.name, tasks: [] }]));
+  const groups = new Map<string, SidebarProject<T>>(projects.map((p) => [p.id, { id: p.id, name: p.name, tasks: [], queued: 0 }]));
   const shared: T[] = [];
   const archived: T[] = [];
   for (const t of byId.values()) {
@@ -56,8 +66,9 @@ export function groupTasks<T extends TaskEntry>(projects: readonly ListedProject
     else if (t.projects.length === 1) {
       const p = t.projects[0]!;
       let group = groups.get(p.id);
-      if (group === undefined) groups.set(p.id, (group = { id: p.id, name: p.name, tasks: [] }));
+      if (group === undefined) groups.set(p.id, (group = { id: p.id, name: p.name, tasks: [], queued: 0 }));
       group.tasks.push(t);
+      if (t.queued) group.queued++;
     } else shared.push(t);
   }
   const sorted = [...groups.values()].sort((x, y) => x.name.localeCompare(y.name) || x.id.localeCompare(y.id));
