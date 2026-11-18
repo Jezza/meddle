@@ -13,7 +13,7 @@ import { memorySource } from "./memory-model";
 import { PaneHead, type PoolRef, StateDot } from "./common";
 import { Graph } from "./Graph";
 import { graphRows } from "./graph-model";
-import { branchLines, mergeProjects, type HeldProject } from "./pool-model";
+import { branchLines, listedOnline, mergeProjects, type HeldProject } from "./pool-model";
 import { hashOf, type ProjectTab } from "./routes";
 import { waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
@@ -79,7 +79,7 @@ export function ProjectPage({ hosts, pool, index, id, tab }: {
     const t = index.tasks.find((t) => t.id === taskId && !t.archived);
     return t === undefined ? null : { title: t.title, href: hashOf({ name: "task", nodeId: t.nodeId, id: t.id }) };
   };
-  const unheld = <p class="muted">{listed === undefined ? "No online node holds this project." : "Loading…"}</p>;
+  const unheld = <p class="muted">{listedOnline(nodes, onlineIds, id) ? "Loading…" : "No online node holds this project."}</p>;
   const shown = tab ?? "graph";
   const column = (key: "graph" | ProjectTab) => `proj-col${shown === key ? " on" : ""}`;
   const tabLink = (key: "graph" | ProjectTab, label: ComponentChildren) => (

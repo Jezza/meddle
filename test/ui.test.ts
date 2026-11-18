@@ -1,6 +1,6 @@
 // test/ui.test.ts
 import { test, expect } from "bun:test";
-import { branchLines, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
+import { branchLines, listedOnline, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
@@ -112,6 +112,17 @@ test("the project page marks a conflicted branch, names its siblings as a checko
       name: "next", isDefault: false, conflicted: false, text: "still fetching eeeeeeeeeeee, aaaaaaaaaaaa, pushed elsewhere", siblings: [],
     },
   ]);
+});
+
+test("listedOnline: a project an offline node last listed is not listed online", () => {
+  const nodes = [
+    { nodeId: "a", projects: [{ id: "p", name: "faff", home: "a" }] },
+    { nodeId: "b", projects: [{ id: "q", name: "swarm", home: "b" }] },
+  ];
+  expect(listedOnline(nodes, ["a"], "p")).toBe(true);
+  expect(listedOnline(nodes, ["a"], "q")).toBe(false); // b is offline: its summary is its last
+  expect(listedOnline(nodes, ["a", "b"], "q")).toBe(true);
+  expect(listedOnline(nodes, ["a", "b"], "r")).toBe(false);
 });
 
 test("projectChoices: every project an online member lists, once, named as its home lists it", () => {
