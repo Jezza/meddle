@@ -1,7 +1,10 @@
 // test/jj.test.ts
 import { test, expect } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
-import { initColocated, isJjRepo, workspaceAdd, workspaceForget, changeId, bookmarkList, bookmarkSet, fetch, jj, push, remoteAdd, track } from "../src/jj";
+import {
+  abandon, changeId, bookmarkList, bookmarkSet, commitOf, commitsIn, configSetWorkspace, fetch, initColocated, isJjRepo, jj, push,
+  remoteAdd, track, workspaceAdd, workspaceForget,
+} from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import { twoPoolNodes } from "./pool-helpers";
 test("init, workspace add, change id, bookmark, forget", async () => {
@@ -141,4 +144,125 @@ test("a task's namespace, its glob and a side bookmark's name", async () => {
   expect(taskNamespace("abc")).toBe("meddle/task/abc/");
   expect(taskGlob("abc")).toBe("glob:meddle/task/abc/*");
   expect(sideBookmark("abc", "proj", "spike")).toBe("meddle/task/abc/proj.spike");
+});
+
+/** Commits `files` on top of `parent` in `repo` as `message` (a commit that `parent` is the parent of); its commit id. */
+async function commitOn(repo: string, parent: string, message: string, files: Record<string, string>): Promise<string> {
+  await jj(["new", parent], repo);
+  for (const [name, content] of Object.entries(files)) await Bun.write(`${repo}/${name}`, content);
+  await jj(["commit", "-m", message], repo);
+  return commitOf(repo, "@-");
+}
+
+test("workspaceAdd with two revisions makes a merge: the new working copy's parents equal both", async () => {
+  const repo = await mkdtemp("/tmp/meddle-jj-");
+  await initColocated(repo);
+  const base = await commitOn(repo, "root()", "base", { "f.txt": "a\nb\nc\n" });
+  const left = await commitOn(repo, base, "left", { "l.txt": "l\n" });
+  const right = await commitOn(repo, base, "right", { "r.txt": "r\n" });
+  const parents = async (ws: string) => (await jj(["log", "--ignore-working-copy", "-r", "@", "--no-graph", "-T", 'parents.map(|c| c.commit_id()).join(",")'], ws)).trim().split(",");
+
+  const merge = `${repo}-merge`;
+  await workspaceAdd(repo, "merge", merge, [left, right]);
+  expect(await parents(merge)).toEqual([left, right]);
+  // The merge has both sides' files.
+  expect(await Bun.file(`${merge}/l.txt`).text()).toBe("l\n");
+  expect(await Bun.file(`${merge}/r.txt`).text()).toBe("r\n");
+
+  // One revision, as a string or a list of one, is an ordinary start.
+  const one = `${repo}-one`;
+  await workspaceAdd(repo, "one", one, left);
+  expect(await parents(one)).toEqual([left]);
+  const alone = `${repo}-alone`;
+  await workspaceAdd(repo, "alone", alone, [right]);
+  expect(await parents(alone)).toEqual([right]);
+});
+
+test("abandon drops empty leftovers", async () => {
+  const repo = await mkdtemp("/tmp/meddle-jj-");
+  await initColocated(repo);
+  const base = await commitOn(repo, "root()", "base", { "f.txt": "a\n" });
+  const tip = await commitOn(repo, base, "tip", { "g.txt": "g\n" });
+  await jj(["new", base], repo);
+  const leftover = await commitOf(repo, "@");
+  // (A revset naming an abandoned commit by its id still finds it: look in everything visible.)
+  const alive = async (commit: string) => (await commitsIn(repo, "all()")).some((c) => c.commitId === commit);
+  expect(await alive(leftover)).toBe(true);
+
+  await abandon(repo, leftover);
+  expect(await alive(leftover)).toBe(false);
+  // What it did not select stays.
+  expect(await alive(tip)).toBe(true);
+  expect(await alive(base)).toBe(true);
+  // A revset selecting nothing is no error.
+  await abandon(repo, `${leftover} & ${tip}`);
+  expect(await alive(tip)).toBe(true);
+});
+
+test("abandon moves a bookmark on a leftover to its parent instead of deleting it", async () => {
+  const repo = await mkdtemp("/tmp/meddle-jj-");
+  await initColocated(repo);
+  const base = await commitOn(repo, "root()", "base", { "f.txt": "a\n" });
+  const leftover = await commitOn(repo, base, "", {});
+  await bookmarkSet(repo, "meddle/task/t/p", leftover);
+  await abandon(repo, leftover);
+  const [line] = await bookmarkList(repo);
+  expect(line).toMatchObject({ name: "meddle/task/t/p", remote: null, conflicted: false });
+  expect((await commitsIn(repo, "meddle/task/t/p")).map((c) => c.commitId)).toEqual([base]);
+});
+
+test("abandon with ignoreWorkingCopy never snapshots the working copy", async () => {
+  const repo = await mkdtemp("/tmp/meddle-jj-");
+  await initColocated(repo);
+  const base = await commitOn(repo, "root()", "base", { "f.txt": "a\n" });
+  const leftover = await commitOn(repo, base, "", {});
+  const other = await commitOn(repo, base, "", {});
+  await jj(["new", base], repo);
+  const recorded = async () => (await jj(["diff", "--ignore-working-copy", "-r", "@", "--name-only"], repo)).split("\n").filter(Boolean);
+  await Bun.write(`${repo}/edited.txt`, "x\n");
+  await abandon(repo, leftover, undefined, { ignoreWorkingCopy: true });
+  expect((await commitsIn(repo, "all()")).map((c) => c.commitId)).not.toContain(leftover);
+  expect(await recorded()).not.toContain("edited.txt");
+  // Without the option, the edit is snapshotted.
+  await abandon(repo, other);
+  expect(await recorded()).toContain("edited.txt");
+});
+
+test("commitsIn reports empty, conflict, description and mutability", async () => {
+  const repo = await mkdtemp("/tmp/meddle-jj-");
+  await initColocated(repo);
+  const base = await commitOn(repo, "root()", "base", { "f.txt": "a\nb\nc\n" });
+  const described = await commitOn(repo, base, "one line\n\nthe body of it", { "g.txt": "g\n" });
+  const bare = await commitOn(repo, described, "", {});
+  const left = await commitOn(repo, base, "left", { "f.txt": "L\nb\nc\n" });
+  const right = await commitOn(repo, base, "right", { "f.txt": "R\nb\nc\n" });
+  const merge = await commitOn(repo, `${left} | ${right}`, "both", {});
+  // The root has no description and no parents.
+  const [root] = await commitsIn(repo, "root()");
+  expect(root).toMatchObject({ parents: [], empty: true, conflict: false, description: "", mutable: false });
+
+  const [d] = await commitsIn(repo, described);
+  expect(d).toMatchObject({ commitId: described, parents: [base], empty: false, conflict: false, mutable: true });
+  expect(d!.description.trimEnd()).toBe("one line\n\nthe body of it");
+  expect(d!.changeId).toMatch(/^[k-z]{32}$/);
+
+  const [b] = await commitsIn(repo, bare);
+  expect(b).toMatchObject({ commitId: bare, parents: [described], empty: true, conflict: false, description: "", mutable: true });
+
+  const [m] = await commitsIn(repo, merge);
+  expect(m).toMatchObject({ commitId: merge, conflict: true, description: "both\n" });
+  expect(m!.parents.sort()).toEqual([left, right].sort());
+
+  // Several commits come in `jj log` order (the newest first) and the revset may select any.
+  expect((await commitsIn(repo, `${base} | ${described} | ${bare}`)).map((c) => c.commitId)).toEqual([bare, described, base]);
+  expect(await commitsIn(repo, `${merge} & ~conflicts()`)).toEqual([]);
+  expect((await commitsIn(repo, `${merge} & conflicts()`)).map((c) => c.commitId)).toEqual([merge]);
+
+  // `mutable` is the view of the directory it runs in: a task workspace's own `immutable_heads()` makes its base so.
+  const ws = `${repo}-ws`;
+  await workspaceAdd(repo, "ws", ws, [described]);
+  await configSetWorkspace(ws, 'revset-aliases."immutable_heads()"', `present(${described})`);
+  const view = async (cwd: string) => Object.fromEntries((await commitsIn(cwd, `${base} | ${described} | ${bare}`)).map((c) => [c.commitId, c.mutable]));
+  expect(await view(repo)).toEqual({ [base]: true, [described]: true, [bare]: true });
+  expect(await view(ws)).toEqual({ [base]: false, [described]: false, [bare]: true });
 });

@@ -23,7 +23,8 @@ up, and where things are; the sections below are the reference.
 ## Install
 
 Each machine needs [jj](https://jj-vcs.github.io/jj/) 0.46.0 or later (a task's workspaces are made with
-`jj workspace add --colocate`, which 0.45 lacks) and git, and either the single binary (see
+`jj workspace add --colocate`, which 0.45 lacks) and git 2.38 or later (the merge train tries merges with
+`git merge-tree --write-tree`), and either the single binary (see
 [The single binary](#the-single-binary)) or a checkout run with [bun](https://bun.sh):
 
 ```sh
