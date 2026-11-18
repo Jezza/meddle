@@ -248,7 +248,7 @@ async function serve(): Promise<number> {
     // Every project of the pool kept here, its rows applied to its service repo and view as they change.
     node.stopApplier = startApplier({ cfg, db, pool });
     node.stopTunnels = acceptDashboardStreams(pool.net, host, (id) => pool.store.isMember(id));
-    node.dashboard = await startDashboard(cfg, host, pool);
+    node.dashboard = await startDashboard(cfg, host, pool, runner.blobs);
   } catch (err) {
     await shutdown(node);
     throw err;
