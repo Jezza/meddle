@@ -1,17 +1,21 @@
-// Settings: the pool (this node, its secret and its members), the pool's settings and its login tokens.
+// Settings: the pool (this node, its secret and its members), the pool's settings and its login tokens with their usage.
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { useAction, useValue } from "./hooks";
 import { PaneHead, tokenText, type PoolRef } from "./common";
+import type { NodeRef } from "./sources";
+import { UsageMeter, useNow } from "./Usage";
+import { readAgo, windowMeter } from "./usage-model";
+import type { UsageReading } from "../../token-usage";
 
-export function Settings({ pool }: { pool: PoolRef }) {
+export function Settings({ pool, node }: { pool: PoolRef; node: NodeRef }) {
   return (
     <>
       <PaneHead><strong>Settings</strong></PaneHead>
       <div class="page">
         <PoolSection pool={pool} />
         <PoolSettings pool={pool} />
-        <TokenSection pool={pool} />
+        <TokenSection pool={pool} node={node} />
       </div>
     </>
   );
@@ -162,8 +166,27 @@ function tokenState(t: { status: string; until: string | null; detail: string | 
   return `${t.status}${until}${t.detail === null ? "" : ` (${t.detail})`}`;
 }
 
-function TokenSection({ pool }: { pool: PoolRef }) {
+/** A token's latest reading on this node: its 5-hour and 7-day meters with their resets, and how old it is. */
+function TokenUsage({ reading, now }: { reading: UsageReading | undefined; now: number }) {
+  if (reading === undefined) return <span class="muted">No data yet: no turn on this node has used it.</span>;
+  const windows = [["5h", reading.fiveHour], ["7d", reading.sevenDay]] as const;
+  return (
+    <div class="token-usage">
+      {windows.map(([label, w]) => {
+        const meter = windowMeter(label, w, reading.readAt, now);
+        return meter === null
+          ? <span key={label} class="usage-meter"><span class="usage-k">{label}</span><span class="muted">no data</span></span>
+          : <UsageMeter key={label} meter={meter} wide />;
+      })}
+      <span class="muted">{readAgo(reading.readAt, now)}</span>
+    </div>
+  );
+}
+
+function TokenSection({ pool, node }: { pool: PoolRef; node: NodeRef }) {
   const tokens = useValue(pool.tokens);
+  const usage = useValue(node.tokenUsage);
+  const now = useNow();
   const active = useValue(pool.activeTokenId);
   const nodes = useValue(pool.nodes);
   const action = useAction();
@@ -175,13 +198,14 @@ function TokenSection({ pool }: { pool: PoolRef }) {
       {action.error !== null && <p class="error">{action.error}</p>}
       {tokens.length > 0 && (
         <table>
-          <thead><tr><th>Label</th><th>Id</th><th>Status</th><th>Set by</th><th>Expires</th><th></th></tr></thead>
+          <thead><tr><th>Label</th><th>Id</th><th>Status</th><th>Usage</th><th>Set by</th><th>Expires</th><th></th></tr></thead>
           <tbody>
             {tokens.map((t, i) => (
               <tr key={t.id} class={t.id === active ? "active" : ""}>
                 <td>{t.label}{t.id === active ? " (active)" : ""}</td>
                 <td title={t.id}><code>{t.id.slice(0, 8)}</code></td>
                 <td>{tokenState(t)}</td>
+                <td><TokenUsage reading={usage[t.id]} now={now} /></td>
                 <td title={t.setBy ?? ""}>{setByName(t.setBy)}</td>
                 <td>{tokenText({ present: true, expiresAt: t.expiresAt })}</td>
                 <td>
@@ -216,7 +240,8 @@ function TokenSection({ pool }: { pool: PoolRef }) {
         Claude Code OAuth tokens are added on a node with <code>meddle token add</code> and shared with the pool; turns use
         the first usable one in this order. Their values never pass through the dashboard: it shows only what is listed
         here. Up and Down change the order (<code>meddle token move</code>), and Enable marks an exhausted or disabled
-        token usable again, both for the whole pool.
+        token usable again, both for the whole pool. Usage is the latest reading turns on this node got for each token:
+        the share of its 5-hour and 7-day plan limits used. A token only ever used on another node has none here.
       </p>
     </>
   );

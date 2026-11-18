@@ -122,7 +122,7 @@ function Body({ hosts, pool, node, index, view, open, update }: {
     case "project": return <ProjectPage key={view.id} hosts={hosts} pool={pool} index={index} id={view.id} tab={view.tab} />;
     case "add-project": return <AddProject node={node} />;
     case "node": return <NodePage key={view.nodeId} hosts={hosts} pool={pool} index={index} nodeId={view.nodeId} update={update} />;
-    case "settings": return <Settings pool={pool} />;
+    case "settings": return <Settings pool={pool} node={node} />;
   }
 }
 
