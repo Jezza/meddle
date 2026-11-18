@@ -304,6 +304,30 @@ test("the agent's reason stands however the turn's end, the calls that join it a
   }
 }, 90_000);
 
+test("a task accepted again while its declining turn finishes stays queued: the decline takes it off once", async () => {
+  const { nodes, close } = await queueNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
+  const A = nodes[0]!;
+  try {
+    const { m, queuedAt, left, decline } = await acceptedTask(A);
+    const outcome = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
+    await decline("the API it fixes is gone");
+    expect(queuedAt()).toBeNull();
+    // The user takes the notice's "Accept again" while the turn still runs.
+    expect(A.runner.liveQuery(m.id)).not.toBeNull();
+    await A.runner.accept(m.id);
+    const again = queuedAt();
+    expect(again).not.toBeNull();
+
+    expect(await outcome).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+    await until("the state", () => A.runner.state(m.id), "idle", 30_000);
+    expect(queuedAt()).toBe(again);
+    expect(left).toEqual(["the API it fixes is gone"]);
+  } finally {
+    await close();
+  }
+}, 90_000);
+
 test("the prompts match the spec copy", () => {
   expect(describePrompt(DESCRIBE_PROMPT, [])).toBe("Before your work lands on main: Add a description (4-7 words) to your revision(s).");
   expect(describePrompt(DESCRIBE_PROMPT, ["kxqzlmno"])).toBe(

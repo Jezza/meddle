@@ -60,6 +60,8 @@ async function fixture() {
   const advances: Array<[string, string]> = [];
   const abandoned: Array<[string, string[]]> = [];
   const left: Array<[string, string]> = [];
+  /** The tasks that left by declining: their holder took them off already, so `leave` only records them. */
+  const declines: string[] = [];
   const satOut: Array<[string, string]> = [];
   const heldBack: Array<[string, string]> = [];
   const steps: RoundStep[] = [];
@@ -138,9 +140,10 @@ async function fixture() {
       await bookmarkSet(repo, "main", next);
       advances.push([old, next]);
     },
-    async leave(taskId, reason) {
+    async leave(taskId, reason, declined) {
       left.push([taskId, reason]);
-      tasks.get(taskId)!.queued = false;
+      if (declined) declines.push(taskId);
+      else tasks.get(taskId)!.queued = false;
     },
     async sitOut(taskId, reason) {
       satOut.push([taskId, reason]);
@@ -155,7 +158,7 @@ async function fixture() {
   };
   const run = (resume?: RoundStep) => runRound(deps, cfg, repo, DESCRIBE, resume);
   return {
-    repo, cfg, B, on, task, tasks, tipOf, line, deps, run, log, turns, created, discarded, advances, abandoned, left, satOut,
+    repo, cfg, B, on, task, tasks, tipOf, line, deps, run, log, turns, created, discarded, advances, abandoned, left, declines, satOut,
     heldBack, steps, offline, gone, act: (id: string, f: Behaviour) => behaviours.set(id, f),
     /** Makes `advance` refuse with `text` (null: as usual), with `main` where it is. */
     refuse: (text: string | null) => { refuse.with = text; },
@@ -248,7 +251,7 @@ test("a rebase turn that leaves the work conflicting sits the task out", async (
 });
 
 test("decline takes a task off", async () => {
-  const { B, on, task, tasks, run, turns, left, satOut, advances, act } = await fixture();
+  const { B, on, task, tasks, run, turns, left, declines, satOut, advances, act } = await fixture();
   const draft = await on(B, "", { "f.txt": edited(1, "ONE") });
   const clean = await on(B, "add g", { "g.txt": "more g\n" });
   await task("t1", draft);
@@ -262,6 +265,8 @@ test("decline takes a task off", async () => {
   expect(await run()).toEqual({ landed: clean, again: false, paused: null });
   expect(turns).toEqual([{ taskId: "t1", kind: "describe", text: describePrompt(DESCRIBE, []) }]);
   expect(left).toEqual([["t1", "main already does this"]]);
+  // Only recorded: the user may have accepted it again since.
+  expect(declines).toEqual(["t1"]);
   expect(satOut).toEqual([]);
   expect(advances).toEqual([[B, clean]]);
 });

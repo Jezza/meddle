@@ -343,6 +343,35 @@ test("retry brings a sitting-out task back", async () => {
   }
 }, 180_000);
 
+test("a task accepted again before the train hears of its decline stays queued: the train only records it", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const left: string[] = [];
+    n.runner.onQueue((_, queue, reason) => { if (queue === null) left.push(String(reason)); });
+    let turns = 0;
+    // The agent declines, which takes the task off on its holder as it is logged; then the user accepts it again, all
+    // before the round hears how the turn went. The train is paused then, so no round asks it again.
+    n.hooks.trainTurn = async (taskId, kind) => {
+      if (kind !== "describe") return undefined;
+      turns++;
+      await n.runner.unqueue(taskId, "main already does this");
+      await n.runner.accept(taskId);
+      pauseTrain(n.db, P, "held by the test");
+      return { kind: "declined", reason: "main already does this" };
+    };
+    const t = await taskWithWork(n, P, "x.txt", { undescribed: true });
+    await n.runner.accept(t.id);
+    await waitFor("the round to end", async () => turns === 1 && (await liveTrains(n)).length === 0);
+    expect(n.runner.queue(t.id)).not.toBeNull();
+    expect(left).toEqual(["main already does this"]);
+    expect(trainState(n.db, P).queued.map((q) => [q.taskId, q.reason])).toEqual([[t.id, null]]);
+  } finally {
+    await close();
+  }
+}, 180_000);
+
 const HELD = "update in progress (build 1ee71ee71ee7)";
 const NO_HOLDS = { turns: null, work: null, hosting: null };
 

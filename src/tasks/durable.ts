@@ -695,8 +695,9 @@ export class TaskRunner {
    *
    * The agent's `decline` takes the task off its queue here, its holder, with the agent's reason, as it is logged
    * (`#engineInput`), whether or not a call waits for the turn: a call cut off by a restart, or one that never comes,
-   * changes nothing. Asked again for a task turn of `kind` once the latest one ended declined, and the task is still off
-   * its queue, this answers that decline and prompts no one: it is what a call cut off from that turn would have heard.
+   * changes nothing, and the call's end takes it off no more (the user may have accepted it again meanwhile). Asked
+   * again for a task turn of `kind` once the latest one ended declined, and the task is still off its queue, this
+   * answers that decline and prompts no one: it is what a call cut off from that turn would have heard.
    */
   async trainTurn(taskId: string, kind: TrainTurnKind, text: string): Promise<TrainTurnOutcome> {
     // Only with the hook set: awaiting nothing would let a prompt sent just after onto the prompt chain first.
@@ -710,10 +711,8 @@ export class TaskRunner {
     if (!("end" in turn)) return turn;
     const end = await turn.end;
     const events = listEventsBetween(this.#db, taskId, turn.after, end, ["meddle", "result"]);
-    const outcome = trainOutcome(events.map((e) => e.message));
-    // Done as the decline was logged; again here, which changes nothing then (`#unqueue` writes only a queued task).
-    if (outcome.kind === "declined") this.#leaveQueue(taskId, declineReason(outcome.reason));
-    return outcome;
+    // A decline took the task off its queue as it was logged: one queued now was accepted again since.
+    return trainOutcome(events.map((e) => e.message));
   }
 
   /**

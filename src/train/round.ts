@@ -51,8 +51,8 @@ export class TaskGone extends Error {
  * - `title`: how a notice names a task, also one that is no candidate;
  * - `abandonLeftovers`: abandons a task's leftovers (commit ids) where it is, on its holder;
  * - `advance`: moves the branch from `old` to `next` (`advanceBranch`), rejecting with the refusal's text;
- * - `leave`: a task leaves the queue, saying why (one that declined has left already, on its holder: this only records
- *   it then);
+ * - `leave`: a task leaves the queue, saying why; one that `declined` has left already, on its holder, and this only
+ *   records it then (the user may have accepted it again since);
  * - `sitOut`: a task stays queued but not eligible until Retry, saying why;
  * - `holdBack`: a task stays queued but is not eligible this round, with the notice to show;
  * - `checkpoint`: where the round is (`RoundStep`), for the train's page and for a round resumed after a restart or Retry.
@@ -65,7 +65,7 @@ export type RoundDeps = MergeDeps & {
   title(taskId: string): Promise<string>;
   abandonLeftovers(taskId: string, commits: string[]): Promise<void>;
   advance(old: string, next: string): Promise<void>;
-  leave(taskId: string, reason: string): Promise<void>;
+  leave(taskId: string, reason: string, declined: boolean): Promise<void>;
   sitOut(taskId: string, reason: string): Promise<void>;
   holdBack(taskId: string, notice: string): Promise<void>;
   checkpoint(step: RoundStep): Promise<void>;
@@ -490,7 +490,7 @@ class Round {
       return false;
     }
     if (outcome.kind === "declined") {
-      await this.#leave(taskId, declineReason(outcome.reason));
+      await this.#leave(taskId, declineReason(outcome.reason), true);
       return false;
     }
     if (outcome.kind === "failed") {
@@ -507,9 +507,9 @@ class Round {
     return commits.map((commit) => found.get(commit) ?? commit);
   }
 
-  async #leave(taskId: string, reason: string): Promise<void> {
+  async #leave(taskId: string, reason: string, declined = false): Promise<void> {
     this.#left.add(taskId);
-    await this.deps.leave(taskId, reason);
+    await this.deps.leave(taskId, reason, declined);
   }
 
   async #sitOut(taskId: string, reason: string): Promise<void> {

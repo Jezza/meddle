@@ -1020,8 +1020,12 @@ test("leaving the train raises a train notice, and what the user did to leave ra
     const node = await client.get(NodeObject, {});
     const user = await taskWithWork(n, P, "u.txt");
     const leaver = await taskWithWork(n, P, "l.txt", { undescribed: true });
-    // Its agent declines the describe turn.
-    n.hooks.trainTurn = async (_taskId, kind) => (kind === "describe" ? { kind: "declined", reason: "main already has this" } : undefined);
+    // Its agent declines the describe turn, which takes it off its queue on its holder as the decline is logged.
+    n.hooks.trainTurn = async (taskId, kind) => {
+      if (kind !== "describe") return undefined;
+      await n.runner.unqueue(taskId, "main already has this");
+      return { kind: "declined", reason: "main already has this" };
+    };
     // The train is held while the user queues and unqueues, so no round runs meanwhile.
     pauseTrain(n.db, P, "the test queues first");
     for (const reason of [UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]) {

@@ -885,9 +885,9 @@ class Conductor {
         work();
         await this.#advance(project, round, old, next);
       },
-      leave: async (taskId, reason) => {
+      leave: async (taskId, reason, declined) => {
         live();
-        await this.#leave(project, taskId, reason);
+        await this.#leave(project, taskId, reason, declined);
       },
       sitOut: async (taskId, reason) => {
         live();
@@ -1031,10 +1031,14 @@ class Conductor {
     }
   }
 
-  /** Task `taskId` leaves the queue for `reason`, on its holder (a decline has done so there already); a failure is logged. */
-  async #leave(project: Project, taskId: string, reason: string): Promise<void> {
+  /**
+   * Task `taskId` leaves the queue for `reason`, on its holder; a failure is logged. One that `declined` has left there
+   * already, as its decline was logged, and is only forgotten here: unqueued again, a task the user accepted again since
+   * would be taken off once more.
+   */
+  async #leave(project: Project, taskId: string, reason: string, declined: boolean): Promise<void> {
     try {
-      await this.#onHolder(project, taskId, null, (r) => r.unqueue(taskId, reason), (peer) => peer.unqueueTask({ taskId, reason }));
+      if (!declined) await this.#onHolder(project, taskId, null, (r) => r.unqueue(taskId, reason), (peer) => peer.unqueueTask({ taskId, reason }));
     } catch (err) {
       this.#log(`meddle: train: ${taskId} did not leave the queue of ${project.name} (${reason}): ${messageOf(err)}`);
     }
