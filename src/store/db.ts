@@ -128,6 +128,16 @@ const MIGRATIONS = [
     drops TEXT NOT NULL,
     PRIMARY KEY (project, branch, node)
   )`,
+  // Each project's merge train as its home runs it (src/train/train.ts): why it is paused (NULL: it runs); the tasks
+  // sitting out and those held back, each a JSON object of task id to reason; and where its round is (a JSON
+  // `RoundStep`), NULL when no round is under way or left unfinished.
+  `CREATE TABLE IF NOT EXISTS trains (
+    project TEXT PRIMARY KEY,
+    paused TEXT,
+    sitting TEXT NOT NULL DEFAULT '{}',
+    held TEXT NOT NULL DEFAULT '{}',
+    round TEXT
+  )`,
 ];
 
 /** Columns added to a table after its first release: each is added to a database that lacks it. */

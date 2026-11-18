@@ -171,7 +171,7 @@ test("a new task with attachments is not placed on a node that takes none, nor c
   }
 }, 60_000);
 
-test("PeerObject.createTaskAt (and trainTurn) refuses a peer that is not a member, before creating anything", async () => {
+test("PeerObject.createTaskAt (and the train's calls) refuses a peer that is not a member, before creating anything", async () => {
   const db = openDb(":memory:");
   const created: unknown[] = [];
   const never: Subscribable<null> = { subscribe: () => () => {} };
@@ -194,6 +194,10 @@ test("PeerObject.createTaskAt (and trainTurn) refuses a peer that is not a membe
       setModel: async () => {},
       setEffort: async () => {},
       trainTurn: async () => { created.push("trainTurn"); return { kind: "done" as const }; },
+      trainStatus: async () => { created.push("trainStatus"); return []; },
+      abandonLeftovers: async () => { created.push("abandonLeftovers"); },
+      unqueue: async () => { created.push("unqueue"); },
+      discardMergeTask: async () => { created.push("discardMergeTask"); },
     },
   });
   const [down, up] = memoryLinkPair();
@@ -210,6 +214,17 @@ test("PeerObject.createTaskAt (and trainTurn) refuses a peer that is not a membe
     refusal = null;
     await peer.trainTurn({ taskId: "0123456789ab", kind: "describe", text: "hi" }).catch((err: unknown) => { refusal = err; });
     expect(refusal).toMatchObject({ code: "forbidden" });
+    const taskId = "0123456789ab";
+    for (const call of [
+      () => peer.trainTasks({ taskIds: [taskId] }),
+      () => peer.abandonLeftovers({ taskId, commits: ["1".repeat(40)] }),
+      () => peer.unqueueTask({ taskId, reason: "r" }),
+      () => peer.discardTask({ taskId }),
+    ]) {
+      refusal = null;
+      await call().catch((err: unknown) => { refusal = err; });
+      expect(refusal).toMatchObject({ code: "forbidden" });
+    }
     expect(created).toEqual([]);
     peer.release();
   } finally {

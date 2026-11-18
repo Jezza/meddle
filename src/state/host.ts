@@ -39,6 +39,7 @@ import {
 } from "../tasks/changes";
 import { taskNamespace, type ManifestProject, type Start, type TaskManifest } from "../tasks/manifest";
 import { initialTitle } from "../tasks/names";
+import { startTrains } from "../train/train";
 import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { activeUsage as activeUsageNow, tokenUsages } from "../token-usage";
@@ -127,9 +128,14 @@ export type PeerObjectDeps = {
   isMember(nodeId: string): boolean;
   /**
    * Receives tasks other nodes move here (each call names the calling node), creates tasks members place here, and runs
-   * the train turns members ask for.
+   * what a member's merge train asks of the tasks held here: train turns, their status, abandoning leftovers, leaving
+   * the queue, discarding a merge task.
    */
-  runner: Pick<TaskRunner, "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel" | "setEffort" | "trainTurn">;
+  runner: Pick<
+    TaskRunner,
+    | "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel" | "setEffort" | "trainTurn"
+    | "trainStatus" | "abandonLeftovers" | "unqueue" | "discardMergeTask"
+  >;
 };
 
 /** A project as another node sees it. */
@@ -188,10 +194,26 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         if (!deps.isMember(from)) throw forbidden("members only");
         return deps.runner.trainTurn(taskId, kind, text);
       },
-      // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
-      createTaskAt: async ({ title, taskId, starts, prompt, attachments = [], nameFromPrompt, model, effort }) => {
+      trainTasks: ({ taskIds }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
-        const manifest = await deps.runner.create({ title, taskId, starts });
+        return deps.runner.trainStatus(taskIds);
+      },
+      abandonLeftovers: ({ taskId, commits }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return deps.runner.abandonLeftovers(taskId, commits);
+      },
+      unqueueTask: ({ taskId, reason }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return deps.runner.unqueue(taskId, reason);
+      },
+      discardTask: ({ taskId }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return deps.runner.discardMergeTask(taskId);
+      },
+      // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
+      createTaskAt: async ({ title, taskId, starts, prompt, attachments = [], nameFromPrompt, model, effort, merge }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        const manifest = await deps.runner.create({ title, taskId, starts, ...(merge === undefined ? {} : { merge }) });
         if (model !== undefined) await deps.runner.setModel(manifest.id, model);
         if (effort !== undefined) await deps.runner.setEffort(manifest.id, effort);
         const first = firstPrompt(prompt, attachments);
@@ -333,6 +355,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const noTokenFailures = new Set<string>();
     /** Pending request ids already notified, so each request is announced once. */
     const announced = self.state("announced", Type.Array(Type.String()), []);
+    // The merge trains of the projects homed here run as long as the host does.
+    self.resource("trains", {
+      version: 1,
+      open: () => startTrains({ cfg, db, pool, runner, ...(deps.inputHold === undefined ? {} : { inputHold: deps.inputHold }) }),
+      close: (stop) => stop(),
+    });
 
     /** The task root, jj and git can come and go while the node runs. */
     const refreshHostsTasks = async (ctx: Ctx) => {

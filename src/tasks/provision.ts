@@ -202,12 +202,13 @@ function resolveProjects(db: Database, projectIds: string[]): Project[] {
  * which jj there must know (the task's line brought it), editing it in `edit` mode or a new change on it in `child`
  * mode; a start with `parents` gets a new change with all of them (a merge), its `parent` the first. Each workspace is
  * scoped to the task's line from its base (`scopeWorkspace`), and the task's bookmark `meddle/task/<id>/<project>`
- * points at its working copy, set without snapshotting the repo's own. On failure, removes what it made.
+ * points at its working copy, set without snapshotting the repo's own. `merge` makes it a merge task of the merge train
+ * (`TaskManifest.merge`). On failure, removes what it made.
  */
 export async function provisionTask(
   cfg: NodeConfig,
   db: Database,
-  input: { title: string; taskId: string; starts: Start[] },
+  input: { title: string; taskId: string; starts: Start[]; merge?: TaskManifest["merge"] },
 ): Promise<TaskManifest> {
   const root = await checkTaskRoot(cfg);
   if (!root.ok) throw new Error(root.reason);
@@ -269,6 +270,7 @@ export async function provisionTask(
       projects: entries,
       primaryProjectId: primary?.id ?? null,
       createdAt: new Date().toISOString(),
+      ...(input.merge === undefined ? {} : { merge: { project: input.merge.project, batch: [...input.merge.batch] } }),
     };
     await writeFile(join(task, "CLAUDE.md"), generatedClaudeMd(manifest, projects));
     await writeManifest(cfg, manifest);

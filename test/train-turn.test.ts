@@ -19,8 +19,19 @@ import { openHarness } from "../src/tasks/harness";
 import { describePrompt, mergePrompt, mergeTitle, rebasePrompt } from "../src/train/prompts";
 import { TRAIN_TOOLS, trainOutcome, trainToolList, trainTools } from "../src/train/tools";
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
+import { pauseTrain } from "../src/train/train";
 import { createTask, replay, setupNode } from "./helpers";
 import { peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+
+/**
+ * `poolNodes`, each node's train of its project paused: these tests queue tasks and drive their turns themselves, so no
+ * round of the conductor's may take them.
+ */
+async function queueNodes(...args: Parameters<typeof poolNodes>): ReturnType<typeof poolNodes> {
+  const made = await poolNodes(...args);
+  for (const n of made.nodes) pauseTrain(n.db, n.project.id, "held by the test");
+  return made;
+}
 
 type EngineSeen = Parameters<NonNullable<RunnerHooks["engineInput"]>>[1];
 
@@ -157,7 +168,7 @@ async function withWork(node: GitPoolNode, taskId: string): Promise<void> {
 }
 
 test("prompts sent during a train turn wait for it: queued, not steered; the task stays queued until one runs", async () => {
-  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
+  const { nodes, close } = await queueNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
   const A = nodes[0]!;
   try {
     const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
@@ -229,7 +240,7 @@ async function acceptedTask(A: GitPoolNode) {
 }
 
 test("a decline takes the task off its queue as it is logged, with no call waiting; asked again, the train hears it and prompts no one", async () => {
-  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
+  const { nodes, close } = await queueNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
   const A = nodes[0]!;
   try {
     const { m, queuedAt, left, decline } = await acceptedTask(A);
@@ -266,7 +277,7 @@ test("a decline takes the task off its queue as it is logged, with no call waiti
 }, 90_000);
 
 test("the agent's reason stands however the turn's end, the calls that join it and a prompt that waited fall", async () => {
-  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
+  const { nodes, close } = await queueNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
   const A = nodes[0]!;
   try {
     const { m, queuedAt, left, decline } = await acceptedTask(A);

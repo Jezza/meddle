@@ -1,0 +1,328 @@
+// test/train.test.ts — the merge train's conductor: the project's home runs a round whenever something could change
+// the outcome (a task queued, a queued task's turn ending, the branch moving, Resume or Retry), one at a time, as a
+// durable `meddle.train` that a restart resumes; Pause holds landing across restarts; a push mid-round starts the round
+// over against the new main; Retry brings a task that sat out back. The agents' turns are faked through the runner's
+// `trainTurn` hook (the stand-in Claude Code runs no tools); everything the conductor does around them is real.
+import { expect, test } from "bun:test";
+import { delimiter, join } from "node:path";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createRegistry } from "@earendil-works/pi-durable";
+import { paths } from "../src/config";
+import { commitOf, commitsIn, jj } from "../src/jj";
+import { listBranchRows } from "../src/pool/rows";
+import { makeCheckout } from "../src/projects/checkouts";
+import { getProject } from "../src/projects/project";
+import { defaultBranchCommit } from "../src/projects/starts";
+import { createNodeHost } from "../src/state/host";
+import { getTask, listTasks } from "../src/store/records";
+import { TaskRunner } from "../src/tasks/durable";
+import { openHarness } from "../src/tasks/harness";
+import type { TaskManifest } from "../src/tasks/manifest";
+import type { TrainTurnKind, TrainTurnOutcome } from "../src/train/tools";
+import { pauseTrain, retryTask, trainState } from "../src/train/train";
+import { claudeCodeVersion } from "../src/version";
+import { startApplier } from "../src/projects/applier";
+import { createTask, replay } from "./helpers";
+import { peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+
+async function waitFor(what: string, cond: () => boolean | Promise<boolean>, ms = 60_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!(await cond())) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(50);
+  }
+}
+
+/** Project `P`'s default branch on node `n`, as its rows have it. */
+async function mainOf(n: GitPoolNode, P: string): Promise<string> {
+  return defaultBranchCommit({ cfg: n.cfg, db: n.db, selfId: n.id }, getProject(n.db, P)!);
+}
+
+/** The task's workspace of its (one) project on node `n`. */
+function workspaceOf(n: GitPoolNode, taskId: string): string {
+  const manifest = JSON.parse(getTask(n.db, taskId)!.manifest) as TaskManifest;
+  return join(paths(n.cfg).task(taskId), manifest.projects[0]!.workspace);
+}
+
+/**
+ * A task of project `P` on node `on` whose work adds `file`: committed with a description (its tip the commit), or with
+ * `undescribed` left in its working copy without one (its tip the working copy). Its lines are written, as a turn end
+ * would.
+ */
+async function taskWithWork(on: GitPoolNode, P: string, file: string, options: { undescribed?: boolean } = {}) {
+  const m = await createTask(on, { title: `Add ${file}`, projectIds: [P] });
+  const ws = workspaceOf(on, m.id);
+  await Bun.write(join(ws, file), `${file}\n`);
+  if (options.undescribed === true) await jj(["status"], ws, on.cfg);
+  else await jj(["commit", "-m", `Add ${file}`], ws, on.cfg);
+  await on.runner.writeTaskLines(m.id);
+  const tip = await commitOf(ws, options.undescribed === true ? "@" : "@-", on.cfg);
+  return { id: m.id, ws, tip };
+}
+
+/** The merge tasks live on node `n` (not archived, moved or deleted). */
+function liveMergeTasks(n: GitPoolNode): string[] {
+  return listTasks(n.db)
+    .filter((t) => t.state !== "archived" && t.state !== "moved" && (JSON.parse(t.manifest) as TaskManifest).merge !== undefined)
+    .map((t) => t.id);
+}
+
+/**
+ * Fakes the merge agent on node `n` (through the runner's `trainTurn` hook): it describes the merge in the merge task's
+ * workspace and writes the task's lines, as a turn end would. With `stall`, the first merge turn waits for `release()`
+ * once it has `reached` that point. Records each merge task it ran for (`tasks`), its merge's parents (`parents`), and
+ * the merge tasks live on `n` as it ran (`alive`). Turns of other kinds go to `others` (else the real turn runs).
+ */
+function fakeMerge(n: GitPoolNode, options: { stall?: boolean; others?: (taskId: string, kind: TrainTurnKind, text: string) => Promise<TrainTurnOutcome | undefined> } = {}) {
+  const reached = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const tasks: string[] = [];
+  const parents: string[][] = [];
+  const alive: string[][] = [];
+  n.hooks.trainTurn = async (taskId, kind, text) => {
+    if (kind !== "merge") return options.others?.(taskId, kind, text);
+    tasks.push(taskId);
+    alive.push(liveMergeTasks(n));
+    if (options.stall === true && tasks.length === 1) {
+      reached.resolve();
+      await gate.promise;
+    }
+    // A merge task discarded meanwhile (its node restarted under it) has nothing left to describe.
+    if (getTask(n.db, taskId)?.state !== "idle") return { kind: "failed", reason: "the merge task is gone" };
+    const ws = workspaceOf(n, taskId);
+    parents.push((await commitsIn(ws, "@", n.cfg))[0]!.parents);
+    await jj(["describe", "-m", "Merge the batch"], ws, n.cfg);
+    await n.runner.writeTaskLines(taskId);
+    return { kind: "done" };
+  };
+  return { reached: reached.promise, release: () => gate.resolve(), tasks, parents, alive };
+}
+
+/**
+ * Restarts node `n`'s durable side, as a process restart would: its Harness (closed first, as `serve` shuts down), its
+ * runner and its chord host (whose close stops the conductor) go, and new ones open on the same database and pool, the
+ * conductor starting with the host. `n` is updated in place, so its `close` stops the new ones.
+ */
+async function restart(n: GitPoolNode): Promise<void> {
+  await n.harness.close();
+  await n.host.close();
+  n.runner.close();
+  const harness = await openHarness(n.cfg, createRegistry());
+  const runner = new TaskRunner(n.cfg, n.db, harness.harness, {
+    claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl` },
+    pool: n.pool, log: (line) => n.logs.push(line), hooks: n.hooks,
+  });
+  const host = createNodeHost({ cfg: n.cfg, db: n.db, runner, metrics: n.metrics, claudeCodeVersion: claudeCodeVersion(), pool: n.pool });
+  Object.assign(n, {
+    harness, runner, host,
+    async close() {
+      n.metrics.stop();
+      runner.close();
+      await n.pool.stop();
+      await harness.close();
+      await host.close();
+    },
+  });
+}
+
+/**
+ * Accepts `taskIds` on node `n`, all before a round of project `P`'s train can pick any of them: the train is paused
+ * meanwhile, then resumed.
+ */
+async function acceptAll(n: GitPoolNode, P: string, taskIds: string[]): Promise<void> {
+  pauseTrain(n.db, P, "accepting");
+  for (const id of taskIds) await n.runner.accept(id);
+  pauseTrain(n.db, P, null);
+}
+
+/** The `meddle.train` tasks live in node `n`'s Harness. */
+async function liveTrains(n: GitPoolNode): Promise<unknown[]> {
+  const { tasks } = await n.harness.harness.inspect(BACKGROUND_CONTEXT);
+  return tasks.filter((t) => t.record.kind === "meddle.train").map((t) => t.record.input);
+}
+
+/** `PATH` with this node's `<data>/bin` first: what `makeCheckout` checks for the helper. */
+const helperEnv = (n: GitPoolNode) => ({ PATH: `${paths(n.cfg).bin}${delimiter}${process.env.PATH}` });
+
+test("a queued task triggers a round on the home only", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  // As `serve` runs it: B admits A's row for main once it has its commit, and its acceptance sees the branch move.
+  const stops = [A, B].map((n) => startApplier({ cfg: n.cfg, db: n.db, pool: n.pool, log: (line) => n.logs.push(line) }));
+  try {
+    await peerReady(A, B);
+    await peerReady(B, A);
+    const P = A.project.id;
+    await waitFor("A's project in B's roster", () => B.store.row(A.id)?.summary?.projects?.some((p) => p.id === P) === true);
+    // A task on B, of A's project: B holds its line and its queue, A runs the train.
+    const t = await taskWithWork(B, P, "x.txt");
+    await B.runner.accept(t.id);
+    await waitFor("A to move main onto the task's work", async () => (await mainOf(A, P)) === t.tip);
+    // The branch row is A's; B, the task's holder, archives the task once its work is on main.
+    expect(listBranchRows(A.db, P, "main").map((r) => r.node)).toEqual([A.id]);
+    await waitFor("B to archive the landed task", () => getTask(B.db, t.id)?.state === "archived");
+    expect(trainState(A.db, P)).toEqual({ paused: null, round: null, queued: [] });
+    // B ran no train of A's project: no branch row of its own, nothing recorded, nothing in its Harness.
+    expect(listBranchRows(B.db, P).filter((r) => r.node === B.id)).toEqual([]);
+    expect(B.db.query("SELECT project FROM trains WHERE project = ?").all(P)).toEqual([]);
+    expect(await liveTrains(B)).toEqual([]);
+  } finally {
+    for (const stop of stops) stop();
+    await close();
+  }
+}, 180_000);
+
+test("pause holds landing and survives a restart", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const before = await mainOf(n, P);
+    const merge = fakeMerge(n, { stall: true });
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await merge.reached;
+    // Paused while the merge agent checks: its turn finishes, and nothing lands.
+    pauseTrain(n.db, P, "you paused it");
+    merge.release();
+    await waitFor("the round to end without landing", async () => (await liveTrains(n)).length === 0 && liveMergeTasks(n).length === 0);
+    expect(await mainOf(n, P)).toBe(before);
+    expect(trainState(n.db, P).paused).toBe("you paused it");
+    // A paused train keeps no update waiting.
+    expect(await n.runner.busyTasks()).toEqual([]);
+
+    // Still paused after a restart: no round starts, nothing lands.
+    await restart(n);
+    await Bun.sleep(2000);
+    expect(await liveTrains(n)).toEqual([]);
+    expect(await mainOf(n, P)).toBe(before);
+    expect(merge.tasks).toHaveLength(1);
+    expect(trainState(n.db, P).paused).toBe("you paused it");
+    expect(trainState(n.db, P).queued.map((q) => q.taskId).sort()).toEqual([t1.id, t2.id].sort());
+
+    // Resume: the round checks again, with a fresh merge task, and lands.
+    pauseTrain(n.db, P, null);
+    await waitFor("main to move", async () => (await mainOf(n, P)) !== before);
+    const landed = (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!;
+    expect(landed.parents.sort()).toEqual([t1.tip, t2.tip].sort());
+    expect(merge.tasks).toHaveLength(2);
+    await waitFor("both tasks and the merge task archived", () =>
+      [t1.id, t2.id, merge.tasks[1]!].every((id) => getTask(n.db, id)?.state === "archived"));
+    expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [] });
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a restart mid-round resumes without a second merge task", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  const merge = fakeMerge(n, { stall: true });
+  try {
+    const P = n.project.id;
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await merge.reached;
+    const first = merge.tasks[0]!;
+    const round = trainState(n.db, P).round!;
+    expect({ ...round, batch: [...round.batch].sort() }).toEqual({ step: "checking", batch: [t1.id, t2.id].sort(), mergeTask: first });
+    expect(trainState(n.db, P).queued.map((q) => q.state)).toEqual(["in the batch", "in the batch"]);
+    expect(liveMergeTasks(n)).toEqual([first]);
+    // A round in flight is what an update drains.
+    expect(await n.runner.busyTasks()).toEqual([`train:${P}`]);
+
+    // The node restarts while the merge agent checks the batch.
+    await restart(n);
+    await waitFor("main to land the merge", async () => (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!.parents.length === 2);
+    // The round resumed from its checkpoint: the merge task cut off was discarded before a fresh one checked the batch,
+    // so there never were two.
+    expect(merge.tasks).toHaveLength(2);
+    expect(merge.alive[1]).toEqual([merge.tasks[1]!]);
+    expect(getTask(n.db, first)).toBeNull();
+    await waitFor("both tasks and the merge task archived", () =>
+      [t1.id, t2.id, merge.tasks[1]!].every((id) => getTask(n.db, id)?.state === "archived"));
+    expect(liveMergeTasks(n)).toEqual([]);
+    expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [] });
+    await waitFor("the round to end", async () => (await n.runner.busyTasks()).length === 0);
+  } finally {
+    merge.release();
+    await close();
+  }
+}, 180_000);
+
+test("a push during checking restarts the round against the new main", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const co = await makeCheckout(n.cfg, n.id, n.project, `${n.home}/co`, helperEnv(n));
+    const merge = fakeMerge(n, { stall: true });
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await merge.reached;
+
+    // Someone pushes to main from a checkout while the merge agent checks the batch.
+    await jj(["new", "main"], co, n.cfg);
+    await Bun.write(join(co, "z.txt"), "z\n");
+    await jj(["commit", "-m", "Add z"], co, n.cfg);
+    const z = await commitOf(co, "@-", n.cfg);
+    await jj(["bookmark", "set", "main", "-r", z], co, n.cfg);
+    await jj(["git", "push", "--remote", "meddle", "-b", "main"], co, n.cfg);
+    expect(await mainOf(n, P)).toBe(z);
+    merge.release();
+
+    // The landing is refused (main is not where the round read it), and the round starts over on z: a fresh merge task
+    // checks the batch merged with it, and that lands.
+    await waitFor("main to move past z", async () => (await mainOf(n, P)) !== z);
+    expect(merge.tasks).toHaveLength(2);
+    expect(merge.parents[1]!.sort()).toEqual([t1.tip, t2.tip, z].sort());
+    const landed = (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!;
+    expect(landed.parents.sort()).toEqual([t1.tip, t2.tip, z].sort());
+    expect(getTask(n.db, merge.tasks[0]!)).toBeNull();
+    await waitFor("both tasks and the merge task archived", () =>
+      [t1.id, t2.id, merge.tasks[1]!].every((id) => getTask(n.db, id)?.state === "archived"));
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("retry brings a sitting-out task back", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const describes: string[] = [];
+    let described = "";
+    // Its first describe turn fails; the next describes its work, as the agent would.
+    n.hooks.trainTurn = async (taskId, kind, text) => {
+      if (kind !== "describe") return undefined;
+      describes.push(text);
+      if (describes.length === 1) return { kind: "failed", reason: "the agent gave up" };
+      const ws = workspaceOf(n, taskId);
+      await jj(["describe", "-m", "Add x"], ws, n.cfg);
+      described = await commitOf(ws, "@", n.cfg);
+      await n.runner.writeTaskLines(taskId);
+      return { kind: "done" };
+    };
+    const t = await taskWithWork(n, P, "x.txt", { undescribed: true });
+    const before = await mainOf(n, P);
+    await n.runner.accept(t.id);
+    await waitFor("the task to sit out", () => trainState(n.db, P).queued[0]?.state === "sitting out");
+    expect(trainState(n.db, P).queued).toEqual([{ taskId: t.id, state: "sitting out", reason: "its describe turn failed: the agent gave up" }]);
+    // Nothing brings it back by itself: no second describe turn, nothing lands.
+    await Bun.sleep(2500);
+    expect(describes).toHaveLength(1);
+    expect(await mainOf(n, P)).toBe(before);
+
+    retryTask(n.db, P, t.id);
+    await waitFor("main to move", async () => (await mainOf(n, P)) !== before);
+    expect(describes).toHaveLength(2);
+    expect(await mainOf(n, P)).toBe(described);
+    await waitFor("the task archived", () => getTask(n.db, t.id)?.state === "archived");
+    expect(trainState(n.db, P)).toEqual({ paused: null, round: null, queued: [] });
+  } finally {
+    await close();
+  }
+}, 180_000);

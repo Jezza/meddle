@@ -51,6 +51,16 @@ export const TaskManifestSchema = Type.Object({
 /** A turn of the merge train's (`TrainTurnKind`). */
 export const TrainTurnKindSchema = Type.Union([Type.Literal("describe"), Type.Literal("rebase"), Type.Literal("fix"), Type.Literal("merge")]);
 
+/** A merge task's project and the tasks it merges (`TaskManifest.merge`). */
+export const MergeOfSchema = Type.Object({ project: Type.String(), batch: Type.Array(Type.String()) });
+
+/** How a task stands for the merge train on its holder (`TrainTaskStatus`). */
+export const TrainTaskStatusSchema = Type.Object({
+  taskId: Type.String(),
+  state: Type.Union([Type.Literal("idle"), Type.Literal("busy"), Type.Literal("train"), Type.Literal("absent")]),
+  title: Nullable(Type.String()),
+});
+
 /** How a train turn went (`TrainTurnOutcome`). */
 export const TrainTurnOutcomeSchema = Type.Union([
   Type.Object({ kind: Type.Literal("done") }),
@@ -879,6 +889,11 @@ export const PeerObject = remote("meddle.peer", {
             nameFromPrompt: Type.Optional(Type.Boolean()),
             model: Type.Optional(Type.String()),
             effort: Type.Optional(Type.String()),
+            /**
+             * Makes it a merge task of the merge train (`TaskManifest.merge`). A node older than this field drops it:
+             * the train sends a merge task only to a node that starts tasks on merges (`mergeStarts`), which has it.
+             */
+            merge: Type.Optional(MergeOfSchema),
           }),
           Type.Object({ manifest: TaskManifestSchema }),
         ),
@@ -902,6 +917,27 @@ export const PeerObject = remote("meddle.peer", {
           Type.Object({ taskId: Type.String(), kind: TrainTurnKindSchema, text: Type.String() }),
           TrainTurnOutcomeSchema,
         ),
+        /**
+         * How each of `taskIds` stands for the merge train here (`TaskRunner.trainStatus`; a member only, `forbidden`
+         * otherwise): what the conductor reads to tell which queued tasks are eligible. A node older than this method
+         * has none.
+         */
+        trainTasks: method(Type.Object({ taskIds: Type.Array(Type.String()) }), Type.Array(TrainTaskStatusSchema)),
+        /**
+         * Abandons the empty leftovers `commits` of task `taskId` here, where its workspace sees them as its own, and
+         * writes its lines (`TaskRunner.abandonLeftovers`; a member only). Refused as that refuses.
+         */
+        abandonLeftovers: method(Type.Object({ taskId: Type.String(), commits: Type.Array(Type.String()) })),
+        /**
+         * Takes task `taskId` off its train's queue for `reason` (`TaskRunner.unqueue`; a member only): what the
+         * conductor does when the task leaves the train. A task not queued stays as it is.
+         */
+        unqueueTask: method(Type.Object({ taskId: Type.String(), reason: Type.String() })),
+        /**
+         * Discards merge task `taskId` here: its turn interrupted, the task archived and deleted
+         * (`TaskRunner.discardMergeTask`; a member only). Refused for a task that is no merge task.
+         */
+        discardTask: method(Type.Object({ taskId: Type.String() })),
       },
     },
   },

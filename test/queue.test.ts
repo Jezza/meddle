@@ -11,8 +11,19 @@ import { addProjectFromFolder, type Project } from "../src/projects/project";
 import { TaskObject } from "../src/state/contracts";
 import { listEvents } from "../src/store/events";
 import { getTask, updateTask } from "../src/store/records";
+import { pauseTrain } from "../src/train/train";
 import { createTask } from "./helpers";
 import { linkClient, poolNodes, type GitPoolNode } from "./pool-helpers";
+
+/**
+ * `poolNodes`, each node's train of its project paused: these tests queue tasks and drive their turns themselves, so no
+ * round of the conductor's may take them.
+ */
+async function queueNodes(...args: Parameters<typeof poolNodes>): ReturnType<typeof poolNodes> {
+  const made = await poolNodes(...args);
+  for (const n of made.nodes) pauseTrain(n.db, n.project.id, "held by the test");
+  return made;
+}
 
 type Queue = { queuedAt: string; project: string } | null;
 
@@ -73,7 +84,7 @@ async function secondProject(node: GitPoolNode, name: string): Promise<Project> 
 
 /** A node whose turns take `ms` to end, so that a task stays running, and one task of its project `a`. */
 async function slowNode(ms = 4000) {
-  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: String(ms) } }] });
+  const { nodes, close } = await queueNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: String(ms) } }] });
   const A = nodes[0]!;
   const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
   return { A, m, close };
@@ -83,7 +94,7 @@ async function slowNode(ms = 4000) {
 const live = (node: GitPoolNode, taskId: string) => until("the live turn", () => node.runner.liveQuery(taskId) !== null, true);
 
 test("accept queues an idle task with work: its own line row says when", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -109,7 +120,7 @@ test("accept queues an idle task with work: its own line row says when", async (
 }, 60_000);
 
 test("accept is idempotent: a second call changes nothing", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -137,7 +148,7 @@ test("accept is idempotent: a second call changes nothing", async () => {
 }, 60_000);
 
 test("accept refuses a task with nothing to land", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -194,7 +205,7 @@ test("accept refuses while prompts wait: queued for a later turn, or steered int
 }, 60_000);
 
 test("accept refuses two projects, a merge task, and a task that is archived", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const a = A.project;
@@ -223,7 +234,7 @@ test("accept refuses two projects, a merge task, and a task that is archived", a
 }, 60_000);
 
 test("a prompt after accept unqueues the task once its turn has started", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -247,7 +258,7 @@ test("a prompt after accept unqueues the task once its turn has started", async 
 }, 60_000);
 
 test("a queued prompt unqueues the task as its turn starts, not before", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -290,7 +301,7 @@ test("a steer into the running turn after accept unqueues the task", async () =>
 }, 60_000);
 
 test("Send now unqueues a task whose steer it delivers, and does nothing without one", async () => {
-  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }] });
+  const { nodes, close } = await queueNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }] });
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -319,7 +330,7 @@ test("Send now unqueues a task whose steer it delivers, and does nothing without
 }, 60_000);
 
 test("Retry unqueues an accepted task whose turn it runs again", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -340,7 +351,7 @@ test("Retry unqueues an accepted task whose turn it runs again", async () => {
 }, 60_000);
 
 test("approving doesn't unqueue", async () => {
-  const { nodes, close } = await poolNodes(1, { nodes: [{ fixture: "approval.jsonl" }] });
+  const { nodes, close } = await queueNodes(1, { nodes: [{ fixture: "approval.jsonl" }] });
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -365,7 +376,7 @@ test("approving doesn't unqueue", async () => {
 }, 60_000);
 
 test("archiving unqueues, and so does deleting what an archive left queued", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   try {
     const P = A.project;
@@ -417,7 +428,7 @@ test("accepting a running task keeps it queued until its turn ends, and after", 
 }, 60_000);
 
 test("the task serves its queue, and Accept and Unqueue, to a client", async () => {
-  const { nodes, close } = await poolNodes(1);
+  const { nodes, close } = await queueNodes(1);
   const A = nodes[0]!;
   const owner = linkClient(A.host);
   try {
