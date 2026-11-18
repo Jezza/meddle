@@ -2,7 +2,7 @@
 import { test, expect } from "bun:test";
 import { branchLines, listedOnline, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
-import { agentCounts, foldedLine, panelRows, rootOf } from "../src/dashboard/ui/agents-model";
+import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/dashboard/ui/agents-model";
 import type { AgentEntry } from "../src/state/contracts";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
@@ -556,7 +556,7 @@ test("panelRows: running agents with their step and numbers, then the newest fin
   const list = [
     agentEntry("Implement Task 3: blobs between nodes", { doing: "Running bun test", tools: 31, tokens: 79502 }),
     agentEntry("Review Task 2"),
-    finished(1), finished(2, { state: "stopped", orphaned: true }), finished(3, { state: "failed" }), finished(4, { state: "stopped" }), finished(5),
+    finished(1), finished(2, { state: "stopped", orphaned: true }), finished(3, { state: "failed", tools: 1 }), finished(4, { state: "stopped" }), finished(5),
   ];
   const { rows, earlier } = panelRows(list, NOW, false);
   expect(rows.map((r) => [r.agent.description, r.doing, r.nums])).toEqual([
@@ -564,7 +564,7 @@ test("panelRows: running agents with their step and numbers, then the newest fin
     ["Review Task 2", "Working", "0 tools · 0 · 3m 25s"],
     ["f1", "done 4m ago", "14 tools · 37k · 1m 22s"],
     ["f2", "stopped with the session", "14 tools · 37k · 1m 22s"],
-    ["f3", "failed", "14 tools · 37k · 1m 22s"],
+    ["f3", "failed", "1 tool · 37k · 1m 22s"],
   ]);
   expect(earlier).toBe("2 earlier: 1 stopped, 1 done");
   expect(panelRows(list, NOW, true)).toMatchObject({ earlier: null });
@@ -573,6 +573,10 @@ test("panelRows: running agents with their step and numbers, then the newest fin
   expect(panelRows(many, NOW, false)).toMatchObject({ earlier: "27 earlier: 27 done" });
   expect(panelRows(many, NOW, false).rows).toHaveLength(3);
   expect(panelRows([], NOW, false)).toEqual({ rows: [], earlier: null });
+});
+
+test("toolCount says how many tools, one tool in the singular", () => {
+  expect([0, 1, 2, 44].map(toolCount)).toEqual(["0 tools", "1 tool", "2 tools", "44 tools"]);
 });
 
 test("rootOf follows an agent's parents up to the outermost listed one", () => {

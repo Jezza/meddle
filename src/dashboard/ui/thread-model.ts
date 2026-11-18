@@ -1,6 +1,6 @@
 // The thread a task's event log renders as: pure, so it is tested without a DOM or a link.
 import { type Attachment, attachmentProblem } from "../../blobs/attachment";
-import { isProgress, type Live } from "../../state/contracts";
+import { type AgentEntry, isProgress, type Live } from "../../state/contracts";
 import type { DiffRow, Hunk } from "./diff-model";
 
 export type ThreadItem =
@@ -593,9 +593,29 @@ export function isRunning(tool: ToolItem): boolean {
 }
 
 /**
+ * Whether a call's row runs. An agent's call runs as the agent list says (`entry`, the agent's state there), whatever
+ * holds its row: a wake or a follow-up runs it again after its notice. Any other call, or an agent's with no entry (an
+ * older node), runs as it does itself (`own`, `isRunning`) while what holds its row runs (`agentRuns`): the agent whose
+ * row holds it, or at the top the task's turn. Nothing runs on once its process is gone, whether or not its notice came.
+ */
+export function callRuns(entry: AgentEntry["state"] | undefined, own: boolean, agentRuns: boolean): boolean {
+  return entry !== undefined ? entry === "running" : own && agentRuns;
+}
+
+/**
+ * What a stopped or failed agent's row says first: that it failed, with its notice's text when there is one, or that it
+ * stopped before it reported, and that the session ended when it went with its process (`orphaned`).
+ */
+export function agentEndNote(failed: boolean, orphaned: boolean, notice: string | undefined): string {
+  if (failed) return notice === undefined || notice === "" ? "Failed" : `Failed: ${notice}`;
+  return orphaned ? "Stopped before it reported: the session ended" : "Stopped before it reported";
+}
+
+/**
  * What a background call's row says in its meta: null for any other call; "background" while it runs, or "stopped"
- * when the agent it ran in has finished (`agentRuns` false) and its notice never came; once it has ended, "ended" for a
- * `Monitor` watcher, else the exit code its notice gave ("exit 0"), else the notice's status.
+ * when what holds its row has finished (`agentRuns` false: the agent it ran in, or at the top the task's turn) and its
+ * notice never came; once it has ended, "ended" for a `Monitor` watcher, else the exit code its notice gave
+ * ("exit 0"), else the notice's status.
  */
 export function backgroundMeta(tool: ToolItem, agentRuns = true): string | null {
   if (tool.background !== true) return null;

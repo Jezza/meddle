@@ -11,7 +11,7 @@ import { type AgentEntry, type Live as LiveState, NodeObject, SessionObject, Tas
 import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useDraft, useObject, useTick, useValue } from "./hooks";
 import { AgentsPanel } from "./Agents";
-import { agentSeconds, rootOf } from "./agents-model";
+import { agentSeconds, rootOf, toolCount } from "./agents-model";
 import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFileTarget } from "./Attachments";
 import { Changes } from "./Changes";
@@ -25,8 +25,9 @@ import { hashOf } from "./routes";
 import { ago, type ProjectLine, projectLines, usageShort } from "./sidebar-model";
 import { useOptionalValue } from "./sources";
 import {
-  activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, EDITS, editDiff, exitCode, type Explored, exploredLine, foldSteps,
-  holdsCall, isAgentCall, isLook, isRunning, keyOf, missingCalls, type ShownItem, textLines, toolSummary, toolTarget, type ToolItem, workspaceSource,
+  activity, activityLine, agentEndNote, backgroundMeta, buildThread, callRuns, cwdOf, duration, EDITS, editDiff, exitCode, type Explored,
+  exploredLine, foldSteps, holdsCall, isAgentCall, isLook, isRunning, keyOf, missingCalls, type ShownItem, textLines, toolSummary, toolTarget,
+  type ToolItem, workspaceSource,
 } from "./thread-model";
 
 type NodeRef = Ref<typeof NodeObject>;
@@ -137,7 +138,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
       {showChanges ? <Changes task={task} /> : state === "moved" ? (
         <p class="pane-note">Moved to {movedTo === null ? "another node" : <a href={hashOf({ name: "task", nodeId: movedTo, id: manifest.id })}>{nameOf(movedTo)}</a>}.</p>
       ) : (
-        <Thread task={task} session={session} readOnly={archived} working={state === "running"} raw={raw}
+        <Thread task={task} session={session} readOnly={archived} working={state === "running"} turnLive={live || state === "moving"} raw={raw}
           agents={agents} focus={focus} setFocus={setFocus} after={<>
           {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
           {queued.map((prompt, i) => <Queued key={i} prompt={prompt} />)}
@@ -304,8 +305,14 @@ const aim = (toolUseId: string, agents: readonly AgentEntry[]) => (prev: Focus |
 
 const NO_AGENTS: readonly AgentEntry[] = [];
 
-function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus, after }: {
-  task: TaskRef; session: SessionRef; readOnly: boolean; working: boolean; raw: boolean;
+function Thread({ task, session, readOnly, working, turnLive, raw, agents, focus, setFocus, after }: {
+  task: TaskRef; session: SessionRef; readOnly: boolean; working: boolean;
+  /**
+   * Whether the task's turn is live (`running`, `waiting`, or `moving` while its move waits for the turn): without it,
+   * no Claude Code process is left to run the session's own calls, so none of them runs on.
+   */
+  turnLive: boolean;
+  raw: boolean;
   agents: readonly AgentEntry[]; focus: Focus | null; setFocus: Dispatch<StateUpdater<Focus | null>>;
   after: preact.ComponentChildren;
 }) {
@@ -425,11 +432,13 @@ function Thread({ task, session, readOnly, working, raw, agents, focus, setFocus
         )}
         {action.error !== null && <p class="error">{action.error}</p>}
         {blocks.length === 0 && !tail && <p class="muted empty">{readOnly ? "Nothing in this task's log." : "Nothing yet: send a prompt below."}</p>}
-        {blocks.map((b, i) => (
-          <BlockView key={b.items.map(keyOf).find((k) => k !== undefined) ?? i} block={b}>
-            {i === blocks.length - 1 && lastClaude && tail && <Live live={live} doing={doing} pulse={pulse} />}
-          </BlockView>
-        ))}
+        <AgentRuns.Provider value={turnLive}>
+          {blocks.map((b, i) => (
+            <BlockView key={b.items.map(keyOf).find((k) => k !== undefined) ?? i} block={b}>
+              {i === blocks.length - 1 && lastClaude && tail && <Live live={live} doing={doing} pulse={pulse} />}
+            </BlockView>
+          ))}
+        </AgentRuns.Provider>
         {tail && !lastClaude && <BlockView block={{ who: "claude", items: [] }}><Live live={live} doing={doing} pulse={pulse} /></BlockView>}
         {after}
       </div>
@@ -514,8 +523,9 @@ type ThreadContext = {
 const ThreadView = createContext<ThreadContext>({ cwd: "", raw: false, task: null, agents: new Map(), focused: null, focus: () => {} });
 
 /**
- * Whether the agent whose row holds a row still runs; true outside any agent's. Nothing in an agent that has finished
- * runs on, whether or not its notice came.
+ * Whether what holds a row still runs: the agent whose row holds it, or at the top the task's turn (`Thread`'s
+ * `turnLive`). Nothing in an agent that has finished, or in a turn whose process is gone, runs on, whether or not its
+ * notice came.
  */
 const AgentRuns = createContext(true);
 
@@ -616,8 +626,9 @@ function ToolRow({ tool }: { tool: ToolItem }) {
 /**
  * A call's row. A background call runs until its notice; an agent's, while the agent list says it does (by its
  * notices where the list has no entry for it, as on an older node), and it ends with the agent's report, its steps
- * folded beneath; a stopped or failed agent's row is red and open. A call in an agent that has finished runs no longer
- * (a background one's meta says "stopped"), unless the list says it is an agent still running.
+ * folded beneath; a stopped or failed agent's row is red and open. A call in an agent that has finished, or at the top
+ * once the task's turn is not live, runs no longer (a background one's meta says "stopped"), unless the list says it
+ * is an agent still running (`callRuns`).
  */
 function CallRow({ tool }: { tool: ToolItem }) {
   const { cwd, raw, task, agents, focused, focus } = useContext(ThreadView);
@@ -629,7 +640,7 @@ function CallRow({ tool }: { tool: ToolItem }) {
   // How an agent stands: as the agent list says, else as its latest notice did.
   const agentState = entry?.state ?? (agent ? tool.ended?.status : undefined);
   const stopped = agentState === "stopped" || agentState === "failed";
-  const running = entry !== undefined ? entry.state === "running" : isRunning(tool) && agentRuns;
+  const running = callRuns(entry?.state, isRunning(tool), agentRuns);
   const failed = stopped || (entry === undefined && tool.result?.isError === true);
   const diff = useMemo(() => edit ? editDiff(tool) : null, [edit, tool.input, tool.result]);
   const children = useMemo(() => foldSteps(tool.children, raw), [tool.children, raw]);
@@ -657,7 +668,7 @@ function CallRow({ tool }: { tool: ToolItem }) {
   const onToggle = isFocused ? (e: { currentTarget: HTMLDetailsElement }) => { if (!e.currentTarget.open) focus(null); } : undefined;
   const body = (
     <div class="step-body">
-      {stopped && <p class="tool-note error">Stopped before it reported{entry?.orphaned === true && ": the session ended"}</p>}
+      {stopped && <p class="tool-note error">{agentEndNote(agentState === "failed", entry?.orphaned === true, tool.ended?.text)}</p>}
       {typeof input.description === "string" && !agent && <p class="tool-note muted">{input.description}</p>}
       {diff !== null && (diff.hunks.length > 0
         ? <DiffView hunks={diff.hunks} file={result?.original ?? null} {...fromWorkspace} />
@@ -703,7 +714,7 @@ function CallRow({ tool }: { tool: ToolItem }) {
 /** An agent row's meta from the agent list: its model, how many tools it used and for how long, ticking while it runs. */
 function AgentMeta({ entry, model }: { entry: AgentEntry; model: string | undefined }) {
   useTick(entry.state === "running" ? 1000 : null);
-  const parts = [model, `${entry.tools} tools`, duration(agentSeconds(entry, Date.now()))];
+  const parts = [model, toolCount(entry.tools), duration(agentSeconds(entry, Date.now()))];
   return <span class="meta">{parts.filter((p) => p !== undefined).join(" · ")}</span>;
 }
 
@@ -741,7 +752,7 @@ function Reports({ reports, done }: { reports: readonly string[]; done: boolean 
 function Steps({ tools, items }: { tools: number; items: readonly ShownItem[] }) {
   return (
     <details class="step">
-      <summary><Chevron /><Icon name="search" /><span class="verb">Steps</span><span class="target plain muted">{tools} tools</span></summary>
+      <summary><Chevron /><Icon name="search" /><span class="verb">Steps</span><span class="target plain muted">{toolCount(tools)}</span></summary>
       <div class="sub"><Items items={items} /></div>
     </details>
   );
@@ -756,8 +767,9 @@ function MessageRow({ tool, resumes }: { tool: ToolItem; resumes: string }) {
   const agentRuns = useContext(AgentRuns);
   const entry = agents.get(resumes);
   const input = (tool.input ?? {}) as Record<string, unknown>;
-  // Its run is over once the agent is, notice or not; with no entry for it, once the agent this call is in is.
-  const running = isRunning(tool) && (entry !== undefined ? entry.state === "running" : agentRuns);
+  // Its run is over once the agent is, notice or not; with no entry for it, once what holds this row is (`callRuns`).
+  const own = isRunning(tool);
+  const running = own && callRuns(entry?.state, own, agentRuns);
   const to = entry?.description ?? (typeof input.to === "string" ? input.to : "");
   const summary = typeof input.summary === "string" ? input.summary : "";
   return (

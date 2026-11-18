@@ -1,8 +1,8 @@
 // test/thread-model.test.ts
 import { test, expect } from "bun:test";
 import {
-  activity, activityLine, backgroundMeta, buildThread, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps, holdsCall, isRunning, keyOf,
-  missingCalls, relativePath, toolSummary, toolTarget, type ThreadItem, type ToolItem, workspaceSource,
+  activity, activityLine, agentEndNote, backgroundMeta, buildThread, callRuns, cwdOf, duration, editDiff, exitCode, exploredLine, foldSteps,
+  holdsCall, isRunning, keyOf, missingCalls, relativePath, toolSummary, toolTarget, type ThreadItem, type ToolItem, workspaceSource,
 } from "../src/dashboard/ui/thread-model";
 import type { Attachment } from "../src/blobs/attachment";
 
@@ -498,4 +498,37 @@ test("a background call whose notice never came reads stopped once the agent it 
   // A notice that came says how it ended, whatever became of the agent.
   expect(backgroundMeta(bash, false)).toBe("exit 0");
   expect(backgroundMeta(buildThread([call(1, "tB", "Bash", { command: "ls" })])[0] as ToolItem, false)).toBeNull();
+});
+
+test("a row runs as the agent list says for an agent's call, else as the call does while what holds it runs", () => {
+  // What holds a row: the agent whose row holds it, or at the top the task's turn. A running call in a live turn runs.
+  expect(callRuns(undefined, true, true)).toBe(true);
+  expect(callRuns(undefined, true, false)).toBe(false);
+  expect(callRuns(undefined, false, true)).toBe(false);
+  // An agent's call runs as its entry says, a wake or follow-up after its notice included, whatever holds it.
+  expect(callRuns("running", false, false)).toBe(true);
+  expect(callRuns("completed", true, true)).toBe(false);
+  expect(callRuns("stopped", true, true)).toBe(false);
+  expect(callRuns("failed", true, true)).toBe(false);
+});
+
+test("the main session's own background call whose notice never came reads stopped once the task's turn is not live", () => {
+  const [bash, monitor] = buildThread([
+    call(1, "tB", "Bash", { command: "bun test", run_in_background: true }),
+    sys(2, "task_started", { task_id: "c1", tool_use_id: "tB", task_type: "local_bash", is_backgrounded: true }),
+    call(3, "tM", "Monitor", { command: "tail -f log" }),
+    sys(4, "task_started", { task_id: "m1", tool_use_id: "tM", task_type: "local_bash", is_backgrounded: true }),
+  ]) as [ToolItem, ToolItem];
+  for (const tool of [bash, monitor]) {
+    expect([backgroundMeta(tool, true), callRuns(undefined, isRunning(tool), true)]).toEqual(["background", true]);
+    expect([backgroundMeta(tool, false), callRuns(undefined, isRunning(tool), false)]).toEqual(["stopped", false]);
+  }
+});
+
+test("a stopped agent's row says it stopped before it reported, and a failed one that it failed, with its notice's text", () => {
+  expect(agentEndNote(false, false, undefined)).toBe("Stopped before it reported");
+  expect(agentEndNote(false, true, "")).toBe("Stopped before it reported: the session ended");
+  expect(agentEndNote(true, false, "API Error: 529 overloaded")).toBe("Failed: API Error: 529 overloaded");
+  expect(agentEndNote(true, false, "")).toBe("Failed");
+  expect(agentEndNote(true, false, undefined)).toBe("Failed");
 });
