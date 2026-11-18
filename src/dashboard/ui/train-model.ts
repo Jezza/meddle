@@ -84,11 +84,12 @@ export type TrainOffer = "accept" | "unqueue" | null;
 
 /**
  * Accept for a task that is idle or running and not queued; Unqueue for a queued task that is live; none for a merge
- * task (it lands with its train), one moving, moved, or archived, or a task on a node that says nothing of a queue
- * (`queued` null: an older meddle). The node says why it refuses one anyway (prompts waiting, no work to land).
+ * task (it lands with its train), one moving, moved, or archived, a task with no project (`projects`: how many it has;
+ * there is no train for it), or a task on a node that says nothing of a queue (`queued` null: an older meddle). The node
+ * says why it refuses one anyway (prompts waiting, no work to land, several projects).
  */
-export function trainOffer(t: { state: string; queued: boolean | null; merge: boolean; moving: boolean }): TrainOffer {
-  if (t.merge || t.moving || t.queued === null) return null;
+export function trainOffer(t: { state: string; queued: boolean | null; merge: boolean; moving: boolean; projects: number }): TrainOffer {
+  if (t.merge || t.moving || t.queued === null || t.projects === 0) return null;
   if (t.queued) return t.state === "idle" || t.state === "running" || t.state === "waiting" ? "unqueue" : null;
   return t.state === "idle" || t.state === "running" ? "accept" : null;
 }

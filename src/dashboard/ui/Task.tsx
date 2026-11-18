@@ -138,7 +138,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
     <div class="task">
       <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving}
         partly={acceptance === "partly" && !archived && state !== "moved"} queue={queue} merge={manifest.merge !== undefined}
-        raw={raw} onRaw={() => setRaw(!raw)}
+        projects={manifest.projects.length} raw={raw} onRaw={() => setRaw(!raw)}
         changes={switchable ? { count: changeCount(changes), on: showChanges } : null} />
       {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
       {showChanges ? <Changes task={task} /> : state === "moved" ? (
@@ -172,7 +172,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
 
 // ─── the head ───
 
-function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, queue, merge, raw, onRaw, changes }: {
+function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, queue, merge, projects, raw, onRaw, changes }: {
   task: TaskRef; nodes: PoolRef["nodes"]["value"]; nodeId: string; title: string; state: string; pendingCount: number; moving: boolean;
   /** A pushed branch contains the task's line for some of its projects, not all: nothing is archived yet. */
   partly: boolean;
@@ -180,6 +180,8 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
   queue: { queuedAt: string; project: string } | null | undefined;
   /** A merge task of the train: it lands with its batch, and is never accepted. */
   merge: boolean;
+  /** How many projects the task has: one with none has no train to accept it. */
+  projects: number;
   raw: boolean; onRaw: () => void;
   /** The `Thread` / `Changes n` switch: the non-empty changes (no number for none), and whether they show; null hides it. */
   changes: { count: number; on: boolean } | null;
@@ -190,7 +192,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
   const archived = state === "archived";
   const live = state === "running" || state === "waiting";
   const stateText = pendingCount > 0 ? "waiting on you" : state;
-  const offer = trainOffer({ state, queued: queue === undefined ? null : queue !== null, merge, moving });
+  const offer = trainOffer({ state, queued: queue === undefined ? null : queue !== null, merge, moving, projects });
   const remove = () => action.run(async () => {
     if (!confirm(`Delete "${title}", its log and its archive? This cannot be undone.`)) return;
     await task.delete({});

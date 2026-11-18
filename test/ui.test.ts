@@ -762,7 +762,7 @@ test("resumeLabel: Resume after the user's pause, Retry after the train's own", 
 });
 
 test("trainOffer: Accept for an idle or running task, Unqueue for a queued one, nothing for a merge task or one that cannot", () => {
-  const t = (over: Partial<Parameters<typeof trainOffer>[0]> = {}) => trainOffer({ state: "idle", queued: false, merge: false, moving: false, ...over });
+  const t = (over: Partial<Parameters<typeof trainOffer>[0]> = {}) => trainOffer({ state: "idle", queued: false, merge: false, moving: false, projects: 1, ...over });
   expect(t()).toBe("accept");
   expect(t({ state: "running" })).toBe("accept");
   expect(t({ state: "waiting" })).toBeNull();
@@ -778,6 +778,10 @@ test("trainOffer: Accept for an idle or running task, Unqueue for a queued one, 
   // a node of an older meddle says nothing of a queue: neither is offered
   expect(t({ queued: null })).toBeNull();
   expect(t({ queued: null, state: "running" })).toBeNull();
+  // a task with no project has no train; one with several is offered Accept, which the node refuses saying why
+  expect(t({ projects: 0 })).toBeNull();
+  expect(t({ projects: 0, state: "running" })).toBeNull();
+  expect(t({ projects: 2 })).toBe("accept");
 });
 
 test("mergeStatus: what the merge task's card says it is doing", () => {

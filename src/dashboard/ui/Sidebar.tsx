@@ -125,7 +125,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
     setMenu({ kind: "actions", anchor: { x: e.clientX, y: e.clientY } });
   };
   const moving = task.moveTo !== null;
-  const offer = task.archived || !queueable(task.ref) ? null : trainOffer({ state: task.state, queued: task.queued, merge: task.merge, moving });
+  const offer = task.archived || !queueable(task.ref) ? null : trainOffer({ state: task.state, queued: task.queued, merge: task.merge, moving, projects: task.projects.length });
   const trainHref = hashOf({ name: "train", projectId: task.projects[0]?.id ?? "", task: task.id });
   const where = moving ? `${nameOf(task.nodeId)} → ${nameOf(task.moveTo!)}` : task.archived ? `on ${nameOf(task.nodeId)}` : nameOf(task.nodeId);
   const href = hashOf({ name: "task", nodeId: task.nodeId, id: task.id });
