@@ -54,7 +54,8 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
   };
 
   for (const { seq, at, message } of events) {
-    const m = message as Message;
+    const m = obj(message);
+    if (m === null) continue;
     if (m.type === "meddle" && m.subtype === "turn_started") {
       turnSeq = seq;
       continue;

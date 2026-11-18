@@ -373,6 +373,26 @@ test("a task's activation reads its log summary from the newest events, and its 
   }
 });
 
+test("a task's agents come from its log, and one left running with no live turn shows stopped", async () => {
+  const { client, db, project, close } = await connect();
+  try {
+    const node = await client.get(NodeObject, {});
+    const { id } = (await node.createTask({ title: "t", projects: [{ id: project.id }] })).manifest;
+    appendEvent(db, id, { type: "meddle", subtype: "turn_started", at: "2026-11-17T19:00:00.000Z", resume: false });
+    appendEvent(db, id, { type: "system", subtype: "task_started", task_id: "a1", tool_use_id: "tA", task_type: "local_agent", is_backgrounded: true, description: "Implement Task 3" });
+    appendEvent(db, id, { type: "system", subtype: "task_started", task_id: "a2", tool_use_id: "tB", task_type: "local_agent", is_backgrounded: true, description: "Review Task 2" });
+    appendEvent(db, id, { type: "system", subtype: "task_notification", task_id: "a2", tool_use_id: "tB", status: "completed", summary: "" });
+    for (let i = 0; i < 300; i++) appendEvent(db, id, { type: "stream_event", event: {} });
+    const task = await client.get(TaskObject, { id });
+    expect(task.agents.value.map((a) => [a.id, a.state, a.orphaned]).sort()).toEqual([["a1", "stopped", true], ["a2", "completed", false]]);
+    expect(task.agentsRunning.value).toBe(0);
+    task.release();
+    node.release();
+  } finally {
+    await close();
+  }
+});
+
 test("a project's graph shows a task's line and follows a turn's end", async () => {
   const { client, project, close } = await connect();
   try {

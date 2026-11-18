@@ -35,6 +35,11 @@ test("events the fold does not read, and commands' own starts, leave the log as 
   expect(foldAgentLog(log, [e(2, 2, { type: "assistant", message: {} }), bash])).toBe(log);
 });
 
+test("an event whose message is not an object is passed over", () => {
+  const log = foldAgentLog(EMPTY_AGENT_LOG, [started(1, 1)]);
+  expect(foldAgentLog(log, [e(2, 2, null as never), e(3, 2, "text" as never)])).toBe(log);
+});
+
 test("an agent 'completed' while its own commands run is still running, waiting on them; its wake keeps its start", () => {
   let log = foldAgentLog(EMPTY_AGENT_LOG, [turn(1, 0), started(2, 1)]);
   log = foldAgentLog(log, [

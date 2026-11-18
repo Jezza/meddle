@@ -28,7 +28,9 @@ import {
   addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, setDefaultBranch,
   type Project,
 } from "../projects/project";
-import { latestEventOfType, latestEventWithField, listEvents, listEventsTail, type EventRecord } from "../store/events";
+import {
+  latestEventOfType, latestEventWithField, listEvents, listEventsOfKinds, listEventsTail, type EventRecord,
+} from "../store/events";
 import { getTask, getTaskSettings, listArchivedTasks, listLiveTasks, listTasks, newId } from "../store/records";
 import type { MoveState, TaskRunner, TaskState } from "../tasks/durable";
 import {
@@ -40,7 +42,9 @@ import { shortId } from "../pool/ids";
 import { listTokens, pickToken } from "../token";
 import { gated } from "../update/gate";
 import { VERSION } from "../version";
+import { AGENT_EVENT_KINDS, EMPTY_AGENT_LOG, foldAgentLog, runningCount, servedAgents } from "./agents";
 import {
+  AgentLogSchema,
   BranchSchema,
   isProgress,
   NodeObject,
@@ -53,6 +57,7 @@ import {
   SessionViewSchema,
   TaskLogSchema,
   TaskObject,
+  type AgentLog,
   type Notification,
   type SessionView,
   type TaskLog,
@@ -722,6 +727,10 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const queued = self.state("queued", members.queued, { init: () => runner.queued(id).map((p) => p.text) });
     const queuedPrompts = self.state("queuedPrompts", members.queuedPrompts, { init: () => runner.queued(id) });
     const log = self.state("log", TaskLogSchema, { init: () => taskLogNow(id) });
+    const agentLog = self.state("agentLog", AgentLogSchema, { init: () => agentLogNow(id) });
+    /** Whether a turn's Claude Code process is live: what an agent the log leaves running needs to be running. */
+    const liveTurn = self.state("liveTurn", Type.Boolean(), { init: () => runner.liveQuery(id) !== null });
+    const agents = self.derive([agentLog, liveTurn], (l, live) => servedAgents(l, live));
     const bookmarks = self.state("bookmarks", members.bookmarks, { init: () => taskBookmarksNow(id) });
     // Read once the object is up (`self.task` below), not before: a dashboard opens one per task it lists.
     const changes = self.state("changes", members.changes, { init: () => [] });
@@ -753,10 +762,20 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       await refreshChanges(ctx);
     };
 
+    /** Follows the runner's live turn: its process ends before its `idle` state does, and starts after its `running`. */
+    const refreshLiveTurn = (ctx: Ctx) => {
+      const live = runner.liveQuery(id) !== null;
+      if (live !== liveTurn.value) liveTurn.replace(ctx, live);
+    };
     /** Brings the cells up to the runner, the approvals and the event log. */
     const catchUpLog = (ctx: Ctx) => {
       const fresh = listEvents(db, id, { fromSeq: log.value.lastSeq + 1 });
-      if (fresh.length > 0) log.replace(ctx, foldTaskLog(log.value, fresh));
+      if (fresh.length > 0) {
+        log.replace(ctx, foldTaskLog(log.value, fresh));
+        const agents = foldAgentLog(agentLog.value, fresh);
+        if (agents !== agentLog.value) agentLog.replace(ctx, agents);
+      }
+      refreshLiveTurn(ctx);
     };
     self.on("events", events, (event, ctx) => { if (event.taskId === id) catchUpLog(ctx); });
     self.on("states", states, (event, ctx) => {
@@ -767,6 +786,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       const on = archivedOnNow(id);
       if (on !== archivedOn.value) archivedOn.replace(ctx, on);
       refreshRow(ctx);
+      refreshLiveTurn(ctx);
       // A turn's end set (and pushed) them; a move fetched or forgot them.
       return refreshLines(ctx);
     });
@@ -846,6 +866,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       model: self.derive([store.chosenModels], (c) => c[id] ?? null),
       effort: self.derive([store.efforts], (e) => e[id] ?? null),
       contextUsage: self.derive([log], (l) => l.contextUsage),
+      agents,
+      // Chord pushes a derived value only when it differs, so a progress frame leaves this alone for the sidebars.
+      agentsRunning: self.derive([agents], (list) => runningCount(list)),
       move,
       movedTo,
       archivedOn,
@@ -1078,6 +1101,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       if (effort !== undefined) out[t.id] = effort;
     }
     return out;
+  }
+
+  /** A task's agents from its `task_*` and `turn_started` events alone, not its whole log. */
+  function agentLogNow(taskId: string): AgentLog {
+    return foldAgentLog(EMPTY_AGENT_LOG, listEventsOfKinds(db, taskId, AGENT_EVENT_KINDS));
   }
 
   /** A task's log summary from its newest `init`, mode-carrying `status` and `result` and its newest seq, not its whole log. */
