@@ -23,6 +23,7 @@ import { readManifest, sideBookmark, transcriptPath, type TaskManifest } from ".
 import { MOVE_NOW_FOLLOW_UP } from "../src/tasks/move";
 import { workspaceImmutableHeads } from "../src/tasks/provision";
 import { exportTask, receiptsMatch, type Receipt } from "../src/tasks/transfer";
+import { pauseTrain } from "../src/train/train";
 import { claudeCodeVersion } from "../src/version";
 import { createTask, replay, setupNode } from "./helpers";
 import { linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
@@ -725,10 +726,13 @@ function queuedOn(node: GitPoolNode, projectId: string, taskId: string): string 
 }
 
 test("a moved task stays queued: the target's row has queuedAt as the request and the activation carry it, through its next turn and a move back", async () => {
-  const { A, B, close } = await twoPoolNodes();
+  // B's turns take 3 s, so that the task can be queued again while one runs.
+  const { A, B, close } = await twoPoolNodes({ nodes: [{}, { extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
   try {
     const m = await turnedTask(A);
     const P = A.project.id;
+    // The project's train (on its home, A) stays out of this: no round takes the queued task.
+    pauseTrain(A.db, P, "held by the test");
     const queuedAt = "2026-11-18T10:00:00.000Z";
     setQueued(A.db, P, m.id, "a", queuedAt);
     await peerReady(A, B);
@@ -750,9 +754,19 @@ test("a moved task stays queued: the target's row has queuedAt as the request an
     expect(queuedOn(B, P, m.id)).toBe(queuedAt);
     await until("the queue on A's copy", () => queuedOn(A, P, m.id), queuedAt);
 
-    // B's turn end writes the line anew, and the queue stays.
+    // A prompt on B takes the task off the queue as its turn starts (the user's input changes what was accepted); queued
+    // again while that turn runs (accepted mid-turn), it stays queued as the turn's end writes the line anew.
     await writeFile(join(paths(B.cfg).task(m.id), "a", "more"), "more\n");
-    await promptAndWait(B, m.id, "On B.");
+    const before = listLineRows(B.db, P, m.id).find((r) => r.name === "a")!.commit;
+    const idle = idleOn(B, m.id);
+    expect(await B.runner.prompt(m.id, "On B.")).toBe("turn");
+    expect(queuedOn(B, P, m.id)).toBeNull();
+    await until("B's turn", () => B.runner.state(m.id), "running");
+    setQueued(B.db, P, m.id, "a", queuedAt);
+    // Queued before the turn's end, which is what writes the line anew.
+    expect(B.runner.state(m.id)).toBe("running");
+    await idle;
+    expect(listLineRows(B.db, P, m.id).find((r) => r.name === "a")!.commit).not.toBe(before);
     expect(queuedOn(B, P, m.id)).toBe(queuedAt);
     await until("the queue on A's copy", () => queuedOn(A, P, m.id), queuedAt);
 
@@ -771,6 +785,8 @@ test("a move that rolls back keeps the task queued where it was", async () => {
   try {
     const m = await turnedTask(A);
     const P = A.project.id;
+    // The project's train (on its home, A) stays out of this: no round takes the queued task.
+    pauseTrain(A.db, P, "held by the test");
     const queuedAt = "2026-11-18T10:00:00.000Z";
     setQueued(A.db, P, m.id, "a", queuedAt);
     await peerReady(A, B);
