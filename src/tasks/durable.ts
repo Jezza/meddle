@@ -642,14 +642,21 @@ export class TaskRunner {
    * train turn of `kind` already running (one a restart cut off from the call that started it) is joined, whatever its
    * text; a train turn the restart limit parked has failed. Refused, before anything starts, as `#refuseElsewhere`
    * refuses, while the task is being archived, while it runs another turn (`task is running`: the user's, or the
-   * train's of another kind) or has prompts waiting, and while a pool update holds turns.
+   * train's of another kind) or has prompts waiting, and while a pool update holds turns. A turn whose agent declined
+   * takes the task off its queue here, its holder, with the agent's reason (`onQueue` tells it), whether this call
+   * started the turn or joined it.
    */
   async trainTurn(taskId: string, kind: TrainTurnKind, text: string): Promise<TrainTurnOutcome> {
     // On the task's prompt chain: a prompt sent meanwhile either came first (and the task is busy) or sees the turn.
     const turn = await serialised(`prompt\0${taskId}`, () => this.#startTrainTurn(taskId, kind, text));
     if (turn === "parked") return { kind: "failed", reason: "the task's turn is parked; retry it" };
     const end = await turn.end;
-    return trainOutcome(listEventsBetween(this.#db, taskId, turn.after, end, ["meddle", "result"]).map((e) => e.message));
+    // Nothing is awaited from the turn's end to the unqueue: a prompt that waited for the turn starts after it (its
+    // turn is created first), so the task leaves for the agent's reason rather than as input of the user's.
+    const events = listEventsBetween(this.#db, taskId, turn.after, end, ["meddle", "result"]);
+    const outcome = trainOutcome(events.map((e) => e.message));
+    if (outcome.kind === "declined") this.#leaveQueue(taskId, outcome.reason.trim() === "" ? "its agent declined" : outcome.reason);
+    return outcome;
   }
 
   /**

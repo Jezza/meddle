@@ -9,6 +9,7 @@ import { createRegistry } from "@earendil-works/pi-durable";
 import { paths } from "../src/config";
 import { buildOptions } from "../src/engine/options";
 import type { MeddleEvent } from "../src/engine/session";
+import { listLineRows } from "../src/pool/rows";
 import { DESCRIBE_PROMPT } from "../src/pool/settings";
 import { PeerObject } from "../src/state/contracts";
 import { appendEvent, listEvents } from "../src/store/events";
@@ -202,6 +203,41 @@ test("prompts sent during a train turn wait for it: queued, not steered; the tas
     expect(first).toBeGreaterThan(trainEnd);
     expect(A.runner.queue(m.id)).toBeNull();
     expect(left).toEqual(["you sent it a prompt"]);
+  } finally {
+    await close();
+  }
+}, 90_000);
+
+test("a task whose agent declines leaves the queue with the agent's reason, before a prompt that waited runs", async () => {
+  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_RESULTS_MS: "3000" } }] });
+  const A = nodes[0]!;
+  try {
+    const P = A.project;
+    const m = await createTask(A, { title: "t", projectIds: [P.id] });
+    await withWork(A, m.id);
+    await A.runner.accept(m.id);
+    const queuedAt = () => listLineRows(A.db, P.id, m.id).find((r) => r.name === "a")?.queuedAt ?? null;
+    expect(queuedAt()).not.toBeNull();
+    const left: string[] = [];
+    A.runner.onQueue((id, queue, reason) => { if (id === m.id && queue === null) left.push(String(reason)); });
+
+    const outcome = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
+    // A second call joins the turn; a prompt sent meanwhile waits for it.
+    const joined = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    expect(await A.runner.prompt(m.id, "Meanwhile.")).toBe("queued");
+    // The agent calls decline: its handler logs into the task's log, as the turn's own `meddle` server's does.
+    const [decline] = trainToolList("rebase", (e) => { appendEvent(A.db, m.id, e); });
+    await decline!.handler({ reason: "the API it fixes is gone" }, {});
+
+    expect(await outcome).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+    expect(await joined).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+    expect(queuedAt()).toBeNull();
+    expect(A.runner.queue(m.id)).toBeNull();
+    // The prompt that waited runs next; the task had left already, once, for the agent's reason.
+    await until("the user's prompt", () => userPrompts(A.db, m.id), ["Meanwhile."], 30_000);
+    await until("the state", () => A.runner.state(m.id), "idle", 30_000);
+    expect(left).toEqual(["the API it fixes is gone"]);
   } finally {
     await close();
   }
