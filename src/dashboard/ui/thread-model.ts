@@ -210,18 +210,20 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
   /**
    * A task's start marks the call it belongs to: an agent's, the Agent call that first started it (a follow-up's
    * carries the `SendMessage` call's id, and that call is marked to lead to the agent's row); any other task's, the
-   * call that started it. A start with no such call is left as an unknown message.
+   * call that started it. A start with no such call is left as an unknown message. A resumed agent (a follow-up or a
+   * wake) is always registered in the background, whatever its start says.
    */
   function addTaskStarted(m: Message) {
     const taskId = str(m.task_id);
     const named = tools.get(str(m.tool_use_id));
+    const resumed = m.task_type === "local_agent" && rows.has(taskId);
     const row = m.task_type === "local_agent" ? rows.get(taskId) ?? named : named;
     if (row === undefined) {
       top.push(unknown(m));
       return;
     }
     if (taskId !== "") rows.set(taskId, row);
-    startTask(row, m.is_backgrounded === true);
+    startTask(row, resumed || m.is_backgrounded === true);
     if (named !== undefined && named !== row) {
       named.resumes = row.toolUseId;
       startTask(named, true);

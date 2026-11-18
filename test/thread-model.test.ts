@@ -419,3 +419,27 @@ test("a call of the session's own running before a background agent is what the 
   expect(activity(null, items, 1)).toBe("Running Bash");
   expect(activity(null, [])).toBe("Working");
 });
+
+test("a resumed agent's row runs in the background again whatever its start says, until the next notice", () => {
+  const ended = (seq: number, toolUseId: string) => sys(seq, "task_notification", { task_id: "a1", tool_use_id: toolUseId, status: "completed", summary: "" });
+  const events = [
+    call(1, "tA", "Agent", { description: "Implement Task 3", run_in_background: true }),
+    agentStart(2),
+    answer(3, "tA", "Async agent launched successfully."),
+    ended(4, "tA"),
+  ];
+  const running = (more: Array<{ seq: number; message: unknown }>) => isRunning(buildThread([...events, ...more])[0] as ToolItem);
+  expect(running([])).toBe(false);
+  // A follow-up from a SendMessage call, its start without `is_backgrounded`.
+  const followUp = [
+    call(5, "tS", "SendMessage", { to: "a1", summary: "Fix it", message: "Fix it" }),
+    answer(6, "tS", "Resuming agent a1"),
+    agentStart(7, { tool_use_id: "tS", prompt: "Fix it", is_backgrounded: undefined }),
+  ];
+  expect(running(followUp)).toBe(true);
+  expect(running([...followUp, ended(8, "tS")])).toBe(false);
+  // A wake: the same task and call as the Agent's own, its prompt a notice, its start without `is_backgrounded`.
+  const wake = agentStart(9, { prompt: "<task-notification>a command ended</task-notification>", is_backgrounded: undefined });
+  expect(running([...followUp, ended(8, "tS"), wake])).toBe(true);
+  expect(running([...followUp, ended(8, "tS"), wake, ended(10, "tA")])).toBe(false);
+});
