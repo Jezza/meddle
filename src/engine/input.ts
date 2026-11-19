@@ -1,6 +1,9 @@
-import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKMessageOrigin, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Prompt } from "../blobs/attachment";
 import type { UserContent } from "../blobs/content";
+
+/** The origin of a prompt a person wrote: Claude Code lets only a person's waiting prompt move foreground work aside. */
+export const HUMAN: SDKMessageOrigin = { kind: "human" };
 
 /** A prompt sent into a turn's input that Claude Code has not taken yet, by the uuid it was sent with. */
 export type Untaken = { uuid: string; prompt: Prompt };
@@ -22,13 +25,16 @@ export class InputQueue implements AsyncIterable<SDKUserMessage> {
   /**
    * Queues `prompt`; answers the uuid it is sent with. Claude Code is sent `content` (the prompt's text unless given
    * another, say with its images inline); the prompt itself, with its attachments' refs, is what `take` and `untaken`
-   * hand back for the log.
+   * hand back for the log. It goes with `origin` when given (`HUMAN` for a person's), and with none otherwise.
    */
-  push(prompt: Prompt, priority: "now" | "next" = "next", content: UserContent = prompt.text): string {
+  push(prompt: Prompt, priority: "now" | "next" = "next", content: UserContent = prompt.text, origin?: SDKMessageOrigin): string {
     if (this.#ended) throw new Error("input queue ended");
     const uuid = crypto.randomUUID();
     this.#untaken.set(uuid, prompt);
-    this.#items.push({ type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "", priority, uuid });
+    this.#items.push({
+      type: "user", message: { role: "user", content }, parent_tool_use_id: null, session_id: "", priority, uuid,
+      ...(origin !== undefined ? { origin } : {}),
+    });
     this.#notify();
     return uuid;
   }

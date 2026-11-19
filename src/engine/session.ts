@@ -5,6 +5,7 @@ import {
   type PermissionDeniedHookInput,
   type Query,
   type SDKMessage,
+  type SDKMessageOrigin,
   type SDKResultMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -163,6 +164,8 @@ export type RunTurnArgs = {
    * user prompt.
    */
   train?: { kind: TrainTurnKind; after: number };
+  /** Who wrote `prompt` (`HUMAN` for a person), as Claude Code is told; no origin when not given. */
+  origin?: SDKMessageOrigin;
   db: Database;
   approvals: Approvals;
   queue?: InputQueue;
@@ -208,7 +211,7 @@ export function runTurn(args: RunTurnArgs): {
   const taskId = input.manifest.id;
   const record = recorder(args);
   const queue = args.queue ?? new InputQueue();
-  const uuid = queue.push(args.prompt, "next", args.content);
+  const uuid = queue.push(args.prompt, "next", args.content, args.origin);
   queue.take(uuid);
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
   record(args.train === undefined
