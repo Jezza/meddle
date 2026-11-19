@@ -6,7 +6,7 @@ import type { Database } from "bun:sqlite";
 import { ChordError, createHost, forbidden, type Ctx, type Host, type Subscribable } from "@earendil-works/chord";
 import type { PermissionResult, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Attachment, Prompt } from "../blobs/attachment";
-import { checkTaskRoot, type NodeConfig } from "../config";
+import type { NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
 import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
@@ -331,7 +331,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     db,
     selfId: pool.identity.id,
     claudeCodeVersion: deps.claudeCodeVersion,
-    hostsTasks: async () => (await checkTaskRoot(cfg)).ok,
+    hostsTasks: async () => (await runner.hostingProblem()) === null,
     changes: projectChanges,
     isMember: (id) => pool.store.isMember(id),
     recheck: {
@@ -353,12 +353,9 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     const tokenUsage = self.state("tokenUsage", NodeStore.def.members.tokenUsage, { init: () => tokenUsages(db) });
     const activeUsage = self.state("activeUsage", NodeStore.def.members.activeUsage, { init: () => activeUsageNow(cfg, db) });
     const metricsNow = self.state("metrics", NodeStore.def.members.metrics, { init: () => metrics.latest() });
-    const hostsTasks = self.state("hostsTasks", NodeStore.def.members.hostsTasks, { init: async () => (await checkTaskRoot(cfg)).ok });
+    const hostsTasks = self.state("hostsTasks", NodeStore.def.members.hostsTasks, { init: async () => (await runner.hostingProblem()) === null });
     const hostingProblem = self.state("hostingProblem", NodeStore.def.members.hostingProblem, {
-      init: async () => {
-        const check = await checkTaskRoot(cfg);
-        return check.ok ? null : check.reason;
-      },
+      init: async () => (await runner.hostingProblem())?.reason ?? null,
     });
     const models = self.state("models", NodeStore.def.members.models, []);
     const notifications = self.state("notifications", NodeStore.def.members.notifications, []);
@@ -377,12 +374,11 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       close: (stop) => stop(),
     });
 
-    /** The task root, jj and git can come and go while the node runs. */
+    /** The task root, jj and git can come and go while the node runs, and a pool update can hold it. */
     const refreshHostsTasks = async (ctx: Ctx) => {
-      const check = await checkTaskRoot(cfg);
+      const problem = (await runner.hostingProblem())?.reason ?? null;
       if (ctx.signal.aborted) return;
-      if (check.ok !== hostsTasks.value) hostsTasks.replace(ctx, check.ok);
-      const problem = check.ok ? null : check.reason;
+      if ((problem === null) !== hostsTasks.value) hostsTasks.replace(ctx, problem === null);
       if (problem !== hostingProblem.value) hostingProblem.replace(ctx, problem);
     };
 

@@ -127,6 +127,11 @@ export type RunnerHooks = {
  * `hosting`, no task is created or received here. `moveTo(id)` says why a task may not move to member `id` (its build
  * differs from this node's), or null.
  */
+/** A refusal for what keeps this node from taking a task (`TaskRunner.hostingProblem`). */
+export function hostingRefusal(problem: { reason: string; held: boolean }): string {
+  return problem.held ? `this node takes no tasks now: ${problem.reason}` : `this node does not host tasks: ${problem.reason}`;
+}
+
 export type RunnerHolds = { turns: string | null; work: string | null; hosting: string | null };
 
 /**
@@ -430,6 +435,16 @@ export class TaskRunner {
   /** What is held here now. */
   holds(): RunnerHolds {
     return { ...this.#holds };
+  }
+
+  /**
+   * Why this node takes no task now, or null: its task root, jj or git not usable (`checkTaskRoot`), or a pool update
+   * holding it (`held`). What placement, a receive, peers and the node's own state all go by.
+   */
+  async hostingProblem(): Promise<{ reason: string; held: boolean } | null> {
+    const root = await checkTaskRoot(this.#cfg);
+    if (!root.ok) return { reason: root.reason, held: false };
+    return this.#holds.hosting === null ? null : { reason: this.#holds.hosting, held: true };
   }
 
   /** The Harness this runner drives its turns on; the merge train's conductor runs its rounds there too. */
@@ -1362,9 +1377,8 @@ export class TaskRunner {
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const ours = claudeCodeVersion();
     if (version !== ours || ours === "unknown" || version === "unknown") return { ok: false, reason: `claude code ${ours} here, ${version} there` };
-    const hosting = await checkTaskRoot(this.#cfg);
-    if (!hosting.ok) return { ok: false, reason: `this node does not host tasks: ${hosting.reason}` };
-    if (this.#holds.hosting !== null) return { ok: false, reason: `this node takes no tasks now: ${this.#holds.hosting}` };
+    const hosting = await this.hostingProblem();
+    if (hosting !== null) return { ok: false, reason: hostingRefusal(hosting) };
     const deps = this.#replicaDeps();
     if (deps === null) return { ok: false, reason: "this node has no pool" };
     try {
@@ -1924,9 +1938,10 @@ export class TaskRunner {
   async chooseNode(projectIds: string[], accept: (nodeId: string) => boolean = () => true): Promise<string> {
     const pool = this.#pool;
     if (pool === undefined) throw new Error("this node has no pool");
+    const hosting = await this.hostingProblem();
     const self = {
       nodeId: pool.identity.id,
-      hostsTasks: (await checkTaskRoot(this.#cfg)).ok,
+      hostsTasks: hosting === null,
       running: this.running(),
       taskCount: listLiveTasks(this.#db).length,
       projects: listProjects(this.#db).map((p) => ({ id: p.id, home: p.home })),
@@ -1938,7 +1953,7 @@ export class TaskRunner {
     if (!("error" in choice)) return choice.nodeId;
     // Alone (the only member, or the only one online): the reason is this node's own.
     if (!nodes.some((n) => n.online && n.nodeId !== self.nodeId)) {
-      if (!self.hostsTasks) throw new Error("this node has no task root");
+      if (hosting !== null) throw new Error(hostingRefusal(hosting));
       if (self.limit > 0 && self.running >= self.limit) throw new Error("this node is at its running limit; use --here");
     }
     throw new Error(choice.error);

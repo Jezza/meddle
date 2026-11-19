@@ -306,7 +306,7 @@ test("with no other node online, an automatic create says why this node cannot t
   try {
     await rm(rootless.cfg.taskRoot, { recursive: true, force: true });
     const nodeOne = await one.client.get(NodeObject, {});
-    await expect(nodeOne.createTask({ title: "t", projects: [], node: null })).rejects.toThrow("this node has no task root");
+    await expect(nodeOne.createTask({ title: "t", projects: [], node: null })).rejects.toThrow("this node does not host tasks: task root");
     nodeOne.release();
 
     const busy = await createTask(full, { title: "busy", projectIds: [] });

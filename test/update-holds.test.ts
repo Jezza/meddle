@@ -62,6 +62,8 @@ test("a turn cut off by a restart waits on a held Harness, then carries on once 
   await expect(again.archive(m.id)).rejects.toThrow(HELD);
   expect(() => again.checkMove(getTask(db, m.id)!, "b".repeat(64))).toThrow(HELD);
   await expect(createTask({ ...node, runner: again }, { title: "u", projectIds: [node.project.id] })).rejects.toThrow("this node takes no tasks now");
+  // and placement, peers and the node's state all see it: not a node to place a task on.
+  expect(await again.hostingProblem()).toEqual({ reason: HELD, held: true });
   // Confirmed: the hold lifts, the Harness resumes, and the cut-off turn carries on.
   again.setHolds({ turns: null, work: null, hosting: null });
   again.resumeHarness();
