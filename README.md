@@ -1340,11 +1340,13 @@ in it alone and a New task row; then Tasks, the tasks with no project or several
 Archived, collapsed, every online node's archived tasks; and at its foot Nodes, every member with what runs on it and
 its load, or since when it has been offline. A task's row shows its state (a dot: running, waiting on you, idle), how
 many approvals and questions wait on you, how many of its subagents are running (a purple count after its title), and
-the node it runs on (`from → to` while it moves); a task queued on its project's train has a 🚂 after its title,
-which opens the train page with the task's row highlighted; its ⋯ menu (or a right click) accepts it (Accept, first;
-Unqueue for a queued task), renames it, moves it, archives it, or for an archived task restores or deletes it. Within
-a project, below a 🚂 Train entry that opens the project's train page and counts its queue, tasks are listed by latest
-activity; a merge task of the train shows among them as `🚂 Merge <task titles>` while it exists. The sidebar hides
+the node it runs on (`from → to` while it moves); a task queued on its project's train has the train's icon (a
+merge, drawn as jj log draws one) after its title, which opens the train page with the task's row highlighted; its ⋯
+menu (or a right click) accepts it (Accept, first; Unqueue for a queued task), renames it, moves it, archives it, or
+for an archived task restores or deletes it. A project's line ends in the train's icon and how many tasks are queued
+on its train, which opens the project's train page (with none queued it shows, as Train, only while you hover the
+line or that train's page is open). Within a project, tasks are listed by latest activity; a merge task of the train
+shows among them as `Merge <task titles>` after the train's icon (in purple) while it exists. The sidebar hides
 (◧), and on a narrow screen it is a drawer. Opening the dashboard shows the task that waits on you most recently, else
 a new task. Failed turns, moves and token trouble show as notices in the top right until dismissed, and so do the
 train's, for a task that needs you: `<task> left meddle's train: <reason>` (Open task, and Accept again; a task you
@@ -1356,12 +1358,12 @@ or is held back, is still queued (its header offers Unqueue): Retry brings back 
 is settled by accepting the other task or unqueueing this one. It flags a pool whose members run different meddle or
 Claude Code versions in the Nodes header.
 
-A task opens beside the sidebar: its title (✎ renames it), state (a queued task says `🚂 queued` beside it, as a
-partly accepted one says so; the 🚂 links to the train page) and actions (Interrupt, Retry, Archive, then Accept, or
-Unqueue for a queued task; Restore and Delete for an archived one; unlike Archive, which only an idle task has,
-Accept also shows while a turn runs, since a running task can be queued), its thread with the assistant's text as
-Markdown and each run of tool calls folded into one line (a prompt of the train's is marked as meddle's), what waits
-on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
+A task opens beside the sidebar: its title (✎ renames it), state (a queued task says `queued` beside it, after the
+train's icon, as a partly accepted one says so; it links to the train page) and actions (Interrupt, Retry, Archive,
+then Accept, or Unqueue for a queued task; Restore and Delete for an archived one; unlike Archive, which only an idle
+task has, Accept also shows while a turn runs, since a running task can be queued), its thread with the assistant's
+text as Markdown and each run of tool calls folded into one line (a prompt of the train's is marked as meddle's), what
+waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
 was sent and has not taken yet (`queued`), its subagents (below), the composer (Queue while a turn runs, Send otherwise),
 and a bar with its projects, its node, its bookmark, its context (the tokens its latest API call sent, over the model's
 window) and the 5-hour and 7-day plan usage of the login its node's next turn uses (the latest reading turns there got;
@@ -1385,7 +1387,7 @@ Projects adds a project from a folder on this node or a URL; it builds the servi
 checkout, for which the form points you to `meddle project add` on the command line. A node's page (from Nodes) shows its meddle and Claude Code versions, token, task root, resources and tasks while
 it is online, and what the roster last recorded of it (and when it was last seen) while it is not.
 
-A project's train page (the 🚂 Train entry under the project in the sidebar, or a queued task's 🚂, which highlights
+A project's train page (the train's icon on the project's line in the sidebar, or a queued task's, which highlights
 that task's row) shows what is live of its train, as its home, which runs it, has it, in two columns. It is for
 watching: you accept on the task, where you have just looked at its work. **Queued** lists the tasks in the order they
 were accepted, each with its state as `train` prints it, Retry on one that sits out, and Unqueue; a task `in the

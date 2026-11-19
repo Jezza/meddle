@@ -1,7 +1,7 @@
 // The dashboard in the browser: a client host linked to this node over /ws, one more per other node of the pool
 // (over /ws/node/<nodeId>), the sidebar over every node's tasks, and the view the location hash names beside it.
 import type { Host, Ref } from "@earendil-works/chord";
-import { render } from "preact";
+import { type ComponentChildren, render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { NodeObject, PoolObject, ProjectObject, type Notification } from "../../state/contracts";
 import { clientHost, Hosts, nodeSocket, useAction, useObject, useValue } from "./hooks";
@@ -19,6 +19,7 @@ import { TrainPage } from "./Train";
 import { Blind, UpdateBar, useUpdate } from "./Update";
 import { buildAlerts, type UpdateView } from "./update-model";
 import { guardDrops } from "./attach-model";
+import { Glyph } from "./icons";
 import { shortId } from "../../pool/ids";
 
 const NO_ALERTS: ReadonlyMap<string, string> = new Map();
@@ -148,7 +149,7 @@ function Home({ hosts, pool, index, open }: { hosts: Hosts; pool: PoolRef; index
 /** The kinds that toast: what the sidebar's dots do not already say. */
 const TOASTED: ReadonlySet<Notification["kind"]> = new Set(["failed", "move", "token", "train"]);
 
-const TOAST_ICONS: Partial<Record<Notification["kind"], string>> = { failed: "✕", token: "⚠", train: "🚂" };
+const TOAST_ICONS: Partial<Record<Notification["kind"], ComponentChildren>> = { failed: "✕", token: "⚠", train: <Glyph name="merge" cls="train-ico" /> };
 
 /** Failed turns, moves, token trouble and tasks the train left from every reachable node, newest first, each dismissable. */
 function Toasts({ hosts, index, pool, open }: { hosts: Hosts; index: PoolIndex; pool: PoolRef; open: Open }) {

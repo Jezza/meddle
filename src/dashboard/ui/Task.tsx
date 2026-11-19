@@ -19,7 +19,7 @@ import { changeCount } from "./changes-model";
 import { composerKey, withTakenBack } from "./composer-model";
 import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
-import { Chevron, Icon, Iconoir } from "./icons";
+import { Chevron, Glyph, Icon, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { ago, type ProjectLine, projectLines } from "./sidebar-model";
@@ -217,7 +217,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
         {queue != null && (
           <a class="muted state-text" href={hashOf({ name: "train", projectId: queue.project, task: task.manifest.value.id })}
             title="Accepted, and waiting on its project's train: open the train">
-            · 🚂 queued
+            · <Glyph name="merge" cls="train-ico" /> queued
           </a>
         )}
       </div>
@@ -245,7 +245,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
         {/* Unlike Archive, Accept also shows while a turn runs: a running task waits in the queue until its turn ends. */}
         {offer === "accept" && (
           <button class="accept" disabled={action.busy} title="Queues the task's work to land on its project's default branch (the merge train)"
-            onClick={() => action.run(() => task.accept({}))}>🚂 Accept</button>
+            onClick={() => action.run(() => task.accept({}))}><Glyph name="merge" cls="train-ico" /> Accept</button>
         )}
         {offer === "unqueue" && (
           <button disabled={action.busy} title="Takes the task off the train" onClick={() => action.run(() => task.unqueue({}))}>Unqueue</button>

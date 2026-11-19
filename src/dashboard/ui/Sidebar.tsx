@@ -1,6 +1,6 @@
 // The sidebar: projects with their tasks, the tasks with no project or several, the archived tasks (collapsed), and
-// the pool's nodes at the foot. Each project has its train beneath it. Each task row carries its state, what waits on you,
-// how many of its agents run, whether it is queued on its train, and the node it runs on.
+// the pool's nodes at the foot. Each project's line opens its train too. Each task row carries its state, what waits on
+// you, how many of its agents run, whether it is queued on its train, and the node it runs on.
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { store, stored, useAction, useValue } from "./hooks";
@@ -48,12 +48,13 @@ export function Sidebar({ pool, index, view, selfId, alerts, onHide, onNavigate 
         {groups.projects.map((p) => (
           <div key={p.id} class="side-group">
             <a class={`side-project${view.name === "project" && view.id === p.id ? " sel" : ""}`} href={hashOf({ name: "project", id: p.id })} title={p.id}>
-              <span class="folder">▸</span>{p.name}
-            </a>
-            <a class={`side-row train-entry indent${trainSelected(p.id) ? " sel" : ""}`} href={hashOf({ name: "train", projectId: p.id })}
-              title={`${p.name}'s merge train: the tasks accepted to land on its default branch`}>
-              <span class="title">🚂 Train</span>
-              {p.queued > 0 && <span class="count">{p.queued}</span>}
+              <span class="folder">▸</span><span class="title">{p.name}</span>
+              {/* Its train: how many tasks are queued, or, while none are, "Train" on hover or focus. Not stopped, so the drawer closes. */}
+              <button class={`train-mark${p.queued > 0 ? " busy" : ""}${trainSelected(p.id) ? " sel" : ""}`}
+                title={`${p.name}'s merge train: the tasks accepted to land on its default branch`}
+                onClick={(e) => { e.preventDefault(); location.hash = hashOf({ name: "train", projectId: p.id }); }}>
+                <Glyph name="merge" />{p.queued > 0 ? p.queued : "Train"}
+              </button>
             </a>
             {p.tasks.map((t) => row(t, true))}
             <a class={`side-row new indent${isNew(p.id) ? " sel" : ""}`} href={hashOf({ name: "new", projectId: p.id })}>New task</a>
@@ -137,10 +138,10 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
         <StateDot state={task.state} waiting={waitsOnYou(task)} />
         {renaming
           ? <RenameInput value={task.title} onDone={() => setRenaming(false)} onSave={(title) => action.run(() => task.ref.rename({ title }))} />
-          : <span class="title">{task.merge ? "🚂 " : ""}{task.title}</span>}
+          : <span class="title">{task.merge && <Glyph name="merge" cls="merge-mark" />}{task.title}</span>}
         {task.queued && task.projects.length === 1 && (
           <button class="queued-mark" title="Queued on its project's train: open the train"
-            onClick={(e) => { e.preventDefault(); e.stopPropagation(); location.hash = trainHref; }}>🚂</button>
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); location.hash = trainHref; }}><Glyph name="merge" /></button>
         )}
         {task.pending > 0 && <span class="badge">{task.pending}</span>}
         {task.agents > 0 && (
