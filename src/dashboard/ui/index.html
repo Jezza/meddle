@@ -436,11 +436,15 @@
   .step .meta .add { color: var(--add); }
   .step .meta .del { color: var(--bad); }
   .step.bad > summary .meta { color: var(--bad); }
-  /* A running agent's row says, under its name, what the agent is doing now. */
-  .step.agent > summary { flex-wrap: wrap; row-gap: 0; }
-  .now { flex-basis: 100%; display: flex; align-items: center; gap: 6px; padding: 0 0 2px 51px; margin-top: -4px;
+  /* A running agent's row says, under its name, what the agent is doing now: the dots under the name, what it does
+     under the description. */
+  .step.agent > summary { flex-wrap: wrap; row-gap: 3px; padding-bottom: 6px; }
+  .now { flex-basis: 100%; display: flex; align-items: center; gap: 9px; padding-left: 52px;
     color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; }
-  .now .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; font: 12px ui-monospace, "JetBrains Mono", Menlo, monospace; color: var(--fg-soft); }
+  .sub .now { padding-left: 50px; }
+  .now .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; font: 12px ui-monospace, "JetBrains Mono", Menlo, monospace; color: var(--muted); }
+  .now .dots { flex: none; width: 58px; margin: 0; }
+  .sub .now .dots { width: 50px; }
   .now .dots i { width: 4px; height: 4px; }
   .step.focus > summary { background: var(--accent-soft); }
   .spin { animation: spin 0.9s linear infinite; }
