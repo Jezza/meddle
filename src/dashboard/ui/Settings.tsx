@@ -1,10 +1,10 @@
 // Settings: the pool (this node, its secret and its members), the pool's settings and its login tokens with their usage.
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
-import { useAction, useValue } from "./hooks";
+import { useAction, useNow, useValue } from "./hooks";
 import { PaneHead, tokenText, type PoolRef } from "./common";
 import type { NodeRef } from "./sources";
-import { UsageMeter, useNow } from "./Usage";
+import { UsageMeter } from "./Usage";
 import { readAgo, windowMeter } from "./usage-model";
 import type { UsageReading } from "../../token-usage";
 

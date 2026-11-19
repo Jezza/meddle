@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { ProjectObject } from "../../state/contracts";
 import { isMemoryPath } from "../../projects/memory-names";
 import type { MemoryChange, MemoryEntry } from "../../projects/memory-view";
+import { Unavailable } from "./common";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
 import { errorText, type Hosts, useObject, useValue } from "./hooks";
@@ -28,7 +29,7 @@ export function Memory({ hosts, nodeId, editable, id, tasks, nodeName }: {
   hosts: Hosts; nodeId: string; editable: boolean; id: string; tasks: readonly ListedTask[]; nodeName(short: string): string;
 }) {
   const host = hosts.for(nodeId);
-  return host === undefined ? <Column /> : <MemoryOn host={host} editable={editable} id={id} context={{ tasks, nodeName }} />;
+  return host === undefined ? <Column><Unavailable status={hosts.status(nodeId)} /></Column> : <MemoryOn host={host} editable={editable} id={id} context={{ tasks, nodeName }} />;
 }
 
 /** The column with only its title in the head: while the memory loads, or when it cannot be read. */

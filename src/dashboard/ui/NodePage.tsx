@@ -5,6 +5,7 @@ import { NodeObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useObject, useValue } from "./hooks";
 import { mb, nodeDot, PaneHead, type PoolNode, type PoolRef, StateDot, tokenText, Unavailable } from "./common";
+import { unknownVersion } from "./pool-model";
 import { hashOf } from "./routes";
 import { nodeLineText, waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
@@ -75,8 +76,8 @@ function Summary({ row, selfRow }: { row: PoolNode; selfRow: PoolNode | undefine
 
 /** A version, flagged when it is not this node's. */
 function Version({ value, self }: { value: string; self: string | undefined }) {
-  if (value === "") return <span class="muted">unknown</span>;
-  const differs = self !== undefined && self !== "" && value !== self;
+  if (unknownVersion(value)) return <span class="muted">unknown</span>;
+  const differs = self !== undefined && !unknownVersion(self) && value !== self;
   return differs ? <span class="flag" title={`this node runs ${self}`}>{value} (differs)</span> : <span>{value}</span>;
 }
 

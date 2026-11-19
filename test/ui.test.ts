@@ -1,10 +1,10 @@
 // test/ui.test.ts
 import { test, expect } from "bun:test";
-import { branchLines, listedOnline, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
+import { branchLines, listedOnline, mergeProjects, projectChoices, unknownVersion } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/dashboard/ui/agents-model";
 import type { AgentEntry } from "../src/state/contracts";
-import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
+import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, uniqueTasks, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { mergeStatus, resumeLabel, trainColumns, trainError, trainOffer, type TrainView } from "../src/dashboard/ui/train-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
@@ -13,7 +13,7 @@ import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, 
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "../src/dashboard/ui/changes-model";
-import { composerKey, withTakenBack } from "../src/dashboard/ui/composer-model";
+import { composerKey, composing, enters, withTakenBack } from "../src/dashboard/ui/composer-model";
 import { contextMeter, levelOf, readAgo, windowMeter } from "../src/dashboard/ui/usage-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
@@ -67,23 +67,10 @@ test("viewOf falls back to home for a malformed escape instead of throwing", () 
   expect(viewOf("#/task/abc/%E0%A4%A")).toEqual({ name: "home" });
 });
 
-test("a task moves only to another online member that hosts tasks and runs the same known Claude Code version", () => {
-  const [a, b, c, d, e, f] = ["a", "b", "c", "d", "e", "f"].map((x) => x.repeat(64)) as [string, string, string, string, string, string];
-  const row = (nodeId: string, over: Partial<{ status: "member" | "removed"; online: boolean; hostsTasks: boolean; claudeCodeVersion: string }> = {}) =>
-    ({ nodeId, status: "member" as const, online: true, hostsTasks: true, claudeCodeVersion: "2.1.0", ...over });
-  const nodes = [
-    row(a),
-    row(b),
-    row(c, { online: false }),
-    row(d, { hostsTasks: false }),
-    row(e, { claudeCodeVersion: "2.2.0" }),
-    row(f, { status: "removed" }),
-  ];
-  expect(moveTargets(nodes, a, "2.1.0").map((n) => n.nodeId)).toEqual([b]);
-  expect(moveTargets(nodes, b, "2.1.0").map((n) => n.nodeId)).toEqual([a]);
-  // an unknown version on this node (a compiled binary) moves nowhere, nor to a node that reports unknown
-  expect(moveTargets(nodes, a, "unknown")).toEqual([]);
-  expect(moveTargets([row(a, { claudeCodeVersion: "unknown" }), row(b, { claudeCodeVersion: "unknown" })], a, "unknown")).toEqual([]);
+test("a version that says nothing is unknown: a compiled binary's, or one not reported yet", () => {
+  expect(unknownVersion("unknown")).toBe(true);
+  expect(unknownVersion("")).toBe(true);
+  expect(unknownVersion("2.1.0")).toBe(false);
 });
 
 test("the projects view merges each project's holders by id, home's name first, holders in pool order", () => {
@@ -222,6 +209,17 @@ test("moveChoices lists every other member, takers first, the rest with why they
     ["old", "Claude Code 2.0.0 ≠ 2.1.0"],
   ]);
   expect(moveChoices(nodes, "a", "unknown").every((c) => c.reason !== null)).toBe(true);
+  // nor to a node that reports unknown, even from one that reports the same
+  expect(moveChoices([row("a", { claudeCodeVersion: "unknown" }), row("b", { claudeCodeVersion: "unknown" })], "a", "unknown").map((c) => c.reason))
+    .toEqual(["Claude Code version unknown"]);
+});
+
+test("uniqueTasks lists a task held by two nodes once, its live entry over its archived one", () => {
+  const live = { id: "t", archived: false, nodeId: "b" };
+  const gone = { id: "t", archived: true, nodeId: "a" };
+  const other = { id: "u", archived: false, nodeId: "a" };
+  expect(uniqueTasks([gone, other, live])).toEqual([live, other]);
+  expect(uniqueTasks([live, gone])).toEqual([live]);
 });
 
 test("nodeLineText sums a node up for the footer", () => {
@@ -504,6 +502,17 @@ test("changeLabel names the working copy, else the description, else the short i
   expect(changeLabel(change({ workingCopy: true, description: "Wip" }))).toBe("Working copy");
   expect(changeLabel(change({ description: "Add DiffView" }))).toBe("Add DiffView");
   expect(changeLabel(change({ description: "" }))).toBe("kpmxqwrt");
+});
+
+test("an input method's keys are its own: a one-line box submits on a plain Enter only", () => {
+  const key = (k: Partial<Parameters<typeof enters>[0]>) => ({ key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, isComposing: false, keyCode: 13, ...k });
+  expect(enters(key({}))).toBe(true);
+  expect(enters(key({ isComposing: true }))).toBe(false);
+  expect(enters(key({ keyCode: 229 }))).toBe(false);
+  expect(enters(key({ shiftKey: true }))).toBe(false);
+  expect(enters(key({ key: "a" }))).toBe(false);
+  expect(composing(key({ key: "Escape", isComposing: true }))).toBe(true);
+  expect(composing(key({ key: "Escape" }))).toBe(false);
 });
 
 test("composerKey: Enter sends (queued while a turn runs), Ctrl or Cmd+Enter sends now, Shift+Enter and touch keyboards make a new line", () => {

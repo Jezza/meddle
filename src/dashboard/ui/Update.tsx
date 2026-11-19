@@ -5,7 +5,7 @@
 import type { Host } from "@earendil-works/chord";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { UpdateObject } from "../../state/contracts";
-import { useObject } from "./hooks";
+import { useNow, useObject } from "./hooks";
 import { hashOf } from "./routes";
 import type { ListedTask } from "./sources";
 import { blinded, draining, failureText, participantLines, timeLeft, waits, type UpdateView } from "./update-model";
@@ -34,16 +34,6 @@ export function useUpdate(host: Host): UpdateView | null {
   return last.current;
 }
 
-/** The time now, again every `ms`: what counts down a deadline. */
-function useNow(ms = 1000): number {
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), ms);
-    return () => clearInterval(timer);
-  }, [ms]);
-  return now;
-}
-
 const DISMISSED_KEY = "meddle.update.dismissed";
 
 function dismissedRollout(): string | null {
@@ -62,7 +52,7 @@ function TurnLink({ nodeId, id, tasks }: { nodeId: string; id: string; tasks: re
 
 /** The bar over the pane: a rollout draining (what it waits on), or the last one's failure. Nothing otherwise. */
 export function UpdateBar({ update, name, tasks }: { update: UpdateView; name(id: string): string; tasks: readonly ListedTask[] }) {
-  const now = useNow();
+  const now = useNow(1000);
   const [dismissed, setDismissed] = useState(dismissedRollout);
   /** The failure shown whole (a reason may carry the service's last log lines), not cut to one line. */
   const [whole, setWhole] = useState(false);
@@ -118,7 +108,7 @@ const BACK_POLL_MS = 2000;
  * once the node answers again.
  */
 export function Blind({ update, name, connected }: { update: UpdateView; name(id: string): string; connected: boolean }) {
-  const now = useNow();
+  const now = useNow(1000);
   const covering = blinded(update);
   useEffect(() => {
     if (connected || !covering) return;

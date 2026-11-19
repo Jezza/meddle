@@ -4,7 +4,7 @@
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { store, stored, useAction, useValue } from "./hooks";
-import { type Anchor, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
+import { type Anchor, deleteTask, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
 import { Glyph } from "./icons";
 import { projectChoices } from "./pool-model";
 import { hashOf, type View } from "./routes";
@@ -159,7 +159,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
               <MenuItem onClick={() => setMenu({ kind: "restore", anchor: menu.anchor })}>Restore…</MenuItem>
               <MenuItem onClick={() => {
                 close();
-                if (confirm(`Delete "${task.title}", its log and its archive? This cannot be undone.`)) void action.run(() => task.ref.delete({}));
+                void action.run(() => deleteTask(task.ref, task.title, selected));
               }}>Delete</MenuItem>
             </>
           ) : (

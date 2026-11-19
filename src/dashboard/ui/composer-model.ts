@@ -4,6 +4,19 @@
 export type ComposerKeyEvent = Pick<KeyboardEvent, "key" | "shiftKey" | "ctrlKey" | "metaKey" | "altKey" | "isComposing" | "keyCode">;
 
 /**
+ * Whether a key belongs to an input method's composition: the Enter that confirms a conversion (keyCode 229 in Safari)
+ * or the Escape that dismisses its candidates, not the box's to act on.
+ */
+export function composing(e: Pick<KeyboardEvent, "isComposing" | "keyCode">): boolean {
+  return e.isComposing || e.keyCode === 229;
+}
+
+/** Whether a key is the plain Enter that submits a one-line box (not one that ends an input method's composition). */
+export function enters(e: Pick<KeyboardEvent, "key" | "shiftKey" | "ctrlKey" | "metaKey" | "altKey" | "isComposing" | "keyCode">): boolean {
+  return e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !composing(e);
+}
+
+/**
  * What a key pressed in the composer does, as in Claude Code: Enter sends (queued while a turn runs), Ctrl or Cmd+Enter
  * sends now, and null leaves the key to the box (Shift+Enter's new line). On a touch screen (`touch`) Enter makes a new
  * line, as a phone's keyboard has no Shift. The Enter that ends an input method's composition (keyCode 229 in Safari)
@@ -14,7 +27,7 @@ export function composerKey(
   e: ComposerKeyEvent,
   { running, touch, anyQueued, value, caret }: { running: boolean; touch: boolean; anyQueued: boolean; value: string; caret: number },
 ): "send" | "send-now" | "take-back" | null {
-  if (e.isComposing || e.keyCode === 229) return null;
+  if (composing(e)) return null;
   const plain = !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
   if (anyQueued && plain && e.key === "Escape") return "take-back";
   if (anyQueued && plain && e.key === "ArrowUp" && !value.slice(0, caret).includes("\n")) return "take-back";

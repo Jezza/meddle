@@ -9,15 +9,15 @@ import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffec
 import type { Attachment, Prompt } from "../../blobs/attachment";
 import { type AgentEntry, type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
-import { errorText, type Hosts, useAction, useDraft, useObject, useTick, useValue } from "./hooks";
+import { errorText, type Hosts, useAction, useDraft, useNow, useObject, useTick, useValue } from "./hooks";
 import { AgentsPanel } from "./Agents";
 import { agentSeconds, rootOf, toolCount } from "./agents-model";
 import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFileTarget } from "./Attachments";
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
-import { composerKey, withTakenBack } from "./composer-model";
-import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { composerKey, enters, withTakenBack } from "./composer-model";
+import { type Anchor, copyText, deleteTask, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Chevron, Glyph, Icon, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
@@ -25,7 +25,7 @@ import { hashOf } from "./routes";
 import { ago, type ProjectLine, projectLines } from "./sidebar-model";
 import { useOptionalValue } from "./sources";
 import { trainOffer } from "./train-model";
-import { UsageMeter, useNow } from "./Usage";
+import { UsageMeter } from "./Usage";
 import { contextMeter, readAgo, windowMeter } from "./usage-model";
 import {
   activity, activityLine, agentEndNote, backgroundMeta, buildThread, callRuns, cwdOf, duration, EDITS, editDiff, exitCode, type Explored,
@@ -193,11 +193,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
   const live = state === "running" || state === "waiting";
   const stateText = pendingCount > 0 ? "waiting on you" : state;
   const offer = trainOffer({ state, queued: queue === undefined ? null : queue !== null, merge, moving, projects });
-  const remove = () => action.run(async () => {
-    if (!confirm(`Delete "${title}", its log and its archive? This cannot be undone.`)) return;
-    await task.delete({});
-    location.hash = hashOf({ name: "home" });
-  });
+  const remove = () => action.run(() => deleteTask(task, title, true));
   return (
     <PaneHead>
       <div class="task-title">
@@ -853,7 +849,8 @@ function ApprovalPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
         : summary !== "" && !summary.endsWith("…") ? <><pre>{summary}</pre><details><summary class="muted">full input</summary><pre>{json(pending.input)}</pre></details></>
         : <pre>{json(pending.input)}</pre>}
       {denying && (
-        <label class="deny-message">Message to Claude <input value={message} onInput={(e) => setMessage(e.currentTarget.value)} /></label>
+        <label class="deny-message">Message to Claude <input value={message} onInput={(e) => setMessage(e.currentTarget.value)}
+          onKeyDown={(e) => { if (enters(e) && !action.busy) void action.run(() => task.deny({ requestId, message })); }} /></label>
       )}
       <div class="ask-actions">
         {denying ? <>
@@ -917,7 +914,8 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
               {o.label}{o.description !== undefined && <span class="muted"> · {o.description}</span>}
             </label>
           ))}
-          <label class="option">Other: <input value={other[q.question] ?? ""} onInput={(e) => setOther({ ...other, [q.question]: e.currentTarget.value })} /></label>
+          <label class="option">Other: <input value={other[q.question] ?? ""} onInput={(e) => setOther({ ...other, [q.question]: e.currentTarget.value })}
+            onKeyDown={(e) => { if (enters(e) && complete && !action.busy) void submit(); }} /></label>
         </div>
       ))}
       <div class="ask-actions">

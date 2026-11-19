@@ -4,7 +4,7 @@ import type { Host, Ref } from "@earendil-works/chord";
 import { type ComponentChildren, render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { NodeObject, PoolObject, ProjectObject, type Notification } from "../../state/contracts";
-import { clientHost, Hosts, nodeSocket, useAction, useObject, useValue } from "./hooks";
+import { clientHost, Hosts, nodeSocket, store, stored, useAction, useObject, useValue } from "./hooks";
 import { Nav, PaneHead, type PoolRef } from "./common";
 import { NewTask } from "./NewTask";
 import { NodePage } from "./NodePage";
@@ -33,14 +33,6 @@ const host = clientHost(socket, () => location.reload());
 
 const NARROW = "(max-width: 760px)";
 const SIDEBAR_KEY = "meddle.sidebar.hidden";
-
-function sidebarHidden(): boolean {
-  try {
-    return localStorage.getItem(SIDEBAR_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
 
 function App({ host }: { host: Host }) {
   const [view, setView] = useState<View>(() => viewOf(location.hash));
@@ -82,16 +74,12 @@ function Shell({ host, pool, node, view, notice, connected }: {
     media.addEventListener("change", change);
     return () => media.removeEventListener("change", change);
   }, []);
-  const [hidden, setHidden] = useState(sidebarHidden);
+  const [hidden, setHidden] = useState(() => stored(SIDEBAR_KEY));
   const [drawer, setDrawer] = useState(false);
   const open = narrow ? drawer : !hidden;
   const toggle = () => {
     if (narrow) return setDrawer(!drawer);
-    try {
-      localStorage.setItem(SIDEBAR_KEY, hidden ? "0" : "1");
-    } catch {
-      // a private window: remembered for this page only
-    }
+    store(SIDEBAR_KEY, !hidden);
     setHidden(!hidden);
   };
   const openTask: Open = (nodeId, id) => { location.hash = hashOf({ name: "task", nodeId, id }); };
@@ -179,6 +167,7 @@ function NodeToasts({ hosts, index, nodeId, node, hostname, open }: {
               : <a href={hashOf({ name: "task", nodeId, id: note.taskId })} onClick={(e) => { e.preventDefault(); open(nodeId, note.taskId); }}>{note.text}</a>}
             <div class="muted">{hostname} · {new Date(note.at).toLocaleTimeString()}</div>
             {note.kind === "train" && <TrainActions hosts={hosts} index={index} nodeId={nodeId} node={node} note={note} open={open} />}
+            {action.error !== null && <div class="error">Not dismissed: {action.error}</div>}
           </div>
           <button class="icon" title="Dismiss" disabled={action.busy} onClick={() => action.run(() => node.dismiss({ id: note.id }))}>×</button>
         </div>

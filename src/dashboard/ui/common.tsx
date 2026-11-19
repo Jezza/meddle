@@ -4,8 +4,10 @@ import type { ComponentChildren } from "preact";
 import { createContext } from "preact";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { NodeObject, PoolObject, TaskObject } from "../../state/contracts";
+import { composing } from "./composer-model";
 import { type HostStatus, useAction } from "./hooks";
 import { EFFORT_LEVELS } from "../../pool/settings";
+import { hashOf } from "./routes";
 import { moveChoices } from "./sidebar-model";
 
 /** `PoolObject` as a dashboard holds it: its `default` variant. */
@@ -213,6 +215,16 @@ export function RestoreMenu({ task, nodes, holder, anchor, onClose, onRestored }
   );
 }
 
+/**
+ * Deletes a task once the user confirms it, then, when its page is the one open (`open`), goes home: the head's
+ * Delete and the sidebar's alike. Run it in a `useAction`.
+ */
+export async function deleteTask(task: Ref<typeof TaskObject>, title: string, open: boolean): Promise<void> {
+  if (!confirm(`Delete "${title}", its log and its archive? This cannot be undone.`)) return;
+  await task.delete({});
+  if (open) location.hash = hashOf({ name: "home" });
+}
+
 /** A title edited in place: Enter saves, Escape or leaving it cancels. */
 export function RenameInput({ value, onSave, onDone }: { value: string; onSave(title: string): Promise<boolean>; onDone(): void }) {
   const [text, setText] = useState(value);
@@ -226,6 +238,7 @@ export function RenameInput({ value, onSave, onDone }: { value: string; onSave(t
     <input ref={ref} class="rename" value={text} onInput={(e) => setText(e.currentTarget.value)} onBlur={onDone}
       onClick={(e) => e.preventDefault()}
       onKeyDown={(e) => {
+        if (composing(e)) return;
         if (e.key === "Enter") { e.preventDefault(); void save(); }
         if (e.key === "Escape") { e.preventDefault(); onDone(); }
       }} />

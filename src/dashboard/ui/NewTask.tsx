@@ -8,7 +8,7 @@ import { type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
 import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, DraftChips, useDrafts, useFileTarget } from "./Attachments";
 import { composerKey } from "./composer-model";
-import { type Anchor, MenuItem, ModelPicker, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
+import { type Anchor, MenuItem, ModelPicker, nodeDot, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
 import { projectChoices } from "./pool-model";
 import type { Open } from "./routes";
 
@@ -122,7 +122,7 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
           <MenuItem onClick={() => { setPicked(null); setMenu(null); }} meta="placement picks">Automatic</MenuItem>
           {canHost.map((n) => (
             <MenuItem key={n.nodeId} title={n.nodeId} onClick={() => { setPicked(n.nodeId); setMenu(null); }} meta={nodeMeta(n)}>
-              <span class={`dot ${n.running > 0 ? "run" : "idle"}`} /> {n.hostname}
+              <span class={nodeDot(n)} /> {n.hostname}
             </MenuItem>
           ))}
         </Popover>
