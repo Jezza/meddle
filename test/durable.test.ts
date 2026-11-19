@@ -1,7 +1,7 @@
 // test/durable.test.ts
 import { test, expect, spyOn } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { loadConfig, ensureDataDirs, paths, type NodeConfig } from "../src/config";
 import { openDb } from "../src/store/db";
 import { addProjectFromFolder } from "../src/projects/project";
@@ -75,7 +75,8 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   await (await import("../src/token")).addToken(cfg, db, "tok", { setBy: null });
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
-  const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };
+  const input = `${await mkdtemp("/tmp/meddle-input-")}/input.jsonl`; // what each Claude Code run is sent
+  const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, MEDDLE_FIXTURE_INPUT: input, ...extra } }) }; };
   const turnsStarted = () => listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started").map(e => (e.message as any).resume);
   // 1. the first process stalls before the result; closing its Harness kills the turn mid-way
   const { h, runner } = await open({ MEDDLE_FIXTURE_STALL: "1" });
@@ -109,6 +110,14 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   // the close logged turn_aborted, so the rerun told Claude to carry on rather than sending the prompt again
   const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
   expect(prompts).toEqual(["Reply with the single word ok.", CARRY_ON_PROMPT, "Also say why."]);
+  // the person's prompt and steer go to Claude Code as a human's (each time it is sent); meddle's own carry-on does not
+  const sent = readFileSync(input, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l));
+  expect(sent.map(f => [f.message.content, f.origin])).toEqual([
+    ["Reply with the single word ok.", { kind: "human" }],
+    ["Also say why.", { kind: "human" }],
+    [CARRY_ON_PROMPT, undefined],
+    ["Also say why.", { kind: "human" }],
+  ]);
   await again.h.close();
 });
 test("a pending approval makes the task waiting until it is answered", async () => {

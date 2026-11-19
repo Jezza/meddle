@@ -362,6 +362,14 @@ test("a pushed prompt is sent as its content and logged as its text and refs", a
   expect(q.untaken()).toEqual([{ uuid, prompt: { text: "look", attachments: [att] } }]);
   expect(q.take(uuid)).toEqual({ text: "look", attachments: [att] });
 });
+test("input queue: a prompt pushed with an origin is sent with it", async () => {
+  const q = new InputQueue();
+  const it = q[Symbol.asyncIterator]();
+  q.push({ text: "mine", attachments: [] }, "next", "mine", { kind: "human" });
+  q.push({ text: "meddle's", attachments: [] });
+  expect((await it.next()).value).toMatchObject({ message: { content: "mine" }, origin: { kind: "human" } });
+  expect("origin" in (await it.next()).value).toBe(false);
+});
 test("promptEvent keeps the text as content and adds the refs", () => {
   expect(promptEvent({ text: "look", attachments: [att] }, "u1")).toMatchObject({ message: { content: "look" }, attachments: [att], uuid: "u1" });
   expect("attachments" in promptEvent({ text: "hi", attachments: [] })).toBe(false);

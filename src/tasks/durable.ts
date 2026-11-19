@@ -12,7 +12,7 @@ import { materialize, promptContent } from "../blobs/content";
 import { BlobFetcher } from "../blobs/pool";
 import { BlobStore } from "../blobs/store";
 import { Approvals } from "../engine/approvals";
-import { InputQueue } from "../engine/input";
+import { HUMAN, InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
 import { resultError, runTurn, type MeddleEvent, type SendNowOutcome, type TokenFault } from "../engine/session";
 import { askTitle } from "../engine/title";
@@ -884,7 +884,7 @@ export class TaskRunner {
       }
       return this.#enqueueNext(taskId, p);
     }
-    queue.push(p, "next", content);
+    queue.push(p, "next", content, HUMAN);
     // Taken into the turn the user accepted the task in, which now has more to do than what they accepted.
     this.#inputRuns(taskId);
     this.#emitQueued(taskId);
@@ -1151,8 +1151,9 @@ export class TaskRunner {
         throw new Error("no usable token");
       }
       // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
-      const prompt: Prompt = resume && cutOff === "token" ? { text: TOKEN_RETRY_PROMPT, attachments: [] }
-        : resume && cutOff === "restart" ? { text: CARRY_ON_PROMPT, attachments: [] }
+      const carryOn = resume && (cutOff === "token" || cutOff === "restart"); // meddle's words, not the person's
+      const prompt: Prompt = carryOn && cutOff === "token" ? { text: TOKEN_RETRY_PROMPT, attachments: [] }
+        : carryOn ? { text: CARRY_ON_PROMPT, attachments: [] }
         : { text: input.prompt, attachments: input.attachments ?? [] };
       // Claude Code is given the task's attachments folder as an additional directory, so it exists for every turn.
       const attachmentsDir = paths(this.#cfg).taskAttachments(taskId);
@@ -1166,6 +1167,7 @@ export class TaskRunner {
         prompt,
         content,
         ...(train === undefined ? {} : { train: { kind: train, after: input.freshAfter ?? 0 } }),
+        ...(carryOn || train !== undefined ? {} : { origin: HUMAN }), // a train turn's prompt is meddle's too
         db: this.#db,
         approvals: this.approvals,
         queue,

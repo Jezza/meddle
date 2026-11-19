@@ -9,6 +9,7 @@
 // MEDDLE_FIXTURE_BACKGROUND_MS=<ms> (wait that long before each `task_notification`: background work that outlasts its
 // turn's `result`),
 // MEDDLE_FIXTURE_MEMORY=1 (append the first prompt to the project's memory, see `transcribe`),
+// MEDDLE_FIXTURE_INPUT=<path> (append every user message this run is sent to <path>, one JSON line each, as sent),
 // MEDDLE_FIXTURE_BY_TOKEN=<token>=<path>,<token>=<path> (the recording of the entry whose token is the
 // CLAUDE_CODE_OAUTH_TOKEN this run got; MEDDLE_FIXTURE when none is),
 // MEDDLE_FIXTURE_TOOL_USE=<tool> (before the first `result`, as Claude Code does once that tool has run, calls each
@@ -42,6 +43,7 @@ const fixture = fixtureForToken() ?? process.env.MEDDLE_FIXTURE;
 if (!fixture) { process.stderr.write("replay.ts: MEDDLE_FIXTURE is not set\n"); process.exit(2); }
 const stall = process.env.MEDDLE_FIXTURE_STALL === "1";
 const memory = process.env.MEDDLE_FIXTURE_MEMORY === "1";
+const input = process.env.MEDDLE_FIXTURE_INPUT;
 const laterResultsMs = Number(process.env.MEDDLE_FIXTURE_LATER_RESULTS_MS ?? 0);
 const backgroundMs = Number(process.env.MEDDLE_FIXTURE_BACKGROUND_MS ?? 0);
 const resultsMs = Number(process.env.MEDDLE_FIXTURE_RESULTS_MS ?? 0);
@@ -158,6 +160,7 @@ process.stdin.on("data", (chunk: Buffer) => {
       // stand-in ends the session itself instead.
       void finish();
     }
+    if (f.type === "user" && input !== undefined) appendFileSync(input, line + "\n");
     arrived.push({ frame: f, used: false });
   }
   wake();
