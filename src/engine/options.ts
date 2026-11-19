@@ -52,9 +52,26 @@ export type EngineInput = {
 export const FILE_TOOLS_MATCHER = "Edit|Write|Bash";
 
 /**
- * The environment of a task's Claude Code: `PATH`, `HOME`, `XDG_CONFIG_HOME` (when meddle has one: the agent's jj reads
- * its workspace's config, `scopeWorkspace`, from where meddle's jj wrote it) and the passthrough names, from this
- * process's environment, then the pool's settings (`cfg.poolEnv`), the names meddle sets itself (which a pool setting
+ * What a Claude Code meddle runs (a task's turn, a title query) takes of this process's environment: `PATH`, `HOME`,
+ * `XDG_CONFIG_HOME` (when meddle has one: the agent's jj reads its workspace's config, `scopeWorkspace`, from where
+ * meddle's jj wrote it) and the passthrough names (a proxy, a CA file), with no `<data>/bin` on `PATH` and no
+ * `MEDDLE_GIT_SOCKET` (see `buildEnv`).
+ */
+export function inheritedEnv(cfg: NodeConfig): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const name of ["PATH", "HOME", "XDG_CONFIG_HOME", ...cfg.envPassthrough]) {
+    const value = process.env[name];
+    if (value !== undefined && name !== "MEDDLE_GIT_SOCKET") env[name] = value;
+  }
+  if (env.PATH !== undefined) {
+    const bin = resolve(paths(cfg).bin);
+    env.PATH = env.PATH.split(delimiter).filter((dir) => dir === "" || resolve(dir) !== bin).join(delimiter);
+  }
+  return env;
+}
+
+/**
+ * The environment of a task's Claude Code: what it inherits (`inheritedEnv`), then the pool's settings (`cfg.poolEnv`), the names meddle sets itself (which a pool setting
  * can never replace), the projects' context env and `extraEnv`.
  *
  * An agent can't reach `meddle://` remotes: its `PATH` has no `<data>/bin` (the remote helper), even when this
@@ -62,17 +79,8 @@ export const FILE_TOOLS_MATCHER = "Edit|Write|Bash";
  * through this node's own git socket would count as one of your checkouts'.
  */
 export function buildEnv(i: EngineInput): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const name of ["PATH", "HOME", "XDG_CONFIG_HOME", ...i.cfg.envPassthrough]) {
-    const value = process.env[name];
-    if (value !== undefined && name !== "MEDDLE_GIT_SOCKET") env[name] = value;
-  }
-  if (env.PATH !== undefined) {
-    const bin = resolve(paths(i.cfg).bin);
-    env.PATH = env.PATH.split(delimiter).filter((dir) => dir === "" || resolve(dir) !== bin).join(delimiter);
-  }
   return {
-    ...env,
+    ...inheritedEnv(i.cfg),
     ...i.cfg.poolEnv,
     CLAUDE_CONFIG_DIR: paths(i.cfg).taskConfig(i.manifest.id),
     // Without a project, Claude Code names the project dir after the folder it runs in, as it does on its own.
