@@ -7,6 +7,7 @@ import { NodeObject } from "../../state/contracts";
 import { type Hosts, useAction, useDraft, useObject, useValue } from "./hooks";
 import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, DraftChips, useDrafts, useFileTarget } from "./Attachments";
+import { composerKey } from "./composer-model";
 import { type Anchor, MenuItem, ModelPicker, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
 import { projectChoices } from "./pool-model";
 import type { Open } from "./routes";
@@ -46,6 +47,8 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
   const action = useAction();
   const input = useRef<HTMLTextAreaElement>(null);
   useEffect(() => input.current?.focus(), []);
+  // Keys as in a task's composer: Enter starts, Shift+Enter makes a new line (Enter does on a touch screen).
+  const touch = matchMedia("(pointer: coarse)").matches;
   // A node that went offline (or stopped hosting tasks) since it was picked falls back to Automatic.
   const where = canHost.find((n) => n.nodeId === picked) ?? null;
   // Placement picks a node that takes files when there are some; a node of an older meddle takes none.
@@ -80,7 +83,12 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
         <DraftChips drafts={drafts.drafts} onRemove={drafts.remove} />
         <textarea ref={input} rows={4} value={prompt} placeholder="What should Claude do?"
           onInput={(e) => setPrompt(e.currentTarget.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void start(); } }} />
+          onKeyDown={(e) => {
+            const field = e.currentTarget;
+            if (composerKey(e, { running: false, touch, anyQueued: false, value: field.value, caret: field.selectionStart }) === null) return;
+            e.preventDefault();
+            void start();
+          }} />
         <div class="composer-row">
           {chosen.map((id) => (
             <span key={id} class="pill">◉ {nameOf(id)}
@@ -95,7 +103,7 @@ function NewTaskForm({ node, pool, projectId, open }: { node: NodeRef; pool: Poo
           <span class="bar-gap" />
           {action.error !== null && <span class="error">{action.error}</span>}
           {attaching && <AttachButton onFiles={drafts.add} />}
-          <button class="primary" disabled={action.busy || !ready} onClick={() => void start()} title="Ctrl+Enter">
+          <button class="primary" disabled={action.busy || !ready} onClick={() => void start()} title={touch ? undefined : "Enter"}>
             {action.busy ? "Starting…" : "Start"}
           </button>
         </div>
