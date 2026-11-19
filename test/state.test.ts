@@ -51,7 +51,7 @@ async function connect(fixture?: string) {
 }
 
 test("claudeCodeVersion reads the pinned SDK's manifest", () => {
-  expect(claudeCodeVersion()).toBe("2.1.314");
+  expect(claudeCodeVersion()).toBe("2.1.328");
 });
 
 test("a client follows a task through a prompted turn over a link", async () => {
@@ -67,7 +67,7 @@ test("a client follows a task through a prompted turn over a link", async () => 
     metrics.start();
     await until(node.metrics, (m) => m !== null);
     metrics.stop();
-    expect(node.claudeCodeVersion.value).toBe("2.1.314");
+    expect(node.claudeCodeVersion.value).toBe("2.1.328");
     expect(node.token.value.present).toBe(true);
 
     const { manifest } = await node.createTask({ title: "t", projects: [{ id: project.id }] });

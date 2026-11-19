@@ -108,7 +108,7 @@ test("PoolObject shows a pool of one, and a linked node that proved the secret a
     const poolA = a!.pool;
     expect(poolA.self.value).toBe(A.identity.id);
     expect(poolA.nodes.value).toEqual([{
-      nodeId: A.id, hostname: hostname(), status: "member", online: true, version: VERSION, claudeCodeVersion: "2.1.314",
+      nodeId: A.id, hostname: hostname(), status: "member", online: true, version: VERSION, claudeCodeVersion: "2.1.328",
       hostsTasks: true, taskCount: 0, running: 0, limit: 0, projects: [{ id: A.project.id, name: "a", home: A.id, defaultBranch: "main" }],
       attachments: true, lastSeenAt: expect.any(String), gone: false, link: null,
     }]);

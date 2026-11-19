@@ -90,7 +90,7 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     expect(status.code).toBe(0);
     const lines = status.stdout.trim().split("\n");
     expect(lines[0]).toMatch(/^meddle \d+\.\d+\.\d+$/);
-    expect(lines[1]).toBe("claude code 2.1.314");
+    expect(lines[1]).toBe("claude code 2.1.328");
     expect(lines[2]).toBe(`data dir ${dir}/d`);
     expect(lines[3]).toBe(`task root ${dir}/t ok`);
     expect(lines[4]).toMatch(/^token present expires \d{4}-\d\d-\d\dT[\d:.]+Z$/);

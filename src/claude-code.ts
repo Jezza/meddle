@@ -6,9 +6,9 @@ import { join } from "node:path";
 
 /** The Claude Code a build pinned: the Agent SDK's manifest entry for the build's platform. */
 export type ClaudePin = {
-  /** Claude Code's version (`2.1.314`), from the manifest. */
+  /** Claude Code's version (`2.1.328`), from the manifest. */
   version: string;
-  /** The Agent SDK's version (`0.3.314`): its platform package, which carries Claude Code, has the same. */
+  /** The Agent SDK's version (`0.3.328`): its platform package, which carries Claude Code, has the same. */
   sdkVersion: string;
   /** The manifest's platform key and the platform package's suffix (`linux-x64`, `linux-arm64-musl`, …). */
   platform: string;
