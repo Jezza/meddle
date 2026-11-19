@@ -142,6 +142,46 @@ export async function refusePush(pushed: PushedRef[], heads: BranchHeads, g: Gra
   return null;
 }
 
+/** The branch a pushed ref moves: `refs/heads/<b>`, or a sibling's `refs/heads/meddle/conflict/<b>/<id>`. */
+function branchOf(ref: string): string | null {
+  if (ref.startsWith(CONFLICT)) {
+    const rest = ref.slice(CONFLICT.length);
+    const slash = rest.lastIndexOf("/");
+    return slash > 0 ? rest.slice(0, slash) : null;
+  }
+  return ref.startsWith(HEADS) ? ref.slice(HEADS.length) : null;
+}
+
+/**
+ * Why a push of `pushed` to a project is refused, or null when it is accepted: the checks the `pre-receive` hook runs
+ * on a checkout's push, and `advanceBranch` on a node's own, in this order, the first refusal winning. `refuse`, when
+ * the node takes no input now (an update awaits confirmation), refuses any push with its reason. Then `refusePush`,
+ * with the branches' `heads`. Then `<b>: this node is still fetching it; push again shortly` while the view shows a
+ * pushed branch behind its rows (`stale`): the pusher judged its push against the view, the plan would judge it against
+ * rows the pusher never saw, and drop them as if forced. Last, whether the push can be planned (`planPush`, from the
+ * node `selfId`'s `rows` of `project`): what lands is recorded, so a push that can't be is refused.
+ */
+export async function pushRefusal(
+  input: {
+    refuse: string | null; pushed: PushedRef[]; heads: BranchHeads; stale: string[]; rows: readonly BranchRow[];
+    selfId: string; project: string;
+  },
+  g: Graph,
+): Promise<string | null> {
+  const { refuse, pushed, heads, stale, rows, selfId, project } = input;
+  if (refuse !== null && refuse !== "") return `meddle: ${refuse}`;
+  const refused = await refusePush(pushed, heads, g);
+  if (refused !== null) return refused;
+  const behind = pushed.map((p) => branchOf(p.ref)).find((b) => b !== null && stale.includes(b));
+  if (behind !== undefined && behind !== null) return `${behind}: this node is still fetching it; push again shortly`;
+  try {
+    await planPush(selfId, project, pushed, rows, g);
+  } catch (err) {
+    return `meddle: the push could not be recorded: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  return null;
+}
+
 /**
  * The branch rows node `selfId` writes for a push that `refusePush` accepted, one per branch it touched, each to be
  * written with its seq + 1. `rows` are the project's rows as this node has them before the push.

@@ -31,9 +31,10 @@ Outside the node:
 - **Your browser**, on any node's dashboard. The dashboard binds to localhost only; for a remote machine, tunnel it
   (`ssh -L 7777:127.0.0.1:7777 <host>`, the same port at both ends: the node accepts a browser only on its own port)
   and open the same URL.
-- **On each machine:** [jj](https://jj-vcs.github.io/jj/) 0.46.0 or later and git, and the `meddle` binary (below).
-  Claude Code itself is inside it, so a task needs no `claude` on the machine. The `claude` CLI is needed once, on
-  any machine, to mint a login token (`claude setup-token`); the token then reaches every node through the pool.
+- **On each machine:** [jj](https://jj-vcs.github.io/jj/) 0.46.0 or later and git 2.38 or later, and the `meddle`
+  binary (below). Claude Code itself is inside it, so a task needs no `claude` on the machine. The `claude` CLI is
+  needed once, on any machine, to mint a login token (`claude setup-token`); the token then reaches every node through
+  the pool.
 
 ## Is it a binary?
 
@@ -50,10 +51,10 @@ run. Copy it to each machine of the same platform and put it on the `PATH`:
 scp dist/meddle <host>:.local/bin/meddle
 ```
 
-Those machines need jj and git, and nothing else: no bun, no checkout. The first time a node starts, it downloads
-that Claude Code from the npm registry (about 140 MB) and checks it against the checksum the build carries; a machine
-that cannot reach the registry needs a build made with `bun run build --embed-claude` (about 450 MB, Claude Code
-inside). Give every machine the same build, so that they all run the same Claude Code and can move tasks to each
+Those machines need jj and git 2.38 or later, and nothing else: no bun, no checkout. The first time a node starts,
+it downloads that Claude Code from the npm registry (about 140 MB) and checks it against the checksum the build
+carries; a machine that cannot reach the registry needs a build made with `bun run build --embed-claude` (about
+450 MB, Claude Code inside). Give every machine the same build, so that they all run the same Claude Code and can move tasks to each
 other. A build runs on one platform; for a machine of
 another (a Raspberry Pi is `bun-linux-arm64`), see the README's [single binary](../README.md#the-single-binary).
 
@@ -178,8 +179,11 @@ that commit, so run `jj new` afterwards to go on working. `--rev <rev>` starts i
 else, `--project myproject` starts it on the project's default branch.
 
 The task's work is its line, which a checkout's fetch shows as the read-only bookmark
-`meddle/task/<task id>/myproject@meddle`; it moves as the agent works. To take the work, fetch, review, then
-fast-forward your branch onto the line and push it:
+`meddle/task/<task id>/myproject@meddle`; it moves as the agent works. To take the work, accept the task:
+`meddle task accept <task id>` (or Accept in the task's view in the dashboard) queues it on the project's merge train,
+which has its revisions described, checks it together with any other task you accepted, and moves `main` to the result.
+`meddle train` shows the queue, and your checkout sees `main` move on its next `jj git fetch --remote meddle`. You can
+take the work yourself instead: fetch, review, then fast-forward your branch onto the line and push it:
 
 ```sh
 jj git fetch --remote meddle
@@ -187,9 +191,10 @@ jj bookmark set main -r meddle/task/<task id>/myproject@meddle
 jj git push --remote meddle -b main
 ```
 
-Once a pushed branch contains the task's work, the task is archived on its own
-([Taking a task's work](../README.md#taking-a-tasks-work)). meddle never merges anything. The task's folder, with a jj
-workspace per project, is under the task root.
+Once the train's landing or a pushed branch contains the task's work, the task is archived on its own
+([Taking a task's work](../README.md#taking-a-tasks-work), [The merge train](../README.md#the-merge-train)). Pushing
+`main` on to an upstream such as GitHub stays yours. The task's folder, with a jj workspace per project, is under the
+task root.
 
 ### 7. Run it as a service
 

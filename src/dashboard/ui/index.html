@@ -118,12 +118,16 @@
   .side-row:hover .more { display: inline; }
   .side-row:hover .where { display: none; }
   .side-row .rename { flex: 1; min-width: 0; padding: 1px 6px; }
+  /* A project's 🚂 Train, and the 🚂 on a queued task's row: both open the project's train page. */
+  .side-row.train-entry { color: var(--fg-soft); font-size: 12px; min-height: 24px; }
+  .train-entry .count { background: var(--chip); color: var(--chip-fg); border-radius: 9px; font-size: 10.5px; padding: 0 6px; flex: none; }
+  .side-row .queued-mark { background: none; border: none; padding: 0 2px; font-size: 11px; line-height: 1; flex: none; }
+  .side-row .queued-mark:hover:not(:disabled) { background: none; filter: brightness(1.2); }
   .badge { background: var(--warn); color: var(--bg); font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; flex: none; }
   /* How many of a task's agents run. */
   .agent-count { display: inline-flex; align-items: center; gap: 3px; flex: none; font-size: 11px; font-weight: 600; color: var(--tint-purple);
     background: var(--tint-purple-bg); border-radius: 8px; padding: 0 6px 0 4px; }
   .agent-count svg { width: 11px; height: 11px; }
-  .chip { font-size: 10.5px; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 5px; flex: none; }
   .side-foot { border-top: 1px solid var(--line); padding: 2px 0 8px; flex: none; max-height: 40%; overflow-y: auto; }
   .side-foot .side-head { padding-top: 8px; }
   .node-row { display: flex; align-items: center; gap: 8px; padding: 3px 10px 3px 14px; color: var(--fg); font-size: 12.5px; }
@@ -163,6 +167,43 @@
     .proj-cols { grid-template-columns: minmax(0, 1fr); }
     .proj-col { border-right: none; }
     .proj-col:not(.on) { display: none; }
+  }
+
+  /* ─── a project's train: Queued, and This round with its merge task and the batch under it ─── */
+  .train { display: flex; flex-direction: column; height: 100%; min-height: 0; container-type: inline-size; }
+  .train-wait { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .train-error { font-size: 12px; margin: 6px 14px; }
+  .pane-head .train-error { margin: 0; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .train-board { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+  .train-col { min-width: 0; min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); padding-bottom: 24px; }
+  .train-col:last-child { border-right: none; }
+  .train-col.round { background: color-mix(in srgb, var(--tint-purple-bg) 45%, transparent); }
+  .train-colhead { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 9px 12px 5px; }
+  .train-empty { margin: 0; padding: 6px 12px; color: var(--faint); font-size: 12px; }
+  .train-steps { display: flex; flex-wrap: wrap; gap: 4px; font-size: 10.5px; padding: 0 12px 6px; }
+  .train-steps span { padding: 0 6px; border-radius: 9px; background: var(--chip); color: var(--muted); }
+  .train-steps span.finished { color: var(--ok); }
+  .train-steps span.current { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+  .train-row { display: flex; align-items: center; gap: 7px; padding: 6px 12px; font-size: 12px; border-top: 1px solid var(--line); }
+  .train-row.hl { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+  .train-row .tt { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .train-row a.tt { color: var(--fg); }
+  .train-row .tree { color: var(--faint); font-family: ui-monospace, monospace; width: 14px; flex: none; }
+  .train-row button.link { background: none; border: none; color: var(--muted); padding: 0 2px; font-size: 11.5px; }
+  .train-row button.link:hover:not(:disabled) { background: none; color: var(--fg); text-decoration: underline; }
+  .train-chip { display: inline-block; flex: none; background: var(--chip); color: var(--chip-fg); border-radius: 4px; padding: 0 5px; font-size: 10.5px; white-space: nowrap; }
+  .train-chip.blue { background: var(--tint-blue-bg); color: var(--tint-blue); }
+  .train-chip.warn { background: var(--warn-bg); color: var(--warn); }
+  .train-chip.purple { background: var(--tint-purple-bg); color: var(--tint-purple); }
+  .train-merge { margin: 4px 12px 6px; border: 1px solid var(--tint-purple); border-radius: 7px; background: var(--tint-purple-bg); padding: 8px 10px; }
+  .train-merge .mt { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  .train-merge .mt .grow { flex: 1; }
+  .train-merge .mt a { font-weight: 400; font-size: 12px; }
+  .train-merge .ms { font-size: 11.5px; color: var(--fg-soft); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .train-merge + .train-row { border-top: none; }
+  @container (max-width: 640px) {
+    .train-board { grid-template-columns: minmax(0, 1fr); overflow-y: auto; }
+    .train-col { overflow-y: visible; border-right: none; border-bottom: 1px solid var(--line); }
   }
 
   /* ─── a project's memory ─── */
@@ -212,6 +253,8 @@
   .head-actions button { background: none; border-color: transparent; color: var(--muted); padding: 2px 7px; }
   .head-actions button:hover:not(:disabled) { color: var(--fg); background: var(--hover); }
   .head-actions button.on { border-color: var(--line-strong); color: var(--fg); }
+  .head-actions button.accept, .head-actions button.accept:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+  .head-actions button.accept:hover:not(:disabled) { filter: brightness(1.1); }
   .head-actions .error { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
   /* The Thread / Changes switch. */
   .task-tabs { display: flex; gap: 2px; background: var(--side); border: 1px solid var(--line); border-radius: 6px; padding: 2px; margin-right: 4px; }
@@ -299,8 +342,11 @@
   /* Your messages sit in a card; Claude's prose reads at full size. */
   .msg.you { background: var(--you-bg); border: 1px solid var(--you-line); color: var(--you-fg); border-radius: 10px; padding: 10px 14px; font-size: 14px; }
   .msg.claude .md { font-size: 14px; line-height: 1.6; }
+  /* The merge train's prompts: a card like yours, dashed, under meddle's name. */
+  .msg.you.meddle { border-style: dashed; }
+  .msg.you .by { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
   .msg.queued { opacity: 0.6; }
-  .msg.queued .chip { display: inline-block; margin-top: 4px; }
+  .msg.queued .tag { display: inline-block; margin-top: 4px; }
   .msg.failed { border-color: color-mix(in srgb, var(--bad) 55%, var(--you-line)); }
   .failed-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; }
   .failed-line .ico { font-size: 14px; }
@@ -579,6 +625,8 @@
   .toast.failed .toast-icon { color: var(--bad); }
   .toast-body { flex: 1; min-width: 0; }
   .toast-body a { color: var(--fg); }
+  .toast-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .toast-acts .error { flex-basis: 100%; font-size: 12px; }
 
   @media (max-width: 760px) {
     .thread { padding: 14px 14px 10px; }

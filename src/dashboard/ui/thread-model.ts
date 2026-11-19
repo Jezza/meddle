@@ -4,8 +4,11 @@ import { type AgentEntry, isProgress, type Live } from "../../state/contracts";
 import type { DiffRow, Hunk } from "./diff-model";
 
 export type ThreadItem =
-  /** `attachments`: the files the prompt carried (the refs meddle logged beside its text). */
-  | { kind: "user"; text: string; attachments: Attachment[] }
+  /**
+   * `attachments`: the files the prompt carried (the refs meddle logged beside its text). `by: "meddle"`: the merge
+   * train's prompt (a `train_turn`), not one of yours.
+   */
+  | { kind: "user"; text: string; attachments: Attachment[]; by?: "meddle" }
   | { kind: "assistant"; text: string; thinking?: string }
   | {
     kind: "tool";
@@ -274,6 +277,19 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
         return;
       case "token_fault":
         top.push({ kind: "status", text: tokenFaultText(m) });
+        return;
+      case "train_turn":
+        // The train's prompt starts the turn as yours would, marked as meddle's.
+        top.push({ kind: "user", text: str(m.text), attachments: [], by: "meddle" });
+        return;
+      case "train_decline":
+        top.push({ kind: "status", text: `Declined: ${str(m.reason)}` });
+        return;
+      case "train_blame":
+        top.push({ kind: "status", text: `Blamed ${str(m.task)}: ${str(m.reason)}` });
+        return;
+      case "train_left":
+        top.push({ kind: "status", text: `Left meddle's train: ${str(m.reason)}` });
         return;
       case "permission_denied_hook": {
         const input = (m.input ?? {}) as { tool_use_id?: unknown; tool_name?: unknown; reason?: unknown };

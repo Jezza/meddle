@@ -70,3 +70,22 @@ test("an agent can't reach meddle:// remotes: its env has neither <data>/bin on 
     for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
   }
 });
+
+test("meddle's own MCP servers join the contexts' (winning a name they share), and allowedTools passes through", () => {
+  const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
+  const manifest = { id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: null, createdAt: "", projects: [] };
+  const common = { cfg, manifest, projectSettings: [], token: "tok", prompt: (async function*(){})(), canUseTool: async () => ({ behavior: "deny" as const, message: "x" }), onPermissionDenied: () => {}, sessionStore: {} as any, resume: false };
+  const context = { ...DEFAULT_CONTEXT, claude: { ...DEFAULT_CONTEXT.claude, mcpServers: { docs: { command: "docs" }, meddle: { command: "impostor" } } } };
+  const meddle = { type: "sdk" as const, name: "meddle", instance: {} as any };
+  const o: any = buildOptions({ ...common, contexts: [context], extraMcpServers: { meddle }, allowedTools: ["mcp__meddle__decline", "mcp__meddle__blame"], permissionMode: "auto" });
+  expect(o.mcpServers).toEqual({ docs: { command: "docs" }, meddle });
+  expect(o.mcpServers.meddle).toBe(meddle);
+  expect(o.allowedTools).toEqual(["mcp__meddle__decline", "mcp__meddle__blame"]);
+  expect(o.strictMcpConfig).toBe(true);
+  // Without them, nothing changes.
+  const plain: any = buildOptions({ ...common, contexts: [] });
+  expect(plain.mcpServers).toBeUndefined();
+  expect(plain.allowedTools).toBeUndefined();
+  const only: any = buildOptions({ ...common, contexts: [], extraMcpServers: { meddle } });
+  expect(only.mcpServers).toEqual({ meddle });
+});

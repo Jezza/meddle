@@ -4,16 +4,13 @@
 // it needs: git runs it on every push.
 import { readFile } from "node:fs/promises";
 import type { BranchRow } from "../pool/rows";
-import { planPush, refusePush, type BranchHeads, type Graph, type PushedRef } from "../projects/branches";
+import { pushRefusal, type BranchHeads, type Graph, type PushedRef } from "../projects/branches";
 
 /**
  * What a push is planned from: the file `MEDDLE_ROWS` names, written by the node as it spawns `receive-pack`. `stale`
  * are the branches the view does not show where the rows put them (the applier has yet to catch up).
  */
 export type PushRows = { selfId: string; project: string; rows: BranchRow[]; stale: string[] };
-
-const HEADS = "refs/heads/";
-const CONFLICT = "refs/heads/meddle/conflict/";
 
 /** Reads all of `stream` as text. */
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
@@ -83,24 +80,15 @@ async function rowsOf(file: string | undefined): Promise<PushRows | null> {
   }
 }
 
-/** The branch a pushed ref moves: `refs/heads/<b>`, or a sibling's `refs/heads/meddle/conflict/<b>/<id>`. */
-function branchOf(ref: string): string | null {
-  if (ref.startsWith(CONFLICT)) {
-    const rest = ref.slice(CONFLICT.length);
-    const slash = rest.lastIndexOf("/");
-    return slash > 0 ? rest.slice(0, slash) : null;
-  }
-  return ref.startsWith(HEADS) ? ref.slice(HEADS.length) : null;
-}
-
 /**
  * Why a push of `pushed` is refused, or null when it is accepted. `MEDDLE_REFUSE`, when the node set it, refuses any
  * push with its reason (the node takes no input while an update awaits confirmation). `MEDDLE_REPO_KIND` names the
- * repo: a memory repo takes only `refs/heads/memory`, and never its deletion. A project's push goes through `refusePush`, with the branches' heads from
- * `MEDDLE_HEADS`, then is planned (`planPush`) from the rows the file `MEDDLE_ROWS` names (both the node's, when it
- * spawned `receive-pack`): refused with `<b>: this node is still fetching it; push again shortly` while the view shows a
- * pushed branch behind its rows, and refused when planning fails. (A peer's row naming a commit this node lacks is not
- * among the rows: it waits until the commit is here, so it never holds a push up.)
+ * repo: a memory repo takes only `refs/heads/memory`, and never its deletion. A project's push is judged by
+ * `pushRefusal` (the checks `advanceBranch` makes too), with the branches' heads from `MEDDLE_HEADS` and the rows the
+ * file `MEDDLE_ROWS` names (both the node's, when it spawned `receive-pack`): refused with `<b>: this node is still
+ * fetching it; push again shortly` while the view shows a pushed branch behind its rows, and refused when planning
+ * fails. (A peer's row naming a commit this node lacks is not among the rows: it waits until the commit is here, so it
+ * never holds a push up.)
  */
 export async function preReceiveRefusal(pushed: PushedRef[], env: Record<string, string | undefined>): Promise<string | null> {
   // The node takes no input now (an update awaits confirmation): the push is refused whole, with why.
@@ -116,19 +104,8 @@ export async function preReceiveRefusal(pushed: PushedRef[], env: Record<string,
   const heads = headsOf(env.MEDDLE_HEADS);
   const plan = await rowsOf(env.MEDDLE_ROWS);
   if (heads === null || plan === null) return "meddle: no branches given; refusing the push";
-  const graph = hookGraph(env);
-  const refused = await refusePush(pushed, heads, graph);
-  if (refused !== null) return refused;
-  // A branch the view shows behind its rows: the pusher judged its push against the view, the plan would judge it
-  // against rows the pusher never saw (and drop them as if forced).
-  const behind = pushed.map((p) => branchOf(p.ref)).find((b) => b !== null && plan.stale.includes(b));
-  if (behind !== undefined && behind !== null) return `${behind}: this node is still fetching it; push again shortly`;
-  try {
-    await planPush(plan.selfId, plan.project, pushed, plan.rows, graph);
-  } catch (err) {
-    return `meddle: the push could not be recorded: ${err instanceof Error ? err.message : String(err)}`;
-  }
-  return null;
+  // `MEDDLE_REFUSE` was met above, for every kind of repo.
+  return pushRefusal({ refuse: null, pushed, heads, stale: plan.stale, rows: plan.rows, selfId: plan.selfId, project: plan.project }, hookGraph(env));
 }
 
 /** The hook: git's lines on stdin; exit 1 with the refusal on stderr, or 0. */

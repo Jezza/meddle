@@ -56,6 +56,8 @@ export class GitError extends Error {
     public args: string[],
     public code: number,
     public stderr: string,
+    /** What the command wrote before it failed: some commands answer in their exit status (`merge-tree`: 1 is a conflict). */
+    public stdout = "",
   ) {
     super(`git ${args.join(" ")} exited with code ${code}: ${stderr.trim()}`);
     this.name = "GitError";
@@ -64,11 +66,11 @@ export class GitError extends Error {
 
 /** Runs git in `cwd`, as `jj` runs jj (same environment, same time limit). Rejects a `GitError` on failure. */
 export async function git(args: string[], cwd: string, cfg?: NodeConfig, options: JjOptions = {}): Promise<string> {
-  return run(["git"], "git", (code, stderr) => new GitError(args, code, stderr), args, cwd, cfg, options);
+  return run(["git"], "git", (code, stderr, stdout) => new GitError(args, code, stderr, stdout), args, cwd, cfg, options);
 }
 
 async function run(
-  command: string[], name: string, fail: (code: number, stderr: string) => Error,
+  command: string[], name: string, fail: (code: number, stderr: string, stdout: string) => Error,
   args: string[], cwd: string, cfg: NodeConfig | undefined, options: JjOptions,
 ): Promise<string> {
   const { timeoutMs } = options;
@@ -107,7 +109,7 @@ async function run(
   } finally {
     clearTimeout(timer);
   }
-  if (code !== 0) throw fail(code, stderr);
+  if (code !== 0) throw fail(code, stderr, stdout);
   return stdout;
 }
 
@@ -139,8 +141,15 @@ export async function cloneColocated(url: string, dir: string, cfg?: NodeConfig,
   });
 }
 
-export async function workspaceAdd(repo: string, name: string, path: string, revision: string, cfg?: NodeConfig): Promise<void> {
-  await jj(["workspace", "add", "--colocate", "--name", name, "-r", revision, path], repo, cfg);
+/**
+ * Adds the colocated workspace `name` at `path`, whose working copy sits on `revisions`: one revision, or several, which
+ * make it a merge of them (`jj new r1 r2 …`), its parents in that order.
+ */
+export async function workspaceAdd(
+  repo: string, name: string, path: string, revisions: string | readonly string[], cfg?: NodeConfig,
+): Promise<void> {
+  const parents = typeof revisions === "string" ? [revisions] : revisions;
+  await jj(["workspace", "add", "--colocate", "--name", name, ...parents.flatMap((r) => ["-r", r]), path], repo, cfg);
 }
 
 /** Makes `revision` the working copy of the workspace at `workspace` (`jj edit`). */
@@ -185,6 +194,69 @@ export async function changesIn(repo: string, revset: string, cfg?: NodeConfig):
     const [changeId = "", commitId = ""] = line.split(" ");
     return { changeId, commitId };
   });
+}
+
+/** A commit, as `commitsIn` reads it. */
+export type CommitInfo = {
+  changeId: string;
+  commitId: string;
+  /** The parents' commit ids (none for the root). */
+  parents: string[];
+  /** Changes nothing against its parents' merge (jj's `empty`: a merge whose conflicts are left unresolved is empty). */
+  empty: boolean;
+  conflict: boolean;
+  /** The whole description, as jj keeps it (it ends in a newline); "" when there is none. */
+  description: string;
+  /** Not in `immutable_heads()` or below it, in the config of the directory `commitsIn` ran in. */
+  mutable: boolean;
+};
+
+/**
+ * One line per commit: the description last and JSON-quoted (`escape_json` leaves no raw newline in it), the only free
+ * text there is.
+ */
+const COMMIT_TEMPLATE = [
+  "change_id",
+  "commit_id",
+  'parents.map(|c| c.commit_id()).join(",")',
+  "empty",
+  "conflict",
+  "self.immutable()",
+  "description.escape_json()",
+].join(' ++ "\\x1f" ++ ') + ' ++ "\\n"';
+
+/**
+ * The commits `revset` selects, in `jj log` order, read without snapshotting the working copy. `mutable` is the one of
+ * `cwd`'s jj config, so run in a task's workspace to see what that task may rewrite (its scoped `immutable_heads()`,
+ * `scopeWorkspace`), or in the repo for the repo's own view.
+ */
+export async function commitsIn(cwd: string, revset: string, cfg?: NodeConfig): Promise<CommitInfo[]> {
+  const out = await jj(["log", "--ignore-working-copy", "-r", revset, "--no-graph", "-T", COMMIT_TEMPLATE], cwd, cfg);
+  return out.split("\n").filter(Boolean).map((line) => {
+    const [changeId = "", commitId = "", parents = "", empty = "", conflict = "", immutable = "", description = '""'] = line.split("\x1f");
+    return {
+      changeId,
+      commitId,
+      parents: parents === "" ? [] : parents.split(","),
+      empty: empty === "true",
+      conflict: conflict === "true",
+      description: JSON.parse(description) as string,
+      mutable: immutable !== "true",
+    };
+  });
+}
+
+/**
+ * Abandons the commits `revset` selects, their descendants rebased onto their parents. A bookmark on one moves to its
+ * parent instead of vanishing: a task's line may point at a leftover. Selecting nothing is no error. With
+ * `ignoreWorkingCopy`, without snapshotting the working copy first (nor updating it): for a repo that is the user's own
+ * checkout, or a workspace that is not this process's to touch (when `@` itself is abandoned, its checkout goes stale).
+ */
+export async function abandon(
+  repo: string, revset: string, cfg?: NodeConfig, options: { ignoreWorkingCopy?: boolean } = {},
+): Promise<void> {
+  const args = ["abandon", "--retain-bookmarks", revset];
+  await jj(options.ignoreWorkingCopy === true ? ["--ignore-working-copy", ...args] : args, repo, cfg);
 }
 
 /**

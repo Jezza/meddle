@@ -27,8 +27,15 @@ export type EngineInput = {
   /** This task has started a session before (the `tasks.started` flag), not crash recovery. */
   resume: boolean;
   model?: string;
-  /** The task's chosen mode; `auto` without one. */
+  /** The task's chosen mode (a train turn's is always `auto`); `auto` without one. */
   permissionMode?: PermissionMode;
+  /**
+   * meddle's own MCP servers for this turn (a train turn's in-process `meddle`), beside the contexts' servers; one of
+   * these wins over a context's server of the same name.
+   */
+  extraMcpServers?: Record<string, McpServerConfig>;
+  /** Tools Claude Code runs without asking (`allowedTools`): a train turn's meddle tools. */
+  allowedTools?: string[];
   tools?: string[];
   effort?: string;
   claudePath?: string;
@@ -81,7 +88,7 @@ export function buildEnv(i: EngineInput): Record<string, string> {
 export function buildOptions(i: EngineInput): Options {
   const { cwd, projectConfigRoot, settingSources } = cwdFor(i.manifest, i.cfg);
   const append = i.contexts.map((c) => c.instructions).filter((s) => s !== "").join("\n\n");
-  const mcpServers: Record<string, unknown> = Object.assign({}, ...i.contexts.map((c) => c.claude.mcpServers));
+  const mcpServers: Record<string, unknown> = Object.assign({}, ...i.contexts.map((c) => c.claude.mcpServers), i.extraMcpServers);
   const skills = i.contexts.findLast((c) => c.claude.skills !== null)?.claude.skills;
 
   const options: Options = {
@@ -126,6 +133,7 @@ export function buildOptions(i: EngineInput): Options {
   if (skills != null) options.skills = skills;
   if (i.model !== undefined) options.model = i.model;
   if (i.tools !== undefined) options.tools = i.tools;
+  if (i.allowedTools !== undefined) options.allowedTools = i.allowedTools;
   if (i.effort !== undefined) options.effort = i.effort as Options["effort"];
   if (i.claudePath !== undefined) {
     options.pathToClaudeCodeExecutable = i.claudePath;

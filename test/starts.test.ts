@@ -52,7 +52,7 @@ test("no revision: a child start at the default branch; its line row is this nod
     const s = await start(f.n, f.project.id, "t1", null, "child");
     expect(s).toEqual({ projectId: f.project.id, mode: "child", commit: f.P, base: [f.P] });
     expect(listLineRows(f.n.db, f.project.id)).toEqual([
-      { project: f.project.id, task: "t1", name: "a", holder: f.n.id, epoch: 0, seq: 1, commit: f.P, base: [f.P], archived: false },
+      { project: f.project.id, task: "t1", name: "a", holder: f.n.id, epoch: 0, seq: 1, commit: f.P, base: [f.P], archived: false, queuedAt: null },
     ]);
     expect(await lineRefs(f.n, f.repo)).toEqual(["refs/remotes/meddle/task/t1/a"]);
     expect(await git(["rev-parse", "refs/remotes/meddle/task/t1/a"], f.repo, f.n.cfg)).toBe(`${f.P}\n`);

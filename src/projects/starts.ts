@@ -75,15 +75,12 @@ async function parentsOf(cfg: NodeConfig, repo: string, commit: string): Promise
  * letters, digits, `-` and `_`.
  */
 export async function startAt(deps: StartDeps, request: StartRequest): Promise<Start> {
-  const { cfg, db, pool } = deps;
+  const { cfg } = deps;
   const { projectId, taskId, rev, mode, checkout } = request;
   // It names the line's ref: one safe segment only.
   if (!SAFE_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
   if (mode === "edit" && rev === null) throw new Error("--edit needs a revision");
-  const project = pool === undefined
-    ? getProject(db, projectId)
-    : await ensureServiceRepo({ cfg, db, pool, ...(deps.log === undefined ? {} : { log: deps.log }) }, projectId, { memory: false });
-  if (project === null) throw new Error(`no project ${shortId(projectId)}`);
+  const project = await startProject(deps, projectId);
   const repo = project.replica;
 
   return serialised(`start:${projectId}`, async () => {
@@ -96,12 +93,47 @@ export async function startAt(deps: StartDeps, request: StartRequest): Promise<S
   });
 }
 
+/** Project `projectId` as a start here finds it: with a pool its service repo is made when it has none. */
+async function startProject(deps: StartDeps, projectId: string): Promise<Project> {
+  const { cfg, db, pool } = deps;
+  const project = pool === undefined
+    ? getProject(db, projectId)
+    : await ensureServiceRepo({ cfg, db, pool, ...(deps.log === undefined ? {} : { log: deps.log }) }, projectId, { memory: false });
+  if (project === null) throw new Error(`no project ${shortId(projectId)}`);
+  return project;
+}
+
+/**
+ * Where task `taskId` starts in project `projectId` on a merge of `parents` (commit ids, in order): its line is written
+ * at the first, held by this node at epoch 0, with all of them as its base, and applied as `startAt` does. The start is
+ * a `child` start with `parents` set, so that its workspace starts on a new commit with all of them
+ * (`provisionTask`). Under `start:<projectId>` like `startAt`. Rejects, writing nothing, `a merge start needs parents`
+ * for none, `no revision <c> in <project>` for a parent that is not a commit jj here knows, and `invalid task id: <id>`
+ * as `startAt` does.
+ */
+export async function mergeStartAt(deps: StartDeps, request: { projectId: string; taskId: string; parents: string[] }): Promise<Start> {
+  const { cfg } = deps;
+  const { projectId, taskId, parents } = request;
+  if (!SAFE_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
+  const [commit] = parents;
+  if (commit === undefined) throw new Error("a merge start needs parents");
+  const project = await startProject(deps, projectId);
+  return serialised(`start:${projectId}`, async () => {
+    // Each goes into a revset below and the workspace's jj config: nothing but a commit jj has.
+    for (const c of parents) {
+      if (!COMMIT_ID.test(c) || (await changesIn(project.replica, `present(${c})`, cfg)).length === 0) throw new Error(`no revision ${c} in ${project.name}`);
+    }
+    await writeLine(deps, project, taskId, commit, parents);
+    return { projectId, mode: "child", commit, base: [...parents], parents: [...parents] };
+  });
+}
+
 /** How long a start's apply may spend fetching commits the project's rows name: its own commit is here already. */
 const APPLY_AT_START_MS = 5000;
 
 /** `startAt`'s work under its lock: the commit, its checks, its base, and the line row written and applied. */
 async function resolveAndWrite(deps: StartDeps, request: StartRequest, project: Project): Promise<Start> {
-  const { cfg, db, selfId, pool } = deps;
+  const { cfg } = deps;
   const { projectId, taskId, rev, mode, checkout } = request;
   const repo = project.replica;
   let commit: string;
@@ -121,11 +153,17 @@ async function resolveAndWrite(deps: StartDeps, request: StartRequest, project: 
     base = await parentsOf(cfg, repo, commit);
   }
 
-  writeLineRow(db, { project: projectId, task: taskId, name: project.name, holder: selfId, epoch: 0, commit, base, archived: false });
-  if (pool !== undefined) {
-    await applyProject({ cfg, db, pool, ...(deps.log === undefined ? {} : { log: deps.log }) }, projectId, APPLY_AT_START_MS);
-  }
+  await writeLine(deps, project, taskId, commit, base);
   return { projectId, mode, commit, base };
+}
+
+/** Writes task `taskId`'s line of `project` (held by this node, epoch 0) at `commit` with `base`, and applies it. */
+async function writeLine(deps: StartDeps, project: Project, taskId: string, commit: string, base: string[]): Promise<void> {
+  const { cfg, db, selfId, pool } = deps;
+  writeLineRow(db, { project: project.id, task: taskId, name: project.name, holder: selfId, epoch: 0, commit, base, archived: false });
+  if (pool !== undefined) {
+    await applyProject({ cfg, db, pool, ...(deps.log === undefined ? {} : { log: deps.log }) }, project.id, APPLY_AT_START_MS);
+  }
 }
 
 /** The one commit `rev` names in `project`'s service repo, refused as `startAt` says. */

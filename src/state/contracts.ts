@@ -23,6 +23,8 @@ export const HandoffModeSchema = Type.Union([Type.Literal("edit"), Type.Literal(
 
 export const StartSchema = Type.Object({
   projectId: Type.String(), mode: HandoffModeSchema, commit: Type.String(), base: Type.Array(Type.String()),
+  /** Set for a start on a merge of these commits (`Start.parents`); a node older than this field would start on `commit` alone. */
+  parents: Type.Optional(Type.Array(Type.String())),
 });
 
 export const TaskManifestSchema = Type.Object({
@@ -42,7 +44,30 @@ export const TaskManifestSchema = Type.Object({
   /** Null for a task without a project. */
   primaryProjectId: Nullable(Type.String()),
   createdAt: Type.String(),
+  /** A merge task's project and the tasks it merges (`TaskManifest.merge`); absent on every other task. */
+  merge: Type.Optional(Type.Object({ project: Type.String(), batch: Type.Array(Type.String()) })),
 });
+
+/** A turn of the merge train's (`TrainTurnKind`). */
+export const TrainTurnKindSchema = Type.Union([Type.Literal("describe"), Type.Literal("rebase"), Type.Literal("fix"), Type.Literal("merge")]);
+
+/** A merge task's project and the tasks it merges (`TaskManifest.merge`). */
+export const MergeOfSchema = Type.Object({ project: Type.String(), batch: Type.Array(Type.String()) });
+
+/** How a task stands for the merge train on its holder (`TrainTaskStatus`). */
+export const TrainTaskStatusSchema = Type.Object({
+  taskId: Type.String(),
+  state: Type.Union([Type.Literal("idle"), Type.Literal("busy"), Type.Literal("train"), Type.Literal("absent")]),
+  title: Nullable(Type.String()),
+});
+
+/** How a train turn went (`TrainTurnOutcome`). */
+export const TrainTurnOutcomeSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("done") }),
+  Type.Object({ kind: Type.Literal("declined"), reason: Type.String() }),
+  Type.Object({ kind: Type.Literal("blamed"), task: Type.String(), reason: Type.String() }),
+  Type.Object({ kind: Type.Literal("failed"), reason: Type.String() }),
+]);
 
 export const PendingApprovalSchema = Type.Object({
   requestId: Type.String(),
@@ -89,12 +114,22 @@ export const ModelSchema = Type.Object({
   efforts: Type.Array(Type.String()),
 });
 
+/**
+ * A notice of the node (`NodeObject.notifications`). `train` is the merge train telling of a task: it left the train, sits
+ * out of it or is held back. `action` is what the notice offers beside opening the task: `accept` (Accept again, a task
+ * that left), `retry` (the project's Retry of a task sitting out, called on the node showing the notice, which runs the
+ * train); none for a task held back, which accepting the task it includes work from, or unqueuing it, settles.
+ */
 export const NotificationSchema = Type.Object({
   id: Type.String(),
   at: Type.String(),
   taskId: Type.String(),
-  kind: Type.Union([Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed"), Type.Literal("move"), Type.Literal("token")]),
+  kind: Type.Union([
+    Type.Literal("approval"), Type.Literal("question"), Type.Literal("finished"), Type.Literal("failed"), Type.Literal("move"),
+    Type.Literal("token"), Type.Literal("train"),
+  ]),
   text: Type.String(),
+  action: Type.Optional(Type.Union([Type.Literal("accept"), Type.Literal("retry")])),
 });
 export type Notification = Type.Static<typeof NotificationSchema>;
 
@@ -301,6 +336,23 @@ export const MemoryEntrySchema = Type.Object({
   last: Nullable(MemoryChangeSchema),
 });
 
+/**
+ * A project's merge train (`TrainState`): why it is paused (null: it runs), where its round is (null when none is under
+ * way or left unfinished), and its queue in the order tasks were accepted. A queued task's `state` is `queued`, `turn
+ * running`, `describing`, `rebasing onto main`, `in the batch`, `sitting out` or `waiting for <node>`; its `reason` is why
+ * it sits out (or waits for its node), or, for a task `queued` that is held back, the notice that says so.
+ */
+export const TrainStateSchema = Type.Object({
+  paused: Nullable(Type.String()),
+  round: Nullable(Type.Object({
+    step: Type.Union([Type.Literal("describing"), Type.Literal("picking"), Type.Literal("checking"), Type.Literal("landing"), Type.Literal("rebasing")]),
+    batch: Type.Array(Type.String()),
+    /** The merge task checking the batch, once made. */
+    mergeTask: Nullable(Type.String()),
+  })),
+  queued: Type.Array(Type.Object({ taskId: Type.String(), state: Type.String(), reason: Nullable(Type.String()) })),
+});
+
 export const ProjectObject = remote("meddle.project", {
   version: 1,
   input: Type.Object({ id: Type.String() }),
@@ -329,6 +381,13 @@ export const ProjectObject = remote("meddle.project", {
          * memory again, not a change id.
          */
         memoryHead: Nullable(Type.String()),
+        /**
+         * The project's merge train, as its home runs it (`trainState`): re-read when the train's row changes, a task
+         * of the project changes state, and when the project's rows change. Meaningful on the project's home only: any
+         * other node serves it empty (`{ paused: null, round: null, queued: [] }`), so read the home's copy. A node
+         * older than the train serves no `train`: read a missing member as empty.
+         */
+        train: TrainStateSchema,
       },
       methods: {
         // The reads of the project's memory work on any node holding its memory repo (refused without one); a path
@@ -358,6 +417,16 @@ export const ProjectObject = remote("meddle.project", {
          */
         writeMemory: method(Type.Object({ path: Type.String(), text: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
         deleteMemory: method(Type.Object({ path: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
+        // The train's calls work on the project's home only, which runs it (refused `not-home: …` elsewhere).
+        /**
+         * Pauses the project's train for `reason` (default `you paused it`): a round under way lets its running turns
+         * finish, but nothing lands and no new round starts, until Resume. Pausing a paused train changes its reason.
+         */
+        pause: method(Type.Object({ reason: Type.Optional(Type.String()) })),
+        /** Lets a paused train run: Resume, and Retry of a train the merge agent's trouble paused. */
+        resume: method(Type.Object({})),
+        /** Brings task `taskId` back from sitting out: it is eligible again, and a round starts. */
+        retry: method(Type.Object({ taskId: Type.String() })),
       },
     },
   },
@@ -475,6 +544,12 @@ export const TaskObject = remote("meddle.task", {
          */
         acceptance: Type.Union([Type.Literal("accepted"), Type.Literal("partly"), Type.Literal("no")]),
         /**
+         * Whether the user accepted the task for its project's train, and still has it queued: when (ISO) and the
+         * project's id; null when it is not queued. Read from the task's own line row, which its holder writes, so it
+         * moves with the task. A node older than this serves no `queue`: read a missing member as null.
+         */
+        queue: Nullable(Type.Object({ queuedAt: Type.String(), project: Type.String() })),
+        /**
          * Every local bookmark under the task's namespace, per project (its id) in the manifest's order: the project's
          * own and the side bookmarks. Re-read when projects change, when the task changes state, and every 60 s.
          */
@@ -516,6 +591,20 @@ export const TaskObject = remote("meddle.task", {
          * turn is starting, stays. Refused while the task is not live here.
          */
         takeBackQueued: method(Type.Object({}), Type.Object({ prompts: Type.Array(PromptSchema) })),
+        /**
+         * Accepts the task: queues it on its project's train, where its work waits to land on the project's default
+         * branch. Idle and running tasks can be accepted; accepting a queued task changes nothing. Refused `nothing to
+         * land: the task's work is already on <branch>`, `send or clear the waiting prompts first`, `accept handles one
+         * project for now; push to land the rest`, `a merge task lands with its train`, and while the task is not live
+         * here (moved, archived, being received) or is moving.
+         */
+        accept: method(Type.Object({})),
+        /**
+         * Takes the task off its project's train. A task not queued stays as it is; refused while it is not live here.
+         * Input of the user's that runs in an accepted task does the same (a prompt, a steer, Send now, Retry);
+         * answering an approval does not.
+         */
+        unqueue: method(Type.Object({})),
         /** Runs the task's turn again after repeated crashes parked it, or, for an idle task that has had a turn, starts one that carries on from it (after an interrupt or a failure); rejects otherwise. */
         retry: method(Type.Object({})),
         approve: method(Type.Object({ requestId: Type.String(), updatedInput: Type.Optional(Type.Record(Type.String(), Type.Unknown())) })),
@@ -666,9 +755,9 @@ export type SessionView = Type.Static<typeof SessionViewSchema>;
 export const WireAddrSchema = Type.Object({ id: Type.String(), relay: Nullable(Type.String()), direct: Type.Array(Type.String()) });
 
 /**
- * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit`, `projects` and
- * `attachments` are optional: an older meddle sends none of them, and they read as 0, 0, [] and false
- * (`withSummaryDefaults`).
+ * What a node reports about itself to the rest of the pool (`NodeSummary`). `running`, `limit`, `projects`,
+ * `attachments` and `mergeStarts` are optional: an older meddle sends none of them, and they read as 0, 0, [], false
+ * and false (`withSummaryDefaults`).
  */
 export const NodeSummarySchema = Type.Object({
   hostname: Type.String(),
@@ -684,6 +773,8 @@ export const NodeSummarySchema = Type.Object({
   projects: Type.Optional(Type.Array(ProjectInfoSchema)),
   /** Whether the node takes prompts with attachments. */
   attachments: Type.Optional(Type.Boolean()),
+  /** Whether the node starts a task on a merge of several commits (`Start.parents`). */
+  mergeStarts: Type.Optional(Type.Boolean()),
 });
 
 /** One node of the pool's roster (`RosterRow`). */
@@ -744,6 +835,8 @@ export const LineRowSchema = Type.Object({
   commit: Nullable(Type.String()),
   base: Type.Array(Type.String()),
   archived: Type.Boolean(),
+  /** When the task was queued for the project's train, null for not queued; absent from a node of a meddle before queues. */
+  queuedAt: Type.Optional(Nullable(Type.String())),
 });
 
 /**
@@ -840,6 +933,11 @@ export const PeerObject = remote("meddle.peer", {
             nameFromPrompt: Type.Optional(Type.Boolean()),
             model: Type.Optional(Type.String()),
             effort: Type.Optional(Type.String()),
+            /**
+             * Makes it a merge task of the merge train (`TaskManifest.merge`). A node older than this field drops it:
+             * the train sends a merge task only to a node that starts tasks on merges (`mergeStarts`), which has it.
+             */
+            merge: Type.Optional(MergeOfSchema),
           }),
           Type.Object({ manifest: TaskManifestSchema }),
         ),
@@ -853,6 +951,37 @@ export const PeerObject = remote("meddle.peer", {
         ),
         /** Whether this node has task `id` (a `moved` row, left by a task that went on, is not having it). */
         taskHeld: method(Type.Object({ id: Type.String() }), Type.Boolean()),
+        /**
+         * Runs a turn of the merge train's on task `taskId` here for the caller (a member only; `forbidden` otherwise),
+         * `kind` with prompt `text`, and answers how it went once it has ended (`TaskRunner.trainTurn`): the conductor
+         * drives tasks on other nodes so. A train turn already running there is joined. Refused as `trainTurn` refuses.
+         * A node older than this method has none.
+         */
+        trainTurn: method(
+          Type.Object({ taskId: Type.String(), kind: TrainTurnKindSchema, text: Type.String() }),
+          TrainTurnOutcomeSchema,
+        ),
+        /**
+         * How each of `taskIds` stands for the merge train here (`TaskRunner.trainStatus`; a member only, `forbidden`
+         * otherwise): what the conductor reads to tell which queued tasks are eligible. A node older than this method
+         * has none.
+         */
+        trainTasks: method(Type.Object({ taskIds: Type.Array(Type.String()) }), Type.Array(TrainTaskStatusSchema)),
+        /**
+         * Abandons the empty leftovers `commits` of task `taskId` here, where its workspace sees them as its own, and
+         * writes its lines (`TaskRunner.abandonLeftovers`; a member only). Refused as that refuses.
+         */
+        abandonLeftovers: method(Type.Object({ taskId: Type.String(), commits: Type.Array(Type.String()) })),
+        /**
+         * Takes task `taskId` off its train's queue for `reason` (`TaskRunner.unqueue`; a member only): what the
+         * conductor does when the task leaves the train. A task not queued stays as it is.
+         */
+        unqueueTask: method(Type.Object({ taskId: Type.String(), reason: Type.String() })),
+        /**
+         * Discards merge task `taskId` here: its turn interrupted, the task archived and deleted
+         * (`TaskRunner.discardMergeTask`; a member only). Refused for a task that is no merge task.
+         */
+        discardTask: method(Type.Object({ taskId: Type.String() })),
       },
     },
   },

@@ -27,7 +27,7 @@ import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
-import { resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
+import { isTrainEvent, resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
 import { PoolObject, ProjectObject } from "./state/contracts";
 import { createNodeHost, NodeObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
@@ -36,6 +36,7 @@ import { listProjects } from "./projects/project";
 import { countRunningTasks, listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
+import { olderHolder, trainArgs, trainProjectChoice, trainText, type TrainArgs, type TrainView } from "./train/surface";
 import {
   addToken, enableToken, listTokens, migrateLegacyToken, moveToken, pickToken, removeToken, sweepTokenValues, findToken,
   type TokenMeta,
@@ -79,6 +80,8 @@ const USAGE = `usage: meddle --version
        meddle task move <id> <node> [--now] | meddle task move <id> --now | meddle task move <id> --cancel
        meddle task archive <id> | meddle task delete <id>
        meddle task restore <id> [--node <id|prefix> | --here]
+       meddle task accept <task-id>... | meddle task unqueue <task-id>...
+       meddle train [<project>] [--follow] | meddle train pause|resume [<project>]
        meddle service install [--dry-run]
        meddle update [--force] [--within <duration>] [<binary>...]
        meddle git-remote <name> <url>   (git's remote helper for meddle:// remotes)
@@ -981,10 +984,15 @@ async function collectTasks(client: Host, localOnly = false): Promise<PoolTasks>
     else {
       const remote = await connect(`/ws/node/${n.nodeId}`);
       try {
-        const read = tasksOf(remote.client).catch(() => null);
+        // A node of an older meddle cannot be asked for its tasks at all (chord refuses the binding), not even by id.
+        let older = false;
+        const read = tasksOf(remote.client).catch((err: unknown) => {
+          older = olderHolder(err);
+          return null;
+        });
         const answered = await Promise.race([read, Bun.sleep(REMOTE_TASKS_MS).then(() => "late" as const)]);
         if (answered === null || answered === "late") {
-          out.unread.push(`${label} did not answer: its tasks are not listed`);
+          out.unread.push(older ? `${label} runs an older meddle: its tasks are not listed` : `${label} did not answer: its tasks are not listed`);
           continue;
         }
         tasks = answered;
@@ -1126,8 +1134,11 @@ async function promptOn(client: Host, socket: WebSocket, id: string, text: strin
           faulted = false;
           continue;
         }
-        // The SDK's own messages after the result (the child's last words) do not decide; meddle's next one does.
-        if (provisional !== null && type === "meddle") return finished.reject(provisional);
+        // The SDK's own messages after the result (the child's last words) do not decide; meddle's next one does, unless
+        // it is the train's (a prompt or a tool call: neither ends a turn).
+        if (provisional !== null && type === "meddle" && !isTrainEvent(message as { type?: unknown; subtype?: unknown })) {
+          return finished.reject(provisional);
+        }
         if (tokenFaultOf(message as Parameters<typeof tokenFaultOf>[0]) !== null) faulted = true;
         if (type === "result") {
           const error = resultError(message as { subtype?: unknown; is_error?: unknown });
@@ -1229,6 +1240,150 @@ function taskArchive(text: string): Promise<number> {
     console.log(`archived ${id}`);
     return 0;
   });
+}
+
+/**
+ * `use` against each of the tasks `texts` name (each an id or a unique prefix, see `withTask`), one after the other. With
+ * one, its failure is the command's. With several, one that fails is reported on stderr with its text before the
+ * message, and the others still run; the exit status is 1 once any failed.
+ */
+async function eachTask(texts: string[], use: (text: string) => Promise<number>): Promise<number> {
+  if (texts.length === 1) return use(texts[0]!);
+  let status = 0;
+  for (const text of texts) {
+    try {
+      status = Math.max(status, await use(text));
+    } catch (err) {
+      if (err instanceof NoNode) throw err;
+      console.error(`meddle: ${text}: ${plainError((err as Error).message)}`);
+      status = 1;
+    }
+  }
+  return status;
+}
+
+/** `<hostname> runs an older meddle`: node `id`'s hostname, or its short id while that is not known (as a creation refuses). */
+function runsOlder(nodes: readonly { nodeId: string; hostname: string }[], id: string): Error {
+  return new Error(`${nodes.find((n) => n.nodeId === id)?.hostname || shortId(id)} runs an older meddle`);
+}
+
+/**
+ * Queues each task on its project's train, on the node holding it; prints `queued <id> on <project>'s train`. A task on a
+ * node older than the train is not found at all (`collectTasks`: chord refuses to bind that node's tasks), so the refusal
+ * is `no such task: <id> (<node> runs an older meddle: its tasks are not listed)`.
+ */
+function taskAccept(texts: string[]): Promise<number> {
+  return eachTask(texts, (text) => withTask(text, async (client, _socket, id) => {
+    const task = await client.get(TaskObject, { id });
+    try {
+      await task.accept({});
+      // Accepted, so it has the one project that accept handles.
+      console.log(`queued ${id} on ${task.manifest.value.projects[0]?.name ?? "its project"}'s train`);
+    } finally {
+      task.release();
+    }
+    return 0;
+  }));
+}
+
+/** Takes each task off its project's train, on the node holding it; prints `unqueued <id>`, or `<id> is not queued`. */
+function taskUnqueue(texts: string[]): Promise<number> {
+  return eachTask(texts, (text) => withTask(text, async (client, _socket, id) => {
+    const task = await client.get(TaskObject, { id });
+    try {
+      const queued = task.queue.value !== null;
+      await task.unqueue({});
+      console.log(queued ? `unqueued ${id}` : `${id} is not queued`);
+    } finally {
+      task.release();
+    }
+    return 0;
+  }));
+}
+
+/**
+ * Shows, pauses or resumes the train of the project `args` names (see `trainProjectChoice`) at the project's home, which
+ * runs it: this node, or the home's over the tunnel (as `collectTasks` reads a member's tasks); refused when the home is
+ * offline or gone (the train waits for it) or runs an older meddle. Showing prints it once (`trainText`, each task by
+ * its title), or with `--follow` each time it changes, until its queue is empty.
+ */
+function train(args: TrainArgs): Promise<number> {
+  return withNode(async (client, socket) => {
+    const pool = await poolView(client);
+    const nodes = [...pool.nodes.value];
+    const self = pool.self.value;
+    pool.release();
+    const here = args.project === undefined ? await checkoutAt(loadConfig(), process.cwd()) : null;
+    const project = trainProjectChoice(poolProjects(nodes), args.project, here?.projectId ?? null);
+    const home = nodes.find((n) => n.nodeId === project.home);
+    if (project.home !== self && home?.online !== true) {
+      throw new Error(`${project.name}'s train waits: its home ${nodeLabel(nodes, project.home)} is ${home?.gone === true ? "gone" : "offline"}`);
+    }
+    const remote = project.home === self ? null : await connect(`/ws/node/${project.home}`);
+    try {
+      const ref = await (remote?.client ?? client).get(ProjectObject, { id: project.id });
+      try {
+        if (args.action === "pause") {
+          await ref.pause({});
+          console.log(`paused ${project.name}'s train`);
+        } else if (args.action === "resume") {
+          await ref.resume({});
+          console.log(`resumed ${project.name}'s train`);
+        } else {
+          await showTrain(client, remote?.socket ?? socket, ref.train, args.follow);
+        }
+      } finally {
+        ref.release();
+      }
+      return 0;
+    } catch (err) {
+      if (olderHolder(err)) throw runsOlder(nodes, project.home);
+      throw err;
+    } finally {
+      await remote?.client.close();
+    }
+  });
+}
+
+/**
+ * Prints the train `cell` holds with each task's title (`trainText`); with `follow`, again each time it changes, a blank
+ * line between, until its queue is empty (at once when it is). The titles are the pool's tasks', read through `client`
+ * again only for a task not looked up yet. `socket` is the link the cell is read over: its closing ends the following.
+ */
+async function showTrain(
+  client: Host, socket: WebSocket, cell: { value: TrainView; subscribe(fn: (value: TrainView) => void): () => void }, follow: boolean,
+): Promise<void> {
+  const titles = new Map<string, string>();
+  const looked = new Set<string>();
+  const print = async (state: TrainView) => {
+    const ids = [...state.queued.map((t) => t.taskId), ...(state.round?.batch ?? []), ...(state.round?.mergeTask == null ? [] : [state.round.mergeTask])];
+    const fresh = ids.filter((id) => !looked.has(id));
+    if (fresh.length > 0) {
+      for (const t of (await collectTasks(client)).tasks) titles.set(t.id, t.title);
+      for (const id of fresh) looked.add(id);
+    }
+    console.log(trainText(state, titles));
+  };
+  if (!follow) return print(cell.value);
+  const finished = Promise.withResolvers<void>();
+  finished.promise.catch(() => {}); // a closed link leaves it unawaited when the train then ends
+  socket.addEventListener("close", () => finished.reject(new Error("the node closed the connection")));
+  // Each change is printed in its turn, a title lookup in between not letting one overtake another.
+  let chain: Promise<void> = Promise.resolve();
+  let printed = false;
+  const stop = cell.subscribe((state) => {
+    chain = chain.then(async () => {
+      if (printed) console.log("");
+      printed = true;
+      await print(state);
+      if (state.queued.length === 0) finished.resolve();
+    }).catch((err: Error) => finished.reject(err));
+  });
+  try {
+    await finished.promise;
+  } finally {
+    stop();
+  }
 }
 
 /**
@@ -1528,6 +1683,8 @@ function readOnly(args: string[]): boolean {
     case "config": return sub === "list";
     case "project": return sub === "list" || sub === "status";
     case "task": return sub === "list";
+    // Watching a train changes nothing; pausing or resuming one does.
+    case "train": return sub !== "pause" && sub !== "resume";
     case "update": return args.length === 1;
     default: return ["--version", "serve", "status", "checkout", "git-remote", "git-pre-receive", "update-guard", "update-preflight", "service"].includes(command ?? "");
   }
@@ -1616,11 +1773,18 @@ function route(args: string[]): (() => Promise<number>) | null {
     return () => taskMove(rest[0]!, rest[1]!, rest.length === 3);
   }
   if (command === "task" && sub === "archive" && rest.length === 1) return () => taskArchive(rest[0]!);
+  if (command === "task" && (sub === "accept" || sub === "unqueue") && rest.length >= 1 && rest.every((t) => !t.startsWith("--"))) {
+    return () => (sub === "accept" ? taskAccept(rest) : taskUnqueue(rest));
+  }
   if (command === "task" && sub === "restore" && rest.length >= 1 && !rest[0]!.startsWith("--")) {
     const where = whereArgs(rest.slice(1));
     return where === null ? null : () => taskRestore(rest[0]!, where);
   }
   if (command === "task" && sub === "delete" && rest.length === 1) return () => taskDelete(rest[0]!);
+  if (command === "train") {
+    const parsed = trainArgs(args.slice(1));
+    return parsed === null ? null : () => train(parsed);
+  }
   // git runs a helper as `git-remote-<scheme> <remote> [<url>]`; without a url, the remote is the url.
   if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);
   // git's pre-receive hook, as `writePreReceiveHook` writes it for the compiled binary.

@@ -128,12 +128,12 @@ test("a node says it takes attachments; an older summary reads as not", () => {
   expect(nodeOf(row(A, older), A, live, []).attachments).toBe(true);
 });
 
-test("a roster row merged from an older peer reads back with running 0, limit 0, no projects and no attachments", async () => {
+test("a roster row merged from an older peer reads back with running 0, limit 0, no projects, no attachments and no merge starts", async () => {
   const { PoolStore } = await import("../src/pool/store");
   const { openDb } = await import("../src/store/db");
   const store = new PoolStore(openDb(":memory:"));
   store.ensurePool({ nodeId: A, hostname: "a" });
   const older = { hostname: "b", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 4 };
   store.merge([row(B, older)]);
-  expect(store.row(B)?.summary).toEqual({ ...older, running: 0, limit: 0, projects: [], attachments: false });
+  expect(store.row(B)?.summary).toEqual({ ...older, running: 0, limit: 0, projects: [], attachments: false, mergeStarts: false });
 });

@@ -1,15 +1,18 @@
 import { test, expect } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { delimiter } from "node:path";
 import { paths } from "../src/config";
 import { startDashboard } from "../src/dashboard/server";
 import { resolveNodeId, shortId } from "../src/pool/ids";
+import { listLineRows } from "../src/pool/rows";
 import { PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
+import { pauseTrain } from "../src/train/train";
+import { updateFiles, writePending } from "../src/update/files";
 import { getTask, listTasks } from "../src/store/records";
 import { markToken, tokenId } from "../src/token";
-import { childEnv, closedPort, createTask, meddle } from "./helpers";
+import { childEnv, closedPort, createTask, meddle, repoRoot } from "./helpers";
 import { linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** The env a CLI child runs with: no inherited MEDDLE_* and a port nothing listens on. */
@@ -752,5 +755,254 @@ test("project status prints each branch: its commit, or a conflicted one's sibli
   } finally {
     await dashboard.stop();
     await close();
+  }
+}, 60_000);
+
+/** Gives the task a file to land: written in its workspace of the project, then to the line's row. */
+async function withFile(node: GitPoolNode, taskId: string, name: string): Promise<void> {
+  await writeFile(`${paths(node.cfg).task(taskId)}/${node.project.name}/${name}`, `${name}\n`);
+  await node.runner.writeTaskLines(taskId);
+}
+
+test("task accept and task unqueue take several tasks, on any node; train prints the queue at the project's home and pauses and resumes it", async () => {
+  const { acceptDashboardStreams } = await import("../src/dashboard/tunnel");
+  const { A, B, close } = await twoPoolNodes();
+  // No round of the conductor takes the tasks queued here.
+  for (const n of [A, B]) pauseTrain(n.db, n.project.id, "held by the test");
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  // As `serve` does: B serves its objects to members' dashboards (and so to A's CLI) over the pool.
+  const stopTunnels = acceptDashboardStreams(B.net, B.host, (id) => B.store.isMember(id));
+  try {
+    await peerReady(A, B);
+    const env = { HOME: A.home, MEDDLE_DATA_DIR: A.cfg.dataDir, MEDDLE_PORT: new URL(dashboard.url).port };
+    const run = (...args: string[]) => meddle(args, env);
+    const one = await createTask(A, { title: "Add a.txt", projectIds: [A.project.id] });
+    const two = await createTask(A, { title: "Add b.txt", projectIds: [A.project.id] });
+    const bare = await createTask(A, { title: "Nothing to add", projectIds: [A.project.id] });
+    const onB = await createTask(B, { title: "Add c.txt", projectIds: [B.project.id] });
+    await withFile(A, one.id, "a.txt");
+    await withFile(A, two.id, "b.txt");
+    await withFile(B, onB.id, "c.txt");
+
+    // Several tasks, named by an id or a prefix; one of another node, acted on at the node holding it.
+    expect(await run("task", "accept", one.id, two.id.slice(0, 8))).toEqual({
+      stdout: `queued ${one.id} on a's train\nqueued ${two.id} on a's train\n`, stderr: "", code: 0,
+    });
+    expect(await run("task", "accept", onB.id.slice(0, 8))).toEqual({ stdout: `queued ${onB.id} on a's train\n`, stderr: "", code: 0 });
+    // Accepting a queued task changes nothing, and says the same.
+    expect(await run("task", "accept", one.id)).toEqual({ stdout: `queued ${one.id} on a's train\n`, stderr: "", code: 0 });
+    // A refusal is the task's own, with `meddle: ` before it; with several tasks the task it is for goes before it, the
+    // others are still accepted, and the exit status says one failed.
+    expect(await run("task", "accept", bare.id)).toEqual({
+      stdout: "", stderr: "meddle: nothing to land: the task's work is already on main\n", code: 1,
+    });
+    expect(await run("task", "accept", bare.id, "zzzz", one.id)).toEqual({
+      stdout: `queued ${one.id} on a's train\n`,
+      stderr: `meddle: ${bare.id}: nothing to land: the task's work is already on main\nmeddle: zzzz: no such task: zzzz\n`,
+      code: 1,
+    });
+
+    // The queue as the project's home has it, while it is paused: A's project here, B's through the tunnel.
+    const home = { paused: "paused: held by the test" };
+    expect(await run("train", A.project.id)).toEqual({
+      stdout: `${home.paused}\nqueued:\n  Add a.txt (${one.id})  queued\n  Add b.txt (${two.id})  queued\n`, stderr: "", code: 0,
+    });
+    expect(await run("train", B.project.id)).toEqual({
+      stdout: `${home.paused}\nqueued:\n  Add c.txt (${onB.id})  queued\n`, stderr: "", code: 0,
+    });
+    // Two projects (both named a), none named, and this folder no checkout: the command asks which.
+    const ask = await run("train");
+    expect(ask).toMatchObject({ stdout: "", code: 1 });
+    expect(ask.stderr).toStartWith("meddle: name a project: a (");
+    expect((await run("train", "nosuch")).stderr).toBe("meddle: unknown project: nosuch\n");
+
+    // Unqueue takes tasks off; one not queued stays as it is, and says so.
+    expect(await run("task", "unqueue", one.id, bare.id)).toEqual({ stdout: `unqueued ${one.id}\n${bare.id} is not queued\n`, stderr: "", code: 0 });
+    expect(await run("task", "unqueue", "zzzz")).toEqual({ stdout: "", stderr: "meddle: no such task: zzzz\n", code: 1 });
+    expect(await run("train", A.project.id)).toMatchObject({ stdout: `${home.paused}\nqueued:\n  Add b.txt (${two.id})  queued\n` });
+
+    // Pause and resume go to the home too, A's here and B's through the tunnel; pausing changes a pause's reason.
+    expect(await run("task", "unqueue", two.id, onB.id)).toMatchObject({ code: 0 });
+    for (const project of [A.project.id, B.project.id]) {
+      expect(await run("train", "pause", project)).toEqual({ stdout: "paused a's train\n", stderr: "", code: 0 });
+      expect(await run("train", project)).toEqual({ stdout: "paused: you paused it\nnothing queued\n", stderr: "", code: 0 });
+      expect(await run("train", "resume", project)).toEqual({ stdout: "resumed a's train\n", stderr: "", code: 0 });
+      expect(await run("train", project)).toEqual({ stdout: "nothing queued\n", stderr: "", code: 0 });
+    }
+  } finally {
+    stopTunnels();
+    await dashboard.stop();
+    await close();
+  }
+}, 90_000);
+
+test("train says when the project's home is offline: its train waits for it, and nothing is asked of it", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  try {
+    await peerReady(A, B);
+    const env = { HOME: A.home, MEDDLE_DATA_DIR: A.cfg.dataDir, MEDDLE_PORT: new URL(dashboard.url).port };
+    await B.pool.stop();
+    const deadline = Date.now() + 20_000;
+    while (A.net.isOnline(B.id)) {
+      if (Date.now() > deadline) throw new Error("A still sees B online");
+      await Bun.sleep(50);
+    }
+    const label = `${shortId(B.id)} (${A.store.row(B.id)!.hostname})`;
+    for (const args of [["train", B.project.id], ["train", B.project.id, "--follow"], ["train", "pause", B.project.id], ["train", "resume", B.project.id]]) {
+      expect({ args, ...(await meddle(args, env)) }).toEqual({
+        args, stdout: "", stderr: `meddle: a's train waits: its home ${label} is offline\n`, code: 1,
+      });
+    }
+    // This node's own project is another matter.
+    expect(await meddle(["train", A.project.id], env)).toMatchObject({ stdout: expect.stringContaining("nothing queued"), code: 0 });
+  } finally {
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);
+
+/**
+ * What a node of a meddle older than the train serves of `TaskObject` (no `queue`, `accept` or `unqueue`) and of
+ * `ProjectObject` (no `train`, `pause`, `resume` or `retry`), with the node's own `NodeObject` listing `taskIds`: a host
+ * that stands for B at the end of A's tunnel. Chord refuses to bind a client built with the train's members to it before
+ * anything is served, so the two older objects have no factory worth running.
+ */
+async function olderNodeHost(taskIds: string[]) {
+  const { createHost, remote } = await import("@earendil-works/chord");
+  const { NodeObject, ProjectObject, TaskObject } = await import("../src/state/contracts");
+  const { Value } = await import("typebox/value");
+  const without = <T extends Record<string, unknown>>(members: T, names: string[]) =>
+    Object.fromEntries(Object.entries(members).filter(([name]) => !names.includes(name)));
+  const task = TaskObject.def.variants.default;
+  const project = ProjectObject.def.variants.default;
+  const OlderTask = remote("meddle.task", {
+    ...TaskObject.def, variants: { default: { state: without(task.state, ["queue"]), methods: without(task.methods, ["accept", "unqueue"]) } },
+  } as never);
+  const OlderProject = remote("meddle.project", {
+    ...ProjectObject.def, variants: { default: { state: without(project.state, ["train"]), methods: without(project.methods, ["pause", "resume", "retry"]) } },
+  } as never);
+  const host = createHost({ name: "node", self: "node" });
+  // The node's own object, as it is: every state member a value its schema takes, `taskIds` the ones given.
+  host.serve(NodeObject, (_input, _principal, self) => ({
+    variant: "default",
+    ...Object.fromEntries(Object.entries(NodeObject.def.variants.default.state).map(([name, schema]) => [
+      name, self.state(name, schema as never, { init: () => (name === "taskIds" ? taskIds : Value.Create(schema as never)) as never }),
+    ])),
+    ...Object.fromEntries(Object.keys(NodeObject.def.variants.default.methods).map((name) => [name, () => { throw new Error(name); }])),
+  }) as never);
+  const never = () => { throw new Error("not bound"); };
+  host.serve(OlderTask, never as never);
+  host.serve(OlderProject, never as never);
+  return host;
+}
+
+test("a task on a node older than the train is not found, and the refusal names that node; train at an older home says so", async () => {
+  const { acceptDashboardStreams } = await import("../src/dashboard/tunnel");
+  const { A, B, close } = await twoPoolNodes();
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  const onB = await createTask(B, { title: "Add c.txt", projectIds: [B.project.id] });
+  const older = await olderNodeHost([onB.id]);
+  // B's tunnel is served by what an older B would serve.
+  const stopTunnels = acceptDashboardStreams(B.net, older, (id) => B.store.isMember(id));
+  try {
+    await peerReady(A, B);
+    const env = { HOME: A.home, MEDDLE_DATA_DIR: A.cfg.dataDir, MEDDLE_PORT: new URL(dashboard.url).port };
+    const label = `${shortId(B.id)} (${A.store.row(B.id)!.hostname})`;
+    const unlisted = `${label} runs an older meddle: its tasks are not listed`;
+    for (const verb of ["accept", "unqueue"]) {
+      expect(await meddle(["task", verb, onB.id], env)).toEqual({ stdout: "", stderr: `meddle: no such task: ${onB.id} (${unlisted})\n`, code: 1 });
+    }
+    // With several, the task it is for goes before it, as for any refusal; a task here is still taken.
+    const here = await createTask(A, { title: "Add a.txt", projectIds: [A.project.id] });
+    await withFile(A, here.id, "a.txt");
+    pauseTrain(A.db, A.project.id, "held by the test");
+    expect(await meddle(["task", "accept", onB.id, here.id], env)).toEqual({
+      stdout: `queued ${here.id} on a's train\n`, stderr: `meddle: ${onB.id}: no such task: ${onB.id} (${unlisted})\n`, code: 1,
+    });
+    // `task list` says the same of that node, and lists the others'.
+    const list = await meddle(["task", "list"], env);
+    expect(list.stderr).toBe(`${unlisted}\n`);
+    expect(list.stdout).toContain(here.id);
+
+    // Its project's train cannot be asked of it either: the home is named, by its hostname.
+    expect(await meddle(["train", B.project.id], env)).toEqual({
+      stdout: "", stderr: `meddle: ${A.store.row(B.id)!.hostname} runs an older meddle\n`, code: 1,
+    });
+    expect(await meddle(["train", "pause", B.project.id], env)).toMatchObject({ stdout: "", code: 1 });
+  } finally {
+    stopTunnels();
+    await older.close();
+    await dashboard.stop();
+    await close();
+  }
+}, 60_000);
+
+test("train --follow prints the train as it changes and ends once its queue is empty; with nothing queued it ends at once", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  pauseTrain(A.db, A.project.id, "held by the test");
+  const dashboard = await startDashboard({ ...A.cfg, port: 0 }, A.host, A.pool);
+  let proc: { kill(): void } | undefined;
+  try {
+    const env = { HOME: A.home, MEDDLE_DATA_DIR: A.cfg.dataDir, MEDDLE_PORT: new URL(dashboard.url).port };
+    const idle = await meddle(["train", "--follow"], env);
+    expect(idle).toEqual({ stdout: "paused: held by the test\nnothing queued\n", stderr: "", code: 0 });
+
+    const m = await createTask(A, { title: "Add a.txt", projectIds: [A.project.id] });
+    await withFile(A, m.id, "a.txt");
+    expect(await meddle(["task", "accept", m.id], env)).toMatchObject({ code: 0 });
+    const follower = Bun.spawn(["bun", "run", `${repoRoot}/src/cli.ts`, "train", "--follow"], {
+      cwd: repoRoot, env: childEnv(env), stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    proc = follower;
+    // It prints the queue and waits for it to change.
+    const reader = follower.stdout.getReader();
+    const decoder = new TextDecoder();
+    let printed = "";
+    const readUntil = async (done: (text: string) => boolean) => {
+      const end = Date.now() + 20_000;
+      while (!done(printed)) {
+        const next = await Promise.race([reader.read(), Bun.sleep(Math.max(0, end - Date.now())).then(() => null)]);
+        if (next === null) throw new Error(`timed out; it printed ${JSON.stringify(printed)}`);
+        if (next.done) return;
+        printed += decoder.decode(next.value, { stream: true });
+      }
+    };
+    await readUntil((text) => text.includes("Add a.txt"));
+    expect(follower.exitCode).toBeNull();
+    expect(await meddle(["task", "unqueue", m.id], env)).toEqual({ stdout: `unqueued ${m.id}\n`, stderr: "", code: 0 });
+    await readUntil(() => false);
+    expect(await Promise.race([follower.exited, Bun.sleep(20_000).then(() => "timeout" as const)])).toBe(0);
+    expect(printed).toBe(`paused: held by the test\nqueued:\n  Add a.txt (${m.id})  queued\n\npaused: held by the test\nnothing queued\n`);
+    expect(await new Response(follower.stderr).text()).toBe("");
+  } finally {
+    proc?.kill();
+    await dashboard.stop();
+    await close();
+  }
+}, 90_000);
+
+test("task accept, task unqueue and train pause or resume are refused while an update awaits confirmation; watching the train is not", async () => {
+  const dir = await mkdtemp("/tmp/meddle-train-cli-");
+  try {
+    const env = { HOME: dir, MEDDLE_DATA_DIR: `${dir}/d`, MEDDLE_TASK_ROOT: `${dir}/t`, MEDDLE_PORT: String(await closedPort()) };
+    await mkdir(`${dir}/d`, { recursive: true });
+    const build = "1ee71ee71ee7";
+    await writePending(updateFiles(`${dir}/d`, "/unused"), {
+      v: 1, phase: "swapped", rollout: "r1", build, previousBuild: "0ld0ld0ld0ld", platform: "linux-x64", swappedAt: Date.now(),
+      healthMs: 120_000, starts: 1, healthy: false, late: false,
+    });
+    for (const args of [["task", "accept", "0012", "0034"], ["task", "unqueue", "0012"], ["train", "pause"], ["train", "resume", "site"]]) {
+      expect({ args, ...(await meddle(args, env)) }).toEqual({
+        args, stdout: "", stderr: `meddle: update in progress (build ${build}), try again shortly\n`, code: 1,
+      });
+    }
+    // Reads go on: with no node running they say so, as any command that talks to one does.
+    for (const args of [["train"], ["train", "site"], ["train", "--follow"]]) {
+      expect({ args, ...(await meddle(args, env)) }).toEqual({ args, stdout: "", stderr: 'meddle: start "meddle serve" first\n', code: 1 });
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 }, 60_000);

@@ -1,22 +1,28 @@
 // test/state.test.ts
 import { test, expect } from "bun:test";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { NodeObject, ProjectObject, TaskObject, SessionObject } from "../src/state/host";
 import { claudeCodeVersion } from "../src/version";
 import { appendEvent, listEvents } from "../src/store/events";
-import { errorResultFixture, sideAssistantsFixture } from "./helpers";
-import { linkClient, peerReady, startPoolNode, storedShot, twoPoolNodes } from "./pool-helpers";
+import { createTask, errorResultFixture, sideAssistantsFixture } from "./helpers";
+import { linkClient, peerReady, poolNodes, startPoolNode, storedShot, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 import { repoKey, serialised } from "../src/serial";
 import { getTask } from "../src/store/records";
 import { getProject, setDefaultBranch } from "../src/projects/project";
-import { readManifest } from "../src/tasks/manifest";
+import { readManifest, type TaskManifest } from "../src/tasks/manifest";
 import { createHash } from "node:crypto";
 import { remoteReason } from "../src/pool/object";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { paths, type NodeConfig } from "../src/config";
-import { jj } from "../src/jj";
+import { commitOf, jj } from "../src/jj";
 import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
 import { ensureServiceRepo } from "../src/projects/replicas";
 import { listTokens } from "../src/token";
+import { defaultBranchCommit } from "../src/projects/starts";
+import type { Notification } from "../src/state/contracts";
+import { UNQUEUED_ARCHIVED, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER } from "../src/tasks/durable";
+import { pauseTrain, trainNotices, trainState, trainUpdates } from "../src/train/train";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -924,6 +930,315 @@ test("while an update awaits confirmation, a project's memory is not written, an
     held = null;
     await view.writeMemory({ path: "a.md", text: "x\n", base: null });
     expect((await view.memoryEntries({})).map((e) => e.path)).toEqual(["a.md"]);
+    view.release();
+  } finally {
+    await close();
+    await node.close();
+  }
+}, 15_000);
+
+// ─── the merge train's notices, and its state and calls on the project ───
+
+async function waitFor(what: string, cond: () => boolean | Promise<boolean>, ms = 60_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!(await cond())) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(50);
+  }
+}
+
+/** The task's workspace of its (one) project on node `n`. */
+function workspaceOf(n: GitPoolNode, taskId: string): string {
+  const manifest = JSON.parse(getTask(n.db, taskId)!.manifest) as TaskManifest;
+  return join(paths(n.cfg).task(taskId), manifest.projects[0]!.workspace);
+}
+
+/**
+ * A task of project `P` on node `on` titled `Add <file>`, whose work adds `file`: committed with a description (its tip
+ * the commit), or with `undescribed` left in its working copy; built on `onTopOf` (a commit) rather than on main. Its
+ * lines are written, as a turn end would.
+ */
+async function taskWithWork(on: GitPoolNode, P: string, file: string, options: { undescribed?: boolean; onTopOf?: string } = {}) {
+  const m = await createTask(on, { title: `Add ${file}`, projectIds: [P] });
+  const ws = workspaceOf(on, m.id);
+  if (options.onTopOf !== undefined) await jj(["new", options.onTopOf], ws, on.cfg);
+  await Bun.write(join(ws, file), `${file}\n`);
+  if (options.undescribed === true) await jj(["status"], ws, on.cfg);
+  else await jj(["commit", "-m", `Add ${file}`], ws, on.cfg);
+  await on.runner.writeTaskLines(m.id);
+  const tip = await commitOf(ws, options.undescribed === true ? "@" : "@-", on.cfg);
+  return { id: m.id, ws, tip };
+}
+
+/** Project `P`'s held-back entries in node `n`'s `trains` table, by task. */
+function heldOf(n: GitPoolNode, P: string): Record<string, string> {
+  const row = n.db.query<{ held: string }, [string]>("SELECT held FROM trains WHERE project = ?").get(P);
+  return row === null ? {} : (JSON.parse(row.held) as Record<string, string>);
+}
+
+/**
+ * Runs `trigger` (Resume, say) and waits for the round it starts to end: its row shows a step, then none. Waits first
+ * for any round under way to end, so the round waited for is the one `trigger` started.
+ */
+async function roundAfter(n: GitPoolNode, P: string, trigger: () => void): Promise<void> {
+  const live = async () => (await n.harness.harness.inspect(BACKGROUND_CONTEXT)).tasks.filter((t) => t.record.kind === "meddle.train");
+  await waitFor("rounds under way to end", async () => (await live()).length === 0);
+  const ended = new Promise<void>((resolve) => {
+    let started = false;
+    const stop = trainUpdates.subscribe((projectId) => {
+      if (projectId !== P) return;
+      if (trainState(n.db, P).round !== null) started = true;
+      else if (started) {
+        stop();
+        resolve();
+      }
+    });
+  });
+  trigger();
+  await ended;
+}
+
+/** A node of `poolNodes` (`extraEnv`: for its turns' stand-in) with a client host linked to it. */
+async function trainNode(extraEnv: Record<string, string> = {}) {
+  const { nodes, close: closeNodes } = await poolNodes(1, { extraEnv });
+  const n = nodes[0]!;
+  const { client, close: closeClient } = linkClient(n.host);
+  return {
+    n, client, P: n.project.id,
+    async close() {
+      await closeClient();
+      await closeNodes();
+    },
+  };
+}
+
+const trainNotes = (notes: Notification[]) => notes.filter((x) => x.kind === "train").map(({ taskId, text, action }) => ({ taskId, text, action }));
+
+test("leaving the train raises a train notice, and what the user did to leave raises none", async () => {
+  const { n, client, P, close } = await trainNode();
+  try {
+    const node = await client.get(NodeObject, {});
+    const user = await taskWithWork(n, P, "u.txt");
+    const leaver = await taskWithWork(n, P, "l.txt", { undescribed: true });
+    // Its agent declines the describe turn, which takes it off its queue on its holder as the decline is logged.
+    n.hooks.trainTurn = async (taskId, kind) => {
+      if (kind !== "describe") return undefined;
+      await n.runner.unqueue(taskId, "main already has this");
+      return { kind: "declined", reason: "main already has this" };
+    };
+    // The train is held while the user queues and unqueues, so no round runs meanwhile.
+    pauseTrain(n.db, P, "the test queues first");
+    for (const reason of [UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]) {
+      await n.runner.accept(user.id);
+      expect(n.runner.queue(user.id)).not.toBeNull();
+      await n.runner.unqueue(user.id, reason);
+      expect(n.runner.queue(user.id)).toBeNull();
+    }
+    await n.runner.accept(leaver.id);
+    pauseTrain(n.db, P, null);
+
+    const notes = await until(node.notifications, (ns) => trainNotes(ns).length > 0);
+    // Only the decline is told: the unqueues before it, as the user's, said nothing.
+    expect(trainNotes(notes)).toEqual([{ taskId: leaver.id, text: "Add l.txt left meddle's train: main already has this", action: "accept" }]);
+    expect(n.runner.queue(leaver.id)).toBeNull();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a task that sits out raises a notice with Retry, and again each time it sits out anew after a Retry", async () => {
+  const { n, client, P, close } = await trainNode();
+  try {
+    const node = await client.get(NodeObject, {});
+    const project = await client.get(ProjectObject, { id: P });
+    const describes: string[] = [];
+    // Its first two describe turns fail; the next describes its work, as the agent would.
+    n.hooks.trainTurn = async (taskId, kind, text) => {
+      if (kind !== "describe") return undefined;
+      describes.push(text);
+      if (describes.length <= 2) return { kind: "failed", reason: "the agent gave up" };
+      const ws = workspaceOf(n, taskId);
+      await jj(["describe", "-m", "Add x"], ws, n.cfg);
+      await n.runner.writeTaskLines(taskId);
+      return { kind: "done" };
+    };
+    const t = await taskWithWork(n, P, "x.txt", { undescribed: true });
+    await n.runner.accept(t.id);
+
+    const notes = await until(node.notifications, (ns) => trainNotes(ns).length > 0);
+    expect(trainNotes(notes)).toEqual([{ taskId: t.id, text: "Add x.txt is sitting out: its describe turn failed: the agent gave up", action: "retry" }]);
+    expect(project.train.value.queued).toEqual([{ taskId: t.id, state: "sitting out", reason: "its describe turn failed: the agent gave up" }]);
+
+    // Retry clears the entry; it sits out again, and that is a new condition: told again, the first still showing.
+    await project.retry({ taskId: t.id });
+    const again = await until(node.notifications, (ns) => trainNotes(ns).length === 2);
+    expect(trainNotes(again).map((x) => x.text)).toEqual(Array(2).fill("Add x.txt is sitting out: its describe turn failed: the agent gave up"));
+
+    await project.retry({ taskId: t.id });
+    await until(project.train, (s) => s.queued.length === 0);
+    expect(describes).toHaveLength(3);
+    await waitFor("the landed task archived", () => getTask(n.db, t.id)?.state === "archived");
+    // Nothing more was told: the task is a normal task again.
+    expect(trainNotes(node.notifications.value)).toHaveLength(2);
+    project.release();
+    node.release();
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a task held back for work that isn't queued raises its notice once, until its entry clears and the condition returns", async () => {
+  const { n, client, P, close } = await trainNode();
+  const heard: string[] = [];
+  const stop = trainNotices.subscribe((notice) => heard.push(notice.text));
+  const TEXT = "Add b.txt includes work from Add a.txt, which isn't queued";
+  try {
+    const node = await client.get(NodeObject, {});
+    const other = await taskWithWork(n, P, "a.txt");
+    // Built on the other task's work, which is not queued.
+    const mine = await taskWithWork(n, P, "b.txt", { onTopOf: other.tip });
+    await n.runner.accept(mine.id);
+
+    const notes = await until(node.notifications, (ns) => trainNotes(ns).length > 0);
+    expect(trainNotes(notes)).toEqual([{ taskId: mine.id, text: TEXT, action: undefined }]);
+    expect(notes.find((x) => x.kind === "train")).not.toHaveProperty("action");
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
+
+    // The next round holds it back again, the entry standing: nothing more is told.
+    await roundAfter(n, P, () => { pauseTrain(n.db, P, "again"); pauseTrain(n.db, P, null); });
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
+    expect(trainNotes(node.notifications.value)).toHaveLength(1);
+
+    // Dismissed, it stays away while it stays held back.
+    await node.dismiss({ id: node.notifications.value.find((x) => x.kind === "train")!.id });
+    await roundAfter(n, P, () => { pauseTrain(n.db, P, "once more"); pauseTrain(n.db, P, null); });
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
+    expect(trainNotes(node.notifications.value)).toEqual([]);
+    expect(heard).toEqual([TEXT]);
+
+    // It leaves the train, which clears its entry; queued again, it is held back anew: a new condition, told.
+    await n.runner.unqueue(mine.id, UNQUEUED_BY_USER);
+    await waitFor("its entry to clear", () => Object.keys(heldOf(n, P)).length === 0);
+    await n.runner.accept(mine.id);
+    expect(trainNotes(await until(node.notifications, (ns) => trainNotes(ns).length === 1))).toEqual([{ taskId: mine.id, text: TEXT, action: undefined }]);
+    expect(heard).toEqual([TEXT, TEXT]);
+    node.release();
+  } finally {
+    stop();
+    await close();
+  }
+}, 180_000);
+
+test("a held-back task whose entry clears while it stays queued is told again when it is held back again", async () => {
+  // Turns of tasks stall, so the other task can be busy.
+  const { n, client, P, close } = await trainNode({ MEDDLE_FIXTURE_STALL: "1" });
+  const TEXT = "Add b.txt includes work from Add a.txt, which isn't queued";
+  try {
+    const node = await client.get(NodeObject, {});
+    const other = await taskWithWork(n, P, "a.txt");
+    const mine = await taskWithWork(n, P, "b.txt", { onTopOf: other.tip });
+    await n.runner.accept(mine.id);
+    await until(node.notifications, (ns) => trainNotes(ns).some((x) => x.text === TEXT));
+    expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
+
+    // The other task, busy with a turn, is queued: this one waits for it, no longer held back, and its entry goes.
+    await n.runner.prompt(other.id, "keep going");
+    await waitFor("the other task's turn", () => n.runner.state(other.id) === "running");
+    await n.runner.accept(other.id);
+    await waitFor("its entry to clear", () => Object.keys(heldOf(n, P)).length === 0);
+    expect(trainState(n.db, P).queued.find((q) => q.taskId === mine.id)).toEqual({ taskId: mine.id, state: "queued", reason: null });
+
+    // The other task leaves the train, and this one, still queued, is held back anew: told again.
+    await n.runner.unqueue(other.id, UNQUEUED_BY_USER);
+    await waitFor("it to be held back again", () => heldOf(n, P)[mine.id] === TEXT);
+    const notes = await until(node.notifications, (ns) => trainNotes(ns).length === 2);
+    expect(trainNotes(notes).map((x) => x.text)).toEqual([TEXT, TEXT]);
+    await n.runner.interrupt(other.id);
+    node.release();
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("the project serves the train state and pauses", async () => {
+  const { n, client, P, close } = await trainNode();
+  try {
+    const project = await client.get(ProjectObject, { id: P });
+    expect(project.train.value).toEqual({ paused: null, round: null, queued: [] });
+
+    await project.pause({ reason: "pushing to main" });
+    expect((await until(project.train, (s) => s.paused !== null)).paused).toBe("pushing to main");
+    // A pause without a reason says whose it is.
+    await project.pause({});
+    expect((await until(project.train, (s) => s.paused === "you paused it")).paused).toBe("you paused it");
+
+    const t = await taskWithWork(n, P, "x.txt");
+    await n.runner.accept(t.id);
+    // Queued, and held: no round starts while it is paused.
+    expect(await until(project.train, (s) => s.queued.length === 1)).toEqual({
+      paused: "you paused it", round: null, queued: [{ taskId: t.id, state: "queued", reason: null }],
+    });
+    await Bun.sleep(500);
+    expect(getTask(n.db, t.id)?.state).not.toBe("archived");
+    expect(project.train.value).toEqual(trainState(n.db, P));
+
+    await project.resume({});
+    // The round lands it, and the queue is empty again.
+    await until(project.train, (s) => s.paused === null && s.queued.length === 0);
+    expect(await defaultBranchCommit({ cfg: n.cfg, db: n.db, selfId: n.id }, getProject(n.db, P)!)).toBe(t.tip);
+    project.release();
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a node that does not run the project's train serves it as empty and refuses its calls", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const { client, close: closeClient } = linkClient(B.host);
+  try {
+    await peerReady(B, A);
+    const P = A.project.id;
+    // B holds a replica of A's project.
+    await ensureServiceRepo({ cfg: B.cfg, db: B.db, pool: B.pool }, P);
+    expect(getProject(B.db, P)?.home).toBe(A.id);
+    // A's train is paused, and has a task queued.
+    pauseTrain(A.db, P, "held on A");
+    const t = await taskWithWork(A, P, "x.txt");
+    await A.runner.accept(t.id);
+    expect(trainState(A.db, P).queued).toHaveLength(1);
+
+    const view = await client.get(ProjectObject, { id: P });
+    expect(view.train.value).toEqual({ paused: null, round: null, queued: [] });
+    const refusal = (p: Promise<unknown>) => p.then(() => "", (err: unknown) => remoteReason(err));
+    expect(await refusal(view.pause({ reason: "no" }))).toStartWith("not-home:");
+    expect(await refusal(view.resume({}))).toStartWith("not-home:");
+    expect(await refusal(view.retry({ taskId: t.id }))).toStartWith("not-home:");
+    // Nothing was written here, and A's train is as it was.
+    expect(B.db.query("SELECT project FROM trains WHERE project = ?").all(P)).toEqual([]);
+    expect(trainState(A.db, P).paused).toBe("held on A");
+    view.release();
+  } finally {
+    await closeClient();
+    await close();
+  }
+}, 60_000);
+
+test("while an update awaits confirmation, the train is not paused, resumed or retried, and still reads", async () => {
+  let held: string | null = null;
+  const node = await startPoolNode(undefined, {}, { inputHold: () => held });
+  const { client, close } = linkClient(node.host);
+  try {
+    const view = await client.get(ProjectObject, { id: node.project.id });
+    held = "update in progress";
+    const refusal = (p: Promise<unknown>) => p.then(() => "", (err: unknown) => (err as Error).message);
+    expect(await refusal(view.pause({}))).toContain("update in progress");
+    expect(await refusal(view.resume({}))).toContain("update in progress");
+    expect(await refusal(view.retry({ taskId: "t" }))).toContain("update in progress");
+    expect(view.train.value.paused).toBeNull();
+    held = null;
+    await view.pause({ reason: "now" });
+    expect((await until(view.train, (s) => s.paused === "now")).paused).toBe("now");
     view.release();
   } finally {
     await close();

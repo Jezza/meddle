@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { computeBranch, planPush, refusePush, type Graph, type PushedRef } from "../src/projects/branches";
+import { computeBranch, conflictFix, planPush, pushRefusal, refusePush, type Graph, type PushedRef } from "../src/projects/branches";
 import type { BranchRow, RowRef } from "../src/pool/rows";
 
 // The fake history: X, Y and P branch off O; Z follows X; M merges X and Y; U and V are unrelated roots.
@@ -210,4 +210,28 @@ test("refusals: refs meddle doesn't accept, and a push onto a conflicted branch"
   expect(await refusePush([
     push("main", X, null), dropSibling(X), { ref: `refs/meddle/incoming/${Z}`, old: null, new: Z }, push("next", null, Z),
   ], heads, g)).toBeNull();
+});
+
+test("pushRefusal runs the checks in order: the hold, a refused ref, a branch still fetching, a push that can't be planned", async () => {
+  const conflicted = [{ branch: "main", commits: [X, Y] }];
+  const rows = [row("A", 1, X), row("B", 1, Y)];
+  const input = { refuse: null, pushed: [push("main", X, M)], heads: conflicted, stale: [], rows, selfId: "A", project: "p" };
+  expect(await pushRefusal(input, g)).toBeNull();
+  // A graph that can't be read, so that no push can be planned, except onto a branch of one commit.
+  const broken: Graph = { ...g, isAncestor: async () => { throw new Error("no such commit"); } };
+  const unplannable = { ...input, heads: [{ branch: "main", commits: [X] }] };
+  expect(await pushRefusal(unplannable, broken)).toBe("meddle: the push could not be recorded: no such commit");
+
+  // The last check gives way to the one before it, and each of those to the one before it.
+  const fetching = { ...unplannable, stale: ["main"] };
+  expect(await pushRefusal(fetching, broken)).toBe("main: this node is still fetching it; push again shortly");
+  const siblings = { ...input, pushed: [push("main", X, Z)], stale: ["main"] };
+  expect(await pushRefusal(siblings, g)).toBe(conflictFix("main", [X, Y]));
+  const refused = { ...siblings, pushed: [{ ref: "refs/heads/meddle/task/t/p", old: null, new: X }, push("main", X, Z)] };
+  expect(await pushRefusal(refused, g)).toBe("ref refs/heads/meddle/task/t/p is not accepted here");
+  expect(await pushRefusal({ ...refused, refuse: "an update awaits confirmation" }, g)).toBe("meddle: an update awaits confirmation");
+  // An empty reason is no hold, and a sibling's conflict ref is judged as its branch is.
+  expect(await pushRefusal({ ...input, refuse: "" }, g)).toBeNull();
+  expect(await pushRefusal({ ...input, pushed: [dropSibling(Y)], stale: ["main"] }, g)).toBe("main: this node is still fetching it; push again shortly");
+  expect(await pushRefusal({ ...input, pushed: [push("next", null, X)], stale: ["main"] }, g)).toBeNull();
 });

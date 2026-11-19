@@ -5,13 +5,15 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { NodeConfig } from "../config";
 import { paths } from "../paths";
 import { MeddleTurn } from "./durable";
+import { MeddleTrain } from "../train/train";
 import { MeddleMove } from "./move";
 
 /**
  * Installs the meddle extension in `registry`, opens the durable store and starts scheduling, which
- * reruns any turn or move the last process left unfinished. The extension's `harness` hook is how a turn's or a
- * move's phase finds the Harness it runs in, and through it the TaskRunner. With `hold`, scheduling waits (nothing
- * reruns) until the caller resumes the Harness: a node on an unconfirmed build, or behind the pool's, holds its turns.
+ * reruns any turn, move or train round the last process left unfinished. The extension's `harness` hook is how a
+ * turn's, a move's or a round's phase finds the Harness it runs in, and through it the TaskRunner (or the conductor).
+ * With `hold`, scheduling waits (nothing reruns) until the caller resumes the Harness: a node on an unconfirmed build,
+ * or behind the pool's, holds its turns.
  */
 export async function openHarness(
   cfg: NodeConfig,
@@ -21,8 +23,10 @@ export async function openHarness(
   let opened: Harness | undefined;
   registry.install(defineExtension({
     name: "meddle",
-    tasks: [MeddleTurn, MeddleMove],
-    hooks: [hook(MeddleTurn, { harness: () => opened! }), hook(MeddleMove, { harness: () => opened! })],
+    tasks: [MeddleTurn, MeddleMove, MeddleTrain],
+    hooks: [
+      hook(MeddleTurn, { harness: () => opened! }), hook(MeddleMove, { harness: () => opened! }), hook(MeddleTrain, { harness: () => opened! }),
+    ],
   }));
   const harness = await Harness.open(
     await openNodeSqliteStorage(paths(cfg).durableDb),
