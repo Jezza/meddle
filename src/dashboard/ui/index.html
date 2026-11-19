@@ -56,6 +56,8 @@
   button.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
   .ico { display: inline-flex; flex: none; }
   .ico svg { width: 1em; height: 1em; display: block; }
+  /* The merge train's icon in a line of text: the train page's head, a task's head and its Accept, the train's toasts. */
+  svg.train-ico { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   button.icon, a.icon { background: none; border: none; padding: 2px 6px; color: var(--muted); font-size: 14px; line-height: 1; border-radius: 4px; }
   button.icon:hover, a.icon:hover, a.icon.on { color: var(--fg); background: var(--hover); text-decoration: none; }
   input, select, textarea { background: var(--bg); border: 1px solid var(--line-strong); border-radius: 5px; padding: 4px 8px; }
@@ -101,6 +103,7 @@
   .side-head .count { font-size: 11px; }
   .side-note { padding: 2px 14px; color: var(--muted); font-size: 12px; }
   .side-project { display: flex; align-items: center; gap: 8px; padding: 4px 14px; color: var(--fg); font-weight: 500; }
+  .side-project .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .side-project:hover { background: var(--hover); text-decoration: none; }
   .folder { color: var(--muted); font-size: 10px; }
   .side-row { display: flex; align-items: center; gap: 8px; padding: 4px 8px 4px 14px; color: var(--fg); white-space: nowrap; min-height: 27px; }
@@ -118,11 +121,18 @@
   .side-row:hover .more { display: inline; }
   .side-row:hover .where { display: none; }
   .side-row .rename { flex: 1; min-width: 0; padding: 1px 6px; }
-  /* A project's 🚂 Train, and the 🚂 on a queued task's row: both open the project's train page. */
-  .side-row.train-entry { color: var(--fg-soft); font-size: 12px; min-height: 24px; }
-  .train-entry .count { background: var(--chip); color: var(--chip-fg); border-radius: 9px; font-size: 10.5px; padding: 0 6px; flex: none; }
-  .side-row .queued-mark { background: none; border: none; padding: 0 2px; font-size: 11px; line-height: 1; flex: none; }
-  .side-row .queued-mark:hover:not(:disabled) { background: none; filter: brightness(1.2); }
+  /* The train's mark on a project's line (its queue, or "Train" on hover or focus while it is empty) and on a queued task's row:
+     both open the project's train page. A merge task's title starts with it in the train's purple. */
+  .train-mark { display: inline-flex; align-items: center; gap: 4px; flex: none; background: var(--chip); color: var(--chip-fg); border: none;
+    border-radius: 8px; padding: 0 6px; font-size: 10.5px; font-weight: 400; line-height: 17px; }
+  .train-mark:hover:not(:disabled) { background: var(--chip); color: var(--fg); }
+  .train-mark.sel, .train-mark.sel:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+  .train-mark:not(.busy):not(.sel) { visibility: hidden; }
+  .side-project:hover .train-mark:not(.busy), .side-project:focus-within .train-mark:not(.busy) { visibility: visible; }
+  .train-mark svg, .side-row .queued-mark svg { width: 11px; height: 11px; }
+  .side-row .queued-mark { display: inline-flex; background: none; border: none; padding: 0 2px; color: var(--muted); flex: none; }
+  .side-row .queued-mark:hover:not(:disabled) { background: none; color: var(--fg); }
+  .merge-mark { width: 11px; height: 11px; margin-right: 5px; vertical-align: -1px; color: var(--tint-purple); }
   .badge { background: var(--warn); color: var(--bg); font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; flex: none; }
   /* How many of a task's agents run. */
   .agent-count { display: inline-flex; align-items: center; gap: 3px; flex: none; font-size: 11px; font-weight: 600; color: var(--tint-purple);

@@ -7,6 +7,7 @@ import { ProjectObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
 import { PaneHead, type PoolRef, Unavailable } from "./common";
+import { Glyph } from "./icons";
 import { projectChoices } from "./pool-model";
 import { hashOf } from "./routes";
 import { type ListedTask, type PoolIndex, type ProjectRef, useOptionalTrain } from "./sources";
@@ -56,7 +57,7 @@ export function TrainPage({ hosts, pool, index, projectId, highlight }: {
 function TrainHead({ name, projectId, branch, children }: { name: string; projectId: string; branch?: string | null; children?: preact.ComponentChildren }) {
   return (
     <PaneHead>
-      <strong>🚂 <a href={hashOf({ name: "project", id: projectId })}>{name}</a>{typeof branch === "string" && ` → ${branch}`}</strong>
+      <strong><Glyph name="merge" cls="train-ico" /> <a href={hashOf({ name: "project", id: projectId })}>{name}</a>{typeof branch === "string" && ` → ${branch}`}</strong>
       <span class="bar-gap" />
       {children}
     </PaneHead>
@@ -148,7 +149,7 @@ function Board({ state, index, highlight, project }: { state: TrainView; index: 
               {mergeTask !== null && (
                 <div class="train-merge">
                   <div class="mt">
-                    🚂 Merge task
+                    <Glyph name="merge" cls="train-ico" />Merge task
                     <span class="train-chip purple">{mergeStatus(state.round!.step, merge?.state ?? null)}</span>
                     <span class="grow" />
                     {merge !== undefined && <a href={hashOf({ name: "task", nodeId: merge.nodeId, id: merge.id })}>Open</a>}

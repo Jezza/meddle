@@ -1,5 +1,5 @@
 // The icons the dashboard draws: iconoir's, each SVG's text inlined into the bundle when the dashboard is built, a
-// chevron of its own, and the thread's call icons (also the agent list's and the sidebar's).
+// chevron of its own, the thread's call icons (also the agent list's and the sidebar's), and the merge train's.
 import attachment from "iconoir/icons/attachment.svg" with { type: "text" };
 import check from "iconoir/icons/check.svg" with { type: "text" };
 import copy from "iconoir/icons/copy.svg" with { type: "text" };
@@ -18,7 +18,7 @@ export function Chevron() {
   return <svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>;
 }
 
-/** The call icons' strokes, on a 16-unit square. */
+/** The call icons' strokes, and the merge train's, on a 16-unit square. */
 const ICONS = {
   search: <><circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5 14 14" /></>,
   edit: <path d="M10.5 2.5l3 3L6 13H3v-3z" />,
@@ -31,11 +31,13 @@ const ICONS = {
   failed: <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />,
   done: <path d="M3.5 8.5l3 3 6-7" />,
   running: <path d="M8 2a6 6 0 1 1-6 6" />,
+  /** The merge train: a merge as jj log draws one, the newest change on top and its two parents below. */
+  merge: <path d="M8 2.5v2.5c0 2.5-4 3-4 5.5v3M8 5c0 2.5 4 3 4 5.5v3" />,
 } as const;
 
 export type IconName = keyof typeof ICONS;
 
-/** A call icon on its own, sized by `cls` (the sidebar's agent count, the agent list's head). */
+/** A call icon on its own, or the train's, sized by `cls` or its parent's CSS (the sidebar's counts, the agent list's head). */
 export function Glyph({ name, cls }: { name: IconName; cls?: string }) {
   return (
     <svg class={cls} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
