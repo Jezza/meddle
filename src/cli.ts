@@ -1430,6 +1430,12 @@ function taskDelete(text: string): Promise<number> {
 /** This checkout's root; inside a compiled binary it names a directory with no `src/cli.ts`. */
 const CHECKOUT = resolve(import.meta.dir, "..");
 
+/** A word of a unit's command line: `%` and `$` doubled, quoted when it has a space, a quote or a backslash in it. */
+function unitWord(word: string): string {
+  const escaped = word.replaceAll("%", "%%").replaceAll("$", "$$$$");
+  return /[\s"'\\]/.test(escaped) ? `"${escaped.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"` : escaped;
+}
+
 /**
  * The user unit from `install/meddle.service`: in the single binary, that binary serving from the home directory;
  * from a checkout, the running bun serving from it; either way with this shell's PATH, where tasks find jj and git.
@@ -1437,10 +1443,12 @@ const CHECKOUT = resolve(import.meta.dir, "..");
 async function renderUnit(): Promise<string> {
   const packed = embedded();
   const template = packed?.unit ?? (await Bun.file(join(CHECKOUT, "install/meddle.service")).text());
+  // systemd reads `%` as a specifier (and, in a command line, `$` as a variable) and splits on spaces: the binary's
+  // path and the checkout's are escaped as the PATH below is, and the binary's quoted.
+  const bin = unitWord(process.execPath);
   const [exec, dir] = packed !== null
-    ? [`${process.execPath} serve`, "%h"]
-    : [`${process.execPath} run src/cli.ts serve`, CHECKOUT];
-  // systemd reads `%` as a specifier and splits on spaces: escape the one, quote the assignment for the other.
+    ? [`${bin} serve`, "%h"]
+    : [`${bin} run src/cli.ts serve`, CHECKOUT.replaceAll("%", "%%")];
   // Less what `bun run` (a checkout's CLI) adds in front: its temp directory and every node_modules/.bin up the tree.
   const dirs = (process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin").split(":").filter((d) => !/\/node_modules\/\.bin$|^\/tmp\/bun-node-/.test(d));
   const path = `PATH=${dirs.join(":").replaceAll("%", "%%")}`;

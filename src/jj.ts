@@ -290,6 +290,13 @@ export async function changeId(workspace: string, cfg?: NodeConfig): Promise<str
   return (await jj(["log", "-r", "@", "--no-graph", "-T", "change_id"], workspace, cfg)).trim();
 }
 
+/** Makes sure `repo` has a remote `name` for `url`: added when it has none by that name, its url corrected when it names something else. */
+export async function remoteEnsure(repo: string, name: string, url: string, cfg?: NodeConfig): Promise<void> {
+  const existing = (await remoteList(repo, cfg)).find((r) => r.name === name);
+  if (existing === undefined) await remoteAdd(repo, name, url, cfg);
+  else if (existing.url !== url) await jj(["git", "remote", "set-url", name, url], repo, cfg);
+}
+
 export async function remoteAdd(repo: string, name: string, url: string, cfg?: NodeConfig): Promise<void> {
   await jj(["git", "remote", "add", name, url], repo, cfg);
 }

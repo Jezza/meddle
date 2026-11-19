@@ -137,12 +137,14 @@ export function formatDuration(ms: number): string {
   return `${h > 0 ? `${h}h` : ""}${m > 0 ? `${m}m` : ""}${rest > 0 ? `${rest}s` : ""}`;
 }
 
-/** A duration as `meddle update --within` and the `update.*` settings take it (`90s`, `30m`, `1h`), in ms; null when not one. */
+/**
+ * A duration as `meddle update --within` and the `update.*` settings take it (`90s`, `30m`, `1h`, or as
+ * `formatDuration` writes one, `1h30m`), in ms; null when not one.
+ */
 export function parseDuration(text: string): number | null {
-  const m = /^(\d+)(s|m|h)$/.exec(text.trim());
-  if (m === null) return null;
-  const n = Number(m[1]);
-  const ms = n * (m[2] === "s" ? 1000 : m[2] === "m" ? 60_000 : 3_600_000);
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(text.trim());
+  if (m === null || m.slice(1).every((part) => part === undefined)) return null;
+  const ms = Number(m[1] ?? 0) * 3_600_000 + Number(m[2] ?? 0) * 60_000 + Number(m[3] ?? 0) * 1000;
   return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
 }
 

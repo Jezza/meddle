@@ -14,7 +14,7 @@ import { guardLine, updateBlocked } from "../src/update/node";
 import {
   performSwap, readPending, readState, runGuard, settleSwap, updateFiles, watchHealth, writePending, writeState, type UpdateFiles,
 } from "../src/update/files";
-import { behindPool, binaryProblem, judge, parseDuration, poolBuild } from "../src/update/model";
+import { behindPool, binaryProblem, formatDuration, judge, parseDuration, poolBuild } from "../src/update/model";
 import { statusLines } from "../src/update/report";
 import {
   BINARY_CHECK_MS, bootUpdate, holdsAtBoot, PEER_HEALTH_GRACE_MS, Updater, type Holds, type SwapPlan,
@@ -1260,6 +1260,11 @@ test("durations", () => {
   expect(parseDuration("1h")).toBe(60 * MIN);
   expect(parseDuration("30")).toBeNull();
   expect(parseDuration("0m")).toBeNull();
+  expect(parseDuration("")).toBeNull();
+  expect(parseDuration("m")).toBeNull();
+  expect(parseDuration("30m1h")).toBeNull();
+  // what formatDuration writes reads back
+  for (const ms of [45_000, 30 * MIN, 90 * MIN, 61 * MIN + 5_000]) expect(parseDuration(formatDuration(ms))).toBe(ms);
 });
 
 /** Two nodes' channel ends over in-memory streams, as the pool's net hands streams to its listeners. */

@@ -995,10 +995,11 @@ export class TaskRunner {
     this.#updateSettings(taskId, { permissionMode: mode });
   }
 
-  /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the default. */
+  /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the pool's default (`#defaultModel`). */
   async setModel(taskId: string, model?: string): Promise<void> {
     this.#refuseElsewhere(taskId);
-    await this.liveQuery(taskId)?.setModel(model);
+    // Cleared, the running turn goes on with the model the next turn takes, not Claude Code's own default.
+    await this.liveQuery(taskId)?.setModel(model ?? this.#defaultModel());
     this.#updateSettings(taskId, { model });
   }
 
@@ -1058,6 +1059,11 @@ export class TaskRunner {
   onSettings(cb: (taskId: string) => void): () => void {
     this.#settingsListeners.add(cb);
     return () => { this.#settingsListeners.delete(cb); };
+  }
+
+  /** The model of a task that names none: the pool's default, else meddle's. */
+  #defaultModel(): string {
+    return this.#pool?.settings.defaultModel() ?? FALLBACK_MODEL;
   }
 
   /** Stores a change to the task's settings and tells the `onSettings` listeners. */
@@ -1668,7 +1674,7 @@ export class TaskRunner {
     const manifest = JSON.parse(row.manifest) as TaskManifest;
     for (const p of manifest.projects) {
       await dropWorkspace(this.#cfg, p.replica, `meddle-${row.id}`, join(paths(this.#cfg).task(row.id), p.workspace));
-      await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(row.id), this.#cfg)).catch(() => {});
+      await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(row.id), this.#cfg, { ignoreWorkingCopy: true })).catch(() => {});
     }
     await rm(paths(this.#cfg).task(row.id), { recursive: true, force: true });
     deleteTask(this.#db, row.id, row.session_id);
@@ -2850,7 +2856,7 @@ export class TaskRunner {
     if (this.#pool !== undefined) input.onFilesChanged = () => this.#filesChanged(taskId);
     const chosen = getTaskSettings(this.#db, taskId);
     const { permissionMode } = chosen;
-    input.model = chosen.model ?? this.#pool?.settings.defaultModel() ?? FALLBACK_MODEL;
+    input.model = chosen.model ?? this.#defaultModel();
     input.effort = chosen.effort ?? this.#pool?.settings.defaultEffort() ?? FALLBACK_EFFORT;
     if (train !== undefined) {
       input.permissionMode = "auto";

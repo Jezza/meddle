@@ -292,8 +292,10 @@ export async function importTask(
     else if (parsed.t === "file") {
       const segments = safeSegments(parsed.path);
       if (!Number.isSafeInteger(parsed.size) || parsed.size < 0) throw new Error("bad transfer frame");
-      const handle: FileHandle = await open(await prepareParent(root, segments), "w");
+      // Mode 600, as an archive's files are unpacked (`unpackArchiveFiles`): a transcript is the user's own.
+      const handle: FileHandle = await open(await prepareParent(root, segments), "w", 0o600);
       try {
+        await handle.chmod(0o600);
         let left = parsed.size;
         do {
           const chunk = await next();
