@@ -2,7 +2,7 @@
 // runs (`Updater`), driven over a fake pool of nodes with a fake clock, real files and the real swap and guard.
 import { afterEach, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StreamReader, writeLine } from "../src/pool/frames";
@@ -1335,6 +1335,12 @@ test("a fetch says whose the fault is: the peer's (it lacks it, sent too little,
   const fetch = (dest = join(dir, "got"), stallMs?: number) => fetchBinary(nets.get(A)!, B, want, dest, stallMs).then(() => null, (e: unknown) => e as Error);
   expect(await fetch()).toBeNull();
   expect(await readFile(join(dir, "got"), "utf8")).toBe("the right binary");
+  expect((await stat(join(dir, "got"))).mode & 0o777).toBe(0o755);
+  // A part an earlier fetch left (a crash) is no obstacle.
+  await writeFile(join(dir, "again.part"), "a stale part");
+  expect(await fetch(join(dir, "again"))).toBeNull();
+  expect(await readFile(join(dir, "again"), "utf8")).toBe("the right binary");
+  expect(existsSync(join(dir, "again.part"))).toBe(false);
 
   const cases: Array<[typeof answer, typeof Unavailable | typeof BadBinary, string]> = [
     [{ size: bytes.length, body: bytes.slice(0, 5) }, Unavailable, "ended at 5 of 16 bytes"],

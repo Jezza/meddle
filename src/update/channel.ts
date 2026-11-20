@@ -6,7 +6,8 @@
 // - `{ stream: "rollout-binary", v, build, platform, sha256 }`: a binary of a rollout. The acceptor answers one JSON
 //   line, `{ ok: true, size }` then the file's bytes raw, or `{ ok: false, reason }` when it does not have it. The
 //   bytes stream (a binary is ~150 MB, far over a frame); the fetcher checks size and SHA-256 before it keeps them.
-import { open, rename, rm, chmod, type FileHandle } from "node:fs/promises";
+import { rename, rm, type FileHandle } from "node:fs/promises";
+import { Refused, writeChecked } from "../checked-file";
 import { writeLine } from "../pool/frames";
 import { shortId } from "../pool/identity";
 import type { PeerStream } from "../pool/net";
@@ -150,25 +151,23 @@ export async function fetchBinary(net: ChannelNet, peerId: string, want: BinaryW
     }
     if (answer?.ok !== true) throw new Unavailable(`${who} does not have it`);
     if (answer.size !== want.size) throw new BadBinary(`${who} has it at ${String(answer.size)} bytes, not ${want.size}`);
-    const hasher = new Bun.CryptoHasher("sha256");
-    const out = await open(part, "w", 0o700);
     let got = 0;
-    try {
+    async function* bytes(): AsyncGenerator<Uint8Array> {
       for (;;) {
         const chunk = await peer(s.reader.readChunk(), `reading the binary (${got} of ${want.size} bytes)`);
-        if (chunk === null) break;
+        if (chunk === null) return;
         got += chunk.length;
-        if (got > want.size) throw new BadBinary(`${who} sent more than ${want.size} bytes`);
-        hasher.update(chunk);
-        await out.write(chunk);
+        yield chunk;
       }
-    } finally {
-      await out.close();
     }
-    if (got !== want.size) throw new Unavailable(`the binary from ${who} ended at ${got} of ${want.size} bytes`);
-    const sha = hasher.digest("hex");
-    if (sha !== want.sha256) throw new BadBinary(`the binary from ${who} has SHA-256 ${sha.slice(0, 16)}…, not ${want.sha256.slice(0, 16)}…`);
-    await chmod(part, 0o755);
+    // A part a crash or an abandoned fetch left: the write is of a new file.
+    await rm(part, { force: true });
+    await writeChecked(bytes(), part, { maxBytes: want.size, mode: 0o755, expect: { hash: want.sha256, size: want.size } }).catch((err: unknown) => {
+      if (!(err instanceof Refused)) throw err;
+      if (err.why === "short") throw new Unavailable(`the binary from ${who} ended at ${err.got.size} of ${want.size} bytes`);
+      if (err.why === "over") throw new BadBinary(`${who} sent more than ${want.size} bytes`);
+      throw new BadBinary(`the binary from ${who} has SHA-256 ${err.got.hash?.slice(0, 16)}…, not ${want.sha256.slice(0, 16)}…`);
+    });
     await rename(part, dest);
   } catch (err) {
     await rm(part, { force: true });

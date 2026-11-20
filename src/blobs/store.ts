@@ -1,7 +1,8 @@
 // A node's file store: content-addressed, so a file is kept once under the SHA-256 of its bytes. Files are never
 // deleted; the directory is private to this user (700) and each file 600.
-import { open, readdir, rename, rm, stat } from "node:fs/promises";
+import { readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { Refused, writeChecked } from "../checked-file";
 import { ensurePrivateDir } from "../paths";
 import { isBlobHash, MAX_BLOB_BYTES } from "./attachment";
 
@@ -44,30 +45,14 @@ export class BlobStore {
     const maxBytes = options.maxBytes ?? MAX_BLOB_BYTES;
     await ensurePrivateDir(this.dir);
     const temp = join(this.dir, `${TEMP_PREFIX}${crypto.randomUUID()}`);
-    const handle = await open(temp, "wx", 0o600);
+    const got = await writeChecked(chunks, temp, { maxBytes, mode: 0o600, expect: options.expect }).catch((err: unknown) => {
+      if (!(err instanceof Refused)) throw err;
+      throw new BadBlob(err.why === "over" ? `blob exceeds ${maxBytes} bytes` : `blob does not match ${options.expect?.hash}`);
+    });
     try {
-      const hasher = new Bun.CryptoHasher("sha256");
-      let size = 0;
-      try {
-        for await (const chunk of chunks) {
-          size += chunk.byteLength;
-          if (size > maxBytes) throw new BadBlob(`blob exceeds ${maxBytes} bytes`);
-          hasher.update(chunk);
-          await handle.writeFile(chunk);
-        }
-        // A rename of bytes still in the cache could, after a crash, leave a hash that names an empty file for good.
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      const hash = hasher.digest("hex");
-      const { expect } = options;
-      if (expect !== undefined && (expect.hash !== hash || expect.size !== size)) {
-        throw new BadBlob(`blob does not match ${expect.hash}`);
-      }
-      if (await this.has(hash)) await rm(temp, { force: true });
-      else await rename(temp, this.path(hash));
-      return { hash, size };
+      if (await this.has(got.hash)) await rm(temp, { force: true });
+      else await rename(temp, this.path(got.hash));
+      return got;
     } catch (err) {
       await rm(temp, { force: true });
       throw err;
