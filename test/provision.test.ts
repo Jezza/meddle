@@ -109,7 +109,7 @@ test("a two-project task gets a workspace per project and runs from the task fol
   expect(await readFile(`${task}/CLAUDE.md`, "utf8")).toBe(
     "- a/: jj workspace of project a\n- b/: jj workspace of project b\n\n" +
       "This folder is a meddle task. Each project is a jj workspace; commit with jj.\n\n" +
-      "Add a description (4-7 words) to each revision you make (jj describe).\n\n" +
+      "Describe each revision you make with jj describe:\nAdd a description (4-7 words) to your revision(s).\n\n" +
       `To keep a side branch, give it a bookmark named meddle/task/${m.id}/<project>.<label> (for example meddle/task/${m.id}/<project>.spike). ` +
       "Bookmarks outside that namespace are not backed up and do not travel, and git refuses a name with a slash after the project name.\n",
   );
@@ -119,12 +119,13 @@ test("a two-project task gets a workspace per project and runs from the task fol
   expect(row).toMatchObject({ title: "pair", state: "idle", session_id: m.sessionId, started: 0, turns: 0 });
   expect(JSON.parse(row!.manifest)).toEqual(m);
 });
-test("generatedClaudeMd asks for descriptions of a project task's revisions, and of a scratch task's none", () => {
-  const line = "Add a description (4-7 words) to each revision you make (jj describe).";
+test("generatedClaudeMd asks for descriptions of a project task's revisions, as describe.prompt says, and of a scratch task's none", () => {
+  const line = "Describe each revision you make with jj describe:\nAdd a description (4-7 words) to your revision(s).";
   const m = { id: "0123456789ab" } as TaskManifest;
   const project = { name: "a" } as Project;
   const text = generatedClaudeMd(m, [project]);
   expect(text).toContain(`\n${line}\n`);
+  expect(generatedClaudeMd(m, [project], "Use Conventional Commits.\n")).toContain("with jj describe:\nUse Conventional Commits.\n\n");
   // After the line saying to commit with jj, before the one about bookmarks.
   expect(text.indexOf("commit with jj.")).toBeLessThan(text.indexOf(line));
   expect(text.indexOf(line)).toBeLessThan(text.indexOf("To keep a side branch"));

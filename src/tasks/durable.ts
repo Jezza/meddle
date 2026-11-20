@@ -19,7 +19,7 @@ import { askTitle } from "../engine/title";
 import { abandon, bookmarkForget, bookmarkSet, changeId, changesIn } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
-import { FALLBACK_EFFORT, FALLBACK_MODEL } from "../pool/settings";
+import { DESCRIBE_PROMPT, FALLBACK_EFFORT, FALLBACK_MODEL } from "../pool/settings";
 import { dedupe } from "../pool/report";
 import type { PoolRuntime } from "../pool/runtime";
 import { applyProject } from "../projects/applier";
@@ -1153,7 +1153,8 @@ export class TaskRunner {
       const manifest = await readManifest(this.#cfg, taskId);
       // The task's CLAUDE.md as this meddle writes it, so a task made earlier is asked what newer ones are; the row's
       // manifest names the projects. A turn does not fail for it.
-      await refreshClaudeMd(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest).catch((err: unknown) => {
+      const describe = this.#pool?.settings.describePrompt() ?? DESCRIBE_PROMPT;
+      await refreshClaudeMd(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest, describe).catch((err: unknown) => {
         this.#log(`meddle: task ${taskId}: CLAUDE.md was not refreshed: ${messageOf(err)}`);
       });
       const primary = manifest.primaryProjectId;

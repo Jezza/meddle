@@ -308,7 +308,7 @@ test("a turn rewrites a stale CLAUDE.md, and leaves a current one alone", async 
   await runner.prompt(m.id, "Reply with the single word ok.");
   await first;
   expect(await readFile(file, "utf8")).toBe(current);
-  expect(current).toContain("Add a description (4-7 words) to each revision you make (jj describe).");
+  expect(current).toContain("Describe each revision you make with jj describe:\nAdd a description (4-7 words) to your revision(s).");
   // The next turn finds it current and does not write it again.
   const written = (await stat(file)).mtimeMs;
   const second = settled(runner);

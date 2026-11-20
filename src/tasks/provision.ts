@@ -3,6 +3,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
 import { checkTaskRoot, ensurePrivateDir, paths } from "../paths";
+import { DESCRIBE_PROMPT } from "../pool/settings";
 import {
   bookmarkForget, bookmarkList, bookmarkSet, changesIn, commitOf, configSetWorkspace, editIn, isJjRepo, workspaceAdd,
   workspaceConfigPath, workspaceForget,
@@ -18,7 +19,11 @@ import { taskNamespace, writeManifest, type Start, type TaskManifest } from "./m
 
 export type SettingSource = "user" | "project" | "local";
 
-export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string {
+/**
+ * The task's CLAUDE.md: its projects' workspaces, how to commit, `describe` (the pool's `describe.prompt`, what the
+ * merge train asks too) for each revision, and where side branches go.
+ */
+export function generatedClaudeMd(m: TaskManifest, projects: Project[], describe = DESCRIBE_PROMPT): string {
   if (projects.length === 0) {
     return [
       "This task has no project attached. This folder is scratch space; it travels with the task.",
@@ -31,7 +36,8 @@ export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string 
     "",
     "This folder is a meddle task. Each project is a jj workspace; commit with jj.",
     "",
-    "Add a description (4-7 words) to each revision you make (jj describe).",
+    "Describe each revision you make with jj describe:",
+    describe.trim(),
     "",
     `To keep a side branch, give it a bookmark named meddle/task/${m.id}/<project>.<label> (for example meddle/task/${m.id}/<project>.spike). Bookmarks outside that namespace are not backed up and do not travel, and git refuses a name with a slash after the project name.`,
     "",
@@ -39,12 +45,13 @@ export function generatedClaudeMd(m: TaskManifest, projects: Project[]): string 
 }
 
 /**
- * Makes `<task>/CLAUDE.md` what `generatedClaudeMd` gives task `m` now, writing it only when its content differs: a task
- * made before a line was added to it picks the line up, and an agent's edit to the file does not outlast the turn. `m`
+ * Makes `<task>/CLAUDE.md` what `generatedClaudeMd` gives task `m` and `describe` now, writing it only when its content
+ * differs: a task made before a line was added to it, or before `describe.prompt` changed, picks it up, and an agent's
+ * edit to the file does not outlast the turn. `m`
  * is the task's row's manifest, never `task.json`'s copy, which its agent can edit. A task with a project this node
  * does not have is left as it is.
  */
-export async function refreshClaudeMd(cfg: NodeConfig, db: Database, m: TaskManifest): Promise<void> {
+export async function refreshClaudeMd(cfg: NodeConfig, db: Database, m: TaskManifest, describe: string): Promise<void> {
   const projects: Project[] = [];
   for (const entry of m.projects) {
     const project = getProject(db, entry.id);
@@ -52,7 +59,7 @@ export async function refreshClaudeMd(cfg: NodeConfig, db: Database, m: TaskMani
     projects.push({ ...project, name: entry.name });
   }
   const file = join(paths(cfg).task(m.id), "CLAUDE.md");
-  const text = generatedClaudeMd(m, projects);
+  const text = generatedClaudeMd(m, projects, describe);
   if (await readFile(file, "utf8").catch(() => null) === text) return;
   await writeFile(file, text);
 }
