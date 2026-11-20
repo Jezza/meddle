@@ -15,6 +15,9 @@ test("parses and composes", () => {
   expect(s.autoMode.allow).toEqual(["$defaults", "Cargo builds"]);
   expect(s.permissions.ask).toEqual(["Bash(git push *)"]);
   expect(composeEnv([DEFAULT_CONTEXT, c])).toEqual({ RUST_LOG: "debug" });
+  // A project may set what meddle sets, but never meddle's git socket.
+  const own = { ...DEFAULT_CONTEXT, env: { CLAUDE_CODE_OAUTH_TOKEN: "theirs", MEDDLE_GIT_SOCKET: "/d/git.sock" } };
+  expect(composeEnv([c, own])).toEqual({ RUST_LOG: "debug", CLAUDE_CODE_OAUTH_TOKEN: "theirs" });
 });
 test("unknown key is named", () => {
   expect(() => parseContext(`[claude]\nallwo = []\n`)).toThrow("unknown key claude.allwo");
