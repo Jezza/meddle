@@ -1,10 +1,10 @@
 // The sidebar: projects with their tasks, the tasks with no project or several, the archived tasks (collapsed), and
 // the pool's nodes at the foot. Each project's line opens its train too. Each task row carries its state, what waits on
 // you, how many of its agents run, whether it is queued on its train, and the node it runs on.
-import { useState } from "preact/hooks";
+import { useContext, useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { store, stored, useAction, useValue } from "./hooks";
-import { type Anchor, deleteTask, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
+import { type Anchor, BuildAlerts, deleteTask, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
 import { Glyph } from "./icons";
 import { projectChoices } from "./pool-model";
 import { hashOf, type View } from "./routes";
@@ -14,12 +14,10 @@ import { trainOffer } from "./train-model";
 
 const ARCHIVED_OPEN_KEY = "meddle.sidebar.archived";
 
-export function Sidebar({ pool, index, view, selfId, alerts, onHide, onNavigate }: {
-  pool: PoolRef; index: PoolIndex; view: View; selfId: string;
-  /** Nodes on a build other than the pool's, and why (`buildAlerts`): their dot is red. */
-  alerts: ReadonlyMap<string, string>;
-  onHide(): void; onNavigate(): void;
+export function Sidebar({ pool, index, view, selfId, onHide, onNavigate }: {
+  pool: PoolRef; index: PoolIndex; view: View; selfId: string; onHide(): void; onNavigate(): void;
 }) {
+  const alerts = useContext(BuildAlerts);
   const nodes = useValue(pool.nodes);
   const mixedVersions = useValue(pool.mixedVersions);
   const groups = groupTasks(projectChoices(nodes), index.tasks);
