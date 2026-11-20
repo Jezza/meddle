@@ -223,7 +223,8 @@ const GROUPS: Group[] = [
         details:
           "A project's default branch is set when it is added: the folder's `main`, else `master`, or the URL's HEAD " +
           "branch. A task started from outside a checkout with no --rev starts there, and a checkout's fetch makes it " +
-          "the HEAD branch. This changes it on this node. Needs the node running.",
+          "the HEAD branch. It is set on the project's home, which every node takes it from: on a node other than the " +
+          "home, it is refused while the home is offline. Needs the node running.",
       },
       {
         name: "project status",

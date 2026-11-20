@@ -599,10 +599,23 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         projectIds.replace(ctx, projectIdsNow());
         return project;
       },
+      // The home's default branch is the project's: every other node takes it from there (`makeServiceRepo`), so one
+      // set elsewhere is set on the home first, else the next sweep would put the home's back.
       setDefaultBranch: async ({ projectId, branch }) => {
-        const project = setDefaultBranch(db, projectId, branch);
-        if (project === null) throw new Error(`no project ${shortId(projectId)}`);
-        return project;
+        const found = getProject(db, projectId);
+        if (found === null) throw new Error(`no project ${shortId(projectId)}`);
+        if (found.home !== pool.identity.id) {
+          if (!pool.net.isOnline(found.home)) {
+            throw new Error(`${found.name}'s home ${shortId(found.home)} is offline: its default branch is set there`);
+          }
+          const home = await pool.peerRef(found.home, NodeObject);
+          try {
+            await home.setDefaultBranch({ projectId, branch });
+          } finally {
+            home.release();
+          }
+        }
+        return setDefaultBranch(db, projectId, branch)!;
       },
       dismiss: ({ id }, ctx) => {
         notifications.replace(ctx, notifications.value.filter((n) => n.id !== id));
