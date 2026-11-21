@@ -1,16 +1,5 @@
 // A usage meter (`usage-model.ts`): its label, a short bar, its text, and where there is room its note.
-import { useEffect, useState } from "preact/hooks";
 import type { Meter } from "./usage-model";
-
-/** The time now, renewed every minute: what a reading's age and its windows' resets are judged against. */
-export function useNow(): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 60_000);
-    return () => clearInterval(timer);
-  }, []);
-  return now;
-}
 
 /** One meter; `wide` adds its note (`resets 14:30`). No bar while the whole is not known. */
 export function UsageMeter({ meter, wide, class: cls }: { meter: Meter; wide?: boolean; class?: string }) {

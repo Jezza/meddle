@@ -1,7 +1,7 @@
 // test/durable.test.ts
 import { test, expect, spyOn } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { loadConfig, ensureDataDirs, paths, type NodeConfig } from "../src/config";
 import { openDb } from "../src/store/db";
 import { addProjectFromFolder } from "../src/projects/project";
@@ -75,7 +75,8 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   const p = await addProjectFromFolder(cfg, db, a, PROJECT_HOME, "a");
   await (await import("../src/token")).addToken(cfg, db, "tok", { setBy: null });
   const fixture = `${import.meta.dir}/fixtures/hello.jsonl`;
-  const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, ...extra } }) }; };
+  const input = `${await mkdtemp("/tmp/meddle-input-")}/input.jsonl`; // what each Claude Code run is sent
+  const open = async (extra: Record<string,string> = {}) => { const { createRegistry } = await import("@earendil-works/pi-durable"); const h = await openHarness(cfg, createRegistry()); return { h, runner: new TaskRunner(cfg, db, h.harness, { claudePath: replay, claudeRuntime: "bun", extraEnv: { MEDDLE_FIXTURE: fixture, MEDDLE_FIXTURE_INPUT: input, ...extra } }) }; };
   const turnsStarted = () => listEvents(db, m.id).filter(e => (e.message as any).subtype === "turn_started").map(e => (e.message as any).resume);
   // 1. the first process stalls before the result; closing its Harness kills the turn mid-way
   const { h, runner } = await open({ MEDDLE_FIXTURE_STALL: "1" });
@@ -109,6 +110,14 @@ test("a turn interrupted by a process death resumes after reopen", async () => {
   // the close logged turn_aborted, so the rerun told Claude to carry on rather than sending the prompt again
   const prompts = listEvents(db, m.id).filter(e => (e.message as any).type === "user").map(e => (e.message as any).message.content);
   expect(prompts).toEqual(["Reply with the single word ok.", CARRY_ON_PROMPT, "Also say why."]);
+  // the person's prompt and steer go to Claude Code as a human's (each time it is sent); meddle's own carry-on does not
+  const sent = readFileSync(input, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l));
+  expect(sent.map(f => [f.message.content, f.origin])).toEqual([
+    ["Reply with the single word ok.", { kind: "human" }],
+    ["Also say why.", { kind: "human" }],
+    [CARRY_ON_PROMPT, undefined],
+    ["Also say why.", { kind: "human" }],
+  ]);
   await again.h.close();
 });
 test("a pending approval makes the task waiting until it is answered", async () => {
@@ -284,6 +293,28 @@ test("a project id in task.json that the task's row lacks fails the turn", async
   } finally {
     logged.mockRestore();
   }
+  await h.close();
+});
+test("a turn rewrites a stale CLAUDE.md, and leaves a current one alone", async () => {
+  const { stat } = await import("node:fs/promises");
+  const { getProject } = await import("../src/projects/project");
+  const { generatedClaudeMd } = await import("../src/tasks/provision");
+  const { cfg, db, h, runner, m, settled } = await setup();
+  const file = join(paths(cfg).task(m.id), "CLAUDE.md");
+  const project = getProject(db, m.projects[0]!.id)!;
+  const current = generatedClaudeMd(m, [project]);
+  await writeFile(file, "Old text, as an older meddle wrote it.\n");
+  const first = settled(runner);
+  await runner.prompt(m.id, "Reply with the single word ok.");
+  await first;
+  expect(await readFile(file, "utf8")).toBe(current);
+  expect(current).toContain("Describe each revision you make with jj describe:\nAdd a description (4-7 words) to your revision(s).");
+  // The next turn finds it current and does not write it again.
+  const written = (await stat(file)).mtimeMs;
+  const second = settled(runner);
+  await runner.prompt(m.id, "Again.");
+  await second;
+  expect((await stat(file)).mtimeMs).toBe(written);
   await h.close();
 });
 test("a prompt sent once the turn's input has closed waits, queued, and runs as the next turn", async () => {

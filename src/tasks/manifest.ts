@@ -33,6 +33,11 @@ export type TaskManifest = {
   /** The first project's id; null for a task without a project. */
   primaryProjectId: string | null;
   createdAt: string;
+  /**
+   * Set on a merge task, the merge train's check of a batch: the project it merges in and the ids of the tasks
+   * whose work it merges. Absent on every other task.
+   */
+  merge?: { project: string; batch: string[] };
 };
 
 /** How a task takes a revision it starts at: `edit` works on it in place, `child` on a new change on top of it. */
@@ -41,9 +46,10 @@ export type HandoffMode = "edit" | "child";
 /**
  * Where one project of a task starts, as the node asked resolved it (commit ids): the task's line is written at
  * `commit`, and `base` are the commits the task's work is measured from (`[commit]` in `child` mode, its parents in
- * `edit` mode).
+ * `edit` mode). `parents`, when set, make it a start on a merge: the workspace starts on a new commit with all of
+ * them (a `child` start, `commit` the first and `base` all of them: `mergeStartAt`).
  */
-export type Start = { projectId: string; mode: HandoffMode; commit: string; base: string[] };
+export type Start = { projectId: string; mode: HandoffMode; commit: string; base: string[]; parents?: string[] };
 
 /**
  * Every bookmark of task `taskId` is under `meddle/task/<taskId>/`: its project's bookmark `<project name>` and the

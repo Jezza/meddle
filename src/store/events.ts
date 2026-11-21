@@ -44,6 +44,25 @@ export function listEvents(
   return rows.map((row) => ({ seq: row.seq, message: JSON.parse(row.json), at: row.at }));
 }
 
+/** The seq of the task's newest event; 0 when it has none. */
+export function lastSeq(db: Database, taskId: string): number {
+  return db.query<{ last: number }, [string]>("SELECT COALESCE(MAX(seq), 0) AS last FROM events WHERE task_id = ?").get(taskId)!.last;
+}
+
+/**
+ * The task's events after `afterSeq` up to `toSeq` (inclusive) of any of `types` (each message's `type`), oldest first:
+ * the rest of the span is never parsed.
+ */
+export function listEventsBetween(db: Database, taskId: string, afterSeq: number, toSeq: number, types: readonly string[]): EventRecord[] {
+  if (types.length === 0) return [];
+  const rows = db
+    .query<{ seq: number; at: string; json: string }, Array<string | number>>(
+      `SELECT seq, at, json FROM events WHERE task_id = ? AND seq > ? AND seq <= ? AND type IN (${types.map(() => "?").join(", ")}) ORDER BY seq`,
+    )
+    .all(taskId, afterSeq, toSeq, ...types);
+  return rows.map((row) => ({ seq: row.seq, message: JSON.parse(row.json), at: row.at }));
+}
+
 /**
  * The newest `limit` events of a task before `beforeSeq` (all of them without it), leaving out `excludeTypes`; oldest
  * first. Reads only the rows it returns, newest first, so a long log costs no more than a short one.

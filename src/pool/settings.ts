@@ -5,7 +5,7 @@ import type { NodeConfig } from "../config";
 import { parseDuration } from "../update/model";
 
 /** The keys a pool setting may have; `env.<NAME>` sets `<NAME>` for jj and for every task's Claude Code. */
-export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|roster\.forget|defaults\.model|defaults\.effort|update\.within|update\.health|env\.[A-Z_][A-Z0-9_]*)$/;
+export const SETTING_KEY = /^(jj\.user|jj\.email|lighthouse\.url|limits\.running|roster\.forget|defaults\.model|defaults\.effort|describe\.prompt|update\.within|update\.health|env\.[A-Z_][A-Z0-9_]*)$/;
 
 /** How long a member goes unheard of before it is gone (`roster.forget`'s default): three lighthouse announce TTLs. */
 export const DEFAULT_FORGET_SECS = 900;
@@ -69,6 +69,8 @@ export const EFFORT_LEVELS: readonly string[] = ["low", "medium", "high", "xhigh
 /** The model and effort of a task that chose none while the pool sets none. */
 export const FALLBACK_MODEL = "opus";
 export const FALLBACK_EFFORT = "medium";
+/** What `describe.prompt` asks of an agent while the pool sets nothing: the merge train's prompt for describing its work. */
+export const DESCRIBE_PROMPT = "Add a description (4-7 words) to your revision(s).";
 /** The most distinct ignored keys logged; later ones are only counted. */
 const MAX_LOGGED = 100;
 /** How much of an ignored key a log line shows. */
@@ -324,6 +326,12 @@ export class PoolSettings {
   defaultEffort(): string {
     const effort = this.get("defaults.effort");
     return effort !== null && EFFORT_LEVELS.includes(effort) ? effort : FALLBACK_EFFORT;
+  }
+
+  /** `describe.prompt`, what the merge train asks an agent to describe its revisions; `DESCRIBE_PROMPT` when unset or empty. */
+  describePrompt(): string {
+    const prompt = this.get("describe.prompt");
+    return prompt === null || prompt === "" ? DESCRIBE_PROMPT : prompt;
   }
 
   /** `lighthouse.url`, or null when it is unset or empty (a replicated empty value must not reach discovery). */

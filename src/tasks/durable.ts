@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
-import type { PermissionMode, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionMode, Query, SDKMessage, SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
@@ -12,14 +12,14 @@ import { materialize, promptContent } from "../blobs/content";
 import { BlobFetcher } from "../blobs/pool";
 import { BlobStore } from "../blobs/store";
 import { Approvals } from "../engine/approvals";
-import { InputQueue } from "../engine/input";
+import { HUMAN, InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
 import { resultError, runTurn, type MeddleEvent, type SendNowOutcome, type TokenFault } from "../engine/session";
 import { askTitle } from "../engine/title";
-import { bookmarkForget, bookmarkSet, changeId } from "../jj";
+import { abandon, bookmarkForget, bookmarkSet, changeId, changesIn } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
-import { FALLBACK_EFFORT, FALLBACK_MODEL } from "../pool/settings";
+import { DESCRIBE_PROMPT, FALLBACK_EFFORT, FALLBACK_MODEL } from "../pool/settings";
 import { dedupe } from "../pool/report";
 import type { PoolRuntime } from "../pool/runtime";
 import { applyProject } from "../projects/applier";
@@ -29,10 +29,13 @@ import type { StreamReader } from "../pool/frames";
 import { getProject, listProjects, type Project } from "../projects/project";
 import { defaultBranchCommit } from "../projects/starts";
 import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRows } from "../projects/lines";
-import { branchChanges, lineChanges, listLineRows, mergeLineRows, writeLineRow, type LineRow } from "../pool/rows";
+import { branchChanges, lineChanges, listLineRows, mergeLineRows, setQueued, writeLineRow, type LineRow, type LineRowIn } from "../pool/rows";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
-import { appendEvent, latestEventOfType, listEventsTail, listPromptAttachments, type EventRecord } from "../store/events";
+import {
+  appendEvent, lastSeq, latestEventOfType, listEventsBetween, listEventsOfKinds, listEventsTail, listPromptAttachments,
+  type EventRecord,
+} from "../store/events";
 import { SqliteSessionStore } from "../store/session-store";
 import {
   clearTaskLog,
@@ -52,22 +55,30 @@ import { markToken, pickToken } from "../token";
 import { recordUsage, usageReadingOf } from "../token-usage";
 import { repoKey, serialised } from "../serial";
 import { claudeCodeVersion } from "../version";
-import { acceptanceOf, branchTips, type Acceptance, type BranchTips, type LineName } from "./accept";
+import {
+  declineReason, TRAIN_TOOLS, trainOutcome, trainServer, trainToolList, type TrainTurnKind, type TrainTurnOutcome,
+} from "../train/tools";
+import { MeddleTrain } from "../train/train";
+import { acceptanceOf, branchTips, containedIn, effectiveHead, type Acceptance, type BranchTips, type LineName } from "./accept";
 import { readArchive, unpackArchiveFiles, writeArchive } from "./archive";
-import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type Start, type TaskManifest } from "./manifest";
+import { readManifest, taskGlob, taskNamespace, transcriptPath, writeManifest, type ManifestProject, type Start, type TaskManifest } from "./manifest";
 import { MeddleMove, releaseFolder, type MoveInput } from "./move";
 import { promptTitle } from "./names";
-import { checkReceivedManifest, dropWorkspace, provisionFromManifest, provisionTask, SAFE_ID } from "./provision";
+import { checkReceivedManifest, COMMIT_ID, dropWorkspace, provisionFromManifest, provisionTask, refreshClaudeMd, SAFE_ID } from "./provision";
 import { adoptTranscriptSlot, importTask, type Receipt } from "./transfer";
 
 export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" | "moved" | "archived";
 
 /**
  * One turn's input: its prompt's text and attachments (an input stored by an older meddle has no `attachments`: none).
- * `freshAfter` (the first turn of a task received from another node): the cut-off check looks only at events after
- * this seq, so a turn the sender ended (by moving the task) is never taken for one this node must carry on.
+ * `freshAfter` (the first turn of a task received from another node, and every train turn): the cut-off check looks
+ * only at events after this seq, so a turn the sender ended (by moving the task), or one before the train's, is never
+ * taken for one this node must carry on. `train`: a turn of the merge train's (`trainTurn`), run in `auto` with
+ * meddle's train tools, its prompt logged as meddle's; what it logged after `freshAfter` says how it went.
  */
-type TurnInput = { taskId: string; prompt: string; attachments?: Attachment[]; freshAfter?: number };
+type TurnInput = {
+  taskId: string; prompt: string; attachments?: Attachment[]; freshAfter?: number; train?: { kind: TrainTurnKind };
+};
 /**
  * Where a turn is. `tokenRetries`: how often `run` was entered again after the turn's token failed it (at most once). A
  * checkpoint stored by an older meddle has none: read it as 0.
@@ -97,8 +108,17 @@ export type RunnerHooks = {
   afterTokenFault?(taskId: string): void | Promise<void>;
   /** Called once what a steer sends Claude Code is made, before the steer goes into the turn's input. */
   afterSteerContent?(taskId: string): void | Promise<void>;
+  /** Called with what a turn's Claude Code is started with (`#engineInput`), before it starts. */
+  engineInput?(taskId: string, input: Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">): void;
+  /** Called with the tools a train turn's `meddle` server serves, as wired (`#engineInput`): a test calls them so. */
+  trainTools?(taskId: string, tools: SdkMcpToolDefinition<any>[]): void;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
   callMs?: number;
+  /**
+   * Called as `trainTurn` starts, before anything else: an outcome it answers is the turn's, and no turn runs (a test
+   * stands in for the agent so); undefined lets the turn run.
+   */
+  trainTurn?(taskId: string, kind: TrainTurnKind, text: string): Promise<TrainTurnOutcome | undefined> | TrainTurnOutcome | undefined;
 };
 
 /**
@@ -107,10 +127,43 @@ export type RunnerHooks = {
  * `hosting`, no task is created or received here. `moveTo(id)` says why a task may not move to member `id` (its build
  * differs from this node's), or null.
  */
+/** A refusal for what keeps this node from taking a task (`TaskRunner.hostingProblem`). */
+export function hostingRefusal(problem: { reason: string; held: boolean }): string {
+  return problem.held ? `this node takes no tasks now: ${problem.reason}` : `this node does not host tasks: ${problem.reason}`;
+}
+
 export type RunnerHolds = { turns: string | null; work: string | null; hosting: string | null };
+
+/**
+ * A train turn refused because a pool update holds turns here (`trainTurn`): the message is the hold's reason. The
+ * merge train waits for the hold to lift rather than count it against the task.
+ */
+export class TurnsHeld extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "TurnsHeld";
+  }
+}
 
 /** A move of a task in progress here: where to, the step it is at, and the error that is failing it (if any). */
 export type MoveState = { to: string; phase: string; error: string | null };
+
+/** A task queued on its project's train: when the user accepted it, and the project's id. */
+export type TaskQueue = { queuedAt: string; project: string };
+
+/**
+ * How a task stands for the merge train on its holder (`trainStatus`): `idle`, a train turn could start on it now;
+ * `train`, a turn of the train's runs on it; `busy`, anything else keeps it (its own turn, prompts waiting, a move or an
+ * archive); `absent`, it is not live there. `title` is the task's, null when it is absent.
+ */
+export type TrainTaskStatus = { taskId: string; state: "idle" | "busy" | "train" | "absent"; title: string | null };
+
+/** Why a task left the queue: the user's Unqueue; input of the user's that runs in it; its archive (or delete). */
+export const UNQUEUED_BY_USER = "you unqueued it";
+export const UNQUEUED_BY_INPUT = "you sent it a prompt";
+export const UNQUEUED_ARCHIVED = "archived";
+/** Why a task leaves the queue when the user took it off: no news to tell, and nothing for its conversation to keep. */
+export const UNQUEUED_AS_ASKED: ReadonlySet<string> = new Set([UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]);
 
 export type RunnerDeps = {
   claudePath?: string;
@@ -209,6 +262,8 @@ type LiveTurn = {
   sendNow: () => Promise<SendNowOutcome | undefined>;
   takeBack: () => Promise<Prompt[]>;
   state: "running" | "waiting";
+  /** A turn of the train's: the user's prompts wait for it, and Send now has nothing to send into it. */
+  train?: TrainTurnKind;
 };
 
 /** How long a turn interrupted by a "move now" has to end before it is closed. */
@@ -293,6 +348,8 @@ export class TaskRunner {
   /** Per task, the check of its acceptance made again later: the last one lacked a commit a row names. */
   #acceptRetries = new Map<string, ReturnType<typeof setTimeout>>();
   #acceptanceListeners = new Set<(taskId: string, acceptance: Acceptance) => void>();
+  #queueListeners = new Set<(taskId: string, queue: TaskQueue | null, reason: string | null) => void>();
+  #holdsListeners = new Set<(holds: RunnerHolds) => void>();
   /** Per task, the accepted idle task waiting for its turn to leave the Harness (`#awaitTurnGone`). */
   #acceptTurnWaits = new Set<string>();
   /** Tasks whose check lacked a commit a row names, and those whose lack is logged already (once per task). */
@@ -361,6 +418,13 @@ export class TaskRunner {
       }
     }
     if (was.work !== null && holds.work === null) for (const row of listLiveTasks(this.#db)) this.#checkAcceptance(row.id);
+    notify(this.#holdsListeners, (cb) => cb({ ...this.#holds }));
+  }
+
+  /** Called with what is held here whenever `setHolds` sets it. */
+  onHolds(cb: (holds: RunnerHolds) => void): () => void {
+    this.#holdsListeners.add(cb);
+    return () => { this.#holdsListeners.delete(cb); };
   }
 
   /** Why a task may not move to member `to` (set by the node: builds that differ); null when it may. */
@@ -374,8 +438,24 @@ export class TaskRunner {
   }
 
   /**
+   * Why this node takes no task now, or null: its task root, jj or git not usable (`checkTaskRoot`), or a pool update
+   * holding it (`held`). What placement, a receive, peers and the node's own state all go by.
+   */
+  async hostingProblem(): Promise<{ reason: string; held: boolean } | null> {
+    const root = await checkTaskRoot(this.#cfg);
+    if (!root.ok) return { reason: root.reason, held: false };
+    return this.#holds.hosting === null ? null : { reason: this.#holds.hosting, held: true };
+  }
+
+  /** The Harness this runner drives its turns on; the merge train's conductor runs its rounds there too. */
+  get harness(): Harness {
+    return this.#harness;
+  }
+
+  /**
    * The tasks whose turns or moves are in flight here: live or pending turns, and the Harness's unfinished turns and
-   * moves that can run (not parked; none while its scheduling is paused). What a queued update drains.
+   * moves that can run (not parked; none while its scheduling is paused), and a round of a merge train's in flight
+   * (`meddle.train`) as `train:<project id>`. What a queued update drains.
    */
   async busyTasks(): Promise<string[]> {
     const busy = new Set<string>([...this.#live.keys(), ...this.#pending]);
@@ -384,6 +464,7 @@ export class TaskRunner {
       for (const t of tasks) {
         if (t.record.state.status === "terminal" || isParked(t)) continue;
         const kind = t.record.kind;
+        if (kind === MeddleTrain.definition.name) busy.add(`train:${(t.record.input as { projectId: string }).projectId}`);
         if (kind !== MeddleTurn.definition.name && kind !== MeddleMove.definition.name) continue;
         busy.add((t.record.input as { taskId: string }).taskId);
       }
@@ -409,12 +490,14 @@ export class TaskRunner {
   /**
    * Provisions task `taskId` (with no project, or several) from the starts the node asked resolved (`startAt`), in
    * order, the first the primary. With a pool, each project gets a service repo here when it has none
-   * (`ensureServiceRepo`), each start's line must reach it first (`awaitLine`: its row, and its commit fetched), and
-   * once the task is provisioned this node takes each line, one epoch up, and applies the project (which forgets the
-   * line's remote ref now that the task's own bookmark holds it). Refused for an id that is not one path segment, or
-   * that a task here already has.
+   * (`ensureServiceRepo`), each start's line must reach it first (`awaitLine`: its row, and its commit and every base
+   * commit fetched: a start on a merge has several), and once the task is provisioned this node takes each line, one
+   * epoch up, and applies the project (which forgets the line's remote ref now that the task's own bookmark holds it).
+   * A merge task of the merge train (`merge`, on a start with parents) writes its lines from its workspace at once, so
+   * that its line names the merge it starts on, not the merge's first parent. Refused for an id that is not one path
+   * segment, or that a task here already has.
    */
-  async create(input: { title: string; taskId: string; starts: Start[] }): Promise<TaskManifest> {
+  async create(input: { title: string; taskId: string; starts: Start[]; merge?: TaskManifest["merge"] }): Promise<TaskManifest> {
     const { taskId, starts } = input;
     if (this.#holds.hosting !== null) throw new Error(`this node takes no tasks now: ${this.#holds.hosting}`);
     if (!SAFE_ID.test(taskId)) throw new Error(`invalid task id: ${taskId}`);
@@ -427,10 +510,12 @@ export class TaskRunner {
       if (project === null) throw new Error(`unknown project: ${start.projectId}`);
       names.set(start.projectId, project.name);
       if (deps === null) continue;
-      const at = await awaitLine(deps, start.projectId, taskId, project.name, AWAIT_LINE_MS);
+      const at = await awaitLine(deps, start.projectId, taskId, project.name, AWAIT_LINE_MS, { withBase: true });
       if (at !== start.commit) throw new Error(`the line of ${project.name} is not at ${start.commit.slice(0, 12)}`);
     }
-    const manifest = await provisionTask(this.#cfg, this.#db, { title: input.title, taskId, starts });
+    const manifest = await provisionTask(this.#cfg, this.#db, {
+      title: input.title, taskId, starts, ...(input.merge === undefined ? {} : { merge: input.merge }),
+    });
     if (deps !== null) {
       const self = deps.pool.identity.id;
       for (const start of starts) {
@@ -443,6 +528,7 @@ export class TaskRunner {
           this.#log(`meddle: apply: project ${shortId(start.projectId)} as ${taskId} was created failed: ${messageOf(err)}`);
         });
       }
+      if (input.merge !== undefined) await this.writeTaskLines(taskId);
     }
     // The new task is live here: whoever lists this node's tasks hears of it, whichever node asked for it.
     this.#emitState(manifest.id, "idle");
@@ -482,11 +568,12 @@ export class TaskRunner {
    * it, so one with attachments is refused when the node it goes to does not take them (`<host> runs a meddle that
    * takes no attachments`).
    * A steer goes into the turn's input, for Claude Code to take into the running turn at its next chance (or as a
-   * turn of its own once that one ends), and is `queued` until it does. A prompt the live turn can no longer take (its
-   * input closed with its `result`), or for a turn that is being created, resumed by the Harness or retried after it
-   * was parked (which this retries), is queued for the task's next turn. A task left `running` with no turn here or in
-   * the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the prompt started a turn,
-   * `"queued"` when it waits to be taken (a steer, or a prompt for a later turn).
+   * turn of its own once that one ends), and is `queued` until it does. A turn of the train's (`trainTurn`) takes no
+   * steer: a prompt sent while one runs or is pending waits for the task's next turn. A prompt the live turn can no
+   * longer take (its input closed with its `result`), or for a turn that is being created, resumed by the Harness or
+   * retried after it was parked (which this retries), is queued for the task's next turn. A task left `running` with
+   * no turn here or in the Harness is idle again, and the prompt starts a turn. Answers `"turn"` when the prompt
+   * started a turn, `"queued"` when it waits to be taken (a steer, or a prompt for a later turn).
    */
   prompt(taskId: string, text: string, attachments: Attachment[] = []): Promise<"turn" | "queued"> {
     // A chain of its own: never behind the task's receive, import or activation (`taskKey`).
@@ -506,7 +593,8 @@ export class TaskRunner {
     let stale = false;
     if (row.state === "running" || row.state === "waiting") {
       const live = this.#live.get(taskId);
-      if (live !== undefined) return this.#send(taskId, live.queue, p);
+      // The train's turn takes no steer: the prompt waits for the task's next turn, the user's own.
+      if (live !== undefined) return live.train === undefined ? this.#send(taskId, live.queue, p) : this.#enqueueNext(taskId, p);
       const turn = await this.#durableTurn(taskId);
       // Held: a parked turn waits for the hold to lift (retrying it would start it).
       if (turn !== undefined && isParked(turn) && this.#holds.turns === null) await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
@@ -534,6 +622,7 @@ export class TaskRunner {
       this.#pending.delete(taskId);
       throw err;
     }
+    this.#inputRuns(taskId);
     return "turn";
   }
 
@@ -594,10 +683,120 @@ export class TaskRunner {
     return `${summary?.hostname ?? shortId(to)} runs a meddle that takes no attachments`;
   }
 
+  /**
+   * Why node `to` must not be sent a start with `parents` (its summary does not say it starts a task on a merge, as an
+   * older meddle's does not, and it would start on the first parent alone), or null: what a creation on another node
+   * checks.
+   */
+  noMergeStartsOn(to: string): string | null {
+    const summary = this.#pool?.store.row(to)?.summary ?? null;
+    if (summary?.mergeStarts === true) return null;
+    return `${summary?.hostname ?? shortId(to)} runs an older meddle`;
+  }
+
   /** Creates the task's next `meddle.turn`; the caller has reserved it in `#pending`. */
   async #createTurn(input: TurnInput): Promise<void> {
     const root = await this.#harness.root(BACKGROUND_CONTEXT);
     await root.commit((tx) => tx.createTask(MeddleTurn, input, { ownership: { kind: "conversation" } }), BACKGROUND_CONTEXT);
+  }
+
+  /**
+   * Runs a turn of the merge train's on the task, `kind` with prompt `text`, and answers how it went (`trainOutcome`,
+   * from what the turn logged, so a restart loses nothing). It is a durable turn like the user's, started apart from
+   * their input, so the task stays on its queue: it runs in `auto` with meddle's train tools (`#engineInput`), its
+   * prompt shows as meddle's, the user's prompts wait for it (`prompt`), and Send now has nothing to send into it. A
+   * train turn of `kind` already running (one a restart cut off from the call that started it) is joined, whatever its
+   * text; a train turn the restart limit parked has failed. Refused, before anything starts, as `#refuseElsewhere`
+   * refuses, while the task is being archived, while it runs another turn (`task is running`: the user's, or the
+   * train's of another kind) or has prompts waiting, and while a pool update holds turns (`TurnsHeld`).
+   *
+   * The agent's `decline` takes the task off its queue here, its holder, with the agent's reason, as it is logged
+   * (`#engineInput`), whether or not a call waits for the turn: a call cut off by a restart, or one that never comes,
+   * changes nothing, and the call's end takes it off no more (the user may have accepted it again meanwhile). Asked
+   * again for a task turn of `kind` once the latest one ended declined, and the task is still off its queue, this
+   * answers that decline and prompts no one: it is what a call cut off from that turn would have heard.
+   */
+  async trainTurn(taskId: string, kind: TrainTurnKind, text: string): Promise<TrainTurnOutcome> {
+    // Only with the hook set: awaiting nothing would let a prompt sent just after onto the prompt chain first.
+    const standIn = this.#deps.hooks?.trainTurn;
+    if (standIn !== undefined) {
+      const stood = await standIn(taskId, kind, text);
+      if (stood !== undefined) return stood;
+    }
+    // On the task's prompt chain: a prompt sent meanwhile either came first (and the task is busy) or sees the turn.
+    const turn = await serialised(`prompt\0${taskId}`, () => this.#startTrainTurn(taskId, kind, text));
+    if (!("end" in turn)) return turn;
+    const end = await turn.end;
+    const events = listEventsBetween(this.#db, taskId, turn.after, end, ["meddle", "result"]);
+    // A decline took the task off its queue as it was logged: one queued now was accepted again since.
+    return trainOutcome(events.map((e) => e.message));
+  }
+
+  /**
+   * Starts the train's turn for `trainTurn`, or joins the one running: its events are those after `after`, up to `end`'s
+   * seq. Or answers at once: the one running is parked (failed), or the latest of `kind` declined (`#declined`).
+   */
+  async #startTrainTurn(
+    taskId: string, kind: TrainTurnKind, text: string,
+  ): Promise<{ after: number; end: Promise<number> } | TrainTurnOutcome> {
+    const refuse = () => {
+      this.#refuseElsewhere(taskId);
+      if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+    };
+    refuse();
+    // Listening before looking: a train turn that ends while the Harness is asked is still heard.
+    const joined = this.#turnEnd(taskId);
+    let running: TaskInspection | undefined;
+    try {
+      running = await this.#durableTurn(taskId);
+    } catch (err) {
+      joined.cancel();
+      throw err;
+    }
+    const input = running?.record.input as TurnInput | undefined;
+    if (running !== undefined && input?.train !== undefined && (isParked(running) || input.train.kind === kind)) {
+      if (!isParked(running)) return { after: input.freshAfter ?? 0, end: joined.end };
+      joined.cancel();
+      return { kind: "failed", reason: "the task's turn is parked; retry it" };
+    }
+    joined.cancel();
+    // Nothing is awaited from here until the turn is reserved.
+    refuse();
+    const declined = this.#declined(taskId, kind);
+    if (declined !== null) return declined;
+    const busy = running !== undefined || this.#live.has(taskId) || this.#pending.has(taskId) || this.#row(taskId).state !== "idle";
+    if (busy) throw new Error("task is running");
+    if (this.queued(taskId).length > 0) throw new Error("task has prompts waiting");
+    if (this.#holds.turns !== null) throw new TurnsHeld(this.#holds.turns);
+    const after = lastSeq(this.#db, taskId);
+    const started = this.#turnEnd(taskId);
+    this.#pending.add(taskId);
+    try {
+      await this.#createTurn({ taskId, prompt: text, freshAfter: after, train: { kind } });
+    } catch (err) {
+      this.#pending.delete(taskId);
+      started.cancel();
+      throw err;
+    }
+    return { after, end: started.end };
+  }
+
+  /**
+   * The decline a task turn of `kind` would answer without running: the first `train_decline` logged since the task's
+   * latest train turn of `kind` began (its `train_turn`'s `after`, the same on a rerun), while the task is off its
+   * queue (a decline took it off; accepting it again lets the train ask afresh). Null otherwise, and always for the
+   * merge task, which is never queued and has no `decline`.
+   */
+  #declined(taskId: string, kind: TrainTurnKind): TrainTurnOutcome | null {
+    if (kind === "merge" || this.queue(taskId) !== null) return null;
+    const latest = listEventsOfKinds(this.#db, taskId, ["meddle:train_turn"])
+      .map((e) => e.message as { kind?: unknown; after?: unknown })
+      .findLast((m) => m.kind === kind);
+    if (latest === undefined || typeof latest.after !== "number") return null;
+    const decline = listEventsBetween(this.#db, taskId, latest.after, lastSeq(this.#db, taskId), ["meddle"])
+      .map((e) => e.message as { subtype?: unknown; reason?: unknown })
+      .find((m) => m.subtype === "train_decline");
+    return decline === undefined ? null : { kind: "declined", reason: typeof decline.reason === "string" ? decline.reason : "" };
   }
 
   /**
@@ -634,6 +833,8 @@ export class TaskRunner {
       updateTask(this.#db, taskId, { queued: queuedColumn(rest) });
     })();
     this.#starting.delete(taskId);
+    // The prompt runs now: sent after the task was accepted (`accept` refuses while one waits), it changes what was accepted.
+    this.#inputRuns(taskId);
     this.#emitQueued(taskId);
   }
 
@@ -698,7 +899,9 @@ export class TaskRunner {
       }
       return this.#enqueueNext(taskId, p);
     }
-    queue.push(p, "next", content);
+    queue.push(p, "next", content, HUMAN);
+    // Taken into the turn the user accepted the task in, which now has more to do than what they accepted.
+    this.#inputRuns(taskId);
     this.#emitQueued(taskId);
     return "queued";
   }
@@ -740,13 +943,17 @@ export class TaskRunner {
    * Sends the steers the task's running turn has not taken now, as Claude Code's own "send now" does: in order, into
    * the turn when Claude Code can fit them in, or else it cuts the turn short and runs them next. A steer `prompt` sent
    * just before is among them; texts queued for the task's next turn are not (they run next already). Answers what
-   * Claude Code says it did, `nothing_waiting` without a running turn.
+   * Claude Code says it did, `nothing_waiting` without a running turn or for a turn of the train's (what the user sent
+   * meanwhile waits for the turn after it).
    */
   async sendNow(taskId: string): Promise<SendNowOutcome | undefined> {
     this.#refuseElsewhere(taskId);
     const live = this.#live.get(taskId);
-    if (live === undefined) return "nothing_waiting";
-    return live.sendNow();
+    if (live === undefined || live.train !== undefined) return "nothing_waiting";
+    const outcome = await live.sendNow();
+    // Input of the user's runs now, when there was any: a queued task is no longer what they accepted.
+    if (outcome === "delivering" || outcome === "stopped") this.#inputRuns(taskId);
+    return outcome;
   }
 
   /**
@@ -777,17 +984,22 @@ export class TaskRunner {
     return [...live, ...later];
   }
 
-  /** Switches the live turn's permission mode, if any, and keeps it for the task's later turns. */
+  /**
+   * Switches the live turn's permission mode, if any, and keeps it for the task's later turns. A turn of the train's
+   * keeps `auto`: the mode is the user's turns'.
+   */
   async setPermissionMode(taskId: string, mode: PermissionMode): Promise<void> {
     this.#refuseElsewhere(taskId);
-    await this.liveQuery(taskId)?.setPermissionMode(mode);
+    const live = this.#live.get(taskId);
+    if (live?.train === undefined) await live?.query.setPermissionMode(mode);
     this.#updateSettings(taskId, { permissionMode: mode });
   }
 
-  /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the default. */
+  /** Switches the live turn's model, if any, and keeps it for the task's later turns; none is the pool's default (`#defaultModel`). */
   async setModel(taskId: string, model?: string): Promise<void> {
     this.#refuseElsewhere(taskId);
-    await this.liveQuery(taskId)?.setModel(model);
+    // Cleared, the running turn goes on with the model the next turn takes, not Claude Code's own default.
+    await this.liveQuery(taskId)?.setModel(model ?? this.#defaultModel());
     this.#updateSettings(taskId, { model });
   }
 
@@ -849,6 +1061,11 @@ export class TaskRunner {
     return () => { this.#settingsListeners.delete(cb); };
   }
 
+  /** The model of a task that names none: the pool's default, else meddle's. */
+  #defaultModel(): string {
+    return this.#pool?.settings.defaultModel() ?? FALLBACK_MODEL;
+  }
+
   /** Stores a change to the task's settings and tells the `onSettings` listeners. */
   #updateSettings(taskId: string, patch: Parameters<typeof updateTaskSettings>[2]): void {
     updateTaskSettings(this.#db, taskId, patch);
@@ -871,6 +1088,7 @@ export class TaskRunner {
     if (turn !== undefined && isParked(turn)) {
       if (this.#holds.turns !== null) throw new Error(this.#holds.turns);
       await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+      this.#inputRuns(taskId);
       return;
     }
     if (this.#row(taskId).state === "idle" && latestEventOfType(this.#db, taskId, "meddle", "turn_started") !== null) {
@@ -933,6 +1151,12 @@ export class TaskRunner {
       this.#pending.delete(taskId);
       if (!moving) this.#emitState(taskId, "running");
       const manifest = await readManifest(this.#cfg, taskId);
+      // The task's CLAUDE.md as this meddle writes it, so a task made earlier is asked what newer ones are; the row's
+      // manifest names the projects. A turn does not fail for it.
+      const describe = this.#pool?.settings.describePrompt() ?? DESCRIBE_PROMPT;
+      await refreshClaudeMd(this.#cfg, this.#db, JSON.parse(row.manifest) as TaskManifest, describe).catch((err: unknown) => {
+        this.#log(`meddle: task ${taskId}: CLAUDE.md was not refreshed: ${messageOf(err)}`);
+      });
       const primary = manifest.primaryProjectId;
       const deps = this.#replicaDeps();
       // A task without a project has no memory to sync.
@@ -949,8 +1173,9 @@ export class TaskRunner {
         throw new Error("no usable token");
       }
       // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
-      const prompt: Prompt = resume && cutOff === "token" ? { text: TOKEN_RETRY_PROMPT, attachments: [] }
-        : resume && cutOff === "restart" ? { text: CARRY_ON_PROMPT, attachments: [] }
+      const carryOn = resume && (cutOff === "token" || cutOff === "restart"); // meddle's words, not the person's
+      const prompt: Prompt = carryOn && cutOff === "token" ? { text: TOKEN_RETRY_PROMPT, attachments: [] }
+        : carryOn ? { text: CARRY_ON_PROMPT, attachments: [] }
         : { text: input.prompt, attachments: input.attachments ?? [] };
       // Claude Code is given the task's attachments folder as an additional directory, so it exists for every turn.
       const attachmentsDir = paths(this.#cfg).taskAttachments(taskId);
@@ -958,10 +1183,13 @@ export class TaskRunner {
       const content = await promptContent(this.blobs.store, attachmentsDir, prompt);
       const queue = new InputQueue();
       let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
+      const train = input.train?.kind;
       const { query, done, sendNow, takeBack } = runTurn({
-        input: await this.#engineInput(taskId, manifest, resume, picked.value),
+        input: await this.#engineInput(taskId, manifest, resume, picked.value, train),
         prompt,
         content,
+        ...(train === undefined ? {} : { train: { kind: train, after: input.freshAfter ?? 0 } }),
+        ...(carryOn || train !== undefined ? {} : { origin: HUMAN }), // a train turn's prompt is meddle's too
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -980,7 +1208,7 @@ export class TaskRunner {
         },
         onTokenFault: (f) => { fault = f; },
       });
-      this.#live.set(taskId, { query, queue, sendNow, takeBack, state: "running" });
+      this.#live.set(taskId, { query, queue, sendNow, takeBack, state: "running", ...(train === undefined ? {} : { train }) });
       notify(this.#liveListeners, (cb) => cb(taskId));
       let result: Awaited<typeof done>;
       try {
@@ -1152,13 +1380,12 @@ export class TaskRunner {
    * stay `from`'s until the task is activated here, and a receive abandoned or refused leaves none of this node's.
    */
   async receiveTask(
-    manifest: TaskManifest, from: string, version: string, lineRows: readonly LineRow[],
+    manifest: TaskManifest, from: string, version: string, lineRows: readonly LineRowIn[],
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const ours = claudeCodeVersion();
     if (version !== ours || ours === "unknown" || version === "unknown") return { ok: false, reason: `claude code ${ours} here, ${version} there` };
-    const hosting = await checkTaskRoot(this.#cfg);
-    if (!hosting.ok) return { ok: false, reason: `this node does not host tasks: ${hosting.reason}` };
-    if (this.#holds.hosting !== null) return { ok: false, reason: `this node takes no tasks now: ${this.#holds.hosting}` };
+    const hosting = await this.hostingProblem();
+    if (hosting !== null) return { ok: false, reason: hostingRefusal(hosting) };
     const deps = this.#replicaDeps();
     if (deps === null) return { ok: false, reason: "this node has no pool" };
     try {
@@ -1448,7 +1675,7 @@ export class TaskRunner {
     const manifest = JSON.parse(row.manifest) as TaskManifest;
     for (const p of manifest.projects) {
       await dropWorkspace(this.#cfg, p.replica, `meddle-${row.id}`, join(paths(this.#cfg).task(row.id), p.workspace));
-      await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(row.id), this.#cfg)).catch(() => {});
+      await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(row.id), this.#cfg, { ignoreWorkingCopy: true })).catch(() => {});
     }
     await rm(paths(this.#cfg).task(row.id), { recursive: true, force: true });
     deleteTask(this.#db, row.id, row.session_id);
@@ -1506,6 +1733,8 @@ export class TaskRunner {
           release = (await acceptanceOf(deps, manifest, tipsOf)).contained;
         } else await this.#writeLinesNext(taskId, { archived: true });
         await writeArchive(this.#cfg, this.#db, taskId, paths(this.#cfg).archiveFile(taskId));
+        // Off the queue as it is archived (nothing awaited between): a line released below says no more of it.
+        this.#leaveQueue(taskId, UNQUEUED_ARCHIVED);
         // Recorded before the folder goes: a node that stops in between has an archived task whose leftovers a
         // restore clears, never an idle one without its folder.
         updateTask(this.#db, taskId, { state: "archived", archived_on: self, archived_at: new Date().toISOString() });
@@ -1716,9 +1945,10 @@ export class TaskRunner {
   async chooseNode(projectIds: string[], accept: (nodeId: string) => boolean = () => true): Promise<string> {
     const pool = this.#pool;
     if (pool === undefined) throw new Error("this node has no pool");
+    const hosting = await this.hostingProblem();
     const self = {
       nodeId: pool.identity.id,
-      hostsTasks: (await checkTaskRoot(this.#cfg)).ok,
+      hostsTasks: hosting === null,
       running: this.running(),
       taskCount: listLiveTasks(this.#db).length,
       projects: listProjects(this.#db).map((p) => ({ id: p.id, home: p.home })),
@@ -1730,7 +1960,7 @@ export class TaskRunner {
     if (!("error" in choice)) return choice.nodeId;
     // Alone (the only member, or the only one online): the reason is this node's own.
     if (!nodes.some((n) => n.online && n.nodeId !== self.nodeId)) {
-      if (!self.hostsTasks) throw new Error("this node has no task root");
+      if (hosting !== null) throw new Error(hostingRefusal(hosting));
       if (self.limit > 0 && self.running >= self.limit) throw new Error("this node is at its running limit; use --here");
     }
     throw new Error(choice.error);
@@ -1753,6 +1983,8 @@ export class TaskRunner {
       }
       const deps = this.#replicaDeps();
       const manifest = JSON.parse(row.manifest) as TaskManifest;
+      // A queue the archive left (an older meddle's) must not outlive the lines it was written on.
+      if (row.state === "archived") this.#leaveQueue(taskId, UNQUEUED_ARCHIVED);
       if (deps !== null) {
         await releaseFolder(this.#cfg, this.#db, taskId);
         await this.#releaseTask(deps, manifest, row.state === "archived");
@@ -1973,6 +2205,207 @@ export class TaskRunner {
     notify(this.#acceptanceListeners, (cb) => cb(taskId, verdict));
   }
 
+  // ─── queueing a task on its project's train ───
+
+  /**
+   * Accepts task `taskId`: queues it on its project's train by recording on the task's own line row, which this node
+   * holds, when (`setQueued`), so the queue replicates and moves with the task. An idle or a running task can be
+   * accepted; a running one stays queued when its turn ends. Accepting a queued task changes nothing. Refused:
+   * - while the task is not live here, or is moving or being archived (the state's own message);
+   * - a merge task: `a merge task lands with its train`;
+   * - work in several projects: `accept handles one project for now; push to land the rest`;
+   * - prompts waiting, queued for a later turn or steered into the running turn: `send or clear the waiting prompts
+   *   first`, so that nothing newer than what the user accepted runs after it;
+   * - no work to land, the line's effective head at or below its base or already on the project's default branch:
+   *   `nothing to land: the task's work is already on <branch>`.
+   * One at a time with the task's prompts (their chain), so that a prompt sent just before is waiting or has run, and
+   * one sent just after unqueues it.
+   */
+  accept(taskId: string): Promise<void> {
+    return serialised(`prompt\0${taskId}`, () => this.#accept(taskId));
+  }
+
+  async #accept(taskId: string): Promise<void> {
+    const deps = this.#replicaDeps();
+    if (deps === null) throw new Error("this node has no pool");
+    /** Throws why the task cannot be accepted now; the manifest of one that can. Asked again once git has answered. */
+    const check = (): TaskManifest => {
+      this.#refuseElsewhere(taskId);
+      if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+      const manifest = JSON.parse(this.#row(taskId).manifest) as TaskManifest;
+      if (manifest.merge !== undefined) throw new Error("a merge task lands with its train");
+      if (manifest.projects.length > 1) throw new Error("accept handles one project for now; push to land the rest");
+      if (this.queued(taskId).length > 0) throw new Error("send or clear the waiting prompts first");
+      return manifest;
+    };
+    const p = check().projects[0];
+    if (p === undefined) throw new Error("nothing to land: the task has no project");
+    const project = getProject(this.#db, p.id);
+    if (project === null) throw new Error(`unknown project: ${p.id}`);
+    const line = this.#ownLine(taskId, p);
+    if (line === null || line.commit === null) throw new Error(`this node holds no line of ${project.name} for the task`);
+    if (line.queuedAt !== null) return;
+    const branch = project.defaultBranch;
+    if (branch === null) throw new Error(`${project.name} has no default branch to land on`);
+    const { cfg } = deps;
+    const head = await effectiveHead(cfg, project.replica, line.commit);
+    // Work is what is above the line's base commits and not on the branch yet.
+    const base = [...new Set([...line.base, ...p.base])];
+    const tip = await defaultBranchCommit({ cfg, db: deps.db, selfId: deps.pool.identity.id, pool: deps.pool, log: this.#log }, project);
+    if ((await containedIn(cfg, project.replica, head, base)) || (await containedIn(cfg, project.replica, head, [tip]))) {
+      throw new Error(`nothing to land: the task's work is already on ${branch}`);
+    }
+    // Nothing is awaited from here on: a move, an archive or a queue that came in meanwhile counts.
+    check();
+    const now = this.#ownLine(taskId, p);
+    if (now === null || now.queuedAt !== null) return;
+    const queuedAt = new Date().toISOString();
+    setQueued(this.#db, p.id, taskId, p.name, queuedAt);
+    notify(this.#queueListeners, (cb) => cb(taskId, { queuedAt, project: p.id }, null));
+  }
+
+  /**
+   * Takes task `taskId` off its project's train for `reason` (what `onQueue` tells, and the dashboard shows): its line
+   * row says it is not queued. A reason of the train's (any but `UNQUEUED_AS_ASKED`) stays in the task's conversation
+   * too, as a `train_left` event. A task not queued stays as it is. Refused while the task is not live here (moved,
+   * archived, being received) or is moving.
+   */
+  async unqueue(taskId: string, reason: string): Promise<void> {
+    this.#refuseElsewhere(taskId);
+    if (this.#unqueue(taskId, reason) && !UNQUEUED_AS_ASKED.has(reason)) {
+      this.#record(taskId, { type: "meddle", subtype: "train_left", reason });
+    }
+  }
+
+  /** Where task `taskId` is queued (when, and the project's id), as its line row says; null when it is not, or not held here. */
+  queue(taskId: string): TaskQueue | null {
+    const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
+    if (row === null) return null;
+    for (const p of queueProjects(row)) {
+      const line = this.#ownLine(taskId, p);
+      if (line !== null && line.queuedAt !== null) return { queuedAt: line.queuedAt, project: p.id };
+    }
+    return null;
+  }
+
+  /**
+   * Called whenever a task is queued here (`queue` is where, `reason` null) or leaves the queue (`queue` null, and
+   * the `reason` it went, as `unqueue` was given it or as input of the user's or an archive made it).
+   */
+  onQueue(cb: (taskId: string, queue: TaskQueue | null, reason: string | null) => void): () => void {
+    this.#queueListeners.add(cb);
+    return () => { this.#queueListeners.delete(cb); };
+  }
+
+  /** Task `taskId`'s own line row of its project `p`, when this node holds it: the row that says whether it is queued. */
+  #ownLine(taskId: string, p: ManifestProject): LineRow | null {
+    const self = this.#pool?.identity.id;
+    const line = listLineRows(this.#db, p.id, taskId).find((r) => r.name === p.name);
+    return line !== undefined && line.holder === self ? line : null;
+  }
+
+  /**
+   * Takes the task off the queue, if it is on it, and tells the listeners: whether it was. A task without a project has
+   * no queue.
+   */
+  #unqueue(taskId: string, reason: string): boolean {
+    const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
+    if (row === null) return false;
+    let left = false;
+    for (const p of queueProjects(row)) {
+      const line = this.#ownLine(taskId, p);
+      if (line === null || line.queuedAt === null) continue;
+      setQueued(this.#db, p.id, taskId, p.name, null);
+      left = true;
+      notify(this.#queueListeners, (cb) => cb(taskId, null, reason));
+    }
+    return left;
+  }
+
+  /** `#unqueue` for what must go on whether or not it works: a failure is logged (`meddle: queue: …`), never thrown. */
+  #leaveQueue(taskId: string, reason: string): void {
+    try {
+      this.#unqueue(taskId, reason);
+    } catch (err) {
+      this.#log(`meddle: queue: ${taskId} was not taken off its queue (${reason}): ${messageOf(err)}`);
+    }
+  }
+
+  /**
+   * Input of the user's runs in the task (a prompt starts a turn or is steered into one, Send now delivers, Retry runs
+   * a turn again): a task accepted before it is no longer what the user accepted, so it leaves the queue. Never called
+   * for a turn of the train's, nor an approval's answer, which carries on the work that was accepted.
+   */
+  #inputRuns(taskId: string): void {
+    this.#leaveQueue(taskId, UNQUEUED_BY_INPUT);
+  }
+
+  // ─── what the merge train's conductor asks of a task's holder ───
+
+  /**
+   * How each of `taskIds` stands for the merge train here (`TrainTaskStatus`), in their order: `idle` when a train turn
+   * could start on it now (live here and idle, no turn of it live, pending or in the Harness, no prompt waiting, neither
+   * moving nor being archived), `train` while a train turn of it runs or is pending in the Harness, `busy` otherwise
+   * (its own turn, held open by background work too; a turn the restart limit parked), `absent` when it is not live
+   * here. One look at the Harness for all of them.
+   */
+  async trainStatus(taskIds: readonly string[]): Promise<TrainTaskStatus[]> {
+    if (taskIds.length === 0) return [];
+    const { tasks } = await this.#harness.inspect(BACKGROUND_CONTEXT);
+    const turns = new Map<string, TaskInspection>();
+    for (const t of tasks) if (t.record.kind === MeddleTurn.definition.name) turns.set((t.record.input as TurnInput).taskId, t);
+    return taskIds.map((taskId): TrainTaskStatus => {
+      const row = getTask(this.#db, taskId);
+      if (row === null || row.state === "archived" || row.state === "moved" || row.state === "receiving") return { taskId, state: "absent", title: null };
+      const live = this.#live.get(taskId);
+      const turn = turns.get(taskId);
+      const trainTurn = live?.train !== undefined || (turn !== undefined && (turn.record.input as TurnInput).train !== undefined && !isParked(turn));
+      const busy = live !== undefined || turn !== undefined || this.#pending.has(taskId) || row.state !== "idle"
+        || this.#isMoving(row) || this.#archiving.has(taskId) || this.queued(taskId).length > 0;
+      return { taskId, state: trainTurn ? "train" : busy ? "busy" : "idle", title: row.title };
+    });
+  }
+
+  /**
+   * Abandons `commits` (commit ids) of task `taskId`'s work, the empty undescribed leftovers the merge train found in it,
+   * in its workspace of the project whose repo has them, keeping bookmarks where they are (`abandon`), then writes its
+   * lines. Its workspace sees them as its own, which another node's repo may not. Refused while the task is not live
+   * here, and while it is not idle (`task is running`), so no turn of it races the rewrite: one at a time with its
+   * prompts (their chain).
+   */
+  abandonLeftovers(taskId: string, commits: readonly string[]): Promise<void> {
+    return serialised(`prompt\0${taskId}`, async () => {
+      this.#refuseElsewhere(taskId);
+      for (const c of commits) if (!COMMIT_ID.test(c)) throw new Error(`invalid commit: ${c}`);
+      if (commits.length === 0) return;
+      const row = this.#row(taskId);
+      const idle = row.state === "idle" && !this.#live.has(taskId) && !this.#pending.has(taskId) && !this.#archiving.has(taskId);
+      if (!idle || (await this.#durableTurn(taskId)) !== undefined) throw new Error("task is running");
+      for (const p of (JSON.parse(row.manifest) as TaskManifest).projects) {
+        const workspace = join(paths(this.#cfg).task(taskId), p.workspace);
+        const here = await changesIn(workspace, commits.map((c) => `present(${c})`).join(" | "), this.#cfg);
+        if (here.length > 0) await abandon(workspace, here.map((k) => k.commitId).join(" | "), this.#cfg);
+      }
+      await this.writeTaskLines(taskId);
+    });
+  }
+
+  /**
+   * Takes merge task `taskId` off this node, as the merge train does with a merge task it no longer needs: a turn of it
+   * that runs is interrupted and waited for, then the task is archived and deleted (`archive`, `deleteTask`). A task
+   * gone already is a no-op, one archived is only deleted. Refused for a task that is no merge task.
+   */
+  async discardMergeTask(taskId: string): Promise<void> {
+    const row = getTask(this.#db, taskId);
+    if (row === null) return;
+    if ((JSON.parse(row.manifest) as TaskManifest).merge === undefined) throw new Error(`task ${taskId} is no merge task`);
+    if (row.state !== "archived") {
+      await this.awaitTurnEnd(taskId, true, BACKGROUND_CONTEXT, async () => {});
+      if (getTask(this.#db, taskId)?.state !== "archived") await this.archive(taskId);
+    }
+    await this.deleteTask(taskId);
+  }
+
   // ─── moving a task to another node ───
 
   /**
@@ -2116,6 +2549,31 @@ export class TaskRunner {
       }
       await this.#nextTurnEnd(taskId, 250, context);
     }
+  }
+
+  /**
+   * Resolves as the task's turn now running (or its next) ends, with the seq of the task's newest event then: what that
+   * turn logged ends there, before a turn that follows starts. `cancel` stops listening.
+   */
+  #turnEnd(taskId: string): { end: Promise<number>; cancel(): void } {
+    const { promise, resolve, reject } = Promise.withResolvers<number>();
+    const waiters = this.#turnWaiters.get(taskId) ?? new Set<() => void>();
+    this.#turnWaiters.set(taskId, waiters);
+    const wake = () => {
+      try {
+        resolve(lastSeq(this.#db, taskId));
+      } catch (err) {
+        reject(err);
+      }
+    };
+    waiters.add(wake);
+    return {
+      end: promise,
+      cancel: () => {
+        waiters.delete(wake);
+        if (waiters.size === 0 && this.#turnWaiters.get(taskId) === waiters) this.#turnWaiters.delete(taskId);
+      },
+    };
   }
 
   /** Resolves when a turn of the task ends, after `ms`, or when `context` aborts. */
@@ -2356,11 +2814,18 @@ export class TaskRunner {
     return tasks.find((t) => t.record.kind === MeddleTurn.definition.name && (t.record.input as TurnInput).taskId === taskId);
   }
 
+  /**
+   * What the task's turn starts Claude Code with. A train turn (`train`) runs in `auto` whatever the task's mode (which
+   * stays as it is), with meddle's train tools (`trainToolList`) allowed without asking. A call is logged in the task's
+   * log; a `decline` takes the task off its queue then and there, with the agent's reason: this node runs the turn, so it
+   * holds the task's line, and nothing waits on a caller of `trainTurn`, which a restart may have cut off.
+   */
   async #engineInput(
     taskId: string,
     manifest: TaskManifest,
     resume: boolean,
     token: string,
+    train?: TrainTurnKind,
   ): Promise<Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">> {
     // A project's meddle context is the one captured at the task's start, from the task's row: not `task.json` nor the
     // workspace, which its agent can edit. The row alone names the projects, their workspaces and their contexts; a
@@ -2392,12 +2857,24 @@ export class TaskRunner {
     if (this.#pool !== undefined) input.onFilesChanged = () => this.#filesChanged(taskId);
     const chosen = getTaskSettings(this.#db, taskId);
     const { permissionMode } = chosen;
-    input.model = chosen.model ?? this.#pool?.settings.defaultModel() ?? FALLBACK_MODEL;
+    input.model = chosen.model ?? this.#defaultModel();
     input.effort = chosen.effort ?? this.#pool?.settings.defaultEffort() ?? FALLBACK_EFFORT;
-    if (permissionMode !== undefined) input.permissionMode = permissionMode;
+    if (train !== undefined) {
+      input.permissionMode = "auto";
+      const tools = trainToolList(train, (e) => {
+        this.#record(taskId, e);
+        if (e.subtype === "train_decline") this.#leaveQueue(taskId, declineReason(e.reason));
+      });
+      input.extraMcpServers = { meddle: trainServer(tools) };
+      input.allowedTools = [...TRAIN_TOOLS];
+      this.#deps.hooks?.trainTools?.(taskId, tools);
+    } else if (permissionMode !== undefined) {
+      input.permissionMode = permissionMode;
+    }
     if (this.#deps.claudePath !== undefined) input.claudePath = this.#deps.claudePath;
     if (this.#deps.claudeRuntime !== undefined) input.claudeRuntime = this.#deps.claudeRuntime;
     if (this.#deps.extraEnv !== undefined) input.extraEnv = this.#deps.extraEnv;
+    this.#deps.hooks?.engineInput?.(taskId, input);
     return input;
   }
 
@@ -2449,6 +2926,14 @@ function manifestNames(row: TaskRow, projectId: string): boolean {
 }
 
 /** The `tasks.queued` value that holds `prompts`: null for none, else each one's `queueEntry`. */
+/**
+ * The projects of task `row` whose lines can carry its queue: its manifest's, none for a task without a project (a row
+ * whose manifest names no `projects` at all included).
+ */
+function queueProjects(row: TaskRow): ManifestProject[] {
+  return (JSON.parse(row.manifest) as Partial<TaskManifest>).projects ?? [];
+}
+
 function queuedColumn(prompts: Prompt[]): string | null {
   return prompts.length === 0 ? null : JSON.stringify(prompts.map(queueEntry));
 }

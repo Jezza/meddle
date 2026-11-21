@@ -1,11 +1,11 @@
 // The dashboard in the browser: a client host linked to this node over /ws, one more per other node of the pool
 // (over /ws/node/<nodeId>), the sidebar over every node's tasks, and the view the location hash names beside it.
 import type { Host, Ref } from "@earendil-works/chord";
-import { render } from "preact";
+import { type ComponentChildren, render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { NodeObject, PoolObject, type Notification } from "../../state/contracts";
-import { clientHost, Hosts, nodeSocket, useAction, useObject, useValue } from "./hooks";
-import { Nav, PaneHead, type PoolRef } from "./common";
+import { NodeObject, PoolObject, ProjectObject, type Notification } from "../../state/contracts";
+import { clientHost, Hosts, nodeSocket, store, stored, useAction, useObject, useValue } from "./hooks";
+import { BuildAlerts, Nav, PaneHead, type PoolRef } from "./common";
 import { NewTask } from "./NewTask";
 import { NodePage } from "./NodePage";
 import { AddProject, ProjectPage } from "./Projects";
@@ -15,9 +15,11 @@ import { Sidebar } from "./Sidebar";
 import { homeTask } from "./sidebar-model";
 import { type NodeRef, type PoolIndex, usePoolIndex } from "./sources";
 import { TaskView } from "./Task";
+import { TrainPage } from "./Train";
 import { Blind, UpdateBar, useUpdate } from "./Update";
 import { buildAlerts, type UpdateView } from "./update-model";
 import { guardDrops } from "./attach-model";
+import { Glyph } from "./icons";
 import { shortId } from "../../pool/ids";
 
 const NO_ALERTS: ReadonlyMap<string, string> = new Map();
@@ -31,14 +33,6 @@ const host = clientHost(socket, () => location.reload());
 
 const NARROW = "(max-width: 760px)";
 const SIDEBAR_KEY = "meddle.sidebar.hidden";
-
-function sidebarHidden(): boolean {
-  try {
-    return localStorage.getItem(SIDEBAR_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
 
 function App({ host }: { host: Host }) {
   const [view, setView] = useState<View>(() => viewOf(location.hash));
@@ -80,34 +74,32 @@ function Shell({ host, pool, node, view, notice, connected }: {
     media.addEventListener("change", change);
     return () => media.removeEventListener("change", change);
   }, []);
-  const [hidden, setHidden] = useState(sidebarHidden);
+  const [hidden, setHidden] = useState(() => stored(SIDEBAR_KEY));
   const [drawer, setDrawer] = useState(false);
   const open = narrow ? drawer : !hidden;
   const toggle = () => {
     if (narrow) return setDrawer(!drawer);
-    try {
-      localStorage.setItem(SIDEBAR_KEY, hidden ? "0" : "1");
-    } catch {
-      // a private window: remembered for this page only
-    }
+    store(SIDEBAR_KEY, !hidden);
     setHidden(!hidden);
   };
   const openTask: Open = (nodeId, id) => { location.hash = hashOf({ name: "task", nodeId, id }); };
 
   return (
     <Nav.Provider value={{ open, toggle }}>
-      {sources}
-      <div class={`app${open ? "" : " nav-closed"}${narrow ? " narrow" : ""}`}>
-        {open && <Sidebar pool={pool} index={index} view={view} selfId={selfId} alerts={alerts} onHide={toggle} onNavigate={() => setDrawer(false)} />}
-        {narrow && drawer && <div class="scrim" onClick={() => setDrawer(false)} />}
-        <main class="pane">
-          {notice !== undefined && <p class="error notice">{notice}</p>}
-          {update !== null && <UpdateBar update={update} name={nameOf} tasks={index.tasks} />}
-          <Body hosts={hosts} pool={pool} node={node} index={index} view={view} open={openTask} update={update} />
-        </main>
-      </div>
-      <Toasts index={index} pool={pool} open={openTask} />
-      {update !== null && <Blind update={update} name={nameOf} connected={connected} />}
+      <BuildAlerts.Provider value={alerts}>
+        {sources}
+        <div class={`app${open ? "" : " nav-closed"}${narrow ? " narrow" : ""}`}>
+          {open && <Sidebar pool={pool} index={index} view={view} selfId={selfId} onHide={toggle} onNavigate={() => setDrawer(false)} />}
+          {narrow && drawer && <div class="scrim" onClick={() => setDrawer(false)} />}
+          <main class="pane">
+            {notice !== undefined && <p class="error notice">{notice}</p>}
+            {update !== null && <UpdateBar update={update} name={nameOf} tasks={index.tasks} />}
+            <Body hosts={hosts} pool={pool} node={node} index={index} view={view} open={openTask} update={update} />
+          </main>
+        </div>
+        <Toasts hosts={hosts} index={index} pool={pool} open={openTask} />
+        {update !== null && <Blind update={update} name={nameOf} connected={connected} />}
+      </BuildAlerts.Provider>
     </Nav.Provider>
   );
 }
@@ -122,6 +114,7 @@ function Body({ hosts, pool, node, index, view, open, update }: {
     case "project": return <ProjectPage key={view.id} hosts={hosts} pool={pool} index={index} id={view.id} tab={view.tab} />;
     case "add-project": return <AddProject node={node} />;
     case "node": return <NodePage key={view.nodeId} hosts={hosts} pool={pool} index={index} nodeId={view.nodeId} update={update} />;
+    case "train": return <TrainPage key={view.projectId} hosts={hosts} pool={pool} index={index} projectId={view.projectId} highlight={view.task} />;
     case "settings": return <Settings pool={pool} node={node} />;
   }
 }
@@ -144,37 +137,81 @@ function Home({ hosts, pool, index, open }: { hosts: Hosts; pool: PoolRef; index
 // ─── notifications ───
 
 /** The kinds that toast: what the sidebar's dots do not already say. */
-const TOASTED: ReadonlySet<Notification["kind"]> = new Set(["failed", "move", "token"]);
+const TOASTED: ReadonlySet<Notification["kind"]> = new Set(["failed", "move", "token", "train"]);
 
-/** Failed turns, moves and token trouble from every reachable node, newest first, each dismissable. */
-function Toasts({ index, pool, open }: { index: PoolIndex; pool: PoolRef; open: Open }) {
+const TOAST_ICONS: Partial<Record<Notification["kind"], ComponentChildren>> = { failed: "✕", token: "⚠", train: <Glyph name="merge" cls="train-ico" /> };
+
+/** Failed turns, moves, token trouble and tasks the train left from every reachable node, newest first, each dismissable. */
+function Toasts({ hosts, index, pool, open }: { hosts: Hosts; index: PoolIndex; pool: PoolRef; open: Open }) {
   const nodes = useValue(pool.nodes);
   return (
     <div class="toasts">
       {[...index.nodes].map(([nodeId, ref]) => (
-        <NodeToasts key={nodeId} nodeId={nodeId} node={ref} hostname={nodes.find((n) => n.nodeId === nodeId)?.hostname ?? ""} open={open} />
+        <NodeToasts key={nodeId} hosts={hosts} index={index} nodeId={nodeId} node={ref} hostname={nodes.find((n) => n.nodeId === nodeId)?.hostname ?? ""} open={open} />
       ))}
     </div>
   );
 }
 
-function NodeToasts({ nodeId, node, hostname, open }: { nodeId: string; node: Ref<typeof NodeObject>; hostname: string; open: Open }) {
+function NodeToasts({ hosts, index, nodeId, node, hostname, open }: {
+  hosts: Hosts; index: PoolIndex; nodeId: string; node: Ref<typeof NodeObject>; hostname: string; open: Open;
+}) {
   const notes = useValue(node.notifications);
   const action = useAction();
   return (
     <>
       {notes.filter((n) => TOASTED.has(n.kind)).slice(-3).reverse().map((note) => (
         <div key={note.id} class={`toast ${note.kind}`}>
-          <span class="toast-icon">{note.kind === "failed" ? "✕" : note.kind === "token" ? "⚠" : "⇄"}</span>
+          <span class="toast-icon">{TOAST_ICONS[note.kind] ?? "⇄"}</span>
           <div class="toast-body">
-            <a href={hashOf({ name: "task", nodeId, id: note.taskId })} onClick={(e) => { e.preventDefault(); open(nodeId, note.taskId); }}>{note.text}</a>
+            {note.kind === "train"
+              ? note.text
+              : <a href={hashOf({ name: "task", nodeId, id: note.taskId })} onClick={(e) => { e.preventDefault(); open(nodeId, note.taskId); }}>{note.text}</a>}
             <div class="muted">{hostname} · {new Date(note.at).toLocaleTimeString()}</div>
+            {note.kind === "train" && <TrainActions hosts={hosts} index={index} nodeId={nodeId} node={node} note={note} open={open} />}
+            {action.error !== null && <div class="error">Not dismissed: {action.error}</div>}
           </div>
           <button class="icon" title="Dismiss" disabled={action.busy} onClick={() => action.run(() => node.dismiss({ id: note.id }))}>×</button>
         </div>
       ))}
     </>
   );
+}
+
+/**
+ * What a train notice offers: Open task, and by its `action` Accept again (the task's accept, on its holder) or Retry (the
+ * project's retry, on the node that raised the notice: the project's home, which runs the train). A notice of a task
+ * sitting out comes from the home, and the task may be on another node: it is found in the pool's tasks. Either action
+ * takes the notice away once it is done.
+ */
+function TrainActions({ hosts, index, nodeId, node, note, open }: {
+  hosts: Hosts; index: PoolIndex; nodeId: string; node: Ref<typeof NodeObject>; note: Notification; open: Open;
+}) {
+  const action = useAction();
+  const task = index.tasks.find((t) => t.id === note.taskId && !t.archived);
+  const projectId = task?.projects[0]?.id;
+  const host = hosts.for(nodeId);
+  const done = () => node.dismiss({ id: note.id });
+  return (
+    <div class="toast-acts">
+      <button disabled={action.busy} onClick={() => open(task?.nodeId ?? nodeId, note.taskId)}>Open task</button>
+      {note.action === "accept" && (
+        <button class="primary" disabled={task === undefined || action.busy} onClick={() => action.run(async () => { await task!.ref.accept({}); await done(); })}>Accept again</button>
+      )}
+      {note.action === "retry" && host !== undefined && projectId !== undefined && (
+        <RetryButton host={host} projectId={projectId} taskId={note.taskId} busy={action.busy} run={(call) => action.run(async () => { await call(); await done(); })} />
+      )}
+      {action.error !== null && <div class="error">{action.error}</div>}
+    </div>
+  );
+}
+
+function RetryButton({ host, projectId, taskId, busy, run }: {
+  host: Host; projectId: string; taskId: string; busy: boolean; run: (call: () => Promise<unknown>) => Promise<boolean>;
+}) {
+  const project = useObject(host, ProjectObject, { id: projectId });
+  const ref = project.ref;
+  return <button class="primary" disabled={ref === undefined || busy} onClick={() => run(() => ref!.retry({ taskId }))}>Retry</button>;
 }
 
 render(<App host={host} />, document.getElementById("app")!);

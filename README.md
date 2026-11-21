@@ -13,8 +13,9 @@ on a node unless you name one, a task may have no project, and `task new` create
 in one command. Every node keeps a repo of every project, and
 meddle works as a git remote spread over your machines: from a checkout on any of them you push branches to it, fetch
 every task's work from it, start tasks from your own revisions, and accept a task's work by pushing a branch that
-contains it. No machine is in charge and none has to stay on; pushes that overlap while machines can't see each other
-show up as a conflict you resolve with an ordinary push. A task moves between nodes with its workspaces, conversation
+contains it or by accepting the task, which a merge train lands on the project's default branch for you. No machine
+is in charge and none has to stay on (a project's train is run by its home, and waits while the home is off); pushes
+that overlap while machines can't see each other show up as a conflict you resolve with an ordinary push. A task moves between nodes with its workspaces, conversation
 and queued prompts, and an idle task can be archived off its node and restored on any node.
 
 New here? The [user guide](docs/user-guide.md) says what has to run, how to set the first machine and the pool
@@ -23,7 +24,8 @@ up, and where things are; the sections below are the reference.
 ## Install
 
 Each machine needs [jj](https://jj-vcs.github.io/jj/) 0.46.0 or later (a task's workspaces are made with
-`jj workspace add --colocate`, which 0.45 lacks) and git, and either the single binary (see
+`jj workspace add --colocate`, which 0.45 lacks) and git 2.38 or later (the merge train tries merges with
+`git merge-tree --write-tree`), and either the single binary (see
 [The single binary](#the-single-binary)) or a checkout run with [bun](https://bun.sh):
 
 ```sh
@@ -345,6 +347,7 @@ one, and sets a key picked from the table below (an `env.` key with the name typ
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
 | `roster.forget` | How long, in seconds, a member may go unheard of before a node counts it gone ([Addresses and forgetting](#addresses-and-forgetting)): `0` never, else at least `60`; `900` (three lighthouse announce TTLs) when unset. A node that sets `MEDDLE_FORGET_MS` uses its own instead. |
 | `defaults.model`, `defaults.effort` | The model, and the effort (`low`, `medium`, `high`, `xhigh` or `max`), of a turn whose task chose none, and what the dashboard picks for a new task; unset, `opus` and `medium`. A model cannot be set empty. |
+| `describe.prompt` | One line (no newline, at most 4096 characters) that the merge train gives an agent to describe its work: a task whose revisions land undescribed gets it as a turn of its own (see [The merge train](#the-merge-train)), and the merge agent gets it for the merge it checked. `Add a description (4-7 words) to your revision(s).` when unset or empty. Every project task's `CLAUDE.md` also asks the agent to describe each revision it makes (`jj describe`), and a turn rewrites the task's `CLAUDE.md` at its start when it differs from what meddle generates, so tasks made earlier ask it too. |
 | `update.within` | How long a rollout has, from its start, to be confirmed before it fails and rolls back ([Updating the pool](#updating-the-pool)): a duration such as `90s`, `30m` or `1h`; `30m` when unset. `meddle update --within` overrides it for one rollout. |
 | `update.health` | How long each node has, from its swap, to report healthy on the new build: a duration of at least `30s`; `2m` when unset. A rollout takes the value it starts with. |
 
@@ -434,6 +437,10 @@ bun run src/cli.ts task move <task-id> <node> [--now]   # moves the task to anot
 bun run src/cli.ts task archive <task-id>   # takes an idle task's folder off its node, keeps its log
 bun run src/cli.ts task restore <task-id> [--node <id|prefix> | --here]   # brings an archived task back, here or on another node
 bun run src/cli.ts task delete <task-id>    # deletes an archived or moved task's log and archive
+bun run src/cli.ts task accept <task-id>...   # queues tasks on their project's merge train, which lands their work on its default branch
+bun run src/cli.ts task unqueue <task-id>...   # takes tasks off the train again
+bun run src/cli.ts train [<project>] [--follow]   # shows a project's train: its queue, and the round under way
+bun run src/cli.ts train pause|resume [<project>]   # holds the train, or lets it carry on
 ```
 
 `task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]` creates a task, placed as
@@ -484,6 +491,12 @@ name: <name>` when several have it, `unknown project: <x>` when none does (pass 
 list yet (12 hex digits) is passed on to the node, which asks the online members for it. A task is `idle`, `running` or `waiting` (for an approval) while it lives on a node; a task moving away is `moving` on the node
 it leaves and `receiving` on the node it goes to until it arrives, and the node it left keeps it as `moved`. An
 archived task is `archived` (see [Archiving a task](#archiving-a-task)).
+
+`task accept` and `task unqueue` take any number of tasks, each by its id or a unique prefix, from any node of the
+pool, and print `queued <id> on <project>'s train` and `unqueued <id>` for each. `train` prints a project's train,
+and `train pause` and `train resume` hold it and let it carry on. [Taking a task's work](#taking-a-tasks-work) says
+what accepting does and when it is refused, and [The merge train](#the-merge-train) what the train does and how the
+commands show it.
 
 ### Where a new task runs
 
@@ -769,13 +782,72 @@ A released line's commits stay only where a branch or another line holds them.
 
 ### Taking a task's work
 
-Accepting a task's work emerges from a push; there is no command for it:
+Accept a task, and meddle lands its work on the project's default branch:
+
+```sh
+bun run src/cli.ts task accept <task-id>...    # prints: queued <task id> on <project>'s train
+bun run src/cli.ts train <project>             # watch it land
+```
+
+In the dashboard Accept is a button in the task's header, and the first item of its ⋯ menu. The task joins its
+project's **train** ([The merge train](#the-merge-train)), which has each task's revisions described, checks the tasks
+that land together, and moves the default branch to the result, exactly as a push would move it. You run no jj
+commands and write no descriptions; a checkout sees the result on its next `jj git fetch --remote meddle`.
+
+The words: **Accept** is the button, **Queued** is the state between the button and the landing, and **Accepted**
+keeps the meaning it has below: a branch contains the task's work, so the task is archived. Accept leads to Accepted
+but can fall through: a task whose change no longer makes sense on the branch leaves the train instead.
+
+An idle or a running task can be accepted: a running one waits in the queue until its turn ends. Accepting a task that
+is queued changes nothing. Accept is refused for a task that:
+
+- has no work to land: `nothing to land: the task's work is already on <branch>` (its work is not above where it
+  started, or the branch holds it already);
+- is archived (`task is archived: <id>`) or moving (`task is moving`);
+- has prompts waiting, queued or steered into the running turn: `send or clear the waiting prompts first`, so that
+  nothing newer than what you accepted runs after it;
+- has no project: `nothing to land: the task has no project` (the dashboard offers no Accept on such a task);
+- works in more than one project: `accept handles one project for now; push to land the rest`;
+- is a merge task (the train's own, see below): `a merge task lands with its train`.
+
+`task accept` tries each task on its own: a refusal is printed on stderr (with the task's id when there are several),
+the others are still queued, and the exit status is 1 once any was refused. A task on a node of an older meddle is not
+listed at all, so it is refused as `no such task: <id> (<node> runs an older meddle: its tasks are not listed)`, and
+the dashboard offers no Accept on it. Like the other commands that change something, `task accept` and `task unqueue`
+are refused while an update awaits confirmation.
+
+A task **leaves the queue** when:
+
+- you take it off: Unqueue in the dashboard (its header, its ⋯ menu, or its row on the train page), or `task unqueue
+  <task-id>...`, which prints `unqueued <id>`, or `<id> is not queued` for a task that was not;
+- you archive it;
+- anything of yours runs in it after you accepted: a new prompt, a message steered into the turn that was running when
+  you pressed Accept, Send now, or Retry. Its work is about to change, and you accepted the version before. Answering
+  an approval does not count: it carries on the work you accepted;
+- the train gives up on it: its agent declines, or a commit that would land can't be made pushable by the task
+  (below).
+
+When a task of the batch the train is checking leaves (you unqueue it, send it a message or archive it), the check
+stops at once: the merge agent's turn is interrupted, the merge task is discarded, and the round starts over without
+the task. Nothing pauses for it.
+
+A task the train took off shows why as a notice in the dashboard (see [Dashboard](#dashboard)) and as a line in its
+conversation (`Declined: <reason>` when its agent declined, `Left meddle's train: <reason>` otherwise), and can be
+accepted again, also while the turn its agent declined in is still finishing. A task you go on working in is off the
+train, so work you did not accept never lands through it.
+
+You can take a task's work yourself instead, by pushing. A push from a checkout accepts tasks as it always has, whether
+or not they are queued:
 
 1. Ask the agent to rebase onto your branch (each project's line onto that project's branch, for a task of several).
 2. Review its work in a checkout: `jj git fetch --remote meddle`, then `jj log -r meddle/task/<task id>/<project>@meddle`
    or `jj new meddle/task/<task id>/<project>@meddle` to try it.
 3. Fast-forward your branch onto the line and push: `jj bookmark set main -r meddle/task/<task id>/<project>@meddle`,
    `jj git push --remote meddle -b main`.
+
+Descriptions and conflicts are then yours; the train is not involved. The push route also lands work in a project of
+several, and onto a branch other than the default one, which the train does not. A queued task whose work a push
+lands is accepted and archived like any other.
 
 Once a branch's computed position contains the task's line, for every project the task changed, the task's work is
 accepted. Any branch counts, not only the default one: a scratch bookmark you set on a task's line and push (a
@@ -791,6 +863,130 @@ leave the work held by nothing.
 You can also go on from a task's work in your own way: `jj new meddle/task/<task id>/<project>@meddle`, or a rebase of
 your own work onto it. Take it once the task's turn has ended: while a turn runs, the line follows the agent's working
 copy, which its next snapshot rewrites.
+
+### The merge train
+
+Each project has one train, which lands its queued tasks on the project's default branch, and only that branch. The
+project's home runs it, so that one node decides the batches and moves the branch; while the home is offline the train
+waits, and the tasks stay queued. A round is a durable operation: a restart carries on where it stopped. One round runs
+at a time per project.
+
+A round starts when something could change its outcome: a task is queued, a queued task's turn ends, the branch moves,
+a train turn finishes, or Retry or Resume is pressed. Its batch is fixed once picked: a task queued meanwhile waits for
+the next round, which starts as soon as this one lands or fails. With `B` the branch's commit, a round goes through
+five steps. Its **eligible** tasks are the queued ones that are idle, on an online node and not in a train turn.
+
+1. **Describing.** Landing a task lands every commit between `B` and its work, and each must push as it is: no
+   conflicts, and no empty commit without a description. The train abandons the empty, undescribed revisions an agent
+   left behind itself. For a revision with no description, or with conflicts, the task gets a turn of its own (all such
+   turns at once): `Before your work lands on main: `, then (when any are conflicted) `resolve the conflicts in
+   <changes>, then `, then the `describe.prompt` setting (`Add a description (4-7 words) to your revision(s).` unless
+   set). Some of the commits are not the task's own:
+   - The revision it started from, and what is below it (your `@` for a task started in a checkout, or what `--rev`
+     named), land with the task, since you chose that start. They must still push: one that is undescribed or
+     conflicted is not the task's to change, so the task leaves the queue, naming the commit and why. So does a task
+     with such a commit that another task has built on.
+   - Another task's work, which the agent merged in or was started on, lands only with that task. When both are
+     queued they land together (step 3); otherwise the task is held back: it stays queued, but not eligible, and a
+     notice says `<task> includes work from <other task>, which isn't queued`. Accepting the other task, or
+     unqueueing this one, settles it.
+2. **Picking.** The eligible tasks are tried biggest work first (lines changed; ties in the order they were accepted),
+   each merged with `B` and the batch so far by `git merge-tree --write-tree`, which touches no workspace. A task that
+   merges cleanly with both joins the batch. One that doesn't merge cleanly with `B` alone is marked to rebase, and one
+   that merges with `B` but not with the batch waits for the next round. The queue keeps the order tasks were accepted
+   in, but bigger work goes first, so a position doesn't promise a landing order, and nothing numbers the queue.
+3. **Checking.** The merge's parents are the heads of the batch's tips and `B`: a tip that is an ancestor of another
+   is dropped, and `B` usually is, because the tasks started from the current branch. Stacked tasks land once: when a
+   queued task contains another queued task's work (it merged that line, or started on it), the contained task's tip
+   drops out, and landing the containing task takes it along; it is merged separately only if it has moved on since.
+   - With one head left (a single task already on top of `B`) no merge is needed. Its own agent tested it after its
+     last rebase, or you accepted it as it was; step 4 lands it as it is.
+   - Otherwise the train starts a **merge task**: a task of the project, placed like any new task, whose workspace
+     starts on a new commit with those parents, titled `Merge <task titles>`. Its first prompt is `Check that <tasks>
+     work together on main. Merged cleanly as <change>. Run the typecheck and the tests that cover what they change;
+     don't run the full suite, and don't change any files. If a test fails, call blame with the task responsible and
+     what failed. Otherwise: ` and the `describe.prompt` setting. The train never runs the full suite. `blame(task,
+     reason)` is a tool only a merge task has. If the agent blames a task, that task leaves the batch for a fix turn
+     (step 5), the merge task is archived and deleted, and the round starts over with the rest of the batch and a fresh
+     merge task. Otherwise the train checks that the merge task's head is the merge itself, with a description, no
+     conflicts and the tree of the clean merge (no file changed). If not, the agent gets a follow-up turn naming what
+     is wrong, up to three, and then the train pauses.
+   - The merge task's start is jj's merge, which can differ from git's trial merge (a file one task renamed and
+     another edited, say). Before its first turn the train reads it: with conflicts, or files other than the trial
+     merge's, the batch doesn't merge cleanly after all, and nothing pauses. The merge task is discarded, the batch's
+     smallest task (with any task holding its work) waits for a later round, and the rest is checked again; when no
+     task would be left, the tasks are marked to rebase (step 5).
+4. **Landing.** The branch moves from `B` to the merge (or to the single head) through the checks and the record of
+   a push to the node (a conflicted branch, a branch behind its rows, or a node that takes no input refuses it), and
+   only as a fast-forward. If someone pushed since `B`, the move is refused, the round starts over against the new
+   commit, and a batch that still merges cleanly is checked again. Each landed task is then accepted as a push accepts
+   it: archived, its line released. So is the merge task.
+5. **Rebasing.** After landing, or straight away when nothing landed, each task marked to rebase gets a turn: `main
+   moved on, and your work no longer merges cleanly with it. Rebase onto main (<commit>), fix the conflicts, run the
+   tests your changes affect (not the full suite), and keep each revision described. If your change no longer makes
+   sense on main, because something it relies on is gone or has changed meaning, call decline with the reason.` A
+   task the merge agent blamed gets the same turn, opening with what the agent reported. A task rebases only its own
+   revisions: when another task has built on them it leaves the queue saying so. A task marked to rebase because only
+   jj's merge conflicts (step 3) must end its turn with its work on `<commit>`. `decline(reason)` is a tool every train
+   turn of a task has (describing, rebasing, fixing), and the merge task's turns don't; calling it takes the task off
+   the queue, with the reason shown. When a train turn ends the task is eligible again, and the next round starts.
+
+Every train turn runs in `auto` permission mode, whatever the task's own mode is; the task's own mode is untouched for
+your turns. `decline` and `blame` need no approval. A train turn shows in the task's conversation like any prompt, marked
+as meddle's. While one runs on a task, what you send to it waits for the task's next turn, and Send now has nothing to
+send into it; the message runs when the train lets go, and takes the task off the queue then (above). A task in the
+batch being checked is not held: a message to it runs at once, which takes it off the queue and stops the check, as
+Unqueue does (above).
+
+**Sitting out.** A task whose train turn fails (after meddle's own reruns for tokens), or ends without doing its job
+(revisions still undescribed or conflicted, or still not merging cleanly with the branch after the rebase, or not on
+it when only jj's merge conflicted), stays queued but is not eligible: it sits out. The train page shows it as
+`sitting out`, and a notice gives the reason, with Retry (also on its row). Only Retry brings it back (Unqueue takes
+it off the train instead), so the train never sends the same prompt round after round. A task whose node is offline
+sits out too, as `waiting for <node>`, and comes back by itself when the node does.
+
+**Pausing.** The train pauses with `Paused: <reason>`, which the dashboard shows with Retry, when:
+
+- the merge agent gets stuck (`the merge agent did not put the merge right after 3 follow-ups: <what is wrong>`) or
+  its turn fails (`the merge agent's turn failed: <why>`): the merge task is left for you to open;
+- the branch refuses the landing for a reason that outlasts the round (`landing was refused: <refusal>`: conflicted,
+  or behind its rows): the merge task is discarded;
+- git can't trial merge the batch at all (`the batch could not be trial merged: <error>`), or the check itself fails
+  (`the batch's check failed: <error>`): no merge task is left;
+- restarts keep cutting its round off (`its round was cut off by restarts too often`).
+
+Retry or `train resume` carries on, and checks again with a fresh merge task (one left for you is discarded first). A
+refusal that passes by itself (the node taking no input while an update awaits confirmation, a branch it is still
+fetching) lifts its pause after 30 seconds. You can pause the train yourself, for "I'm about to push to main
+myself; hold off": train turns already running finish, since no agent is cut off mid-work, but nothing lands and no new
+round starts, until `train resume` or Resume, across restarts. The round then looks at the branch again first, in
+case it moved meanwhile. A pool update holds the train as it holds turns ([Queued and
+forced](#queued-and-forced)): the round winds down and starts again once the hold lifts, and no task sits out for it.
+A round under way counts as busy for a queued update.
+
+`train [<project>]` prints the train as its home has it: why it is paused (`paused: <reason>`), the queue in the order
+tasks were accepted with each task's state, and the round under way:
+
+```
+queued:
+  Fix the flaky test (3f9c0a7d21be)  in the batch
+  Add a --json flag (b81e44c07a95)  in the batch
+  Rename the poller (0d5a6e92c3f1)  turn running
+round: checking
+  batch: Fix the flaky test (3f9c0a7d21be), Add a --json flag (b81e44c07a95)
+  merge task: Merge Fix the flaky test, Add a --json flag (7c2e9b10d4a8)
+```
+
+A task's state is `queued`, `turn running` (its own turn; shown for tasks on the home's own node, other nodes' show as
+`queued`), `describing`, `rebasing onto main` (a train turn of that step), `in the batch`, `sitting out` or `waiting for
+<node>`; for a task that sits out or is held back the reason follows the state. The round's step is `describing`,
+`picking`, `checking`, `landing` or `rebasing`. `nothing queued` when there is none. `<project>` is an id or a name;
+without one it is the project of the checkout you are in, else the pool's only project (a project named `pause` or
+`resume` is given by its id). With `--follow` it prints again each time something changes, a blank line between, and
+ends once the queue is empty. `train pause` and `train resume` print `paused <project>'s train` and `resumed <project>'s
+train`. They talk to the project's home: when it is offline they say `<project>'s train waits: its home <node> is
+offline`, and when it runs a meddle older than the train `<node> runs an older meddle`. Watching works while an update
+awaits confirmation; pausing and resuming do not.
 
 ### Upgrading to service repos
 
@@ -1144,16 +1340,30 @@ in it alone and a New task row; then Tasks, the tasks with no project or several
 Archived, collapsed, every online node's archived tasks; and at its foot Nodes, every member with what runs on it and
 its load, or since when it has been offline. A task's row shows its state (a dot: running, waiting on you, idle), how
 many approvals and questions wait on you, how many of its subagents are running (a purple count after its title), and
-the node it runs on (`from → to` while it moves); its ⋯ menu (or a
-right click) renames it, moves it, archives it, or for an archived task restores or deletes it. Within a project,
-tasks are listed by latest activity. The sidebar hides (◧), and on a narrow screen it is a drawer. Opening the
-dashboard shows the task that waits on you most recently, else a new task. Failed turns, moves and token trouble show
-as notices in the top right until dismissed. It flags a pool whose members run different meddle or Claude Code
-versions in the Nodes header.
+the node it runs on (`from → to` while it moves); a task queued on its project's train has the train's icon (a
+merge, drawn as jj log draws one) after its title, which opens the train page with the task's row highlighted; its ⋯
+menu (or a right click) accepts it (Accept, first; Unqueue for a queued task), renames it, moves it, archives it, or
+for an archived task restores or deletes it. A project's line ends in the train's icon and how many tasks are queued
+on its train, which opens the project's train page (with none queued it shows, as Train, only while you hover the
+line or that train's page is open). Within a project, tasks are listed by latest activity; a merge task of the train
+shows among them as `Merge <task titles>` after the train's icon (in purple) while it exists. The sidebar hides
+(◧), and on a narrow screen it is a drawer. Opening the dashboard shows the task that waits on you most recently, else
+a new task. Failed turns, moves and token trouble show as notices in the top right until dismissed, and so do the
+train's, for a task that needs you: `<task> left meddle's train: <reason>` (Open task, and Accept again; a task you
+took off yourself is no news), `<task> is sitting out: <reason>` (Open task, and Retry) and `<task> includes work from
+<other task>, which isn't queued` (Open task). Each is raised once for its condition, and dismissing a notice only
+clears the notice. A task that left the train is a normal task again, with the reason a line in its conversation and
+Accept back in its header and menu (a task with no project has no train, and offers no Accept). A task that sits out,
+or is held back, is still queued (its header offers Unqueue): Retry brings back one that sits out, and a held-back one
+is settled by accepting the other task or unqueueing this one. It flags a pool whose members run different meddle or
+Claude Code versions in the Nodes header.
 
-A task opens beside the sidebar: its title (✎ renames it), state and actions (Interrupt, Retry, Archive; Restore and
-Delete for an archived one), its thread with the assistant's text as Markdown and each run of tool calls folded into
-one line, what waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
+A task opens beside the sidebar: its title (✎ renames it), state (a queued task says `queued` beside it, after the
+train's icon, as a partly accepted one says so; it links to the train page) and actions (Interrupt, Retry, Archive,
+then Accept, or Unqueue for a queued task; Restore and Delete for an archived one; unlike Archive, which only an idle
+task has, Accept also shows while a turn runs, since a running task can be queued), its thread with the assistant's
+text as Markdown and each run of tool calls folded into one line (a prompt of the train's is marked as meddle's), what
+waits on you inline (Allow, Edit & allow, Deny, Deny & interrupt; a question's options), the messages it
 was sent and has not taken yet (`queued`), its subagents (below), the composer (Queue while a turn runs, Send otherwise),
 and a bar with its projects, its node, its bookmark, its context (the tokens its latest API call sent, over the model's
 window) and the 5-hour and 7-day plan usage of the login its node's next turn uses (the latest reading turns there got;
@@ -1177,6 +1387,18 @@ Projects adds a project from a folder on this node or a URL; it builds the servi
 checkout, for which the form points you to `meddle project add` on the command line. A node's page (from Nodes) shows its meddle and Claude Code versions, token, task root, resources and tasks while
 it is online, and what the roster last recorded of it (and when it was last seen) while it is not.
 
+A project's train page (the train's icon on the project's line in the sidebar, or a queued task's, which highlights
+that task's row) shows what is live of its train, as its home, which runs it, has it, in two columns. It is for
+watching: you accept on the task, where you have just looked at its work. **Queued** lists the tasks in the order they
+were accepted, each with its state as `train` prints it, Retry on one that sits out, and Unqueue; a task `in the
+batch` is not among them but under This round. **This round** shows the steps (describing, picking, checking,
+landing, and rebasing when tasks were sent to rebase after the landing); the merge task as a card of its own, with
+what it is doing (starting, running its checks, waiting on you, verifying, landing) and Open; and the batch's tasks
+under it, each with Unqueue (a batch of one head has no merge task). The page's head names the branch the train lands
+on (`<project> → <branch>`) and has Pause, or while the train is paused `Paused: <reason>` with Resume (after your own
+Pause) or Retry (after the train's own). While the project's home is offline it says `waiting for <node>` and lists the
+tasks the pool knows are queued. There is no history: what landed is on the branch, and its tasks are archived.
+
 Another node's tasks open through the pool: the browser opens `/ws/node/<node id>` on the node it loaded the page
 from, and that node carries the socket to the other one over iroh. A node that is not a member answers 404 and an
 offline member 503.
@@ -1195,7 +1417,7 @@ Settings shows this node's id, the pool's name and id (or that no secret is set)
 Allow again on a removed one); then the
 pool settings, as a table of key, value and the node that set it, each with Unset, and a form that sets a key picked
 from `jj.user`, `jj.email`, `lighthouse.url`, `limits.running`, `roster.forget`, `defaults.model`, `defaults.effort`,
-`update.within`, `update.health` or `env.<NAME>` (see [Pool settings](#pool-settings)),
+`describe.prompt`, `update.within`, `update.health` or `env.<NAME>` (see [Pool settings](#pool-settings)),
 under a note that every member and its dashboard see these values, so none is for a secret; then the tokens in
 order (label, id, status, set by, expiry), with the one a turn would use now marked active and an Enable button on
 each `exhausted` or `disabled` one. Token values never pass through the dashboard: tokens are added and removed with

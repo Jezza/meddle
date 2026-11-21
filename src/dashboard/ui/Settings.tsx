@@ -1,10 +1,10 @@
 // Settings: the pool (this node, its secret and its members), the pool's settings and its login tokens with their usage.
 import { useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
-import { useAction, useValue } from "./hooks";
+import { useAction, useNow, useValue } from "./hooks";
 import { PaneHead, tokenText, type PoolRef } from "./common";
 import type { NodeRef } from "./sources";
-import { UsageMeter, useNow } from "./Usage";
+import { UsageMeter } from "./Usage";
 import { readAgo, windowMeter } from "./usage-model";
 import type { UsageReading } from "../../token-usage";
 
@@ -79,7 +79,7 @@ function PoolSection({ pool }: { pool: PoolRef }) {
 }
 
 /** The keys the set form offers by name; `ENV` stands for `env.<NAME>`, whose name is typed. */
-const SETTING_KEYS = ["jj.user", "jj.email", "lighthouse.url", "limits.running", "roster.forget", "defaults.model", "defaults.effort", "update.within", "update.health"];
+const SETTING_KEYS = ["jj.user", "jj.email", "lighthouse.url", "limits.running", "roster.forget", "defaults.model", "defaults.effort", "describe.prompt", "update.within", "update.health"];
 const ENV = "env.";
 
 /** A node's hostname from the roster, else its short id. */

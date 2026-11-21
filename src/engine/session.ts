@@ -5,12 +5,14 @@ import {
   type PermissionDeniedHookInput,
   type Query,
   type SDKMessage,
+  type SDKMessageOrigin,
   type SDKResultMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Attachment, Prompt } from "../blobs/attachment";
 import type { UserContent } from "../blobs/content";
 import { appendEvent } from "../store/events";
+import type { TrainTurnKind } from "../train/tools";
 import type { Approvals } from "./approvals";
 import { InputQueue } from "./input";
 import { buildOptions, type EngineInput } from "./options";
@@ -18,6 +20,21 @@ import { buildOptions, type EngineInput } from "./options";
 /** meddle's own entries in a task's event log, interleaved with the SDK's messages. */
 export type MeddleEvent =
   | { type: "meddle"; subtype: "turn_started"; at: string; resume: boolean }
+  /**
+   * A train turn's prompt, logged in place of a user prompt (`runTurn`): what the train asked, shown as meddle's.
+   * `after`: the seq the train turn's events follow (its `freshAfter`), the same on each of its attempts.
+   */
+  | { type: "meddle"; subtype: "train_turn"; kind: TrainTurnKind; text: string; after: number }
+  /** The task's agent called meddle's `decline` tool in a train turn. */
+  | { type: "meddle"; subtype: "train_decline"; reason: string }
+  /** The merge agent called meddle's `blame` tool, naming the task responsible. */
+  | { type: "meddle"; subtype: "train_blame"; task: string; reason: string }
+  /**
+   * The train took the task off its queue for `reason`, its own (a commit not the task's to change, work another task
+   * built on): logged on the task's holder as it leaves, so that the reason stays in its conversation. A decline is
+   * `train_decline`, and what the user did to leave is logged as none.
+   */
+  | { type: "meddle"; subtype: "train_left"; reason: string }
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
   | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput }
@@ -36,6 +53,12 @@ export type MeddleEvent =
     rerun: boolean;
     retried?: true;
   };
+
+/** Whether `m` is one of the train's events (`train_turn`, `train_decline`, `train_blame`, `train_left`): none ends a turn. */
+export function isTrainEvent(m: { type?: unknown; subtype?: unknown }): boolean {
+  return m.type === "meddle"
+    && (m.subtype === "train_turn" || m.subtype === "train_decline" || m.subtype === "train_blame" || m.subtype === "train_left");
+}
 
 /**
  * What a `token_fault` that ended a turn says, for a notification or the CLI: `no usable token`, or the token, what
@@ -136,6 +159,13 @@ export type RunTurnArgs = {
   prompt: Prompt;
   /** What Claude Code is sent for `prompt`; its text when not given. */
   content?: UserContent;
+  /**
+   * A train turn, of `kind`, whose events follow seq `after`: its prompt is logged as meddle's (`train_turn`), not as a
+   * user prompt.
+   */
+  train?: { kind: TrainTurnKind; after: number };
+  /** Who wrote `prompt` (`HUMAN` for a person), as Claude Code is told; no origin when not given. */
+  origin?: SDKMessageOrigin;
   db: Database;
   approvals: Approvals;
   queue?: InputQueue;
@@ -152,7 +182,8 @@ export type RunTurnArgs = {
 /**
  * Starts one Claude Code turn and returns its handle at once. `done` records every message, and
  * resolves with the `result` once the child has gone (so a later `resume` never races it). The turn's own prompt is
- * logged as written, with its attachments' refs, and Claude Code is sent `content` for it.
+ * logged as written, with its attachments' refs (a train turn's as meddle's `train_turn`), and Claude Code is sent
+ * `content` for it.
  *
  * Prompts pushed into `queue` while the turn runs steer it: each is logged (`promptEvent`, with its uuid) when Claude
  * Code takes it, which it does into the running turn or, after that turn's `result`, as a turn of its own (an `init`,
@@ -180,10 +211,12 @@ export function runTurn(args: RunTurnArgs): {
   const taskId = input.manifest.id;
   const record = recorder(args);
   const queue = args.queue ?? new InputQueue();
-  const uuid = queue.push(args.prompt, "next", args.content);
+  const uuid = queue.push(args.prompt, "next", args.content, args.origin);
   queue.take(uuid);
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
-  record(promptEvent(args.prompt, uuid));
+  record(args.train === undefined
+    ? promptEvent(args.prompt, uuid)
+    : { type: "meddle", subtype: "train_turn", kind: args.train.kind, text: args.prompt.text, after: args.train.after });
 
   const canUseTool: CanUseTool = (toolName, toolInput, options) => args.approvals.ask({
     requestId: options.requestId,

@@ -6,7 +6,8 @@ import { ensureMemoryReplica } from "../src/memory";
 import { shortId } from "../src/pool/identity";
 import { getProject, listProjects, type Project } from "../src/projects/project";
 import { ensureRemote, ensureServiceRepo, pushBookmark, type ReplicaDeps } from "../src/projects/replicas";
-import { linkNodes, peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+import { NodeObject } from "../src/state/contracts";
+import { linkClient, linkNodes, peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 const depsOf = (n: GitPoolNode): ReplicaDeps => ({ cfg: n.cfg, db: n.db, pool: n.pool });
 
@@ -97,6 +98,34 @@ test("ensureServiceRepo makes an empty service repo with the home's remote, and 
     await ensureServiceRepo(depsOf(B), id);
     expect(await bookmarkList(memoryB, B.cfg)).toContainEqual({ name: "memory", remote: shortA, changeId: memoryChange, conflicted: false });
   } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a default branch set on a node other than the home is set on the home, so the next sweep keeps it", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  const link = linkClient(B.host);
+  try {
+    const id = A.project.id;
+    await peerReady(B, A);
+    await ensureServiceRepo(depsOf(B), id);
+    const node = await link.client.get(NodeObject, {});
+    try {
+      expect((await node.setDefaultBranch({ projectId: id, branch: "dev" })).defaultBranch).toBe("dev");
+      expect(getProject(A.db, id)!.defaultBranch).toBe("dev");
+      expect(getProject(B.db, id)!.defaultBranch).toBe("dev");
+      // B's sweep takes the home's: the same.
+      expect((await ensureServiceRepo(depsOf(B), id)).defaultBranch).toBe("dev");
+      // With the home offline it is refused, and nothing changes here.
+      A.net.unwatch(B.id, "bye");
+      B.net.unwatch(A.id, "bye");
+      await expect(node.setDefaultBranch({ projectId: id, branch: "next" })).rejects.toThrow("is offline: its default branch is set there");
+      expect(getProject(B.db, id)!.defaultBranch).toBe("dev");
+    } finally {
+      node.release();
+    }
+  } finally {
+    await link.close();
     await close();
   }
 }, 15_000);

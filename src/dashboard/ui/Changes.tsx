@@ -204,7 +204,7 @@ const files = (n: number) => `${n} ${n === 1 ? "file" : "files"}`;
 
 /**
  * One file's diff, its rows hidden while `closed`; its hidden lines read from `rev` (none for an added file) on the
- * first click, a read's refusal shown beneath. `box` is given the file's element.
+ * first click. `box` is given the file's element.
  */
 function FileDiff({ task, project, patch, rev, closed, onToggle, box }: {
   task: TaskRef;
@@ -215,22 +215,14 @@ function FileDiff({ task, project, patch, rev, closed, onToggle, box }: {
   onToggle(): void;
   box(el: HTMLElement | null): void;
 }) {
-  const [error, setError] = useState<string | null>(null);
   const load = rev === undefined ? undefined : async () => {
-    try {
-      const text = await task.changeFile({ project, rev, path: patch.oldPath ?? patch.path });
-      setError(null);
-      return text === null ? null : textLines(text);
-    } catch (err) {
-      setError(remoteReason(err));
-      throw err;
-    }
+    const text = await task.changeFile({ project, rev, path: patch.oldPath ?? patch.path });
+    return text === null ? null : textLines(text);
   };
   return (
     <div ref={box} class="chg-file">
       <DiffView hunks={patch.hunks} file={null} load={load} closed={closed} onToggle={onToggle}
         head={{ path: patch.path, status: patch.status, added: patch.added, removed: patch.removed, binary: patch.binary }} />
-      {error !== null && <p class="error">{error}</p>}
     </div>
   );
 }

@@ -9,22 +9,23 @@ import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffec
 import type { Attachment, Prompt } from "../../blobs/attachment";
 import { type AgentEntry, type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
-import { errorText, type Hosts, useAction, useDraft, useObject, useTick, useValue } from "./hooks";
+import { errorText, type Hosts, useAction, useDraft, useNow, useObject, useTick, useValue } from "./hooks";
 import { AgentsPanel } from "./Agents";
 import { agentSeconds, rootOf, toolCount } from "./agents-model";
 import { draftAttachments, readyToSend } from "./attach-model";
 import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFileTarget } from "./Attachments";
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
-import { composerKey, withTakenBack } from "./composer-model";
-import { type Anchor, copyText, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { composerKey, enters, withTakenBack } from "./composer-model";
+import { type Anchor, copyText, deleteTask, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
-import { Chevron, Icon, Iconoir } from "./icons";
+import { Chevron, Glyph, Icon, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
 import { ago, type ProjectLine, projectLines } from "./sidebar-model";
 import { useOptionalValue } from "./sources";
-import { UsageMeter, useNow } from "./Usage";
+import { trainOffer } from "./train-model";
+import { UsageMeter } from "./Usage";
 import { contextMeter, readAgo, windowMeter } from "./usage-model";
 import {
   activity, activityLine, agentEndNote, backgroundMeta, buildThread, callRuns, cwdOf, duration, EDITS, editDiff, exitCode, type Explored,
@@ -98,6 +99,8 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   const nameOf = (id: string) => nodes.find((n) => n.nodeId === id)?.hostname ?? shortId(id);
   // A node of an older meddle serves no `agents`: its tasks have none to list.
   const agents = useOptionalValue(task, "agents") ?? NO_AGENTS;
+  // Nor a `queue`: such a node cannot queue a task, which `undefined` here says (null is a task not queued).
+  const queue = useOptionalValue(task, "queue");
   /** The agent row the agent list (or a `Message` row) last led the thread to. */
   const [focus, setFocus] = useState<Focus | null>(null);
 
@@ -134,7 +137,8 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   return (
     <div class="task">
       <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving}
-        partly={acceptance === "partly" && !archived && state !== "moved"} raw={raw} onRaw={() => setRaw(!raw)}
+        partly={acceptance === "partly" && !archived && state !== "moved"} queue={queue} merge={manifest.merge !== undefined}
+        projects={manifest.projects.length} raw={raw} onRaw={() => setRaw(!raw)}
         changes={switchable ? { count: changeCount(changes), on: showChanges } : null} />
       {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
       {showChanges ? <Changes task={task} /> : state === "moved" ? (
@@ -168,10 +172,16 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
 
 // ─── the head ───
 
-function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, raw, onRaw, changes }: {
+function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, queue, merge, projects, raw, onRaw, changes }: {
   task: TaskRef; nodes: PoolRef["nodes"]["value"]; nodeId: string; title: string; state: string; pendingCount: number; moving: boolean;
   /** A pushed branch contains the task's line for some of its projects, not all: nothing is archived yet. */
   partly: boolean;
+  /** Where the task is queued on its project's train; null when it is not, undefined from a node that has no queue. */
+  queue: { queuedAt: string; project: string } | null | undefined;
+  /** A merge task of the train: it lands with its batch, and is never accepted. */
+  merge: boolean;
+  /** How many projects the task has: one with none has no train to accept it. */
+  projects: number;
   raw: boolean; onRaw: () => void;
   /** The `Thread` / `Changes n` switch: the non-empty changes (no number for none), and whether they show; null hides it. */
   changes: { count: number; on: boolean } | null;
@@ -182,11 +192,8 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
   const archived = state === "archived";
   const live = state === "running" || state === "waiting";
   const stateText = pendingCount > 0 ? "waiting on you" : state;
-  const remove = () => action.run(async () => {
-    if (!confirm(`Delete "${title}", its log and its archive? This cannot be undone.`)) return;
-    await task.delete({});
-    location.hash = hashOf({ name: "home" });
-  });
+  const offer = trainOffer({ state, queued: queue === undefined ? null : queue !== null, merge, moving, projects });
+  const remove = () => action.run(() => deleteTask(task, title, true));
   return (
     <PaneHead>
       <div class="task-title">
@@ -202,6 +209,12 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
           <span class="muted state-text" title="A pushed branch contains this task's work for some of its projects; it is archived once every project's is">
             · partly accepted
           </span>
+        )}
+        {queue != null && (
+          <a class="muted state-text" href={hashOf({ name: "train", projectId: queue.project, task: task.manifest.value.id })}
+            title="Accepted, and waiting on its project's train: open the train">
+            · <Glyph name="merge" cls="train-ico" /> queued
+          </a>
         )}
       </div>
       <div class="head-actions">
@@ -224,6 +237,14 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
         {state === "idle" && !moving && (
           <button disabled={action.busy} title="Removes the task's folder from this node and keeps its log; Restore brings it back"
             onClick={() => action.run(() => task.archive({}))}>▣ Archive</button>
+        )}
+        {/* Unlike Archive, Accept also shows while a turn runs: a running task waits in the queue until its turn ends. */}
+        {offer === "accept" && (
+          <button class="accept" disabled={action.busy} title="Queues the task's work to land on its project's default branch (the merge train)"
+            onClick={() => action.run(() => task.accept({}))}><Glyph name="merge" cls="train-ico" /> Accept</button>
+        )}
+        {offer === "unqueue" && (
+          <button disabled={action.busy} title="Takes the task off the train" onClick={() => action.run(() => task.unqueue({}))}>Unqueue</button>
         )}
         {archived && <>
           <button disabled={action.busy} onClick={(e) => setRestoreAt({ el: e.currentTarget })}>Restore ▾</button>
@@ -456,11 +477,14 @@ function merged(into: Map<number, LogEvent>, events: readonly LogEvent[]): Map<n
   return next;
 }
 
-/** A block: your message in a card, Claude's items, status lines on their own. */
+/** A block: your message in a card (meddle's, the train's, marked so), Claude's items, status lines on their own. */
 function BlockView({ block, children }: { block: Block; children?: preact.ComponentChildren }) {
   const items = <Items items={block.items} />;
   if (block.who === "status") return <div class="status-block">{items}{children}</div>;
-  if (block.who === "user") return <div class="msg you">{items}</div>;
+  if (block.who === "user") {
+    const meddle = block.items[0]?.kind === "user" && block.items[0].by === "meddle";
+    return <div class={meddle ? "msg you meddle" : "msg you"}>{items}</div>;
+  }
   return <div class="msg claude">{items}{children}</div>;
 }
 
@@ -534,7 +558,9 @@ const AgentRuns = createContext(true);
 function ShownView({ item }: { item: ShownItem }) {
   switch (item.kind) {
     case "user":
-      return <PromptBody text={item.text} attachments={item.attachments} />;
+      if (item.by !== "meddle") return <PromptBody text={item.text} attachments={item.attachments} />;
+      // The merge train's prompt: meddle sent it, not you.
+      return <><div class="by" title="The merge train asked this">meddle</div><PromptBody text={item.text} attachments={item.attachments} /></>;
     case "assistant":
       // Thinking alongside text is not shown; thinking on its own is, closed.
       return item.text !== "" ? <Markdown text={item.text} /> : <Thinking text={item.thinking ?? ""} />;
@@ -823,7 +849,8 @@ function ApprovalPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
         : summary !== "" && !summary.endsWith("…") ? <><pre>{summary}</pre><details><summary class="muted">full input</summary><pre>{json(pending.input)}</pre></details></>
         : <pre>{json(pending.input)}</pre>}
       {denying && (
-        <label class="deny-message">Message to Claude <input value={message} onInput={(e) => setMessage(e.currentTarget.value)} /></label>
+        <label class="deny-message">Message to Claude <input value={message} onInput={(e) => setMessage(e.currentTarget.value)}
+          onKeyDown={(e) => { if (enters(e) && !action.busy) void action.run(() => task.deny({ requestId, message })); }} /></label>
       )}
       <div class="ask-actions">
         {denying ? <>
@@ -875,7 +902,7 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
       <h4>Claude asks</h4>
       {questions.map((q) => (
         <div class="question" key={q.question}>
-          <div class="question-head"><span class="chip">{q.header}</span> {q.question}</div>
+          <div class="question-head"><span class="tag">{q.header}</span> {q.question}</div>
           {q.options.map((o) => (
             <label key={o.label} class="option">
               <input
@@ -887,7 +914,8 @@ function QuestionPanel({ task, pending }: { task: TaskRef; pending: Pending }) {
               {o.label}{o.description !== undefined && <span class="muted"> · {o.description}</span>}
             </label>
           ))}
-          <label class="option">Other: <input value={other[q.question] ?? ""} onInput={(e) => setOther({ ...other, [q.question]: e.currentTarget.value })} /></label>
+          <label class="option">Other: <input value={other[q.question] ?? ""} onInput={(e) => setOther({ ...other, [q.question]: e.currentTarget.value })}
+            onKeyDown={(e) => { if (enters(e) && complete && !action.busy) void submit(); }} /></label>
         </div>
       ))}
       <div class="ask-actions">
@@ -916,7 +944,7 @@ function Queued({ prompt }: { prompt: Prompt }) {
   return (
     <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one; Ctrl+Enter in an empty box sends it now; ↑ or Esc in the box takes it back to edit">
       <PromptBody text={prompt.text} attachments={prompt.attachments} />
-      <span class="chip">queued</span>
+      <span class="tag">queued</span>
     </div>
   );
 }

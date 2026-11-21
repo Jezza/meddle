@@ -7,10 +7,12 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { paths } from "../src/config";
 import { git, initColocated, jj } from "../src/jj";
 import { shortId } from "../src/pool/identity";
+import type { NodeSummary } from "../src/pool/store";
 import { listLineRows } from "../src/pool/rows";
-import { addProjectFromFolder, setDefaultBranch } from "../src/projects/project";
+import { addProjectFromFolder, getProject, setDefaultBranch } from "../src/projects/project";
+import { mergeStartAt } from "../src/projects/starts";
 import { NodeObject, PeerObject } from "../src/state/contracts";
-import { listTasks } from "../src/store/records";
+import { listTasks, newId } from "../src/store/records";
 import { workspaceImmutableHeads } from "../src/tasks/provision";
 import { linkClient, peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -232,6 +234,60 @@ test("a task with no projects starts as it always did: no workspace, no start, n
     expect(manifest.primaryProjectId).toBeNull();
     expect(listLineRows(A.db)).toEqual([]);
     expect(await lineRefs(A, a.repo)).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("create waits for all bases: a line whose commit is here but whose other parent is not, still being fetched", async () => {
+  const { A, B, a, close } = await setup();
+  try {
+    // B has the fork point once a task of a has been made there.
+    await withNode(B, (node) => node.createTask({ title: "first", projects: [{ id: a.project.id }], node: "here" }));
+    expect(await read(B, getProject(B.db, a.project.id)!.replica, `present(${a.fork})`)).toBe(a.fork);
+
+    // X on the fork point, in A's service repo only; `@` back on the fork point.
+    await jj(["new", a.fork], a.repo, A.cfg);
+    await writeFile(`${a.repo}/x`, "x\n");
+    await jj(["commit", "-m", "X"], a.repo, A.cfg);
+    const X = await read(A, a.repo, "@-");
+    await jj(["new", a.fork], a.repo, A.cfg);
+
+    // A starts a merge of X and the fork point: its row says so, and B hears of the row (nothing applies it there).
+    const taskId = newId();
+    const parents = [a.fork, X];
+    const start = await mergeStartAt({ cfg: A.cfg, db: A.db, selfId: A.id, pool: A.pool }, { projectId: a.project.id, taskId, parents });
+    expect(start).toEqual({ projectId: a.project.id, mode: "child", commit: a.fork, base: parents, parents });
+    expect(await lineRefs(A, a.repo)).toContain(`refs/remotes/meddle/task/${taskId}/a ${a.fork}`);
+    await eventually(() => listLineRows(B.db, a.project.id, taskId).length > 0, () => "B to hear of the line");
+
+    // B has the line's commit, the fork point, but not X: create fetches it before it makes the workspace.
+    expect(await read(B, getProject(B.db, a.project.id)!.replica, `present(${X})`)).toBe("");
+    const manifest = await B.runner.create({ title: "merge", taskId, starts: [start] });
+    expect(manifest.projects[0]).toMatchObject({ parent: a.fork, base: parents });
+    const workspace = `${paths(B.cfg).task(taskId)}/a`;
+    expect((await read(B, workspace, "@", 'parents.map(|c| c.commit_id()).join(" ")')).split(" ")).toEqual(parents);
+    expect(await scopeOf(B, workspace)).toBe(workspaceImmutableHeads(taskId, parents));
+    expect(rowsOf(B, taskId)).toEqual([["a", B.id, 1, a.fork, parents]]);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("a node whose summary does not say it starts tasks on several parents is an older meddle", async () => {
+  const { A, B, close } = await setup();
+  try {
+    const row = A.store.row(B.id)!;
+    expect(row.summary!.mergeStarts).toBe(true);
+    expect(A.runner.noMergeStartsOn(B.id)).toBeNull();
+    // What A last heard of B: an older meddle's summary, without the flag, dated later than anything B sends meanwhile.
+    const { mergeStarts: _, ...older } = { ...row.summary!, hostname: "older-b" };
+    A.store.seen(B.id, "9999-01-01T00:00:00.000Z", older as NodeSummary, row.lastAddr);
+    expect(A.store.row(B.id)!.summary!.mergeStarts).toBe(false);
+    expect(A.runner.noMergeStartsOn(B.id)).toBe("older-b runs an older meddle");
+    // A node it knows nothing of is named by its short id.
+    const stranger = "f".repeat(64);
+    expect(A.runner.noMergeStartsOn(stranger)).toBe(`${shortId(stranger)} runs an older meddle`);
   } finally {
     await close();
   }

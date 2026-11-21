@@ -5,7 +5,7 @@ import { rm } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { paths, type NodeConfig } from "../config";
 import { repoName, type Repo } from "../git/wire";
-import { bookmarkSet, fetch, isJjRepo, jj, push, remoteAdd, remoteList, track } from "../jj";
+import { bookmarkSet, fetch, isJjRepo, jj, push, remoteEnsure, track } from "../jj";
 import { cloneMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
 import { repoKey, serialised } from "../serial";
@@ -173,10 +173,7 @@ export function rosterProjectIds(pool: PoolRuntime): Set<string> {
  */
 export async function ensureRemote(cfg: NodeConfig, replica: string, nodeId: string, repo: Repo): Promise<string> {
   const name = shortId(nodeId);
-  const url = meddleUrl(nodeId, repo);
-  const existing = (await remoteList(replica, cfg)).find((r) => r.name === name);
-  if (existing === undefined) await remoteAdd(replica, name, url, cfg);
-  else if (existing.url !== url) await jj(["git", "remote", "set-url", name, url], replica, cfg);
+  await remoteEnsure(replica, name, meddleUrl(nodeId, repo), cfg);
   return name;
 }
 

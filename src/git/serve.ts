@@ -10,26 +10,22 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { NodeConfig } from "../config";
-import { git, gitImport } from "../jj";
+import { gitImport } from "../jj";
 import { paths } from "../paths";
 import type { PeerStream, PoolNet } from "../pool/net";
 import { shortId } from "../pool/ids";
 import { listBranchRows, writeBranchRow, type BranchRow } from "../pool/rows";
 import type { PoolRuntime } from "../pool/runtime";
+import { APPLY_AFTER_PUSH_MS } from "../projects/advance";
 import { applyProject, catchUp, gitGraph, holdView, releaseView } from "../projects/applier";
-import { computeBranch, planPush, type BranchHeads, type PushedRef } from "../projects/branches";
+import { planPush, type PushedRef } from "../projects/branches";
 import { memoryChanged } from "../projects/memory-sync";
 import { getProject } from "../projects/project";
 import { rosterProjectIds } from "../projects/replicas";
+import { NAMESPACE, branchStates, viewRefs } from "../projects/view";
 import { repoKey, serialised } from "../serial";
 import type { PushRows } from "./pre-receive";
 import { parseGitHeader, repoName, type GitService, type Repo } from "./wire";
-
-/** The git namespace a project repo is served to a checkout as. */
-const NAMESPACE = "view";
-const VIEW = `refs/namespaces/${NAMESPACE}/`;
-/** How long a push waits, once recorded, for the view to be applied from the rows before its stream ends. */
-const APPLY_AFTER_PUSH_MS = 5000;
 
 export type GitServeDeps = {
   db: Database;
@@ -119,20 +115,6 @@ function viewCommand(cfg: NodeConfig, service: GitService, gitDir: string): stri
     : ["git", `--namespace=${NAMESPACE}`, "-c", "receive.denyCurrentBranch=ignore", "-c", `core.hooksPath=${paths(cfg).checkoutHooks}`, "receive-pack", gitDir];
 }
 
-/** The refs of the view, by name as a checkout sees them (`refs/…`, the namespace stripped), with their commits. */
-async function viewRefs(cfg: NodeConfig, repo: string): Promise<Map<string, string>> {
-  const out = await git(["for-each-ref", "--format=%(refname) %(objectname)", VIEW], repo, cfg);
-  const refs = new Map<string, string>();
-  for (const line of out.split("\n")) {
-    const at = line.lastIndexOf(" ");
-    if (at <= 0) continue;
-    const ref = line.slice(VIEW.length, at);
-    // `HEAD` is the applier's symref, never pushed.
-    if (ref.startsWith("refs/")) refs.set(ref, line.slice(at + 1));
-  }
-  return refs;
-}
-
 /** The refs a push changed: what differs between the view before it and after it. */
 function pushedRefs(before: Map<string, string>, after: Map<string, string>): PushedRef[] {
   const pushed: PushedRef[] = [];
@@ -142,58 +124,6 @@ function pushedRefs(before: Map<string, string>, after: Map<string, string>): Pu
     if (old !== next) pushed.push({ ref, old, new: next });
   }
   return pushed;
-}
-
-/** Where the view shows branch `branch`: its own ref and its siblings' (`meddle/conflict/<b>/<id>`), as one key. */
-function shownAt(view: Map<string, string>, branch: string): string {
-  const conflicts = `refs/heads/meddle/conflict/${branch}/`;
-  const siblings = [...view].filter(([ref]) => ref.startsWith(conflicts) && !ref.slice(conflicts.length).includes("/"));
-  return JSON.stringify([view.get(`refs/heads/${branch}`) ?? null, siblings.map(([, commit]) => commit).sort()]);
-}
-
-/**
- * Each branch's heads from the project's rows, for the hook: its commit, or its siblings while conflicted. And the
- * branches the view does not show where the rows put them (`stale`): a row the applier has not applied yet (or whose
- * commit this repo lacks, so its heads are unknown), which a checkout's jj has not seen either. A push to one of them
- * is refused until the view catches up: judged against rows the pusher never saw, it would drop them.
- */
-async function branchStates(
-  cfg: NodeConfig, repo: string, rows: BranchRow[], view: Map<string, string>,
-): Promise<{ heads: BranchHeads; stale: string[] }> {
-  const byBranch = new Map<string, BranchRow[]>();
-  for (const r of rows) byBranch.set(r.branch, [...(byBranch.get(r.branch) ?? []), r]);
-  // A branch the view shows with no rows at all is out of date too.
-  for (const ref of view.keys()) {
-    if (ref.startsWith("refs/heads/") && !ref.startsWith("refs/heads/meddle/") && ref !== "refs/heads/meddle") {
-      const branch = ref.slice("refs/heads/".length);
-      if (!byBranch.has(branch)) byBranch.set(branch, []);
-    }
-  }
-  const graph = gitGraph(cfg, repo);
-  const heads: BranchHeads = [];
-  const stale: string[] = [];
-  for (const [branch, branchRows] of byBranch) {
-    let state: Awaited<ReturnType<typeof computeBranch>>;
-    try {
-      state = await computeBranch(branchRows, graph);
-    } catch {
-      // git could not read the graph (every admitted row's commit is here): refused, as for a view behind its rows.
-      stale.push(branch);
-      continue;
-    }
-    let expected: string;
-    if (state.kind === "single") {
-      heads.push({ branch, commits: [state.commit] });
-      expected = JSON.stringify([state.commit, []]);
-    } else if (state.kind === "conflicted") {
-      heads.push({ branch, commits: state.siblings });
-      expected = JSON.stringify([state.served, [...state.siblings].sort()]);
-    } else {
-      expected = JSON.stringify([null, []]);
-    }
-    if (shownAt(view, branch) !== expected) stale.push(branch);
-  }
-  return { heads, stale };
 }
 
 /** How many times reading what a landed push changed in the view is tried, at once, under the repo's lock. */

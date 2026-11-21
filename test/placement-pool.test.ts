@@ -171,7 +171,7 @@ test("a new task with attachments is not placed on a node that takes none, nor c
   }
 }, 60_000);
 
-test("PeerObject.createTaskAt refuses a peer that is not a member, before creating anything", async () => {
+test("PeerObject.createTaskAt (and the train's calls) refuses a peer that is not a member, before creating anything", async () => {
   const db = openDb(":memory:");
   const created: unknown[] = [];
   const never: Subscribable<null> = { subscribe: () => () => {} };
@@ -193,6 +193,11 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
       nameFromPrompt: async () => {},
       setModel: async () => {},
       setEffort: async () => {},
+      trainTurn: async () => { created.push("trainTurn"); return { kind: "done" as const }; },
+      trainStatus: async () => { created.push("trainStatus"); return []; },
+      abandonLeftovers: async () => { created.push("abandonLeftovers"); },
+      unqueue: async () => { created.push("unqueue"); },
+      discardMergeTask: async () => { created.push("discardMergeTask"); },
     },
   });
   const [down, up] = memoryLinkPair();
@@ -205,6 +210,21 @@ test("PeerObject.createTaskAt refuses a peer that is not a member, before creati
     await peer.createTaskAt({ title: "t", taskId: "0123456789ab", starts: [{ projectId: "p", mode: "child", commit: "1".repeat(40), base: ["1".repeat(40)] }], prompt: "hi" })
       .catch((err: unknown) => { refusal = err; });
     expect(refusal).toMatchObject({ code: "forbidden" });
+    expect(created).toEqual([]);
+    refusal = null;
+    await peer.trainTurn({ taskId: "0123456789ab", kind: "describe", text: "hi" }).catch((err: unknown) => { refusal = err; });
+    expect(refusal).toMatchObject({ code: "forbidden" });
+    const taskId = "0123456789ab";
+    for (const call of [
+      () => peer.trainTasks({ taskIds: [taskId] }),
+      () => peer.abandonLeftovers({ taskId, commits: ["1".repeat(40)] }),
+      () => peer.unqueueTask({ taskId, reason: "r" }),
+      () => peer.discardTask({ taskId }),
+    ]) {
+      refusal = null;
+      await call().catch((err: unknown) => { refusal = err; });
+      expect(refusal).toMatchObject({ code: "forbidden" });
+    }
     expect(created).toEqual([]);
     peer.release();
   } finally {
@@ -286,7 +306,7 @@ test("with no other node online, an automatic create says why this node cannot t
   try {
     await rm(rootless.cfg.taskRoot, { recursive: true, force: true });
     const nodeOne = await one.client.get(NodeObject, {});
-    await expect(nodeOne.createTask({ title: "t", projects: [], node: null })).rejects.toThrow("this node has no task root");
+    await expect(nodeOne.createTask({ title: "t", projects: [], node: null })).rejects.toThrow("this node does not host tasks: task root");
     nodeOne.release();
 
     const busy = await createTask(full, { title: "busy", projectIds: [] });

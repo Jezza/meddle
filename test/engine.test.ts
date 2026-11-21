@@ -32,6 +32,15 @@ test("hello: every message is recorded, the result returns, the child exits", as
   // the prompt is recorded right after turn_started: Claude Code does not echo it
   expect(listEvents(db, "abc")[1]!.message).toEqual({ type: "user", message: { role: "user", content: "Reply with the single word ok." }, parent_tool_use_id: null, uuid: expect.any(String) });
 });
+test("a train turn's prompt is logged as meddle's train_turn, not as a prompt of the user's", async () => {
+  const { db, input, fixture } = await setup();
+  const { done } = runTurn({ input: { ...input, extraEnv: fixture("hello") }, prompt: { text: "Describe it.", attachments: [] }, db, approvals: new Approvals(), train: { kind: "describe", after: 7 } });
+  expect((await done).type).toBe("result");
+  const recorded = listEvents(db, "abc").map(e => e.message as any);
+  expect(recorded[0]).toMatchObject({ type: "meddle", subtype: "turn_started" });
+  expect(recorded[1]).toEqual({ type: "meddle", subtype: "train_turn", kind: "describe", text: "Describe it.", after: 7 });
+  expect(recorded.filter(m => m.type === "user" && m.message?.content === "Describe it.")).toEqual([]);
+});
 test("approval: the dashboard's answer unblocks the tool", async () => {
   const { db, input, fixture } = await setup();
   const approvals = new Approvals();
@@ -352,6 +361,14 @@ test("a pushed prompt is sent as its content and logged as its text and refs", a
   expect(sent.message.content).toEqual(content);
   expect(q.untaken()).toEqual([{ uuid, prompt: { text: "look", attachments: [att] } }]);
   expect(q.take(uuid)).toEqual({ text: "look", attachments: [att] });
+});
+test("input queue: a prompt pushed with an origin is sent with it", async () => {
+  const q = new InputQueue();
+  const it = q[Symbol.asyncIterator]();
+  q.push({ text: "mine", attachments: [] }, "next", "mine", { kind: "human" });
+  q.push({ text: "meddle's", attachments: [] });
+  expect((await it.next()).value).toMatchObject({ message: { content: "mine" }, origin: { kind: "human" } });
+  expect("origin" in (await it.next()).value).toBe(false);
 });
 test("promptEvent keeps the text as content and adds the refs", () => {
   expect(promptEvent({ text: "look", attachments: [att] }, "u1")).toMatchObject({ message: { content: "look" }, attachments: [att], uuid: "u1" });

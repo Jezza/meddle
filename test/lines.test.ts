@@ -6,7 +6,7 @@ import { rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { paths, type NodeConfig } from "../src/config";
 import { bookmarkRefs, git, jj, JjError } from "../src/jj";
-import { listLineRows, writeBranchRow, writeLineRow } from "../src/pool/rows";
+import { listLineRows, setQueued, writeBranchRow, writeLineRow } from "../src/pool/rows";
 import { applyProject } from "../src/projects/applier";
 import { makeCheckout } from "../src/projects/checkouts";
 import { reclaimLineRows, writeLineRows } from "../src/projects/lines";
@@ -133,6 +133,41 @@ test("writeLineRows snapshots the task's workspace, writes a row per bookmark un
       { name: "a.spike", holder: A.id, epoch: start!.epoch, commit: null },
     ]);
     expect(await log(A.cfg, repo, `meddle/task/${m.id}/a`, "commit_id")).toBe(newHead);
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("writeLineRows keeps the queue of a line it moves, and of one it releases", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const deps = { cfg: A.cfg, db: A.db, pool: A.pool };
+    const repo = A.project.replica;
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    const [start] = listLineRows(A.db, A.project.id, m.id);
+    const spike = sideBookmark(m.id, "a", "spike");
+    await jj(["--ignore-working-copy", "bookmark", "create", spike, "-r", start!.commit!], repo, A.cfg);
+    await writeLineRows(deps, m);
+    const queuedAt = "2026-11-18T10:00:00.000Z";
+    setQueued(A.db, A.project.id, m.id, "a", queuedAt);
+    setQueued(A.db, A.project.id, m.id, "a.spike", queuedAt);
+
+    // The agent edits the workspace: the line moves, and the queue stays.
+    await writeFile(join(paths(A.cfg).task(m.id), "a", "work"), "work\n");
+    await writeLineRows(deps, m);
+    const head = await log(A.cfg, repo, `meddle/task/${m.id}/a`, "commit_id");
+    expect(head).not.toBe(start!.commit);
+    expect(listLineRows(A.db, A.project.id, m.id)).toMatchObject([
+      { name: "a", commit: head, queuedAt }, { name: "a.spike", commit: start!.commit, queuedAt },
+    ]);
+
+    // The agent deletes its side bookmark: the line is released, and still says when it was queued.
+    await jj(["--ignore-working-copy", "bookmark", "delete", `exact:${spike}`], repo, A.cfg);
+    await writeLineRows(deps, m);
+    expect(listLineRows(A.db, A.project.id, m.id)).toMatchObject([
+      { name: "a", commit: head, queuedAt }, { name: "a.spike", commit: null, queuedAt },
+    ]);
   } finally {
     await close();
   }

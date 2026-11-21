@@ -12,17 +12,8 @@ export type MoveCandidate = {
 };
 
 /** A version that says nothing (a compiled binary reports `unknown`; a node with no summary yet, ""). */
-function unknownVersion(version: string): boolean {
+export function unknownVersion(version: string): boolean {
   return version === "unknown" || version === "";
-}
-
-/**
- * The nodes a task on node `from` (running Claude Code `version`) can move to: other online members that host tasks
- * and run the same, known, Claude Code version (decision 16).
- */
-export function moveTargets<N extends MoveCandidate>(nodes: readonly N[], from: string, version: string): N[] {
-  if (unknownVersion(version)) return [];
-  return nodes.filter((n) => n.nodeId !== from && n.status === "member" && n.online && n.hostsTasks && n.claudeCodeVersion === version);
 }
 
 /** A project as a node's summary lists it (`PoolObject.nodes[].projects`). */

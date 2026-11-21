@@ -224,6 +224,16 @@ export function useDraft(key: string): [string, Dispatch<StateUpdater<string>>] 
   return [text, set];
 }
 
+/** The time now, renewed every `ms`: every minute for an age or a window's reset, every second for a countdown. */
+export function useNow(ms = 60_000): number {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), ms);
+    return () => clearInterval(timer);
+  }, [ms]);
+  return now;
+}
+
 /** Renders again every `ms` while mounted; never for null. */
 export function useTick(ms: number | null) {
   const [, setTick] = useState(0);

@@ -7,9 +7,10 @@ import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { ProjectObject } from "../../state/contracts";
 import { isMemoryPath } from "../../projects/memory-names";
 import type { MemoryChange, MemoryEntry } from "../../projects/memory-view";
+import { Unavailable } from "./common";
 import { DiffView } from "./diff";
 import { type FilePatch, parseGitDiff } from "./git-diff";
-import { errorText, type Hosts, useObject, useValue } from "./hooks";
+import { errorText, type Hosts, useDraft, useObject, useValue } from "./hooks";
 import { canSaveNew, changeWho, type HistoryRows, mergeFirstPage, noMemoryRepo, stripFrontmatter, writeError } from "./memory-model";
 import { hashOf } from "./routes";
 import { ago } from "./sidebar-model";
@@ -28,7 +29,7 @@ export function Memory({ hosts, nodeId, editable, id, tasks, nodeName }: {
   hosts: Hosts; nodeId: string; editable: boolean; id: string; tasks: readonly ListedTask[]; nodeName(short: string): string;
 }) {
   const host = hosts.for(nodeId);
-  return host === undefined ? <Column /> : <MemoryOn host={host} editable={editable} id={id} context={{ tasks, nodeName }} />;
+  return host === undefined ? <Column><Unavailable status={hosts.status(nodeId)} /></Column> : <MemoryOn host={host} editable={editable} id={id} context={{ tasks, nodeName }} />;
 }
 
 /** The column with only its title in the head: while the memory loads, or when it cannot be read. */
@@ -39,10 +40,10 @@ function Column({ children }: { children?: ComponentChildren }) {
 function MemoryOn({ host, editable, id, context }: { host: Host; editable: boolean; id: string; context: Context }) {
   const project = useObject(host, ProjectObject, { id });
   if (project.error !== undefined) return <Column><p class="error">{project.error}</p></Column>;
-  return project.ref === undefined ? <Column /> : <MemoryLoaded project={project.ref} editable={editable} context={context} />;
+  return project.ref === undefined ? <Column /> : <MemoryLoaded project={project.ref} id={id} editable={editable} context={context} />;
 }
 
-function MemoryLoaded({ project, editable, context }: { project: ProjectRef; editable: boolean; context: Context }) {
+function MemoryLoaded({ project, id, editable, context }: { project: ProjectRef; id: string; editable: boolean; context: Context }) {
   const head = useValue(project.memoryHead);
   const [entries, setEntries] = useState<MemoryEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -115,7 +116,7 @@ function MemoryLoaded({ project, editable, context }: { project: ProjectRef; edi
         {entries !== null && (
           <div class="mem-list" onClick={follow}>
             {entries.map((entry) => (
-              <Entry key={entry.path} project={project} entry={entry} editable={editable} open={opened.has(entry.path)}
+              <Entry key={entry.path} project={project} projectId={id} entry={entry} editable={editable} open={opened.has(entry.path)}
                 onToggle={() => toggle(entry.path)} onHistory={() => showHistory(entry.path)} reload={load} context={context} />
             ))}
           </div>
@@ -137,16 +138,35 @@ function MemoryLoaded({ project, editable, context }: { project: ProjectRef; edi
   );
 }
 
+/** An entry's edit as its draft keeps it: the text, and the hash of the entry it was opened from. */
+type EditDraft = { text: string; base: string };
+
+/** The edit a draft holds; null for none, or for one this view cannot read. */
+function editDraft(draft: string): EditDraft | null {
+  if (draft === "") return null;
+  try {
+    const parsed: unknown = JSON.parse(draft);
+    const e = parsed as Partial<EditDraft> | null;
+    return typeof e?.text === "string" && typeof e.base === "string" ? { text: e.text, base: e.base } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** One entry: its name, description and type; opened, its text and its last change, or the editor. */
-function Entry({ project, entry, editable, open, onToggle, onHistory, reload, context }: {
-  project: ProjectRef; entry: MemoryEntry; editable: boolean; open: boolean;
+function Entry({ project, projectId, entry, editable, open, onToggle, onHistory, reload, context }: {
+  project: ProjectRef; projectId: string; entry: MemoryEntry; editable: boolean; open: boolean;
   onToggle(): void; onHistory(): void; reload(): Promise<MemoryEntry[] | null>; context: Context;
 }) {
   // The file as last read, with the hash the entry had when that read was asked for: if the file moved on before the
   // read, the text is newer than the hash and a save from it is refused `Changed`, never saved over unseen text.
   const [read, setRead] = useState<{ text: string | null; hash: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState<{ text: string; base: string } | null>(null);
+  // An edit under way, kept as a draft (`useDraft`) as the composer's text is: closing the entry or leaving the page
+  // keeps it, and its `base` with it, so a save from it is still refused `Changed` once the file has moved on.
+  const [draft, setDraft] = useDraft(`memory.${projectId}.${entry.path}`);
+  const editing = editDraft(draft);
+  const setEditing = (next: EditDraft | null) => setDraft(next === null ? "" : JSON.stringify(next));
   const [deleting, setDeleting] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -188,7 +208,7 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
       {open && (editing !== null
         ? (
           <Editor project={project} path={entry.path} initial={editing.text} base={editing.base} listed={[]} reload={reload}
-            onSaved={() => setEditing(null)} onCancel={() => setEditing(null)} />
+            onText={(text) => setEditing({ text, base: editing.base })} onSaved={() => setEditing(null)} onCancel={() => setEditing(null)} />
         )
         : (
           <div class="mem-body">
@@ -215,9 +235,9 @@ function Entry({ project, entry, editable, open, onToggle, onHistory, reload, co
  * `base` it opened with: Save answers `Changed` until the user cancels and edits the reloaded entry, so it never saves
  * over text the user has not seen.
  */
-function Editor({ project, path, initial, base, listed, reload, onSaved, onCancel }: {
+function Editor({ project, path, initial, base, listed, reload, onText, onSaved, onCancel }: {
   project: ProjectRef; path: string | null; initial: string; base: string | null; listed: readonly string[];
-  reload(): Promise<MemoryEntry[] | null>; onSaved(path: string): void; onCancel(): void;
+  reload(): Promise<MemoryEntry[] | null>; onText?(text: string): void; onSaved(path: string): void; onCancel(): void;
 }) {
   const [name, setName] = useState("");
   const [text, setText] = useState(initial);
@@ -251,7 +271,8 @@ function Editor({ project, path, initial, base, listed, reload, onSaved, onCance
       {path === null
         ? <input ref={nameBox} class="mem-file" value={name} onInput={(e) => setName(e.currentTarget.value)} />
         : <label class="mem-file" for={`mem-${path}`}>{path}</label>}
-      <textarea id={path === null ? undefined : `mem-${path}`} class="mem-text" value={text} onInput={(e) => setText(e.currentTarget.value)} />
+      <textarea id={path === null ? undefined : `mem-${path}`} class="mem-text" value={text}
+        onInput={(e) => { setText(e.currentTarget.value); onText?.(e.currentTarget.value); }} />
       <div class="mem-foot">
         <button type="button" class="primary" disabled={busy || !savable} onClick={() => void save()}>Save</button>
         <button type="button" onClick={onCancel}>Cancel</button>

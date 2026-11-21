@@ -2,7 +2,7 @@
 import { mkdir } from "node:fs/promises";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { NodeConfig } from "../config";
-import { jjEnv } from "../jj";
+import { inheritedEnv } from "./options";
 import { paths } from "../paths";
 
 /** The model that names tasks: an alias, so it follows the newest Haiku. */
@@ -33,17 +33,12 @@ export type TitleDeps = {
 /**
  * Asks Haiku for a title for a task whose first prompt is `prompt`: its reply as Claude Code gave it (unchecked: see
  * `cleanTitle`), or null when the query failed or took longer than `timeoutMs`. It runs in its own config dir
- * (`paths.titleConfig`), keeps no session and loads no settings, tools or MCP servers.
+ * (`paths.titleConfig`), keeps no session and loads no settings, tools or MCP servers; it inherits what a turn does
+ * (`inheritedEnv`), so it gets through the same proxy.
  */
 export async function askTitle(prompt: string, deps: TitleDeps): Promise<string | null> {
   const dir = paths(deps.cfg).titleConfig;
   await mkdir(dir, { recursive: true, mode: 0o700 });
-  const meddle = jjEnv(deps.cfg);
-  const env: Record<string, string> = {};
-  for (const name of ["PATH", "HOME"]) {
-    const value = meddle[name];
-    if (value !== undefined) env[name] = value;
-  }
   const abortController = new AbortController();
   const timer = setTimeout(() => abortController.abort(), deps.timeoutMs ?? TITLE_MS);
   const q = query({
@@ -59,7 +54,7 @@ export async function askTitle(prompt: string, deps: TitleDeps): Promise<string 
       persistSession: false,
       abortController,
       env: {
-        ...env,
+        ...inheritedEnv(deps.cfg),
         ...deps.cfg.poolEnv,
         CLAUDE_CONFIG_DIR: dir,
         CLAUDE_CODE_OAUTH_TOKEN: deps.token,

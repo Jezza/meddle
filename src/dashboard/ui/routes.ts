@@ -14,12 +14,14 @@ export type View =
   | { name: "project"; id: string; tab?: ProjectTab }
   | { name: "add-project" }
   | { name: "node"; nodeId: string }
+  /** A project's merge train, watch-only; with `task`, that queued task's row highlighted. */
+  | { name: "train"; projectId: string; task?: string }
   | { name: "settings" };
 
 /**
  * The view a location hash names (`#/task/<nodeId>/<taskId>[/changes]`, `#/new[/<projectId>]`,
- * `#/project/<id>[/memory|/tasks]`, `#/projects/add`, `#/node/<nodeId>`, `#/settings`), home otherwise (a malformed
- * escape included).
+ * `#/project/<id>[/memory|/tasks]`, `#/projects/add`, `#/node/<nodeId>`, `#/train/<projectId>[/<taskId>]`,
+ * `#/settings`), home otherwise (a malformed escape included).
  */
 export function viewOf(hash: string): View {
   let parts: string[];
@@ -38,6 +40,8 @@ export function viewOf(hash: string): View {
   if (name === "project" && parts.length === 4 && given(a) && (b === "memory" || b === "tasks")) return { name: "project", id: a, tab: b };
   if (name === "projects" && a === "add" && parts.length === 3) return { name: "add-project" };
   if (name === "node" && parts.length === 3 && given(a)) return { name: "node", nodeId: a };
+  if (name === "train" && parts.length === 3 && given(a)) return { name: "train", projectId: a };
+  if (name === "train" && parts.length === 4 && given(a) && given(b)) return { name: "train", projectId: a, task: b };
   if (name === "settings" && parts.length === 2) return { name: "settings" };
   return { name: "home" };
 }
@@ -54,6 +58,7 @@ export function hashOf(view: View): string {
     case "project": return `#/project/${e(view.id)}${view.tab === undefined ? "" : `/${view.tab}`}`;
     case "add-project": return "#/projects/add";
     case "node": return `#/node/${e(view.nodeId)}`;
+    case "train": return `#/train/${e(view.projectId)}${view.task === undefined ? "" : `/${e(view.task)}`}`;
     case "settings": return "#/settings";
   }
 }

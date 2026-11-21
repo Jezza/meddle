@@ -1,10 +1,11 @@
 // test/ui.test.ts
 import { test, expect } from "bun:test";
-import { branchLines, listedOnline, mergeProjects, moveTargets, projectChoices } from "../src/dashboard/ui/pool-model";
+import { branchLines, listedOnline, mergeProjects, projectChoices, unknownVersion } from "../src/dashboard/ui/pool-model";
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/dashboard/ui/agents-model";
 import type { AgentEntry } from "../src/state/contracts";
-import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
+import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, uniqueTasks, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
+import { mergeStatus, resumeLabel, trainColumns, trainError, trainOffer, type TrainView } from "../src/dashboard/ui/train-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
@@ -12,7 +13,7 @@ import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, 
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "../src/dashboard/ui/changes-model";
-import { composerKey, withTakenBack } from "../src/dashboard/ui/composer-model";
+import { composerKey, composing, enters, withTakenBack } from "../src/dashboard/ui/composer-model";
 import { contextMeter, levelOf, readAgo, windowMeter } from "../src/dashboard/ui/usage-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
@@ -37,8 +38,16 @@ test("viewOf and hashOf round-trip every route", () => {
     { name: "add-project" },
     { name: "node", nodeId: "abc" },
     { name: "settings" },
+    { name: "train", projectId: "p1" },
+    { name: "train", projectId: "p/1", task: "t1" },
   ] as const;
   for (const view of views) expect(viewOf(hashOf(view))).toEqual(view);
+  expect(hashOf({ name: "train", projectId: "p/1" })).toBe("#/train/p%2F1");
+  expect(hashOf({ name: "train", projectId: "p1", task: "t1" })).toBe("#/train/p1/t1");
+  expect(viewOf("#/train/p1")).not.toHaveProperty("task");
+  expect(viewOf("#/train")).toEqual({ name: "home" });
+  expect(viewOf("#/train//t1")).toEqual({ name: "home" });
+  expect(viewOf("#/train/p1/t1/x")).toEqual({ name: "home" });
   expect(hashOf({ name: "task", nodeId: "abc", id: "t1" })).toBe("#/task/abc/t1");
   expect(hashOf({ name: "task", nodeId: "abc", id: "t1", tab: "changes" })).toBe("#/task/abc/t1/changes");
   expect(viewOf("#/task/abc/t1")).not.toHaveProperty("tab");
@@ -58,23 +67,10 @@ test("viewOf falls back to home for a malformed escape instead of throwing", () 
   expect(viewOf("#/task/abc/%E0%A4%A")).toEqual({ name: "home" });
 });
 
-test("a task moves only to another online member that hosts tasks and runs the same known Claude Code version", () => {
-  const [a, b, c, d, e, f] = ["a", "b", "c", "d", "e", "f"].map((x) => x.repeat(64)) as [string, string, string, string, string, string];
-  const row = (nodeId: string, over: Partial<{ status: "member" | "removed"; online: boolean; hostsTasks: boolean; claudeCodeVersion: string }> = {}) =>
-    ({ nodeId, status: "member" as const, online: true, hostsTasks: true, claudeCodeVersion: "2.1.0", ...over });
-  const nodes = [
-    row(a),
-    row(b),
-    row(c, { online: false }),
-    row(d, { hostsTasks: false }),
-    row(e, { claudeCodeVersion: "2.2.0" }),
-    row(f, { status: "removed" }),
-  ];
-  expect(moveTargets(nodes, a, "2.1.0").map((n) => n.nodeId)).toEqual([b]);
-  expect(moveTargets(nodes, b, "2.1.0").map((n) => n.nodeId)).toEqual([a]);
-  // an unknown version on this node (a compiled binary) moves nowhere, nor to a node that reports unknown
-  expect(moveTargets(nodes, a, "unknown")).toEqual([]);
-  expect(moveTargets([row(a, { claudeCodeVersion: "unknown" }), row(b, { claudeCodeVersion: "unknown" })], a, "unknown")).toEqual([]);
+test("a version that says nothing is unknown: a compiled binary's, or one not reported yet", () => {
+  expect(unknownVersion("unknown")).toBe(true);
+  expect(unknownVersion("")).toBe(true);
+  expect(unknownVersion("2.1.0")).toBe(false);
 });
 
 test("the projects view merges each project's holders by id, home's name first, holders in pool order", () => {
@@ -149,7 +145,7 @@ test("projectChoices: every project an online member lists, once, named as its h
 function entry(id: string, over: Partial<TaskEntry> = {}): TaskEntry {
   return {
     nodeId: "n1", id, title: id, projects: [], state: "idle", pending: 0, agents: 0,
-    activityAt: "2026-11-01T00:00:00.000Z", createdAt: "2026-11-01T00:00:00.000Z", moveTo: null, archived: false, ...over,
+    activityAt: "2026-11-01T00:00:00.000Z", createdAt: "2026-11-01T00:00:00.000Z", moveTo: null, archived: false, queued: false, merge: false, ...over,
   };
 }
 
@@ -177,6 +173,21 @@ test("groupTasks: one-project tasks under their project, the rest shared, archiv
   expect(groups.archived.map((t) => t.id)).toEqual(["f"]);
 });
 
+test("groupTasks counts each project's queued tasks, not those archived or shared", () => {
+  const one = { id: "p1", name: "one" };
+  const two = { id: "p2", name: "two" };
+  const groups = groupTasks([{ id: "p1", name: "one", home: "n1" }, { id: "p2", name: "two", home: "n1" }], [
+    entry("a", { projects: [one], queued: true }),
+    entry("b", { projects: [one], queued: true }),
+    entry("c", { projects: [one] }),
+    entry("m", { projects: [one], merge: true }),
+    entry("d", { projects: [one], queued: true, archived: true }),
+    entry("e", { projects: [one, two], queued: true }),
+    entry("f", { projects: [two], queued: true }),
+  ]);
+  expect(groups.projects.map((p) => [p.name, p.queued])).toEqual([["one", 2], ["two", 1]]);
+});
+
 test("homeTask: the most recently active task waiting on you, none when nothing waits", () => {
   expect(homeTask([entry("a")])).toBeNull();
   const picked = homeTask([
@@ -198,6 +209,17 @@ test("moveChoices lists every other member, takers first, the rest with why they
     ["old", "Claude Code 2.0.0 ≠ 2.1.0"],
   ]);
   expect(moveChoices(nodes, "a", "unknown").every((c) => c.reason !== null)).toBe(true);
+  // nor to a node that reports unknown, even from one that reports the same
+  expect(moveChoices([row("a", { claudeCodeVersion: "unknown" }), row("b", { claudeCodeVersion: "unknown" })], "a", "unknown").map((c) => c.reason))
+    .toEqual(["Claude Code version unknown"]);
+});
+
+test("uniqueTasks lists a task held by two nodes once, its live entry over its archived one", () => {
+  const live = { id: "t", archived: false, nodeId: "b" };
+  const gone = { id: "t", archived: true, nodeId: "a" };
+  const other = { id: "u", archived: false, nodeId: "a" };
+  expect(uniqueTasks([gone, other, live])).toEqual([live, other]);
+  expect(uniqueTasks([live, gone])).toEqual([live]);
 });
 
 test("nodeLineText sums a node up for the footer", () => {
@@ -482,6 +504,17 @@ test("changeLabel names the working copy, else the description, else the short i
   expect(changeLabel(change({ description: "" }))).toBe("kpmxqwrt");
 });
 
+test("an input method's keys are its own: a one-line box submits on a plain Enter only", () => {
+  const key = (k: Partial<Parameters<typeof enters>[0]>) => ({ key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, isComposing: false, keyCode: 13, ...k });
+  expect(enters(key({}))).toBe(true);
+  expect(enters(key({ isComposing: true }))).toBe(false);
+  expect(enters(key({ keyCode: 229 }))).toBe(false);
+  expect(enters(key({ shiftKey: true }))).toBe(false);
+  expect(enters(key({ key: "a" }))).toBe(false);
+  expect(composing(key({ key: "Escape", isComposing: true }))).toBe(true);
+  expect(composing(key({ key: "Escape" }))).toBe(false);
+});
+
 test("composerKey: Enter sends (queued while a turn runs), Ctrl or Cmd+Enter sends now, Shift+Enter and touch keyboards make a new line", () => {
   const key = (k: Partial<Parameters<typeof composerKey>[0]>) => ({ key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, isComposing: false, keyCode: 13, ...k });
   const desk = { running: true, touch: false, anyQueued: false, value: "", caret: 0 };
@@ -663,4 +696,114 @@ test("withTakenBack: the texts, oldest first, above what the box held; the caret
   expect(withTakenBack(["a", "b"], "", 0)).toEqual({ text: "a\nb", caret: 3 });
   expect(withTakenBack(["a", "b"], "xyz", 1)).toEqual({ text: "a\nb\nxyz", caret: 5 });
   expect(withTakenBack([], "xyz", 1)).toEqual({ text: "xyz", caret: 1 });
+});
+
+// ─── the train page ───
+
+const titled = (...pairs: Array<[string, string]>) => new Map(pairs.map(([id, title]) => [id, { title }]));
+
+test("trainColumns hangs the batch under its merge task and marks the current step", () => {
+  const titles = titled(["a", "Small Changes view"], ["b", "Drag and drop"], ["c", "Forcing a queued message"], ["m", "Merge Small Changes view, Drag and drop"]);
+  const state: TrainView = {
+    paused: null,
+    round: { step: "checking", batch: ["a", "b"], mergeTask: "m" },
+    queued: [
+      { taskId: "c", state: "rebasing onto main", reason: null },
+      { taskId: "a", state: "in the batch", reason: null },
+      { taskId: "b", state: "in the batch", reason: null },
+      { taskId: "z", state: "queued", reason: null },
+    ],
+  };
+  expect(trainColumns(state, titles)).toEqual({
+    // the batch is in the round's column, not the queue's; a task the pool does not list is shown by its id
+    queued: [{ taskId: "c", title: "Forcing a queued message", state: "rebasing onto main" }, { taskId: "z", title: "z", state: "queued" }],
+    round: {
+      steps: [
+        { name: "describing", done: true, now: false },
+        { name: "picking", done: true, now: false },
+        { name: "checking", done: false, now: true },
+        { name: "landing", done: false, now: false },
+      ],
+      mergeTask: "m",
+      batch: [{ taskId: "a", title: "Small Changes view" }, { taskId: "b", title: "Drag and drop" }],
+    },
+    paused: null,
+  });
+});
+
+test("trainColumns: each step is the current one in turn, and rebasing follows landing", () => {
+  const at = (step: "describing" | "picking" | "checking" | "landing" | "rebasing") =>
+    trainColumns({ paused: null, round: { step, batch: [], mergeTask: null }, queued: [] }, new Map()).round!.steps.map((s) => (s.now ? `[${s.name}]` : s.done ? `${s.name}✓` : s.name));
+  expect(at("describing")).toEqual(["[describing]", "picking", "checking", "landing"]);
+  expect(at("picking")).toEqual(["describing✓", "[picking]", "checking", "landing"]);
+  expect(at("landing")).toEqual(["describing✓", "picking✓", "checking✓", "[landing]"]);
+  expect(at("rebasing")).toEqual(["describing✓", "picking✓", "checking✓", "landing✓", "[rebasing]"]);
+});
+
+test("trainColumns: before the batch is checked its tasks stay in the queue, with what the train is doing to them", () => {
+  const titles = titled(["a", "A"], ["b", "B"]);
+  const describing = trainColumns({
+    paused: null,
+    round: { step: "describing", batch: ["a"], mergeTask: null },
+    queued: [{ taskId: "a", state: "describing", reason: null }, { taskId: "b", state: "sitting out", reason: "its turn failed" }],
+  }, titles);
+  expect(describing.queued).toEqual([{ taskId: "a", title: "A", state: "describing" }, { taskId: "b", title: "B", state: "sitting out" }]);
+  expect(describing.round).toMatchObject({ mergeTask: null, batch: [] });
+  // a single head lands without a merge task: the batch still shows
+  const landing = trainColumns({
+    paused: null,
+    round: { step: "landing", batch: ["a"], mergeTask: null },
+    queued: [{ taskId: "a", state: "in the batch", reason: null }],
+  }, titles);
+  expect(landing.queued).toEqual([]);
+  expect(landing.round).toMatchObject({ mergeTask: null, batch: [{ taskId: "a", title: "A" }] });
+});
+
+test("trainColumns: no round, a paused train, an empty one", () => {
+  expect(trainColumns({ paused: null, round: null, queued: [] }, new Map())).toEqual({ queued: [], round: null, paused: null });
+  const paused = trainColumns({ paused: "you paused it", round: null, queued: [{ taskId: "a", state: "queued", reason: "x includes work from y, which isn't queued" }] }, titled(["a", "A"]));
+  expect(paused).toEqual({ queued: [{ taskId: "a", title: "A", state: "queued" }], round: null, paused: "you paused it" });
+});
+
+test("resumeLabel: Resume after the user's pause, Retry after the train's own", () => {
+  expect(resumeLabel("you paused it")).toBe("Resume");
+  expect(resumeLabel("the merge agent gave no verdict after 3 follow-ups")).toBe("Retry");
+});
+
+test("trainOffer: Accept for an idle or running task, Unqueue for a queued one, nothing for a merge task or one that cannot", () => {
+  const t = (over: Partial<Parameters<typeof trainOffer>[0]> = {}) => trainOffer({ state: "idle", queued: false, merge: false, moving: false, projects: 1, ...over });
+  expect(t()).toBe("accept");
+  expect(t({ state: "running" })).toBe("accept");
+  expect(t({ state: "waiting" })).toBeNull();
+  expect(t({ state: "archived" })).toBeNull();
+  expect(t({ state: "moved" })).toBeNull();
+  expect(t({ moving: true })).toBeNull();
+  expect(t({ merge: true })).toBeNull();
+  expect(t({ queued: true })).toBe("unqueue");
+  expect(t({ queued: true, state: "running" })).toBe("unqueue");
+  expect(t({ queued: true, state: "waiting" })).toBe("unqueue");
+  expect(t({ queued: true, moving: true })).toBeNull();
+  expect(t({ queued: true, state: "archived" })).toBeNull();
+  // a node of an older meddle says nothing of a queue: neither is offered
+  expect(t({ queued: null })).toBeNull();
+  expect(t({ queued: null, state: "running" })).toBeNull();
+  // a task with no project has no train; one with several is offered Accept, which the node refuses saying why
+  expect(t({ projects: 0 })).toBeNull();
+  expect(t({ projects: 0, state: "running" })).toBeNull();
+  expect(t({ projects: 2 })).toBe("accept");
+});
+
+test("mergeStatus: what the merge task's card says it is doing", () => {
+  expect(mergeStatus("checking", null)).toBe("starting");
+  expect(mergeStatus("checking", "running")).toBe("running its checks");
+  expect(mergeStatus("checking", "waiting")).toBe("waiting on you");
+  expect(mergeStatus("checking", "idle")).toBe("verifying");
+  expect(mergeStatus("landing", "idle")).toBe("landing");
+});
+
+test("trainError: a home older than the train is said to run an older meddle, any other error shows as it came", () => {
+  const older = "upgrade_required: contract_mismatch: meddle.project@1 does not cover the consumer's description (default.train missing or of another kind)";
+  expect(trainError(older, "gem")).toBe("gem runs an older meddle: it has no train.");
+  expect(trainError("not_in_variant: train", "gem")).toBe("gem runs an older meddle: it has no train.");
+  expect(trainError("connection reset", "gem")).toBe("connection reset");
 });

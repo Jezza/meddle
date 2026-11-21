@@ -407,7 +407,7 @@ export async function releaseFolder(cfg: NodeConfig, db: Database, taskId: strin
   const manifest = JSON.parse(row.manifest) as TaskManifest;
   for (const p of manifest.projects) {
     await dropWorkspace(cfg, p.replica, `meddle-${taskId}`, join(paths(cfg).task(taskId), p.workspace));
-    await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(taskId), cfg)).catch(() => {});
+    await serialised(repoKey(p.replica), () => bookmarkForget(p.replica, taskGlob(taskId), cfg, { ignoreWorkingCopy: true })).catch(() => {});
   }
   await rm(paths(cfg).task(taskId), { recursive: true, force: true });
 }

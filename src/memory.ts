@@ -2,7 +2,7 @@ import { cp, mkdir, readdir, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { NodeConfig } from "./config";
 import { paths } from "./paths";
-import { bookmarkSet, cloneColocated, initColocated, isJjRepo, jj, remoteAdd, remoteList } from "./jj";
+import { bookmarkSet, cloneColocated, initColocated, isJjRepo, jj, remoteEnsure } from "./jj";
 import { shortId } from "./pool/ids";
 import { exists } from "./profile";
 
@@ -24,7 +24,7 @@ export async function ensureMemoryReplica(cfg: NodeConfig, projectId: string): P
  * The memory replica of a project homed on node `home`: cloned from `meddle://<home>/memory/<projectId>` with the
  * remote named `shortId(home)` when this node has none. When the clone fails (the home has no memory repo), an empty
  * local repo with that remote instead; a later sync fetches the home's `memory`. An existing replica is kept (it may
- * hold commits the home has not seen) and gets the remote when it lacks it.
+ * hold commits the home has not seen) and gets the remote when it lacks it, or its url corrected (`remoteEnsure`).
  */
 export async function cloneMemoryReplica(cfg: NodeConfig, projectId: string, home: string): Promise<string> {
   const replica = paths(cfg).memory(projectId);
@@ -40,7 +40,7 @@ export async function cloneMemoryReplica(cfg: NodeConfig, projectId: string, hom
       await ensureMemoryReplica(cfg, projectId);
     }
   }
-  if (!(await remoteList(replica, cfg)).some((r) => r.name === remote)) await remoteAdd(replica, remote, url, cfg);
+  await remoteEnsure(replica, remote, url, cfg);
   return replica;
 }
 

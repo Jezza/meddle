@@ -195,6 +195,13 @@ export function composeSettings(contexts: Context[], projectSettings: Json[] = [
   return settings;
 }
 
+/**
+ * The projects' env, later contexts over earlier ones. It may replace what meddle sets (a project's own token or config
+ * dir), all but `MEDDLE_GIT_SOCKET`: an agent never reaches `meddle://` remotes (`buildEnv`), and a project's
+ * `context.toml` is one an agent can change.
+ */
 export function composeEnv(contexts: Context[]): Record<string, string> {
-  return Object.assign({}, ...contexts.map((c) => c.env));
+  const env: Record<string, string> = Object.assign({}, ...contexts.map((c) => c.env));
+  delete env.MEDDLE_GIT_SOCKET;
+  return env;
 }

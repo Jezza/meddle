@@ -10,12 +10,12 @@ import type { GraphCommit } from "../../projects/graph";
 import { type Hosts, useAction, useObject, useValue } from "./hooks";
 import { Memory } from "./Memory";
 import { memorySource } from "./memory-model";
-import { PaneHead, type PoolRef, StateDot } from "./common";
+import { PaneHead, type PoolRef, StateDot, Unavailable } from "./common";
 import { Graph } from "./Graph";
 import { graphRows } from "./graph-model";
 import { branchLines, listedOnline, mergeProjects, type HeldProject } from "./pool-model";
 import { hashOf, type ProjectTab } from "./routes";
-import { waitsOnYou } from "./sidebar-model";
+import { uniqueTasks, waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
 
 /** A node's copy, and its object to read more of its graph from. */
@@ -46,7 +46,7 @@ export function ProjectPage({ hosts, pool, index, id, tab }: {
   const onlineIds = online.map((n) => n.nodeId);
   const project = mergeProjects([...held.values()].filter((c) => onlineIds.includes(c.nodeId) && c.id === id), nodes.map((n) => n.nodeId))[0];
   const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
-  const tasks = index.tasks.filter((t) => !t.archived && t.projects.some((p) => p.id === id));
+  const tasks = uniqueTasks(index.tasks).filter((t) => !t.archived && t.projects.some((p) => p.id === id));
   const listed = nodes.flatMap((n) => n.projects).find((p) => p.id === id);
   const memory = project === undefined ? null : memorySource(project.home, project.holders.map((h) => h.nodeId), onlineIds);
   const nodeName = (short: string) => nodes.find((n) => shortId(n.nodeId) === short)?.hostname ?? short;
@@ -79,7 +79,11 @@ export function ProjectPage({ hosts, pool, index, id, tab }: {
     const t = index.tasks.find((t) => t.id === taskId && !t.archived);
     return t === undefined ? null : { title: t.title, href: hashOf({ name: "task", nodeId: t.nodeId, id: t.id }) };
   };
-  const unheld = <p class="muted">{listedOnline(nodes, onlineIds, id) ? "Loading…" : "No online node holds this project."}</p>;
+  // While no online node that lists it can be reached, why not, as a task's page says it.
+  const listers = online.filter((n) => n.projects.some((p) => p.id === id));
+  const unheld = !listedOnline(nodes, onlineIds, id) ? <p class="muted">No online node holds this project.</p>
+    : listers.some((n) => hosts.for(n.nodeId) !== undefined) ? <p class="muted">Loading…</p>
+    : <Unavailable status={hosts.status(listers[0]!.nodeId)} />;
   const shown = tab ?? "graph";
   const column = (key: "graph" | ProjectTab) => `proj-col${shown === key ? " on" : ""}`;
   const tabLink = (key: "graph" | ProjectTab, label: ComponentChildren) => (

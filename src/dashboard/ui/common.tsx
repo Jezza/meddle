@@ -4,8 +4,10 @@ import type { ComponentChildren } from "preact";
 import { createContext } from "preact";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { NodeObject, PoolObject, TaskObject } from "../../state/contracts";
+import { composing } from "./composer-model";
 import { type HostStatus, useAction } from "./hooks";
 import { EFFORT_LEVELS } from "../../pool/settings";
+import { hashOf } from "./routes";
 import { moveChoices } from "./sidebar-model";
 
 /** `PoolObject` as a dashboard holds it: its `default` variant. */
@@ -40,6 +42,15 @@ export function Unavailable({ status }: { status: HostStatus }) {
  */
 export function nodeDot(node: { online: boolean; running: number }, alert: string | null = null): string {
   return `dot ${alert !== null ? "bad" : !node.online ? "off" : node.running > 0 ? "busy" : "ok"}`;
+}
+
+/** Nodes on a build other than the pool's, and why (`buildAlerts`): every node dot (`NodeDot`) shows them red. */
+export const BuildAlerts = createContext<ReadonlyMap<string, string>>(new Map());
+
+/** A node's dot (`nodeDot`), red with the reason as its title while it is on a build other than the pool's. */
+export function NodeDot({ node }: { node: { nodeId: string; online: boolean; running: number } }) {
+  const alert = useContext(BuildAlerts).get(node.nodeId) ?? null;
+  return <span class={nodeDot(node, alert)} title={alert ?? undefined} />;
 }
 
 /** A task's state as a dot: running, waiting on you, idle, moving, archived. */
@@ -161,7 +172,7 @@ export function MoveMenu({ task, nodes, from, anchor, onClose }: {
       {choices.map(({ node, reason }) => (
         <MenuItem key={node.nodeId} disabled={reason !== null || action.busy} title={node.nodeId} onClick={() => void move(node.nodeId)}
           meta={reason ?? nodeMeta(node)}>
-          <span class={nodeDot(node)} /> {node.hostname}
+          <NodeDot node={node} /> {node.hostname}
         </MenuItem>
       ))}
       <div class="menu-sep" />
@@ -199,18 +210,28 @@ export function RestoreMenu({ task, nodes, holder, anchor, onClose, onRestored }
       <MenuItem disabled={action.busy} onClick={() => void restore(null)} meta="placement picks">Automatic</MenuItem>
       {self !== undefined && (
         <MenuItem disabled={action.busy} title={self.nodeId} onClick={() => void restore(self.nodeId)} meta="holds its archive">
-          <span class={nodeDot(self)} /> {self.hostname}
+          <NodeDot node={self} /> {self.hostname}
         </MenuItem>
       )}
       {choices.map(({ node, reason }) => (
         <MenuItem key={node.nodeId} disabled={reason !== null || action.busy} title={node.nodeId} onClick={() => void restore(node.nodeId)}
           meta={reason ?? nodeMeta(node)}>
-          <span class={nodeDot(node)} /> {node.hostname}
+          <NodeDot node={node} /> {node.hostname}
         </MenuItem>
       ))}
       {action.error !== null && <div class="menu-note error">{action.error}</div>}
     </Popover>
   );
+}
+
+/**
+ * Deletes a task once the user confirms it, then, when its page is the one open (`open`), goes home: the head's
+ * Delete and the sidebar's alike. Run it in a `useAction`.
+ */
+export async function deleteTask(task: Ref<typeof TaskObject>, title: string, open: boolean): Promise<void> {
+  if (!confirm(`Delete "${title}", its log and its archive? This cannot be undone.`)) return;
+  await task.delete({});
+  if (open) location.hash = hashOf({ name: "home" });
 }
 
 /** A title edited in place: Enter saves, Escape or leaving it cancels. */
@@ -226,6 +247,7 @@ export function RenameInput({ value, onSave, onDone }: { value: string; onSave(t
     <input ref={ref} class="rename" value={text} onInput={(e) => setText(e.currentTarget.value)} onBlur={onDone}
       onClick={(e) => e.preventDefault()}
       onKeyDown={(e) => {
+        if (composing(e)) return;
         if (e.key === "Enter") { e.preventDefault(); void save(); }
         if (e.key === "Escape") { e.preventDefault(); onDone(); }
       }} />

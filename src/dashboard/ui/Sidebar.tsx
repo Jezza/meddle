@@ -1,30 +1,30 @@
 // The sidebar: projects with their tasks, the tasks with no project or several, the archived tasks (collapsed), and
-// the pool's nodes at the foot. Each task row carries its state, what waits on you, how many of its agents run, and the
-// node it runs on.
-import { useState } from "preact/hooks";
+// the pool's nodes at the foot. Each project's line opens its train too. Each task row carries its state, what waits on
+// you, how many of its agents run, whether it is queued on its train, and the node it runs on.
+import { useContext, useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { store, stored, useAction, useValue } from "./hooks";
-import { type Anchor, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
+import { type Anchor, BuildAlerts, deleteTask, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
 import { Glyph } from "./icons";
 import { projectChoices } from "./pool-model";
 import { hashOf, type View } from "./routes";
 import { groupTasks, nodeLineText, waitsOnYou } from "./sidebar-model";
-import type { ListedTask, PoolIndex } from "./sources";
+import { type ListedTask, type PoolIndex, queueable } from "./sources";
+import { trainOffer } from "./train-model";
 
 const ARCHIVED_OPEN_KEY = "meddle.sidebar.archived";
 
-export function Sidebar({ pool, index, view, selfId, alerts, onHide, onNavigate }: {
-  pool: PoolRef; index: PoolIndex; view: View; selfId: string;
-  /** Nodes on a build other than the pool's, and why (`buildAlerts`): their dot is red. */
-  alerts: ReadonlyMap<string, string>;
-  onHide(): void; onNavigate(): void;
+export function Sidebar({ pool, index, view, selfId, onHide, onNavigate }: {
+  pool: PoolRef; index: PoolIndex; view: View; selfId: string; onHide(): void; onNavigate(): void;
 }) {
+  const alerts = useContext(BuildAlerts);
   const nodes = useValue(pool.nodes);
   const mixedVersions = useValue(pool.mixedVersions);
   const groups = groupTasks(projectChoices(nodes), index.tasks);
   const [archivedOpen, setArchivedOpen] = useState(() => stored(ARCHIVED_OPEN_KEY));
   const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
   const isNew = (projectId: string | null) => view.name === "new" && view.projectId === projectId;
+  const trainSelected = (projectId: string) => view.name === "train" && view.projectId === projectId;
   const row = (t: ListedTask, indent: boolean) => (
     <TaskRow key={`${t.nodeId}/${t.id}`} task={t} nodes={nodes} nameOf={nameOf} indent={indent}
       selected={view.name === "task" && view.id === t.id} onNavigate={onNavigate} />
@@ -46,7 +46,13 @@ export function Sidebar({ pool, index, view, selfId, alerts, onHide, onNavigate 
         {groups.projects.map((p) => (
           <div key={p.id} class="side-group">
             <a class={`side-project${view.name === "project" && view.id === p.id ? " sel" : ""}`} href={hashOf({ name: "project", id: p.id })} title={p.id}>
-              <span class="folder">▸</span>{p.name}
+              <span class="folder">▸</span><span class="title">{p.name}</span>
+              {/* Its train: how many tasks are queued, or, while none are, "Train" on hover or focus. Not stopped, so the drawer closes. */}
+              <button class={`train-mark${p.queued > 0 ? " busy" : ""}${trainSelected(p.id) ? " sel" : ""}`}
+                title={`${p.name}'s merge train: the tasks accepted to land on its default branch`}
+                onClick={(e) => { e.preventDefault(); location.hash = hashOf({ name: "train", projectId: p.id }); }}>
+                <Glyph name="merge" />{p.queued > 0 ? p.queued : "Train"}
+              </button>
             </a>
             {p.tasks.map((t) => row(t, true))}
             <a class={`side-row new indent${isNew(p.id) ? " sel" : ""}`} href={hashOf({ name: "new", projectId: p.id })}>New task</a>
@@ -118,6 +124,8 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
     setMenu({ kind: "actions", anchor: { x: e.clientX, y: e.clientY } });
   };
   const moving = task.moveTo !== null;
+  const offer = task.archived || !queueable(task.ref) ? null : trainOffer({ state: task.state, queued: task.queued, merge: task.merge, moving, projects: task.projects.length });
+  const trainHref = hashOf({ name: "train", projectId: task.projects[0]?.id ?? "", task: task.id });
   const where = moving ? `${nameOf(task.nodeId)} → ${nameOf(task.moveTo!)}` : task.archived ? `on ${nameOf(task.nodeId)}` : nameOf(task.nodeId);
   const href = hashOf({ name: "task", nodeId: task.nodeId, id: task.id });
   const others = task.projects.length > 1 ? `${task.projects.length} projects` : null;
@@ -128,12 +136,16 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
         <StateDot state={task.state} waiting={waitsOnYou(task)} />
         {renaming
           ? <RenameInput value={task.title} onDone={() => setRenaming(false)} onSave={(title) => action.run(() => task.ref.rename({ title }))} />
-          : <span class="title">{task.title}</span>}
+          : <span class="title">{task.merge && <Glyph name="merge" cls="merge-mark" />}{task.title}</span>}
+        {task.queued && task.projects.length === 1 && (
+          <button class="queued-mark" title="Queued on its project's train: open the train"
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); location.hash = trainHref; }}><Glyph name="merge" /></button>
+        )}
         {task.pending > 0 && <span class="badge">{task.pending}</span>}
         {task.agents > 0 && (
           <span class="agent-count" title={`${task.agents} ${task.agents === 1 ? "agent" : "agents"} running`}><Glyph name="agent" />{task.agents}</span>
         )}
-        {others !== null && <span class="chip">{others}</span>}
+        {others !== null && <span class="tag">{others}</span>}
         <span class={`where${moving ? " moving" : ""}`}>{where}</span>
         <button class="more" title="Actions" onClick={openMenu}>⋯</button>
       </a>
@@ -145,11 +157,18 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
               <MenuItem onClick={() => setMenu({ kind: "restore", anchor: menu.anchor })}>Restore…</MenuItem>
               <MenuItem onClick={() => {
                 close();
-                if (confirm(`Delete "${task.title}", its log and its archive? This cannot be undone.`)) void action.run(() => task.ref.delete({}));
+                void action.run(() => deleteTask(task.ref, task.title, selected));
               }}>Delete</MenuItem>
             </>
           ) : (
             <>
+              {offer === "accept" && (
+                <MenuItem title="Queues the task's work to land on its project's default branch (the merge train)"
+                  onClick={() => { close(); void action.run(() => task.ref.accept({})); }}>Accept</MenuItem>
+              )}
+              {offer === "unqueue" && (
+                <MenuItem title="Takes the task off the train" onClick={() => { close(); void action.run(() => task.ref.unqueue({})); }}>Unqueue</MenuItem>
+              )}
               <MenuItem disabled={moving} onClick={() => { close(); setRenaming(true); }}>Rename</MenuItem>
               <MenuItem disabled={moving} onClick={() => setMenu({ kind: "move", anchor: menu.anchor })} meta={nameOf(task.nodeId)}>Move to…</MenuItem>
               <MenuItem disabled={task.state !== "idle" || moving} title="Removes the task's folder from its node and keeps its log; Restore brings it back"

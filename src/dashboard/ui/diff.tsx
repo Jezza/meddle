@@ -1,5 +1,6 @@
 // A file change's diff: its rows numbered in the old file and the new, with bars for the hidden lines between hunks.
 import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { remoteReason } from "../../projects/memory-names";
 import { type DiffRow, diffRows, fitsNewSide, gapLabel, type GapWhere, type Hunk, nextOpen, type Opened } from "./diff-model";
 import type { FilePatch } from "./git-diff";
 import { Chevron } from "./icons";
@@ -15,7 +16,7 @@ type Loaded = { file: readonly string[] | null };
  * `file`, or else what `load` gives on the first click; `side` says whether it is the old side (the default) or the
  * new, which must fit the hunks to be used. With `head`, a head above the rows names the file and has `Expand`,
  * which opens every gap at once. `closed` hides the rows; with `onToggle`, the head's path is a button that asks for
- * them to be shown or hidden.
+ * them to be shown or hidden. A load's refusal shows beneath the diff until a later one lands.
  */
 export function DiffView({ hunks, file: given, load, side = "old", head, closed = false, onToggle }: {
   hunks: readonly Hunk[];
@@ -28,6 +29,7 @@ export function DiffView({ hunks, file: given, load, side = "old", head, closed 
 }) {
   const [opened, setOpened] = useState<Opened>(new Map());
   const [loaded, setLoaded] = useState<Loaded | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const loading = useRef<Promise<Loaded> | null>(null);
   const file = given ?? loaded?.file ?? null;
   const loadable = given === null && load !== undefined && loaded === null;
@@ -51,10 +53,12 @@ export function DiffView({ hunks, file: given, load, side = "old", head, closed 
     let result: Loaded;
     try {
       result = await pending;
-    } catch {
+    } catch (err) {
       if (loading.current === pending) loading.current = null;
+      setLoadError(remoteReason(err));
       return null;
     }
+    setLoadError(null);
     setLoaded(result);
     return result.file;
   };
@@ -83,21 +87,24 @@ export function DiffView({ hunks, file: given, load, side = "old", head, closed 
   };
   const body = !head?.binary && !closed;
   return (
-    <div ref={outer} class={opened.size > 0 ? "diff open" : "diff"}>
-      {head && (
-        <div class="diff-head">
-          {onToggle !== undefined && !head.binary
-            ? <button type="button" class="path" aria-expanded={!closed} onClick={toggle}><Chevron />{head.path}</button>
-            : <span class="path">{onToggle !== undefined && <span class="chev" />}{head.path}</span>}
-          {head.status !== "modified" && <span class="tag">{head.status === "added" ? "new" : head.status}</span>}
-          {head.binary
-            ? <span class="tag">binary</span>
-            : <span><span class="add">+{head.added}</span> <span class="del">−{head.removed}</span></span>}
-          {body && rows.some((row) => row.kind === "gap" && row.canOpen) && <button type="button" onClick={expand}>Expand</button>}
-        </div>
-      )}
-      {body && <div ref={box} class="diff-body"><DiffRows rows={rows} onOpen={open} /></div>}
-    </div>
+    <>
+      <div ref={outer} class={opened.size > 0 ? "diff open" : "diff"}>
+        {head && (
+          <div class="diff-head">
+            {onToggle !== undefined && !head.binary
+              ? <button type="button" class="path" aria-expanded={!closed} onClick={toggle}><Chevron />{head.path}</button>
+              : <span class="path">{onToggle !== undefined && <span class="chev" />}{head.path}</span>}
+            {head.status !== "modified" && <span class="tag">{head.status === "added" ? "new" : head.status}</span>}
+            {head.binary
+              ? <span class="tag">binary</span>
+              : <span><span class="add">+{head.added}</span> <span class="del">−{head.removed}</span></span>}
+            {body && rows.some((row) => row.kind === "gap" && row.canOpen) && <button type="button" onClick={expand}>Expand</button>}
+          </div>
+        )}
+        {body && <div ref={box} class="diff-body"><DiffRows rows={rows} onOpen={open} /></div>}
+      </div>
+      {loadError !== null && <p class="diff-error error">{loadError}</p>}
+    </>
   );
 }
 
