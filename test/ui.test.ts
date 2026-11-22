@@ -498,8 +498,9 @@ test("fileTree puts folders before files, each by name, and runs on through lone
   expect(fileTree([])).toEqual([]);
 });
 
-test("changeLabel names the working copy, else the description, else the short id", () => {
-  expect(changeLabel(change({ workingCopy: true, description: "Wip" }))).toBe("Working copy");
+test("changeLabel names the description, else the working copy, else the short id", () => {
+  expect(changeLabel(change({ workingCopy: true, description: "Wip" }))).toBe("Wip");
+  expect(changeLabel(change({ workingCopy: true, description: "" }))).toBe("Working copy");
   expect(changeLabel(change({ description: "Add DiffView" }))).toBe("Add DiffView");
   expect(changeLabel(change({ description: "" }))).toBe("kpmxqwrt");
 });

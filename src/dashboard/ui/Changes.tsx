@@ -129,7 +129,7 @@ function ChangeRow({ c, first, selected, onSelect }: { c: TaskChange; first: boo
       <span class="chg-text">
         <span class="chg-label">{changeLabel(c)}</span>
         <span class="meta">
-          {!c.workingCopy && <><span class="id">{c.change.slice(0, 8)}</span> · </>}
+          {(!c.workingCopy || c.description.trim() !== "") && <><span class="id">{c.change.slice(0, 8)}</span> · </>}
           {c.empty ? "empty" : <>{files(c.files)}<Lines added={c.added} removed={c.removed} /></>}
           {c.conflicted && <> · <span class="flag">conflicted</span></>}
         </span>
