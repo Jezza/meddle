@@ -16,6 +16,7 @@ import { paths } from "../paths";
 import { shortId } from "../pool/ids";
 import { remoteReason } from "../pool/object";
 import { dedupe } from "../pool/report";
+import { isRemoved } from "../pool/removed";
 import { branchChanges, lineChanges, listLineRows, topic, type LineRow } from "../pool/rows";
 import type { PoolRuntime } from "../pool/runtime";
 import { advanceBranch } from "../projects/advance";
@@ -177,8 +178,12 @@ export const trainNotices: Subscribable<TrainNotice> = noticeTopic.subscribable;
 
 const tell = changeTopic.tell;
 
-/** Changes project `projectId`'s train row as `change` says, in one transaction (made when it has none). */
+/**
+ * Changes project `projectId`'s train row as `change` says, in one transaction (made when it has none). A removed
+ * project's train keeps no row: it answers the row as it is (or the default) and writes nothing.
+ */
 function updateTrain(db: Database, projectId: string, change: (t: TrainRow) => TrainRow): TrainRow {
+  if (isRemoved(db, projectId)) return readTrain(db, projectId);
   const t = db.transaction(() => {
     const t = change(readTrain(db, projectId));
     db.query(
@@ -289,6 +294,23 @@ async function conductorFor(runtime: TrainRuntime, context: Context): Promise<Co
   await runtime.hooks.each("harness", (get) => { harness = get(); });
   if (harness === undefined) throw new Error("the meddle extension is not installed");
   return slotOf(harness).get(context);
+}
+
+/**
+ * Stops project `projectId`'s train for good, as its removal does: each round of it live in `harness` is aborted (asked
+ * of the Harness directly: the conductor may not be running yet, at a start), the conductor, if bound, forgets the
+ * project, and its `trains` row is deleted (a removed project's is never written again: `updateTrain`).
+ */
+export async function forgetTrain(harness: Harness, db: Database, projectId: string): Promise<void> {
+  const { tasks } = await harness.inspect(BACKGROUND_CONTEXT);
+  for (const t of tasks) {
+    if (t.record.kind !== MeddleTrain.definition.name || t.record.state.status === "terminal") continue;
+    if ((t.record.input as TrainInput).projectId !== projectId) continue;
+    await harness.abortTask(t.record.id, BACKGROUND_CONTEXT);
+  }
+  slotOf(harness).current?.forget(projectId);
+  db.query("DELETE FROM trains WHERE project = ?").run(projectId);
+  updateTopic.tell(projectId);
 }
 
 function isParked(t: TaskInspection): boolean {
@@ -572,9 +594,23 @@ class Conductor {
     return listProjects(this.#db).filter((p) => p.home === this.#selfId);
   }
 
+  /** Project `projectId` when it is homed here and not removed: a removed project starts no round, whatever kicks it. */
   #home(projectId: string): Project | null {
     const project = getProject(this.#db, projectId);
-    return project !== null && project.home === this.#selfId ? project : null;
+    return project !== null && project.home === this.#selfId && !isRemoved(this.#db, projectId) ? project : null;
+  }
+
+  /** Project `projectId` was removed: its timers stop and nothing of its train is kept in memory (an aborted round ends unheard). */
+  forget(projectId: string): void {
+    const t = this.#trains.get(projectId);
+    if (t !== undefined) {
+      clearTimeout(t.timer);
+      clearTimeout(t.retry);
+    }
+    this.#trains.delete(projectId);
+    this.#rounds.delete(projectId);
+    for (const key of [...this.#seen.keys()]) if (key.startsWith(`${projectId}\0`)) this.#seen.delete(key);
+    for (const r of listLineRows(this.#db, projectId)) this.#titles.delete(r.task);
   }
 
   /** Something could change the outcome of a round of project `projectId`'s train: one starts, or one more after it. */

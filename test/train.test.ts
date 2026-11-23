@@ -10,6 +10,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { paths } from "../src/config";
 import { commitOf, commitsIn, jj } from "../src/jj";
+import { markRemoved } from "../src/pool/removed";
 import { lineChanges, listBranchRows, listLineRows } from "../src/pool/rows";
 import { makeCheckout } from "../src/projects/checkouts";
 import { getProject } from "../src/projects/project";
@@ -20,7 +21,7 @@ import { TaskRunner, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER } from "../src/tasks/du
 import { openHarness } from "../src/tasks/harness";
 import type { TaskManifest } from "../src/tasks/manifest";
 import type { TrainTurnKind, TrainTurnOutcome } from "../src/train/tools";
-import { pauseTrain, retryTask, trainState } from "../src/train/train";
+import { forgetTrain, pauseTrain, retryTask, trainState } from "../src/train/train";
 import { claudeCodeVersion } from "../src/version";
 import { startApplier } from "../src/projects/applier";
 import { createTask, replay } from "./helpers";
@@ -728,6 +729,83 @@ test("a hold that starts during a step of several turns refuses each of the rest
     expect([...described].sort()).toEqual([...ids].sort());
     expect(merge.tasks).toHaveLength(1);
     await waitFor("every task archived", () => ids.every((id) => getTask(n.db, id)?.state === "archived"));
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+/** Project `P` on the removed list, as `meddle project remove` leaves it. */
+function remove(n: GitPoolNode, P: string): void {
+  markRemoved(n.db, { id: P, name: getProject(n.db, P)!.name, removedAt: new Date().toISOString(), removedBy: n.id });
+}
+
+/** The ids of the `meddle.train` tasks live in node `n`'s Harness. */
+async function liveTrainIds(n: GitPoolNode): Promise<number[]> {
+  const { tasks } = await n.harness.harness.inspect(BACKGROUND_CONTEXT);
+  return tasks.filter((t) => t.record.kind === "meddle.train").map((t) => t.record.id);
+}
+
+/** The state of the task `id` in node `n`'s Harness, live or settled. */
+async function stateOf(n: GitPoolNode, id: number) {
+  return (await n.harness.harness.getTask(id as never, BACKGROUND_CONTEXT))?.state;
+}
+
+test("forgetting a project's train aborts its round and keeps its row gone", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const merge = fakeMerge(n, { stall: true });
+    const t1 = await taskWithWork(n, P, "x.txt");
+    const t2 = await taskWithWork(n, P, "y.txt");
+    await acceptAll(n, P, [t1.id, t2.id]);
+    await merge.reached;
+    const [round] = await liveTrainIds(n);
+    expect(round).toBeDefined();
+    expect(n.db.query("SELECT project FROM trains WHERE project = ?").all(P)).not.toEqual([]);
+
+    remove(n, P);
+    await forgetTrain(n.harness.harness, n.db, P);
+    // The Harness marks the abort and runs the task's abort handler after.
+    await waitFor("the round aborted", async () => (await stateOf(n, round!))?.status === "terminal");
+    expect(await stateOf(n, round!)).toMatchObject({ status: "terminal", outcome: { status: "aborted" } });
+    expect(n.db.query("SELECT * FROM trains WHERE project = ?").all(P)).toEqual([]);
+
+    // The round's would-be end, and the user's Pause, write nothing back.
+    merge.release();
+    await Bun.sleep(1_000);
+    pauseTrain(n.db, P, "x");
+    await Bun.sleep(500);
+    expect(n.db.query("SELECT * FROM trains WHERE project = ?").all(P)).toEqual([]);
+    expect(await liveTrainIds(n)).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 180_000);
+
+test("a removed project starts no new round", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    const before = await mainOf(n, P);
+    const t = await taskWithWork(n, P, "x.txt");
+    // Queued while the train is paused, so that no round starts; the pause is lifted behind the train's back.
+    pauseTrain(n.db, P, "accepting");
+    await n.runner.accept(t.id);
+    expect(listLineRows(n.db, P).some((r) => r.task === t.id && r.queuedAt !== null)).toBe(true);
+    n.db.query("UPDATE trains SET paused = NULL WHERE project = ?").run(P);
+    remove(n, P);
+    // Something kicks the train (a Resume, a line row change): no round starts for it.
+    const started = new Set<number>();
+    const watch = setInterval(() => void liveTrainIds(n).then((ids) => ids.forEach((id) => started.add(id))), 25);
+    pauseTrain(n.db, P, null);
+    await Bun.sleep(1_500);
+    clearInterval(watch);
+    expect([...started]).toEqual([]);
+    // A round would have landed the queued task.
+    expect(await mainOf(n, P)).toBe(before);
+    expect(getTask(n.db, t.id)?.state).toBe("idle");
   } finally {
     await close();
   }
