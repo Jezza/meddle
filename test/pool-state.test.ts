@@ -7,6 +7,7 @@ import { hexOf, shortId } from "../src/pool/identity";
 import { PeerClosed, PoolNet } from "../src/pool/net";
 import { fromEndpoint, openEndpoint } from "../src/pool/net";
 import { PoolStore } from "../src/pool/store";
+import { markRemoved } from "../src/pool/removed";
 import { listLineRows, writeBranchRow } from "../src/pool/rows";
 import { openDb } from "../src/store/db";
 import { startPool, type PoolRuntime } from "../src/pool/runtime";
@@ -521,6 +522,24 @@ test("a task created on one node shows in the other node's count at once", async
     await nodeA.createTask({ title: "t", projects: [{ id: A.project.id }] });
     await until(b!.pool.nodes, (rows) => rows.some((r) => r.nodeId === A.id && r.taskCount === 1));
     expect(Date.now() - began).toBeLessThan(3000);
+  });
+}, 15_000);
+
+test("a project on a node's removed list leaves that node's project list, and no other's", async () => {
+  await withNodes(2, async ([a, b]) => {
+    const A = a!.node;
+    const B = b!.node;
+    await join(a!, b!);
+    await onlineOn(a!, b!);
+    const listing = (rows: readonly { nodeId: string; projects: readonly { id: string }[] }[]) =>
+      rows.some((r) => r.nodeId === B.id && r.projects.some((p) => p.id === B.project.id));
+    await until(a!.pool.nodes, listing);
+    markRemoved(B.db, { id: B.project.id, name: "b", removedAt: "2026-11-23T10:00:00.000Z", removedBy: B.id });
+    await Bun.sleep(100);
+    expect(listing(a!.pool.nodes.value)).toBe(true);
+    markRemoved(A.db, { id: B.project.id, name: "b", removedAt: "2026-11-23T10:00:00.000Z", removedBy: B.id });
+    await until(a!.pool.nodes, (rows) => !listing(rows));
+    expect(a!.pool.nodes.value.find((r) => r.nodeId === A.id)!.projects.map((p) => p.id)).toEqual([A.project.id]);
   });
 }, 15_000);
 

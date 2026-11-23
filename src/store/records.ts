@@ -67,6 +67,11 @@ export function setProjectDefaultBranchRow(db: Database, id: string, branch: str
   db.query("UPDATE projects SET default_branch = ? WHERE id = ?").run(branch, id);
 }
 
+/** Deletes the project's row. */
+export function deleteProjectRow(db: Database, id: string): void {
+  db.query("DELETE FROM projects WHERE id = ?").run(id);
+}
+
 export function getProjectRow(db: Database, id: string): ProjectRow | null {
   return db.query<ProjectRow, [string]>("SELECT * FROM projects WHERE id = ?").get(id);
 }

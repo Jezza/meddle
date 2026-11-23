@@ -10,6 +10,7 @@ import type { NodeConfig } from "../config";
 import { bookmarkRefs, bookmarkSet, changeId, changesIn, jj } from "../jj";
 import { paths } from "../paths";
 import { shortId } from "../pool/ids";
+import { isRemoved, removedIds } from "../pool/removed";
 import { listLineRows, writeLineRow, type LineRow } from "../pool/rows";
 import { repoKey, serialised } from "../serial";
 import { taskGlob, taskNamespace, type TaskManifest } from "../tasks/manifest";
@@ -42,7 +43,7 @@ export function linePrefix(taskId: string): string {
  * Only the holder writes: a project whose line another node holds (the task moved on, or a rollback took it back from
  * here) is left alone, its workspace, bookmarks and rows untouched, and so is any row another node holds at the task's
  * epoch or above; each such line is logged (`meddle: line: … not written here`). A row another node holds below it (a
- * side line its sender released) is taken at the task's epoch.
+ * side line its sender released) is taken at the task's epoch. A removed project is left alone altogether.
  */
 export async function writeLineRows(deps: ReplicaDeps, manifest: TaskManifest, options: { archived?: boolean } = {}): Promise<void> {
   const { cfg, db, pool } = deps;
@@ -63,6 +64,7 @@ export async function writeLineRows(deps: ReplicaDeps, manifest: TaskManifest, o
     log(`meddle: line: ${taskId}'s line ${shortId(r.project)}/${r.name} is held by ${shortId(r.holder)} at epoch ${r.epoch}; not written here`);
   };
   for (const p of manifest.projects) {
+    if (isRemoved(db, p.id)) continue;
     const before = rowsOf(p.id);
     if (heldAt(before, p.name) === null) {
       skip(before.get(p.name)!);
@@ -165,12 +167,14 @@ function beforeName(name: string, taken: Iterable<string>): string {
 /**
  * Takes task `taskId`'s live line rows as this node's (`selfId`), as they are: each row another node held is written
  * with this node its holder, one epoch up, and each archived one live again; a row already so is left alone. What a
- * node that received the task writes as it activates it, and what a restore here writes. Returns the names written.
+ * node that received the task writes as it activates it, and what a restore here writes. Rows of a removed project are
+ * skipped. Returns the names written.
  */
 export function holdLineRows(db: Database, selfId: string, taskId: string): string[] {
   const written: string[] = [];
+  const removed = removedIds(db);
   for (const row of listLineRows(db, undefined, taskId)) {
-    if (row.commit === null || (row.holder === selfId && !row.archived)) continue;
+    if (removed.has(row.project) || row.commit === null || (row.holder === selfId && !row.archived)) continue;
     const epoch = row.holder === selfId ? row.epoch : row.epoch + 1;
     writeLineRow(db, { project: row.project, task: row.task, name: row.name, holder: selfId, epoch, commit: row.commit, base: row.base, archived: false });
     written.push(row.name);
@@ -183,12 +187,13 @@ export function holdLineRows(db: Database, selfId: string, taskId: string): stri
  * epoch above any the target could have written: the target takes the lines one epoch up only as it activates the
  * task (`holdLineRows`), so a row this node held goes two up, and one the target holds (it activated the task, but its
  * answer was lost) one up from the target's. Each row keeps its commit; `archived` says whether the task is archived
- * here again (a restore-move's). Returns the names written.
+ * here again (a restore-move's). Rows of a removed project are skipped. Returns the names written.
  */
 export function reclaimLineRows(db: Database, selfId: string, taskId: string, archived: boolean): string[] {
   const written: string[] = [];
+  const removed = removedIds(db);
   for (const row of listLineRows(db, undefined, taskId)) {
-    if (row.commit === null) continue;
+    if (removed.has(row.project) || row.commit === null) continue;
     const epoch = row.holder === selfId ? row.epoch + 2 : row.epoch + 1;
     writeLineRow(db, { project: row.project, task: row.task, name: row.name, holder: selfId, epoch, commit: row.commit, base: row.base, archived });
     written.push(row.name);
@@ -198,12 +203,14 @@ export function reclaimLineRows(db: Database, selfId: string, taskId: string, ar
 
 /**
  * Writes released (`commit` null) every line row of task `taskId` (of project `projectId` only, when given) whose name
- * is not in `keep` and that is not released already, each keeping its holder and epoch. Returns the names released.
+ * is not in `keep` and that is not released already, each keeping its holder and epoch; a removed project's are skipped.
+ * Returns the names released.
  */
 export function releaseLineRows(db: Database, taskId: string, keep: string[], projectId?: string): string[] {
   const released: string[] = [];
+  const removed = removedIds(db);
   for (const row of listLineRows(db, projectId, taskId)) {
-    if (row.commit === null || keep.includes(row.name)) continue;
+    if (removed.has(row.project) || row.commit === null || keep.includes(row.name)) continue;
     writeLineRow(db, { project: row.project, task: row.task, name: row.name, holder: row.holder, epoch: row.epoch, commit: null, base: [], archived: row.archived });
     released.push(row.name);
   }

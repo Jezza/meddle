@@ -263,7 +263,7 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
   // current as whatever the pool can reach; a repo still being made is nothing to serve yet. A peer's fetch (a commit
   // by id) never waits on that: it would wait on this node's own fetches from that peer.
   if (project !== null && request.service === "upload-pack"
-    && (getProject(deps.db, project) !== null || rosterProjectIds(deps.pool).has(project))) {
+    && (getProject(deps.db, project) !== null || rosterProjectIds(deps.pool, deps.db).has(project))) {
     await catchUp({ cfg: deps.cfg, db: deps.db, pool: deps.pool, log: deps.log }, project).catch((err: unknown) => {
       deps.log?.(`meddle: git: project ${shortId(project)} was not caught up: ${oneLine(err)}`);
     });

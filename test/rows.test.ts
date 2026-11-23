@@ -5,10 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/store/db";
 import {
-  lineChanges, listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, setQueued, settleBranchRows, waitingBranchRows,
+  deleteProjectRows, lineChanges, listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, setQueued, settleBranchRows, waitingBranchRows,
   writeBranchRow, writeLineRow, type BranchRow, type LineRow,
 } from "../src/pool/rows";
 import { holdLineRows, reclaimLineRows, releaseLineRows } from "../src/projects/lines";
+import { shortId } from "../src/pool/ids";
+import { markRemoved } from "../src/pool/removed";
 import { LineRowSchema } from "../src/state/contracts";
 
 const A = "a".repeat(40);
@@ -342,4 +344,59 @@ test("a database from before queues gets the column, its rows unqueued, and keep
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+const removal = (id: string) => ({ id, name: id, removedAt: "2026-11-23T10:00:00.000Z", removedBy: N1 });
+
+test("rows of a removed project are dropped and not written", () => {
+  const db = openDb(":memory:");
+  markRemoved(db, removal("p"));
+  const lineMerge = mergeLineRows(db, [line(1, 1), line(1, 1, { project: "q" })]);
+  expect(lineMerge).toEqual({ changed: ["q"], rejected: 0 });
+  const branchMerge = mergeBranchRows(db, [branch(1), branch(1, { project: "q" })]);
+  expect(branchMerge).toEqual({ changed: ["q"], rejected: 0 });
+  expect(listLineRows(db, "p")).toEqual([]);
+  expect(waitingBranchRows(db, "p")).toEqual([]);
+  expect(listLineRows(db, "q")).toHaveLength(1);
+  expect(waitingBranchRows(db, "q")).toHaveLength(1);
+  const removed = `project ${shortId("p")} was removed`;
+  expect(() => writeLineRow(db, { project: "p", task: "t", name: "w", holder: N1, epoch: 1, commit: A, base: [], archived: false })).toThrow(removed);
+  expect(() => setQueued(db, "p", "t", "w", "2026-11-23T10:00:00.000Z")).toThrow(removed);
+  expect(() => writeBranchRow(db, N1, { project: "p", branch: "main", commit: A, drops: [] })).toThrow(removed);
+  expect(listLineRows(db, "p")).toEqual([]);
+  expect(waitingBranchRows(db, "p")).toEqual([]);
+  expect(listBranchRows(db, "p")).toEqual([]);
+});
+
+test("deleteProjectRows clears all three tables of one project only", () => {
+  const db = openDb(":memory:");
+  for (const project of ["p", "q"]) {
+    mergeLineRows(db, [line(1, 1, { project })]);
+    mergeBranchRows(db, [branch(1, { project }), branch(1, { project, branch: "dev" })]);
+    settleBranchRows(db, project, new Set([A]));
+    mergeBranchRows(db, [branch(2, { project })]);
+  }
+  expect(listBranchRows(db, "p")).toHaveLength(2);
+  expect(waitingBranchRows(db, "p")).toHaveLength(1);
+  const told: string[] = [];
+  const stop = rowChanges.subscribe((project) => told.push(project));
+  deleteProjectRows(db, "p");
+  stop();
+  expect(told).toEqual(["p"]);
+  expect([listLineRows(db, "p"), listBranchRows(db, "p"), waitingBranchRows(db, "p")]).toEqual([[], [], []]);
+  expect(listLineRows(db, "q")).toHaveLength(1);
+  expect(listBranchRows(db, "q")).toHaveLength(2);
+  expect(waitingBranchRows(db, "q")).toHaveLength(1);
+});
+
+test("reclaimLineRows skips a removed project and reclaims the rest", () => {
+  const db = openDb(":memory:");
+  mergeLineRows(db, [line(1, 1, { project: "p" }), line(1, 1, { project: "q" })]);
+  markRemoved(db, removal("p"));
+  expect(reclaimLineRows(db, N2, "t", false)).toEqual(["w"]);
+  expect(listLineRows(db, "q")).toMatchObject([{ holder: N2, epoch: 2 }]);
+  expect(listLineRows(db, "p")).toMatchObject([{ holder: N1, epoch: 1, seq: 1 }]);
+  expect(holdLineRows(db, N2, "t")).toEqual([]);
+  expect(releaseLineRows(db, "t", [])).toEqual(["w"]);
+  expect(listLineRows(db, "p")).toMatchObject([{ holder: N1, epoch: 1, seq: 1, commit: A }]);
 });

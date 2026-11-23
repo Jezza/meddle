@@ -11,9 +11,12 @@
 // used and relayed: a push is seen nowhere its commit is not, so no node judges a push against a row it can't read,
 // and every node that hands a row on can hand its commit on too. A waiting row's seq still counts for its writer's
 // next row here.
+// No row of a removed project (`removed.ts`) is taken or written: a merge skips it, a write refuses it.
 import type { Database } from "bun:sqlite";
 import type { Subscribable } from "@earendil-works/chord";
 import { COMMIT_ID, SAFE_ID } from "../tasks/provision";
+import { shortId } from "./ids";
+import { isRemoved, removedIds } from "./removed";
 
 /** A branch row, named by its writer and seq: what a branch row's `drops` list. */
 export type RowRef = { node: string; seq: number };
@@ -232,23 +235,31 @@ function branchWins(r: BranchRow, local: BranchRow): boolean {
   return branchContent(r) > branchContent(local);
 }
 
+/** Throws `project <short id> was removed` when `project` is on the removed list: no row of it is written. */
+function refuseRemoved(db: Database, project: string): void {
+  if (isRemoved(db, project)) throw new Error(`project ${shortId(project)} was removed`);
+}
+
 /**
  * Merges a peer's line rows: per (project, task, name), the greater (epoch, seq) wins, then the greater content.
- * `changed` are the projects whose rows changed; `rejected` counts the rows dropped (a task id failing `SAFE_ID`, a
- * commit or base that is not 40 or 64 hex characters, an epoch or seq that is not an integer, a `queuedAt` that is
- * neither a string nor null, a malformed field).
+ * A row of a removed project is skipped (not counted as rejected). `changed` are the projects whose rows changed;
+ * `rejected` counts the rows dropped (a task id failing `SAFE_ID`, a commit or base that is not 40 or 64 hex
+ * characters, an epoch or seq that is not an integer, a `queuedAt` that is neither a string nor null, a malformed
+ * field).
  */
 export function mergeLineRows(db: Database, rows: readonly LineRowIn[]): { changed: string[]; rejected: number } {
   const projects = new Set<string>();
   const keys = new Set<string>();
   let rejected = 0;
   db.transaction(() => {
+    const removed = removedIds(db);
     for (const row of rows) {
       const r = acceptLine(row);
       if (r === null) {
         rejected++;
         continue;
       }
+      if (removed.has(r.project)) continue;
       const local = lineRecord(db, r.project, r.task, r.name);
       if (local === null || lineWins(r, lineOf(local))) {
         putLine(db, r, Math.max(r.seq, local?.seen_seq ?? r.seq));
@@ -267,20 +278,23 @@ export function mergeLineRows(db: Database, rows: readonly LineRowIn[]): { chang
 /**
  * Merges a peer's branch rows: per (project, branch, node), the greater seq wins, then the greater content. A winning
  * row waits (`waitingBranchRows`) until `settleBranchRows` admits it. `changed` are the projects with a row waiting
- * anew (`rowChanges` fires for each, so that the applier fetches its commit); `rejected` counts the rows dropped (a
- * branch name failing `git check-ref-format --branch` or under `meddle/`, a commit that is not 40 or 64 hex
- * characters, a seq or a drop's seq that is not an integer, a malformed field).
+ * anew (`rowChanges` fires for each, so that the applier fetches its commit); a row of a removed project is skipped
+ * (not counted as rejected); `rejected` counts the rows dropped (a branch name failing `git check-ref-format --branch`
+ * or under `meddle/`, a commit that is not 40 or 64 hex characters, a seq or a drop's seq that is not an integer, a
+ * malformed field).
  */
 export function mergeBranchRows(db: Database, rows: readonly BranchRow[]): { changed: string[]; rejected: number } {
   const projects = new Set<string>();
   let rejected = 0;
   db.transaction(() => {
+    const removed = removedIds(db);
     for (const row of rows) {
       const r = acceptBranch(row);
       if (r === null) {
         rejected++;
         continue;
       }
+      if (removed.has(r.project)) continue;
       const local = branchRecord(db, r.project, r.branch, r.node);
       if (local !== null && !branchWins(r, branchOf(local))) continue;
       const waiting = branchRecord(db, r.project, r.branch, r.node, "branch_rows_waiting");
@@ -362,6 +376,7 @@ export function allBranchRows(db: Database): BranchRow[] {
  */
 export function writeLineRow(db: Database, row: Omit<LineRow, "seq" | "queuedAt"> & { queuedAt?: string | null }): LineRow {
   const written = db.transaction(() => {
+    refuseRemoved(db, row.project);
     const local = lineRecord(db, row.project, row.task, row.name);
     // seen_seq is never below the stored row's seq.
     const r: LineRow = {
@@ -382,6 +397,7 @@ export function writeLineRow(db: Database, row: Omit<LineRow, "seq" | "queuedAt"
  */
 export function setQueued(db: Database, project: string, task: string, name: string, queuedAt: string | null): LineRow {
   const written = db.transaction(() => {
+    refuseRemoved(db, project);
     const local = lineRecord(db, project, task, name);
     if (local === null) throw new Error(`no line row ${project}/${task}/${name}`);
     const r: LineRow = { ...lineOf(local), seq: local.seen_seq + 1, queuedAt };
@@ -399,6 +415,7 @@ export function setQueued(db: Database, project: string, task: string, name: str
  */
 export function writeBranchRow(db: Database, selfId: string, row: Omit<BranchRow, "seq" | "node">): BranchRow {
   const written = db.transaction(() => {
+    refuseRemoved(db, row.project);
     const local = branchRecord(db, row.project, row.branch, selfId);
     const waiting = branchRecord(db, row.project, row.branch, selfId, "branch_rows_waiting");
     const drops = new Map<string, RowRef>();
@@ -416,4 +433,12 @@ export function writeBranchRow(db: Database, selfId: string, row: Omit<BranchRow
   }).immediate();
   branchesChanged([written.project]);
   return written;
+}
+
+/** Deletes every row of `projectId` (its line rows, branch rows and waiting branch rows) in one transaction, and tells `rowChanges`. */
+export function deleteProjectRows(db: Database, projectId: string): void {
+  db.transaction(() => {
+    for (const table of ["line_rows", "branch_rows", "branch_rows_waiting"]) db.query(`DELETE FROM ${table} WHERE project = ?`).run(projectId);
+  }).immediate();
+  changed([projectId]);
 }

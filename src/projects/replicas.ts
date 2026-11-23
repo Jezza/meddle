@@ -8,6 +8,7 @@ import { repoName, type Repo } from "../git/wire";
 import { bookmarkSet, fetch, isJjRepo, jj, push, remoteEnsure, track } from "../jj";
 import { cloneMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
+import { isRemoved, removedIds } from "../pool/removed";
 import { repoKey, serialised } from "../serial";
 import type { PoolRuntime } from "../pool/runtime";
 import { PeerObject } from "../state/contracts";
@@ -23,8 +24,9 @@ export function meddleUrl(nodeId: string, repo: Repo): string {
   return `meddle://${nodeId}/${repoName(repo)}`;
 }
 
-/** Asks each online member's PeerObject about `projectId` until one knows it; null when none does. */
-export async function findProject(pool: PoolRuntime, projectId: string): Promise<ProjectInfo | null> {
+/** Asks each online member's PeerObject about `projectId` until one knows it; null when none does, and for a removed project. */
+export async function findProject(pool: PoolRuntime, db: Database, projectId: string): Promise<ProjectInfo | null> {
+  if (isRemoved(db, projectId)) return null;
   for (const member of pool.store.members()) {
     if (member.nodeId === pool.identity.id || !pool.net.isOnline(member.nodeId)) continue;
     const info = await askProject(pool, member.nodeId, projectId);
@@ -60,9 +62,10 @@ const making = new Map<string, Promise<Project>>();
  * its home (when online) gives now. Then, unless `memory` is false, the project's
  * memory, which stays home-based, is cloned from the home best effort (`cloneMemory`), so a later call (the applier's
  * sweep, when a peer comes online) retries it. Rejects `no online node holds project <shortId>` when nobody knows the
- * project.
+ * project, and `project <shortId> was removed` for one on the removed list, whatever this node holds of it.
  */
 export async function ensureServiceRepo(deps: ReplicaDeps, projectId: string, opts: { memory?: boolean } = {}): Promise<Project> {
+  if (isRemoved(deps.db, projectId)) throw new Error(`project ${shortId(projectId)} was removed`);
   const key = `${deps.cfg.dataDir}\0${projectId}`;
   let work = making.get(key);
   if (work === undefined) {
@@ -75,8 +78,9 @@ export async function ensureServiceRepo(deps: ReplicaDeps, projectId: string, op
   return project;
 }
 
-/** What the roster's summaries say of project `projectId`, or null when none lists it. */
-function rosterProject(pool: PoolRuntime, projectId: string): ProjectInfo | null {
+/** What the roster's summaries say of project `projectId`, or null when none lists it (and for a removed project). */
+function rosterProject(pool: PoolRuntime, db: Database, projectId: string): ProjectInfo | null {
+  if (isRemoved(db, projectId)) return null;
   for (const m of pool.store.members()) {
     const found = m.summary?.projects.find((p) => p.id === projectId && p.home !== "");
     if (found !== undefined) return found;
@@ -88,12 +92,23 @@ function rosterProject(pool: PoolRuntime, projectId: string): ProjectInfo | null
 const cloning = new Map<string, Promise<void>>();
 
 /**
+ * Resolves once the `ensureServiceRepo` making project `projectId`'s service repo and the clone of its memory, if any
+ * is in flight on this data dir, have settled, fulfilled or not: what a removal waits for before it deletes the
+ * project's repos.
+ */
+export async function settled(cfg: NodeConfig, projectId: string): Promise<void> {
+  const key = `${cfg.dataDir}\0${projectId}`;
+  await Promise.allSettled([making.get(key), cloning.get(key)]);
+}
+
+/**
  * Clones the memory of `project` from its home (`cloneMemoryReplica`, which keeps a replica already here and gives it
- * the home's remote) when the home is another node and online; a failure is logged, and the next call tries again.
+ * the home's remote) when the home is another node and online, and the project is not removed; a failure is logged,
+ * and the next call tries again.
  */
 async function cloneMemory(deps: ReplicaDeps, project: Project): Promise<void> {
-  const { cfg, pool } = deps;
-  if (project.home === pool.identity.id || !pool.net.isOnline(project.home)) return;
+  const { cfg, db, pool } = deps;
+  if (isRemoved(db, project.id) || project.home === pool.identity.id || !pool.net.isOnline(project.home)) return;
   // One clone at a time per memory replica: a second caller waits for the first.
   const key = `${cfg.dataDir}\0${project.id}`;
   let work = cloning.get(key);
@@ -122,7 +137,7 @@ async function makeServiceRepo(deps: ReplicaDeps, projectId: string): Promise<Pr
   }
   if (row !== null && row.home === pool.identity.id) throw new Error(`the service repo of project ${shortId(projectId)} is missing`);
   // The roster first: it needs no peer to answer.
-  const info = row ?? rosterProject(pool, projectId) ?? (await findProject(pool, projectId));
+  const info = row ?? rosterProject(pool, db, projectId) ?? (await findProject(pool, db, projectId));
   if (info === null) throw new Error(`no online node holds project ${shortId(projectId)}`);
   const home = info.home;
 
@@ -136,6 +151,11 @@ async function makeServiceRepo(deps: ReplicaDeps, projectId: string): Promise<Pr
     await rm(replica, { recursive: true, force: true });
     throw err;
   }
+  // A removal that came in while the repo was made: what was built goes, and nothing is registered.
+  if (isRemoved(db, projectId)) {
+    await rm(replica, { recursive: true, force: true });
+    throw new Error(`project ${shortId(projectId)} was removed`);
+  }
   return row ?? registerReplica(db, {
     id: projectId, name: info.name, home, replica, defaultBranch: info.defaultBranch ?? null,
   });
@@ -144,11 +164,11 @@ async function makeServiceRepo(deps: ReplicaDeps, projectId: string): Promise<Pr
 /**
  * Every member keeps every project: `ensureServiceRepo` for each project a member of the pool reports holding, all
  * at once (this node's own included, which also takes what their homes say of them now, and their memory once their
- * homes are online). One that cannot be made now is logged and left for the next call. Returns the ids of the projects
- * held.
+ * homes are online), but never a removed one. One that cannot be made now is logged and left for the next call.
+ * Returns the ids of the projects held.
  */
 export async function ensureServiceRepos(deps: ReplicaDeps): Promise<string[]> {
-  const held = await Promise.all([...rosterProjectIds(deps.pool)].map(async (id) => {
+  const held = await Promise.all([...rosterProjectIds(deps.pool, deps.db)].map(async (id) => {
     try {
       await ensureServiceRepo(deps, id);
       return id;
@@ -160,10 +180,11 @@ export async function ensureServiceRepos(deps: ReplicaDeps): Promise<string[]> {
   return held.filter((id) => id !== null);
 }
 
-/** The ids of every project a member of the pool reports holding. */
-export function rosterProjectIds(pool: PoolRuntime): Set<string> {
+/** The ids of every project a member of the pool reports holding, but those on this node's removed list. */
+export function rosterProjectIds(pool: PoolRuntime, db: Database): Set<string> {
+  const removed = removedIds(db);
   const ids = new Set<string>();
-  for (const member of pool.store.members()) for (const p of member.summary?.projects ?? []) ids.add(p.id);
+  for (const member of pool.store.members()) for (const p of member.summary?.projects ?? []) if (!removed.has(p.id)) ids.add(p.id);
   return ids;
 }
 

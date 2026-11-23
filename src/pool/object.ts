@@ -10,6 +10,7 @@ import {
 import { TOKEN_ID, enableToken, listTokens, moveToken, pickToken, tokenRow, tokenValue, type TokenMeta } from "../token";
 import { gated } from "../update/gate";
 import { isNodeId } from "./identity";
+import { isRemoved, removedChanges, removedIds } from "./removed";
 import { allBranchRows, listLineRows } from "./rows";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore, WireRosterRow } from "./store";
@@ -70,11 +71,12 @@ type PoolNode = Type.Static<typeof defaultState.nodes>[number];
 /**
  * One roster row as a dashboard sees it; this node's own row shows its live summary. A summary from an older meddle
  * (no `running`, `limit`, `projects` or `attachments`) shows 0, 0, [] and false, as placement reads it. `lastSeenAt` is
- * the newer of the node's own last word and the newest report of a member connected to it.
+ * the newer of the node's own last word and the newest report of a member connected to it. The projects of `removed`
+ * are left out of its `projects`: an offline member's summary keeps listing one for as long as it is not heard from.
  */
 export function nodeOf(
   row: WireRosterRow, selfId: string, live: Live, online: readonly string[], gone: readonly string[] = [],
-  links: Readonly<Record<string, { dialer: string; session: string }>> = {},
+  links: Readonly<Record<string, { dialer: string; session: string }>> = {}, removed: ReadonlySet<string> = new Set(),
 ): PoolNode {
   const self = row.nodeId === selfId;
   const reached = row.reachedAt ?? null;
@@ -91,7 +93,7 @@ export function nodeOf(
     taskCount: summary?.taskCount ?? 0,
     running: summary?.running ?? 0,
     limit: summary?.limit ?? 0,
-    projects: summary?.projects ?? [],
+    projects: (summary?.projects ?? []).filter((p) => !removed.has(p.id)),
     attachments: summary?.attachments ?? false,
     lastSeenAt: self ? live.at : heard,
     gone: !self && gone.includes(row.nodeId),
@@ -186,6 +188,11 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       }),
     );
     const links = self.state("links", Type.Record(Type.String(), LinkSchema), { init: linksNow });
+    const removed = self.state("removed", Type.Array(Type.String()), { init: () => [...removedIds(db)] });
+    // The event fires for every node of the process: only a project this node's db lists changes its set.
+    self.on("removed", removedChanges, (id, ctx) => {
+      if (isRemoved(db, id)) removed.replace(ctx, [...removedIds(db)]);
+    });
     const poolId = self.state("poolId", defaultState.poolId, { init: () => store.pool().poolId });
     const poolName = self.state("poolName", defaultState.poolName, { init: () => store.pool().poolName });
     /** The settings with a value, as the dashboard lists them: who set each, and when. */
@@ -209,7 +216,10 @@ export function servePool(host: Host, deps: PoolObjectDeps): void {
       poolName,
       self: self.state("self", defaultState.self, selfId),
       session: self.state("session", Type.String(), deps.session ?? ""),
-      nodes: self.derive([roster, live, online, goneIds, links], (rows, l, on, g, k) => rows.map((r) => nodeOf(r, selfId, l, on, g, k))),
+      nodes: self.derive(
+        [roster, live, online, goneIds, links, removed],
+        (rows, l, on, g, k, rm) => rows.map((r) => nodeOf(r, selfId, l, on, g, k, new Set(rm))),
+      ),
       tokens,
       activeTokenId: active,
       mixedVersions: self.derive([roster, live], (rows, l) => mixed(rows, selfId, l)),

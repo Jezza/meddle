@@ -118,6 +118,16 @@ test("nodeOf defaults an older peer's summary the same way", () => {
   expect(nodeOf(row(A, older), A, live, [])).toMatchObject({ nodeId: A, running: 1, limit: 2, projects: [{ id: "q", name: "q", home: A }] });
 });
 
+test("nodeOf leaves removed projects out of a summary", () => {
+  const older = { hostname: "b", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 4 };
+  const projects = [{ id: "p", name: "pee", home: B }, { id: "q", name: "queue", home: B }];
+  const live = { summary: { ...older, hostname: "a", projects: [{ id: "p", name: "pee", home: A }] }, at: "t" };
+  const removed = new Set(["p"]);
+  expect(nodeOf(row(B, { ...older, projects }), A, live, [B], [], {}, removed).projects).toEqual([{ id: "q", name: "queue", home: B }]);
+  expect(nodeOf(row(A, older), A, live, [], [], {}, removed).projects).toEqual([]);
+  expect(nodeOf(row(B, { ...older, projects }), A, live, [B]).projects).toEqual(projects);
+});
+
 test("a node says it takes attachments; an older summary reads as not", () => {
   const older = { hostname: "b", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 4 };
   const live = { summary: { ...older, hostname: "a", attachments: true }, at: "t" };

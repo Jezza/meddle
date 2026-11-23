@@ -1,6 +1,7 @@
 // test/projects.test.ts — the pool's projects as the roster lists them, and `--project <id|name>`.
 import { expect, test } from "bun:test";
 import { shortId } from "../src/pool/ids";
+import { nodeOf } from "../src/pool/object";
 import { poolProjects, projectLine, resolveProject } from "../src/pool/projects";
 
 const A = "a".repeat(64);
@@ -39,6 +40,21 @@ test("--project takes an id, or a name exactly one project in the pool has", () 
   expect(resolveProject(rows, "solo")).toBe("p3");
   expect(() => resolveProject(rows, "a")).toThrow("ambiguous project name: a");
   expect(() => resolveProject(rows, "nope")).toThrow("unknown project: nope");
+});
+
+test("a name resolves to the one project left once its twin is removed", () => {
+  const older = { hostname: "x", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 0 };
+  const row = (nodeId: string, projects: Array<{ id: string; name: string; home: string }>) => ({
+    nodeId, hostname: "x", status: "member" as const, updatedAt: "2026-11-02T00:00:00.000Z", addedBy: A, summary: { ...older, projects },
+    lastSeenAt: null, lastAddr: null, reachedAt: null, reachedAddr: null,
+  });
+  // B is offline, and its summary still lists the removed twin.
+  const rows = [row(A, [{ id: "p1", name: "meddle", home: A }]), row(B, [{ id: "p2", name: "meddle", home: B }])];
+  const live = { summary: { ...older, projects: [{ id: "p1", name: "meddle", home: A }] }, at: "t" };
+  const nodes = (removed: ReadonlySet<string>) => rows.map((r) => nodeOf(r, A, live, [], [], {}, removed));
+  expect(() => resolveProject(poolProjects(nodes(new Set())), "meddle")).toThrow("ambiguous project name: meddle");
+  expect(resolveProject(poolProjects(nodes(new Set(["p2"]))), "meddle")).toBe("p1");
+  expect(resolveProject(poolProjects(nodes(new Set(["p1"]))), "meddle")).toBe("p2");
 });
 
 test("--project with an id the roster does not list yet passes it through for the node to ask the members", () => {

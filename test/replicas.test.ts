@@ -4,8 +4,9 @@ import { paths } from "../src/config";
 import { bookmarkList, bookmarkRefs, commitOf, fetch, git, isJjRepo, jj, remoteList } from "../src/jj";
 import { ensureMemoryReplica } from "../src/memory";
 import { shortId } from "../src/pool/identity";
-import { getProject, listProjects, type Project } from "../src/projects/project";
-import { ensureRemote, ensureServiceRepo, pushBookmark, type ReplicaDeps } from "../src/projects/replicas";
+import { markRemoved } from "../src/pool/removed";
+import { forgetProject, getProject, listProjects, type Project } from "../src/projects/project";
+import { ensureRemote, ensureServiceRepo, pushBookmark, rosterProjectIds, settled, type ReplicaDeps } from "../src/projects/replicas";
 import { NodeObject } from "../src/state/contracts";
 import { linkClient, linkNodes, peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -160,6 +161,52 @@ test("pushBookmark reaches the home fresh, over an untracked remote bookmark, an
     await pushBookmark(B.cfg, repo, A.id, "memory", third);
     expect(await onA()).toBe(third);
     expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a removed project is never rebuilt from a peer", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    await makeMain(A);
+    const id = A.project.id;
+    await peerReady(B, A);
+    const project = await ensureServiceRepo(depsOf(B), id);
+    expect(await isJjRepo(project.replica)).toBe(true);
+
+    // B removes it: the row and the repos go, the removed list keeps the id.
+    forgetProject(B.db, id);
+    await rm(project.replica, { recursive: true, force: true });
+    await rm(paths(B.cfg).memory(id), { recursive: true, force: true });
+    markRemoved(B.db, { id, name: "a", removedAt: "2026-11-23T10:00:00.000Z", removedBy: B.id });
+
+    const deadline = Date.now() + 10_000;
+    while (B.store.row(A.id)?.summary?.projects.some((p) => p.id === id) !== true) {
+      if (Date.now() > deadline) throw new Error("A's summary never listed the project");
+      await Bun.sleep(10);
+    }
+    await expect(ensureServiceRepo(depsOf(B), id)).rejects.toThrow(`project ${shortId(id)} was removed`);
+    expect(rosterProjectIds(B.pool, B.db).has(id)).toBe(false);
+    expect(rosterProjectIds(B.pool, B.db).has(B.project.id)).toBe(true);
+    expect(getProject(B.db, id)).toBeNull();
+    expect(await isJjRepo(project.replica)).toBe(false);
+    expect(await isJjRepo(paths(B.cfg).memory(id))).toBe(false);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("settled waits for a service repo being made, and resolves at once when none is", async () => {
+  const { A, B, close } = await twoPoolNodes();
+  try {
+    const id = A.project.id;
+    await peerReady(B, A);
+    await settled(B.cfg, id);
+    const making = ensureServiceRepo(depsOf(B), id, { memory: false });
+    await settled(B.cfg, id);
+    expect(getProject(B.db, id)).not.toBeNull();
+    await making;
   } finally {
     await close();
   }

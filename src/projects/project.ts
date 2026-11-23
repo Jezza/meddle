@@ -7,7 +7,7 @@ import { git, gitImport, initColocated, isJjRepo, jj, networkMs } from "../jj";
 import { ensureMemoryReplica, importMemory } from "../memory";
 import { writeBranchRow } from "../pool/rows";
 import {
-  getProjectRow, insertProject, listProjectRows, newId, setProjectDefaultBranchRow, type ProjectRow,
+  deleteProjectRow, getProjectRow, insertProject, listProjectRows, newId, setProjectDefaultBranchRow, type ProjectRow,
 } from "../store/records";
 
 export type Project = {
@@ -237,6 +237,12 @@ export function listProjects(db: Database): Project[] {
 export function getProject(db: Database, id: string): Project | null {
   const row = getProjectRow(db, id);
   return row ? toProject(row) : null;
+}
+
+/** Deletes project `id`'s row on this node (its repos stay: the caller removes them) and tells `projectChanges`. */
+export function forgetProject(db: Database, id: string): void {
+  deleteProjectRow(db, id);
+  changed();
 }
 
 /** Sets project `projectId`'s default branch to `branch`; null when this node has no such project. */

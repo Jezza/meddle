@@ -12,6 +12,7 @@
 import type { NodeConfig } from "../config";
 import { bookmarkRefs, git, GitError, gitImport, isJjRepo, jj, jjEnv, networkMs } from "../jj";
 import { shortId } from "../pool/ids";
+import { isRemoved, removedIds } from "../pool/removed";
 import { dedupe } from "../pool/report";
 import {
   listBranchRows, listLineRows, mergeBranchRows, mergeLineRows, rowChanges, settleBranchRows, waitingBranchRows,
@@ -388,9 +389,11 @@ export async function projectBranches(deps: Pick<ReplicaDeps, "cfg" | "db">, pro
 /**
  * The project's service repo here, made (`ensureServiceRepo`, without its memory: the applier's sweep clones that)
  * when this node has none yet, by `deadline`; rejects `no service repo of project <shortId> in time` past it (the repo
- * is still made, for a later pass).
+ * is still made, for a later pass). Rejects `project <shortId> was removed` for a removed project, even one this node
+ * still has a row of.
  */
 async function serviceRepo(deps: ReplicaDeps, projectId: string, deadline: number): Promise<Project> {
+  if (isRemoved(deps.db, projectId)) throw new Error(`project ${shortId(projectId)} was removed`);
   const row = getProject(deps.db, projectId);
   if (row !== null && (await isJjRepo(row.replica))) return row;
   const making = ensureServiceRepo(deps, projectId, { memory: false });
@@ -479,6 +482,10 @@ export function startApplier(deps: ReplicaDeps): () => void {
 
   const run = (projectId: string): void => {
     if (stopped) return;
+    if (isRemoved(deps.db, projectId)) {
+      retry.delete(projectId);
+      return;
+    }
     const running = passes.get(projectId);
     if (running !== undefined) {
       running.again = true;
@@ -494,6 +501,11 @@ export function startApplier(deps: ReplicaDeps): () => void {
           if (pending.length > 0) retry.add(projectId);
           else retry.delete(projectId);
         } catch (err) {
+          // Removed while the pass ran: nothing to try again, nothing to report.
+          if (isRemoved(deps.db, projectId)) {
+            retry.delete(projectId);
+            continue;
+          }
           retry.add(projectId);
           if (!stopped) log(`meddle: applier: project ${shortId(projectId)}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -505,7 +517,10 @@ export function startApplier(deps: ReplicaDeps): () => void {
   // Rows first: every project held or listed is applied at once (a new one gets its service repo without waiting on
   // its home); then the sweep, which refreshes what homes say and clones memory, as slowly as homes answer.
   const all = async (): Promise<void> => {
-    for (const id of new Set([...listProjects(deps.db).map((p) => p.id), ...rosterProjectIds(deps.pool), ...retry])) run(id);
+    const removed = removedIds(deps.db);
+    for (const id of new Set([...listProjects(deps.db).map((p) => p.id), ...rosterProjectIds(deps.pool, deps.db), ...retry])) {
+      if (!removed.has(id)) run(id);
+    }
     await ensureServiceRepos(quiet);
   };
   const everything = () => {

@@ -5,9 +5,11 @@ import { paths } from "../src/config";
 import { bookmarkRefs, changesIn, git, isJjRepo, jj, type BookmarkRef } from "../src/jj";
 import { applyProject, catchUp, startApplier } from "../src/projects/applier";
 import { ensureServiceRepo, type ReplicaDeps } from "../src/projects/replicas";
-import { getProject } from "../src/projects/project";
-import { listBranchRows, listLineRows, waitingBranchRows, writeBranchRow, writeLineRow, type BranchRow, type LineRow } from "../src/pool/rows";
+import { forgetProject, getProject } from "../src/projects/project";
+import { markRemoved } from "../src/pool/removed";
+import { deleteProjectRows, listBranchRows, listLineRows, waitingBranchRows, writeBranchRow, writeLineRow, type BranchRow, type LineRow } from "../src/pool/rows";
 import type { PoolRuntime } from "../src/pool/runtime";
+import { shortId } from "../src/pool/ids";
 import { PeerObject } from "../src/state/contracts";
 import { acceptGitStreams } from "../src/git/serve";
 import { parseGitHeader, type Repo } from "../src/git/wire";
@@ -486,6 +488,43 @@ test("a branch bookmark a task's agent moves is back at its row after the turn e
     expect((await viewOf(n1, repo)).get("refs/heads/main")).toBe(row);
     expect(mainRow(n1)).toBe(row);
   } finally {
+    await close();
+  }
+}, 60_000);
+
+test("the applier leaves a removed project alone", async () => {
+  const { nodes, close } = await poolNodes(2);
+  const [n1, n2] = nodes as [GitPoolNode, GitPoolNode];
+  const stops: Array<() => void> = [];
+  try {
+    await peerReady(n2, n1);
+    const P = n1.project.id;
+    await applyProject(depsOf(n2), P);
+    const replica = getProject(n2.db, P)!.replica;
+    expect(await isJjRepo(replica)).toBe(true);
+    await waitFor("n1's summary listing P on n2", () => n2.store.row(n1.id)?.summary?.projects.some((p) => p.id === P) === true);
+
+    // n2 removes P: the row and the repo go, its rows with them; n1 still lists it.
+    forgetProject(n2.db, P);
+    await rm(replica, { recursive: true, force: true });
+    markRemoved(n2.db, { id: P, name: "a", removedAt: "2026-11-23T10:00:00.000Z", removedBy: n2.id });
+    n2.logs.length = 0;
+    stops.push(startApplier(depsOf(n2)));
+    writeBranchRow(n1.db, n1.id, { project: P, branch: "main", commit: mainRow(n1), drops: [] });
+    await Bun.sleep(500);
+    // A row change for the removed project (what its removal tells), and rows from n1 that no longer land.
+    deleteProjectRows(n2.db, P);
+    await catchUp(depsOf(n2), P, 1000).catch(() => {});
+    await Bun.sleep(1000);
+
+    expect(getProject(n2.db, P)).toBeNull();
+    expect(listLineRows(n2.db, P)).toEqual([]);
+    expect([...listBranchRows(n2.db, P), ...waitingBranchRows(n2.db, P)]).toEqual([]);
+    expect(await isJjRepo(replica)).toBe(false);
+    // Nothing failed for it, so nothing is logged and nothing waits to be tried again.
+    expect(n2.logs.filter((line) => line.includes(shortId(P)))).toEqual([]);
+  } finally {
+    for (const stop of stops) stop();
     await close();
   }
 }, 60_000);
