@@ -501,13 +501,15 @@ export function startApplier(deps: ReplicaDeps): () => void {
           if (pending.length > 0) retry.add(projectId);
           else retry.delete(projectId);
         } catch (err) {
+          // Stopped while the pass ran: the db may be closed by now, so nothing here touches it.
+          if (stopped) break;
           // Removed while the pass ran: nothing to try again, nothing to report.
           if (isRemoved(deps.db, projectId)) {
             retry.delete(projectId);
             continue;
           }
           retry.add(projectId);
-          if (!stopped) log(`meddle: applier: project ${shortId(projectId)}: ${err instanceof Error ? err.message : String(err)}`);
+          log(`meddle: applier: project ${shortId(projectId)}: ${err instanceof Error ? err.message : String(err)}`);
         }
       } while (pass.again && !stopped);
       passes.delete(projectId);

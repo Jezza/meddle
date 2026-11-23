@@ -528,3 +528,37 @@ test("the applier leaves a removed project alone", async () => {
     await close();
   }
 }, 60_000);
+
+test("a pass that fails after the applier was stopped leaves the database alone", async () => {
+  const { nodes, close } = await poolNodes(2);
+  const [n1, n2] = nodes as [GitPoolNode, GitPoolNode];
+  const unhandled: unknown[] = [];
+  const onUnhandled = (err: unknown) => { unhandled.push(err); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await peerReady(n2, n1);
+    // The database as the applier sees it: closed from the moment the test says so.
+    let closed = false;
+    const db = new Proxy(n2.db, {
+      get(target, key) {
+        const value: unknown = Reflect.get(target, key);
+        if (key !== "query") return typeof value === "function" ? value.bind(target) : value;
+        return (...args: Parameters<typeof target.query>) => {
+          if (closed) throw new RangeError("Cannot use a closed database");
+          return target.query(...args);
+        };
+      },
+    });
+    const stop = startApplier({ ...depsOf(n2), db, log: () => {} });
+    await Bun.sleep(1500);
+    // A row change for a project nobody holds starts a pass that fails once the members were asked; stopped before that.
+    deleteProjectRows(n2.db, "f".repeat(12));
+    stop();
+    closed = true;
+    await Bun.sleep(1000);
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    await close();
+  }
+}, 60_000);
