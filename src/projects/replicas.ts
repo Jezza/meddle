@@ -79,7 +79,7 @@ export async function ensureServiceRepo(deps: ReplicaDeps, projectId: string, op
 }
 
 /** What the roster's summaries say of project `projectId`, or null when none lists it (and for a removed project). */
-function rosterProject(pool: PoolRuntime, db: Database, projectId: string): ProjectInfo | null {
+export function rosterProject(pool: PoolRuntime, db: Database, projectId: string): ProjectInfo | null {
   if (isRemoved(db, projectId)) return null;
   for (const m of pool.store.members()) {
     const found = m.summary?.projects.find((p) => p.id === projectId && p.home !== "");

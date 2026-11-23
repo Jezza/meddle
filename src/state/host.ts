@@ -24,6 +24,7 @@ import { graphProbe, olderGraph, projectGraph, type GraphCommit, type GraphProbe
 import { memoryChanges, memoryPlacing, MemoryWriteError, syncMemoryBefore, writeMemory } from "../projects/memory-sync";
 import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory } from "../projects/memory-view";
 import { releaseLineRows } from "../projects/lines";
+import { removeProject } from "../projects/removal";
 import { resolveStarts } from "../projects/starts";
 import {
   addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, setDefaultBranch,
@@ -330,9 +331,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
   serveRemovedProjects(host, {
     db,
     inputHold: deps.inputHold,
-    remove: async () => {
-      throw new Error("not ready");
-    },
+    remove: (id) => removeProject({ cfg, db, pool, runner }, id),
   });
   servePeer(host, {
     cfg,

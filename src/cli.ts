@@ -33,6 +33,7 @@ import { createNodeHost, NodeObject, SessionObject, TaskObject } from "./state/h
 import { openDb } from "./store/db";
 import { attachCheckout, checkHelperOnPath, checkoutAt, colocate, fetchCheckout, makeCheckout, pushStart } from "./projects/checkouts";
 import { listProjects } from "./projects/project";
+import { sweepRemoved, watchRemoved } from "./projects/removal";
 import { countRunningTasks, listLiveTasks } from "./store/records";
 import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
@@ -108,6 +109,8 @@ type OpenNode = {
   gitSocket?: GitSocket;
   /** The daily run of the archive janitor. */
   janitor?: ReturnType<typeof setInterval>;
+  /** Stops cleaning up the projects the removed list gains (`watchRemoved`). */
+  stopRemovedWatch?: () => void;
   /** Stops applying rows to the service repos and their views. */
   stopApplier?: () => void;
   /** Stops checking whether tasks' work is accepted (`TaskRunner.close`). */
@@ -118,14 +121,15 @@ type OpenNode = {
 };
 
 /**
- * Closes whatever of the node is open: the dashboard, the applier, the acceptance checks, the tunnels, git (the
- * acceptor, then the socket and its file), the pool, metrics, the harness, the host, then the database.
+ * Closes whatever of the node is open: the dashboard, the removed projects' cleanup, the applier, the acceptance checks,
+ * the tunnels, git (the acceptor, then the socket and its file), the pool, metrics, the harness, the host, then the database.
  */
 async function shutdown(node: OpenNode): Promise<void> {
   await node.dashboard?.stop();
   node.stopRollouts?.();
   await node.updater?.stop();
   clearInterval(node.janitor);
+  node.stopRemovedWatch?.();
   node.stopApplier?.();
   node.stopAccepting?.();
   node.stopTunnels?.();
@@ -248,6 +252,12 @@ async function serve(): Promise<number> {
     });
     // Its host objects activated first, so a dashboard that fails to start never abandons one half-activated.
     await host.ready();
+    // Each project removed from the pool cleaned up here: the watch first, so that an entry merged from now on is not
+    // missed, then whatever is left of those on the list. Not awaited: on a held build it waits for the updater's hold
+    // to lift, after startup.
+    const removal = { cfg, db, pool, runner };
+    node.stopRemovedWatch = watchRemoved(removal);
+    void sweepRemoved(removal);
     // Every project of the pool kept here, its rows applied to its service repo and view as they change.
     node.stopApplier = startApplier({ cfg, db, pool });
     node.stopTunnels = acceptDashboardStreams(pool.net, host, (id) => pool.store.isMember(id));
