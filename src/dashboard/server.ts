@@ -1,4 +1,5 @@
-// The dashboard: the UI page, its script, and a chord link for every browser on /ws, on localhost only; a browser
+// The dashboard: the UI page, its script, and a chord link for every browser on /ws, on localhost only (or through a
+// proxy on `MEDDLE_DASHBOARD_ORIGIN`, which forwards to localhost and guards the way in); a browser
 // reaches another node of the pool on /ws/node/<nodeId>, tunnelled over iroh. It also takes a file a browser attaches
 // to a prompt (PUT /blobs, answered with the file's hash) and gives one back by hash (GET /blobs/<hash>).
 import { join } from "node:path";
@@ -15,7 +16,10 @@ import { embedded } from "../embedded";
 const UI_DIR = join(import.meta.dir, "ui");
 const PREBUILT = join(import.meta.dir, "../../dist/ui/main.js");
 
-/** Every dashboard connection acts as this principal: the server binds to 127.0.0.1 only, and `trusted` holds. */
+/**
+ * Every dashboard connection acts as this principal: the server binds to 127.0.0.1 only, and `trusted` holds. A proxy on
+ * the dashboard origin is what decides who reaches it from elsewhere.
+ */
 const PRINCIPAL = DASHBOARD_PRINCIPAL;
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -24,19 +28,22 @@ const TUNNEL = /^\/ws\/node\/([^/]*)$/;
 const NODE_ID = /^[0-9a-f]{64}$/;
 const BLOB = /^\/blobs\/([^/]*)$/;
 
+/** The dashboard origin a proxy serves it on, and that origin's `Host`. */
+type Proxy = { origin: string; host: string };
+
 /** `peerId` is set for a socket tunnelled to another node. */
 type SocketData = { request: Request; shim?: BunSocketShim; peerId?: string };
 
 export type Dashboard = { url: string; stop(): Promise<void> };
 
 /**
- * Serves the dashboard on `127.0.0.1:<cfg.port>` (`0` picks a free port) with `host`'s objects on `/ws`, and with
- * `pool`, each online member's objects on `/ws/node/<nodeId>` (this node's own id is `/ws`). With `blobs`, files are
- * taken into its store on `PUT /blobs` and given out on `GET /blobs/<hash>`, fetched from the pool first if this node
- * lacks one; without it there is no `/blobs`.
+ * Serves the dashboard on `127.0.0.1:<cfg.port>` (`0` picks a free port), and to a proxy on `cfg.dashboardOrigin` when
+ * set, with `host`'s objects on `/ws`, and with `pool`, each online member's objects on `/ws/node/<nodeId>` (this
+ * node's own id is `/ws`). With `blobs`, files are taken into its store on `PUT /blobs` and given out on
+ * `GET /blobs/<hash>`, fetched from the pool first if this node lacks one; without it there is no `/blobs`.
  */
 export async function startDashboard(
-  cfg: Pick<NodeConfig, "port">,
+  cfg: Pick<NodeConfig, "port"> & Partial<Pick<NodeConfig, "dashboardOrigin">>,
   host: Host,
   pool?: PoolRuntime,
   blobs?: BlobFetcher,
@@ -45,13 +52,14 @@ export async function startDashboard(
   const page = uiPage();
   const sockets = new ShimServer<Request>();
   let port = 0;
-  acceptWebSockets(sockets, host, { principal: (request) => (trusted(request, port) ? PRINCIPAL : undefined) });
+  const proxy = cfg.dashboardOrigin ? { origin: cfg.dashboardOrigin, host: new URL(cfg.dashboardOrigin).host } : null;
+  acceptWebSockets(sockets, host, { principal: (request) => (trusted(request, port, proxy) ? PRINCIPAL : undefined) });
 
   const server = Bun.serve<SocketData, never>({
     hostname: "127.0.0.1",
     port: cfg.port,
     fetch(request, server) {
-      if (!trusted(request, server.port ?? port)) return forbidden();
+      if (!trusted(request, server.port ?? port, proxy)) return forbidden();
       const { pathname, searchParams } = new URL(request.url);
       if (pathname === "/" || pathname === "/index.html") {
         return new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } });
@@ -195,14 +203,15 @@ async function getBlob(hash: string, query: URLSearchParams, blobs: BlobFetcher)
 }
 
 /**
- * Whether a request may reach the node: its `Host` is a loopback name with this port (no DNS rebinding), and its
- * `Origin`, when a browser sent one, is this server's own (no other site's page drives the node over /ws).
+ * Whether a request may reach the node: its `Host` is a loopback name with this port or the dashboard origin's (no DNS
+ * rebinding), and its `Origin`, when a browser sent one, is this server's own or the dashboard origin (no other site's
+ * page drives the node over /ws). A proxy must pass both headers on as the browser sent them.
  */
-function trusted(request: Request, port: number): boolean {
+function trusted(request: Request, port: number, proxy: Proxy | null): boolean {
   const host = request.headers.get("host");
-  if (host === null || !isLoopback(`http://${host}`, port)) return false;
+  if (host === null || !(isLoopback(`http://${host}`, port) || host.toLowerCase() === proxy?.host)) return false;
   const origin = request.headers.get("origin");
-  return origin === null || isLoopback(origin, port);
+  return origin === null || isLoopback(origin, port) || origin === proxy?.origin;
 }
 
 function isLoopback(url: string, port: number): boolean {
