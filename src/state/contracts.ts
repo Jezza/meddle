@@ -409,6 +409,12 @@ export const ProjectObject = remote("meddle.project", {
          */
         olderGraph: method(Type.Object({ limit: Type.Number() }), Type.Array(GraphCommitSchema)),
         /**
+         * The one revision `rev` (a revset) names in this node's replica, as `graph` reads a commit (with its counted
+         * bookmarks): what a new task's start at `rev` would be. Refused as `startAt` refuses it: `no revision <rev>
+         * in <project>`, `<rev> names <n> revisions in <project>`.
+         */
+        resolve: method(Type.Object({ rev: Type.String() }), GraphCommitSchema),
+        /**
          * Writes (`deleteMemory`: deletes) a memory file on the project's home and commits just it to `memory`; `base`
          * is the `hash` it was read with (null: it was absent). Answers the change `memory` is on after it (where it
          * was when that left the file as it was). Refused with a reason (as `remoteReason` reads it) starting with why:

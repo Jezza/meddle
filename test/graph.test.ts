@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ensureDataDirs, loadConfig } from "../src/config";
 import { bookmarkSet, commitOf, git, initColocated, jj } from "../src/jj";
-import { graphProbe, olderGraph, projectGraph, type GraphCommit } from "../src/projects/graph";
+import { graphCommit, graphProbe, olderGraph, projectGraph, type GraphCommit } from "../src/projects/graph";
 
 /**
  * A replica of project `a` with `main` on c1←c2←c3; off c2, task t1's line (two commits), its side line `a.before-1`,
@@ -122,6 +122,19 @@ test("projectGraph reads a branch below the default branch's parent, with its bo
     // Only its own commit: what lies between it and the range is for Older.
     expect(ids(graph)).toContain(c2);
     expect(newestFirst(graph)).toBe(true);
+  } finally {
+    await close();
+  }
+});
+
+test("graphCommit reads one commit with the probe's bookmarks on it", async () => {
+  const { cfg, replica, archived, c2, c3, close } = await graphRepo();
+  try {
+    const probe = await graphProbe(cfg, replica, "a", archived);
+    const read = await graphCommit(cfg, replica, c3, probe);
+    expect(read).toMatchObject({ commit: c3, description: "c3", parents: [c2], immutable: false });
+    expect(read.bookmarks).toEqual([{ kind: "branch", name: "main" }]);
+    expect((await graphCommit(cfg, replica, c3, null)).bookmarks).toEqual([]);
   } finally {
     await close();
   }

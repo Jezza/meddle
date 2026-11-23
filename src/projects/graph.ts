@@ -103,6 +103,11 @@ export async function projectGraph(
     ["--ignore-working-copy", "log", "--no-graph", "--limit", String(limit), "-r", range, "-T", COMMIT_TEMPLATE],
     replica, cfg,
   );
+  return commitRows(out, probe);
+}
+
+/** `jj log` rows of `COMMIT_TEMPLATE`, each with the probe's bookmarks on its commit. */
+function commitRows(out: string, probe: GraphProbe | null): GraphCommit[] {
   return out.split("\n").filter(Boolean).map((row): GraphCommit => {
     const [commit = "", change = "", parents = "", immutable = "", time = "", ...rest] = row.split(FIELD);
     return {
@@ -113,9 +118,17 @@ export async function projectGraph(
       description: rest.join(FIELD),
       immutable: immutable === "true",
       time: Date.parse(time),
-      bookmarks: probe.heads.filter((h) => h.commit === commit).map((h) => h.bookmark),
+      bookmarks: probe?.heads.filter((h) => h.commit === commit).map((h) => h.bookmark) ?? [],
     };
   });
+}
+
+/** Commit `commit` (an id) as the graph reads one, with the probe's bookmarks on it (none without a probe). */
+export async function graphCommit(cfg: NodeConfig, replica: string, commit: string, probe: GraphProbe | null): Promise<GraphCommit> {
+  const out = await jj(["--ignore-working-copy", "log", "--no-graph", "-r", revset([commit]), "-T", COMMIT_TEMPLATE], replica, cfg);
+  const [read] = commitRows(out, probe);
+  if (read === undefined) throw new Error(`no commit ${commit}`);
+  return read;
 }
 
 /** The commits under the probe's heads with no lower bound (`::B`, less the root), newest first, at most `limit`: `Older`. */

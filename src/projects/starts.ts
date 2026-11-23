@@ -167,7 +167,7 @@ async function writeLine(deps: StartDeps, project: Project, taskId: string, comm
 }
 
 /** The one commit `rev` names in `project`'s service repo, refused as `startAt` says. */
-async function resolveRev(cfg: NodeConfig, project: Project, rev: string): Promise<string> {
+export async function resolveRev(cfg: NodeConfig, project: Pick<Project, "name" | "replica">, rev: string): Promise<string> {
   let resolved: Array<{ changeId: string; commitId: string }>;
   try {
     resolved = await changesIn(project.replica, rev, cfg);

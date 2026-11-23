@@ -20,12 +20,12 @@ import { bookmarkList, gitImport, isJjRepo, JjError } from "../jj";
 import { paths } from "../paths";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
-import { graphProbe, olderGraph, projectGraph, type GraphCommit, type GraphProbe } from "../projects/graph";
+import { graphCommit, graphProbe, olderGraph, projectGraph, type GraphCommit, type GraphProbe } from "../projects/graph";
 import { memoryChanges, memoryPlacing, MemoryWriteError, syncMemoryBefore, writeMemory } from "../projects/memory-sync";
 import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory } from "../projects/memory-view";
 import { releaseLineRows } from "../projects/lines";
 import { removeProject } from "../projects/removal";
-import { resolveStarts } from "../projects/starts";
+import { resolveRev, resolveStarts } from "../projects/starts";
 import {
   addProjectFromFolder, addProjectFromUpstream, getProject, listProjects, projectChanges, setDefaultBranch,
   type Project,
@@ -840,6 +840,12 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         if (found === null) throw new ChordError("unavailable", `unknown: no project ${id}`);
         const probe = read?.probe ?? await graphProbe(cfg, found.replica, found.name, archivedOf(id));
         return olderGraph(cfg, found.replica, probe, Math.min(OLDER_GRAPH_MAX, Math.max(1, Math.trunc(limit))));
+      },
+      resolve: async ({ rev }) => {
+        const found = getProject(db, id);
+        if (found === null) throw new ChordError("unavailable", `unknown: no project ${id}`);
+        const commit = await resolveRev(cfg, found, rev);
+        return graphCommit(cfg, found.replica, commit, read?.probe ?? await graphProbe(cfg, found.replica, found.name, archivedOf(id)));
       },
       ...gated({
         writeMemory: ({ path, text, base }: { path: string; text: string; base: string | null }) => write(path, text, base),

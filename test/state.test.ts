@@ -545,6 +545,9 @@ test("a project's graph shows a task's line and follows a turn's end", async () 
     expect(graph.flatMap((c) => c.bookmarks)).toContainEqual({ kind: "task", task: manifest.id });
     expect(graph.flatMap((c) => c.bookmarks)).toContainEqual({ kind: "branch", name: "main" });
     expect(await view.olderGraph({ limit: 1 })).toHaveLength(1);
+    const main = graph.find((c) => c.bookmarks.some((b) => b.kind === "branch" && b.name === "main"))!;
+    expect(await view.resolve({ rev: "main" })).toMatchObject({ commit: main.commit, bookmarks: [{ kind: "branch", name: "main" }] });
+    await expect(view.resolve({ rev: "nope" })).rejects.toThrow(/no revision nope in/);
     // Clamped to 1..2000.
     expect(await view.olderGraph({ limit: 0 })).toHaveLength(1);
 
