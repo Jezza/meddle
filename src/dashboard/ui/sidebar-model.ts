@@ -47,6 +47,11 @@ function byActivity(a: TaskEntry, b: TaskEntry): number {
   return at(b).localeCompare(at(a)) || a.id.localeCompare(b.id);
 }
 
+/** Why a task cannot be restored: one of its projects was removed from the pool (`RemovedProjectsObject`); null when none was. */
+export function restoreBlocked(projectIds: readonly string[], removed: ReadonlySet<string>): string | null {
+  return projectIds.some((id) => removed.has(id)) ? "Project removed" : null;
+}
+
 /** The pool's tasks, each once: a task listed by two nodes (mid-move, or restored from an archive elsewhere) by its live entry over its archived one. */
 export function uniqueTasks<T extends Pick<TaskEntry, "id" | "archived">>(tasks: readonly T[]): T[] {
   const byId = new Map<string, T>();

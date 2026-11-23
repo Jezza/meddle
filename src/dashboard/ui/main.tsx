@@ -5,7 +5,7 @@ import { type ComponentChildren, render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { NodeObject, PoolObject, ProjectObject, type Notification } from "../../state/contracts";
 import { clientHost, Hosts, nodeSocket, store, stored, useAction, useObject, useValue } from "./hooks";
-import { BuildAlerts, Nav, PaneHead, type PoolRef } from "./common";
+import { BuildAlerts, Nav, PaneHead, type PoolRef, RemovedProjects } from "./common";
 import { NewTask } from "./NewTask";
 import { NodePage } from "./NodePage";
 import { AddProject, ProjectPage } from "./Projects";
@@ -87,18 +87,20 @@ function Shell({ host, pool, node, view, notice, connected }: {
   return (
     <Nav.Provider value={{ open, toggle }}>
       <BuildAlerts.Provider value={alerts}>
-        {sources}
-        <div class={`app${open ? "" : " nav-closed"}${narrow ? " narrow" : ""}`}>
-          {open && <Sidebar pool={pool} index={index} view={view} selfId={selfId} onHide={toggle} onNavigate={() => setDrawer(false)} />}
-          {narrow && drawer && <div class="scrim" onClick={() => setDrawer(false)} />}
-          <main class="pane">
-            {notice !== undefined && <p class="error notice">{notice}</p>}
-            {update !== null && <UpdateBar update={update} name={nameOf} tasks={index.tasks} />}
-            <Body hosts={hosts} pool={pool} node={node} index={index} view={view} open={openTask} update={update} />
-          </main>
-        </div>
-        <Toasts hosts={hosts} index={index} pool={pool} open={openTask} />
-        {update !== null && <Blind update={update} name={nameOf} connected={connected} />}
+        <RemovedProjects.Provider value={index.removed}>
+          {sources}
+          <div class={`app${open ? "" : " nav-closed"}${narrow ? " narrow" : ""}`}>
+            {open && <Sidebar pool={pool} index={index} view={view} selfId={selfId} onHide={toggle} onNavigate={() => setDrawer(false)} />}
+            {narrow && drawer && <div class="scrim" onClick={() => setDrawer(false)} />}
+            <main class="pane">
+              {notice !== undefined && <p class="error notice">{notice}</p>}
+              {update !== null && <UpdateBar update={update} name={nameOf} tasks={index.tasks} />}
+              <Body hosts={hosts} pool={pool} node={node} index={index} view={view} open={openTask} update={update} />
+            </main>
+          </div>
+          <Toasts hosts={hosts} index={index} pool={pool} open={openTask} />
+          {update !== null && <Blind update={update} name={nameOf} connected={connected} />}
+        </RemovedProjects.Provider>
       </BuildAlerts.Provider>
     </Nav.Provider>
   );

@@ -4,7 +4,7 @@ import { branchLines, listedOnline, mergeProjects, projectChoices, unknownVersio
 import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/dashboard/ui/agents-model";
 import type { AgentEntry } from "../src/state/contracts";
-import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, uniqueTasks, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
+import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, restoreBlocked, uniqueTasks, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { mergeStatus, resumeLabel, trainColumns, trainError, trainOffer, type TrainView } from "../src/dashboard/ui/train-model";
 import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
@@ -23,6 +23,12 @@ import type { Attachment } from "../src/blobs/attachment";
 test("the dashboard bundle builds", async () => {
   const build = await Bun.build({ entrypoints: ["src/dashboard/ui/main.tsx"], target: "browser", format: "esm" });
   expect(build.success).toBe(true);
+});
+
+test("restoreBlocked says Project removed when any of the task's projects is removed", () => {
+  expect(restoreBlocked(["a", "b"], new Set(["b", "z"]))).toBe("Project removed");
+  expect(restoreBlocked(["a", "b"], new Set(["z"]))).toBeNull();
+  expect(restoreBlocked([], new Set(["a"]))).toBeNull();
 });
 
 test("viewOf and hashOf round-trip every route", () => {

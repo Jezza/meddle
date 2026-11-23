@@ -2,7 +2,7 @@
 // tasks, live and archived. The sources render nothing; they report up while their objects are reachable.
 import type { Host, Readable, Ref } from "@earendil-works/chord";
 import { useCallback, useEffect, useState } from "preact/hooks";
-import { NodeObject, type ProjectObject, TaskObject } from "../../state/contracts";
+import { NodeObject, type ProjectObject, RemovedProjectsObject, TaskObject } from "../../state/contracts";
 import { type Hosts, useObject, useValue } from "./hooks";
 import type { PoolRef, TaskRef } from "./common";
 import type { TaskEntry } from "./sidebar-model";
@@ -16,6 +16,8 @@ export type PoolIndex = {
   tasks: ListedTask[];
   /** Each reachable node's `NodeObject`. */
   nodes: ReadonlyMap<string, NodeRef>;
+  /** Ids of the projects removed from the pool, as this node lists them: none from a node of an older meddle. */
+  removed: ReadonlySet<string>;
 };
 
 type Report<T> = (key: string, value: T | null) => void;
@@ -38,13 +40,16 @@ export function usePoolIndex(hosts: Hosts, pool: PoolRef): { index: PoolIndex; s
   const online = nodes.filter((n) => n.nodeId === hosts.selfId || (n.status === "member" && n.online));
   const [tasks, reportTask] = useReports<ListedTask>();
   const [nodeRefs, reportNode] = useReports<NodeRef>();
+  const [removed, setRemoved] = useState<ReadonlySet<string>>(() => new Set());
   const live = new Set(online.map((n) => n.nodeId));
   const index: PoolIndex = {
     tasks: [...tasks.values()].filter((t) => live.has(t.nodeId)),
     nodes: new Map([...nodeRefs].filter(([id]) => live.has(id))),
+    removed,
   };
   const sources = (
     <>
+      <RemovedSource host={hosts.selfHost} report={setRemoved} />
       {online.map((row) => {
         const host = hosts.for(row.nodeId);
         return host === undefined ? null : <NodeSource key={row.nodeId} host={host} nodeId={row.nodeId} reportNode={reportNode} reportTask={reportTask} />;
@@ -52,6 +57,21 @@ export function usePoolIndex(hosts: Hosts, pool: PoolRef): { index: PoolIndex; s
     </>
   );
   return { index, sources };
+}
+
+/** Reports the ids on this node's removed list; reports none while it is unreachable or (an older meddle) does not serve it. */
+function RemovedSource({ host, report }: { host: Host; report(removed: ReadonlySet<string>): void }) {
+  const removed = useObject(host, RemovedProjectsObject, {});
+  return removed.ref === undefined || removed.ref.variant !== "default" ? null : <RemovedSourceLoaded removed={removed.ref} report={report} />;
+}
+
+function RemovedSourceLoaded({ removed, report }: { removed: Extract<Ref<typeof RemovedProjectsObject>, { variant: "default" }>; report(removed: ReadonlySet<string>): void }) {
+  const list = useValue(removed.removed);
+  useEffect(() => {
+    report(new Set(list.map((p) => p.id)));
+    return () => report(new Set());
+  }, [list, report]);
+  return null;
 }
 
 function NodeSource({ host, nodeId, reportNode, reportTask }: { host: Host; nodeId: string; reportNode: Report<NodeRef>; reportTask: Report<ListedTask> }) {

@@ -17,12 +17,12 @@ import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFi
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
 import { composerKey, enters, withTakenBack } from "./composer-model";
-import { type Anchor, copyText, deleteTask, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { type Anchor, copyText, deleteTask, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RemovedProjects, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Chevron, Glyph, Icon, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
 import { hashOf } from "./routes";
-import { ago, type ProjectLine, projectLines } from "./sidebar-model";
+import { ago, type ProjectLine, projectLines, restoreBlocked } from "./sidebar-model";
 import { useOptionalValue } from "./sources";
 import { trainOffer } from "./train-model";
 import { UsageMeter } from "./Usage";
@@ -111,6 +111,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   useEffect(() => { document.title = `${manifest.title} · meddle`; return () => { document.title = "meddle"; }; }, [manifest.title]);
 
   const archived = state === "archived";
+  const noRestore = restoreBlocked(manifest.projects.map((p) => p.id), useContext(RemovedProjects));
   const moving = state === "moving" || move !== null;
   const live = state === "running" || state === "waiting";
   // The changes show only for a task with a project, live here: `changes` is [] otherwise.
@@ -138,7 +139,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
     <div class="task">
       <TaskHead task={task} nodes={nodes} nodeId={nodeId} title={manifest.title} state={state} pendingCount={pending.length} moving={moving}
         partly={acceptance === "partly" && !archived && state !== "moved"} queue={queue} merge={manifest.merge !== undefined}
-        projects={manifest.projects.length} raw={raw} onRaw={() => setRaw(!raw)}
+        projects={manifest.projects.length} noRestore={noRestore} raw={raw} onRaw={() => setRaw(!raw)}
         changes={switchable ? { count: changeCount(changes), on: showChanges } : null} />
       {move !== null && <MoveBanner task={task} move={move} to={nameOf(move.to)} />}
       {showChanges ? <Changes task={task} /> : state === "moved" ? (
@@ -172,7 +173,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
 
 // ─── the head ───
 
-function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, queue, merge, projects, raw, onRaw, changes }: {
+function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, partly, queue, merge, projects, noRestore, raw, onRaw, changes }: {
   task: TaskRef; nodes: PoolRef["nodes"]["value"]; nodeId: string; title: string; state: string; pendingCount: number; moving: boolean;
   /** A pushed branch contains the task's line for some of its projects, not all: nothing is archived yet. */
   partly: boolean;
@@ -182,6 +183,8 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
   merge: boolean;
   /** How many projects the task has: one with none has no train to accept it. */
   projects: number;
+  /** Why the task cannot be restored (`restoreBlocked`), when it cannot. */
+  noRestore: string | null;
   raw: boolean; onRaw: () => void;
   /** The `Thread` / `Changes n` switch: the non-empty changes (no number for none), and whether they show; null hides it. */
   changes: { count: number; on: boolean } | null;
@@ -247,7 +250,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
           <button disabled={action.busy} title="Takes the task off the train" onClick={() => action.run(() => task.unqueue({}))}>Unqueue</button>
         )}
         {archived && <>
-          <button disabled={action.busy} onClick={(e) => setRestoreAt({ el: e.currentTarget })}>Restore ▾</button>
+          <button disabled={action.busy || noRestore !== null} title={noRestore ?? undefined} onClick={(e) => setRestoreAt({ el: e.currentTarget })}>Restore ▾</button>
           <button disabled={action.busy} onClick={remove}>Delete</button>
         </>}
       </div>

@@ -44,6 +44,9 @@ export function nodeDot(node: { online: boolean; running: number }, alert: strin
   return `dot ${alert !== null ? "bad" : !node.online ? "off" : node.running > 0 ? "busy" : "ok"}`;
 }
 
+/** The ids of the projects removed from the pool (`PoolIndex.removed`): a task of one cannot be restored. */
+export const RemovedProjects = createContext<ReadonlySet<string>>(new Set());
+
 /** Nodes on a build other than the pool's, and why (`buildAlerts`): every node dot (`NodeDot`) shows them red. */
 export const BuildAlerts = createContext<ReadonlyMap<string, string>>(new Map());
 

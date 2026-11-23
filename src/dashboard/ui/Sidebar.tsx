@@ -4,11 +4,11 @@
 import { useContext, useState } from "preact/hooks";
 import { shortId } from "../../pool/ids";
 import { store, stored, useAction, useValue } from "./hooks";
-import { type Anchor, BuildAlerts, deleteTask, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RenameInput, RestoreMenu, StateDot } from "./common";
+import { type Anchor, BuildAlerts, deleteTask, MenuItem, MoveMenu, nodeDot, type PoolNode, type PoolRef, Popover, RemovedProjects, RenameInput, RestoreMenu, StateDot } from "./common";
 import { Glyph } from "./icons";
 import { projectChoices } from "./pool-model";
 import { hashOf, type View } from "./routes";
-import { groupTasks, nodeLineText, waitsOnYou } from "./sidebar-model";
+import { groupTasks, nodeLineText, restoreBlocked, waitsOnYou } from "./sidebar-model";
 import { type ListedTask, type PoolIndex, queueable } from "./sources";
 import { trainOffer } from "./train-model";
 
@@ -117,6 +117,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
   const [menu, setMenu] = useState<Menu | null>(null);
   const [renaming, setRenaming] = useState(false);
   const action = useAction();
+  const noRestore = restoreBlocked(task.projects.map((p) => p.id), useContext(RemovedProjects));
   const close = () => setMenu(null);
   const openMenu = (e: MouseEvent) => {
     e.preventDefault();
@@ -154,7 +155,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
         <Popover anchor={menu.anchor} onClose={close}>
           {task.archived ? (
             <>
-              <MenuItem onClick={() => setMenu({ kind: "restore", anchor: menu.anchor })}>Restore…</MenuItem>
+              <MenuItem disabled={noRestore !== null} title={noRestore ?? undefined} onClick={() => setMenu({ kind: "restore", anchor: menu.anchor })}>Restore…</MenuItem>
               <MenuItem onClick={() => {
                 close();
                 void action.run(() => deleteTask(task.ref, task.title, selected));
