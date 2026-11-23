@@ -20,7 +20,7 @@ import { composerKey, enters, withTakenBack } from "./composer-model";
 import { type Anchor, copyText, deleteTask, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RemovedProjects, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Chevron, Glyph, Icon, Iconoir } from "./icons";
-import { renderMarkdown } from "./markdown";
+import { renderMarkdown, renderPrompt } from "./markdown";
 import { hashOf } from "./routes";
 import { ago, type ProjectLine, projectLines, restoreBlocked } from "./sidebar-model";
 import { useOptionalValue } from "./sources";
@@ -46,7 +46,7 @@ const ARRIVAL_MARGIN = 8;
 const SMALL_DIFF = 12;
 const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
 
-// Links in the model's text open in a new tab, never in place of the dashboard.
+// Links in the thread's text open in a new tab, never in place of the dashboard.
 DOMPurify.addHook("afterSanitizeAttributes", (el) => {
   if (el.tagName === "A") {
     el.setAttribute("target", "_blank");
@@ -958,9 +958,15 @@ function PromptBody({ text, attachments }: { text: string; attachments: Attachme
   return (
     <>
       <AttachmentList attachments={attachments} />
-      {(text.trim() !== "" || attachments.length === 0) && <div class="user-text">{text}</div>}
+      {(text.trim() !== "" || attachments.length === 0) && <PromptText text={text} />}
     </>
   );
+}
+
+/** Your message's text, with its inline Markdown and fenced code formatted, and its lines as you typed them. */
+function PromptText({ text }: { text: string }) {
+  const html = useMemo(() => DOMPurify.sanitize(renderPrompt(text)), [text]);
+  return <div class="user-text md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 /** A prompt the task was sent and has not started on: it joins the thread where Claude takes it. */

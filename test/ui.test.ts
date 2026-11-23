@@ -6,7 +6,7 @@ import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/da
 import type { AgentEntry } from "../src/state/contracts";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, restoreBlocked, uniqueTasks, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { mergeStatus, resumeLabel, trainColumns, trainError, trainOffer, type TrainView } from "../src/dashboard/ui/train-model";
-import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
+import { highlight, renderMarkdown, renderPrompt } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
@@ -312,6 +312,19 @@ test("renderMarkdown highlights code blocks and shows raw HTML as text", () => {
   expect(html).not.toContain("<script>");
   expect(html).toContain("&lt;script&gt;");
   expect(highlight("<b>", "nope")).toBe("&lt;b&gt;");
+});
+
+test("renderPrompt formats inline Markdown and fenced code, and keeps the rest as typed", () => {
+  expect(renderPrompt("I sometimes do stuff _like_ this.\nOr `main`, or **this**.")).toBe(
+    "I sometimes do stuff <em>like</em> this.\nOr <code>main</code>, or <strong>this</strong>.");
+  // Lines that would be blocks in Markdown stay as typed, and words with underscores stay whole.
+  expect(renderPrompt("# not a heading\n- not a list\nsnake_case_name")).toBe("# not a heading\n- not a list\nsnake_case_name");
+  expect(renderPrompt("<b>hi</b> & <script>")).toBe("&lt;b&gt;hi&lt;/b&gt; &amp; &lt;script&gt;");
+  const fenced = renderPrompt("Look:\n```rust\nfn init() {}\n```\nThen _this_.");
+  expect(fenced).toStartWith('Look:<pre class="code"><code class="hljs"><span class="hljs-keyword">fn</span>');
+  expect(fenced).toEndWith("</code></pre>Then <em>this</em>.");
+  // An unclosed fence is only text.
+  expect(renderPrompt("```\nhalf")).not.toContain("<pre");
 });
 
 /** A rollout of build `n3w` to a and b, started at 10:00 with 30m to confirm and 2m for each node's health. */
