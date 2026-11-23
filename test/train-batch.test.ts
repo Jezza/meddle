@@ -31,7 +31,7 @@ async function fixture() {
   const B = await on("root()", "init", { "f.txt": LINES.join(""), "g.txt": "g\n" });
   await bookmarkSet(repo, "main", B);
   const row = (task: string, commit: string, base: string[] = [B], archived = false): LineRow => ({
-    project: "p", task, name: "p", holder: "h", epoch: 0, seq: 1, commit, base, archived, queuedAt: null,
+    project: "p", task, name: "p", holder: "h", epoch: 0, seq: 1, commit, base, archived, queuedAt: null, continues: false,
   });
   /** Task `id`'s line at `tip` as a bookmark, and a workspace of it starting at the first of `base`, scoped as a task's is. */
   const task = async (id: string, tip: string, base: string[] = [B]) => {

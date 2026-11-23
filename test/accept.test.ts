@@ -13,8 +13,10 @@ import { startApplier } from "../src/projects/applier";
 import { makeCheckout } from "../src/projects/checkouts";
 import { addProjectFromFolder, type Project } from "../src/projects/project";
 import { TaskObject } from "../src/state/contracts";
+import { listEvents } from "../src/store/events";
 import { getTask } from "../src/store/records";
 import { acceptance } from "../src/tasks/accept";
+import { pauseTrain } from "../src/train/train";
 import { createTask } from "./helpers";
 import { linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -443,6 +445,50 @@ test("a task whose work was accepted restores here on main, where its work is no
     // Its next work, pushed, is accepted as any task's is.
     await writeFile(join(workspace, "more"), "more\n");
     await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await pushMain(A, P, lineHead(A, P.id, m.id, "a")!);
+    await until("the task's state", () => getTask(A.db, m.id)?.state, "archived");
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("a task accepted to continue is not archived when a push lands its work: it continues on main with no work of its own, and is archived once a plain accept's work lands", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const P = A.project;
+    // The push below lands the work, not the train.
+    pauseTrain(A.db, P.id, "held by the test");
+    const m = await createTask(A, { title: "t", projectIds: [P.id] });
+    const workspace = join(paths(A.cfg).task(m.id), "a");
+    await writeFile(join(workspace, "work"), "work\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await A.runner.accept(m.id, { continue: true });
+    expect(listLineRows(A.db, P.id, m.id)[0]).toMatchObject({ continues: true });
+    const head = lineHead(A, P.id, m.id, "a")!;
+
+    await pushMain(A, P, head);
+
+    await until("the task's queue", () => A.runner.queue(m.id), null);
+    expect(getTask(A.db, m.id)?.state).toBe("idle");
+    // A new change on main, where its work is now, which is its base: no work of its own, so not accepted.
+    expect(await read(A.cfg, workspace, "@-")).toBe(head);
+    expect(await read(A.cfg, workspace, "@", "empty")).toBe("true");
+    expect(await Bun.file(join(workspace, "work")).text()).toBe("work\n");
+    await until("A's line rows", () => heldOf(A, m.id), [`a ${await read(A.cfg, workspace, "@")} here false`]);
+    expect(listLineRows(A.db, P.id, m.id)[0]).toMatchObject({ base: [head], queuedAt: null, continues: false });
+    expect((JSON.parse(getTask(A.db, m.id)!.manifest) as { projects: Array<{ base: string[] }> }).projects[0]!.base).toEqual([head]);
+    expect(A.runner.acceptance(m.id)).toBe("no");
+    const landed = listEvents(A.db, m.id).map((e) => e.message as { subtype?: string }).filter((e) => e.subtype === "landed");
+    expect(landed).toEqual([{ type: "meddle", subtype: "landed", branch: "main", commit: head }]);
+    expect(A.logs).toContain(`meddle: accept: ${m.id}'s work landed; it continues on main at ${head.slice(0, 12)}`);
+    expect(A.logs.filter((l) => l.startsWith("meddle: accept:") && !l.includes("work landed"))).toEqual([]);
+
+    // The conversation goes on there; its next work, accepted plainly and pushed, archives it as any task's does.
+    await writeFile(join(workspace, "more"), "more\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    expect(A.runner.acceptance(m.id)).toBe("no");
+    await A.runner.accept(m.id);
     await pushMain(A, P, lineHead(A, P.id, m.id, "a")!);
     await until("the task's state", () => getTask(A.db, m.id)?.state, "archived");
   } finally {

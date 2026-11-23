@@ -88,7 +88,7 @@ async function fixture() {
       for (const t of tasks.values()) {
         rows.push({
           project: "p", task: t.id, name: "p", holder: "h", epoch: 0, seq: 1, commit: await tipOf(t.id), base: t.base,
-          archived: t.archived, queuedAt: t.queued ? "2026-11-18T10:00:00.000Z" : null,
+          archived: t.archived, queuedAt: t.queued ? "2026-11-18T10:00:00.000Z" : null, continues: false,
         });
       }
       return rows;

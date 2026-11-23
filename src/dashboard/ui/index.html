@@ -265,6 +265,10 @@
   .head-actions button.on { border-color: var(--line-strong); color: var(--fg); }
   .head-actions button.accept, .head-actions button.accept:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
   .head-actions button.accept:hover:not(:disabled) { filter: brightness(1.1); }
+  /* Accept and its ▾ (Accept's other ways), joined as one split button. */
+  .accept-split { display: flex; }
+  .accept-split button.accept:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .accept-split button.accept.more { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left-color: rgba(0, 0, 0, 0.35); padding-left: 5px; padding-right: 5px; }
   .head-actions .error { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
   /* The Thread / Changes switch. */
   .task-tabs { display: flex; gap: 2px; background: var(--side); border: 1px solid var(--line); border-radius: 6px; padding: 2px; margin-right: 4px; }

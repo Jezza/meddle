@@ -19,7 +19,7 @@ const N1 = "1".repeat(64);
 const N2 = "2".repeat(64);
 
 function line(epoch: number, seq: number, extra: Partial<LineRow> = {}): LineRow {
-  return { project: "p", task: "t", name: "w", holder: N1, epoch, seq, commit: A, base: [B], archived: false, queuedAt: null, ...extra };
+  return { project: "p", task: "t", name: "w", holder: N1, epoch, seq, commit: A, base: [B], archived: false, queuedAt: null, continues: false, ...extra };
 }
 
 function branch(seq: number, extra: Partial<BranchRow> = {}): BranchRow {
@@ -320,6 +320,48 @@ test("rows of an equal key, seq and content, differing only in queuedAt, settle 
     const db = openDb(":memory:");
     for (const row of order) mergeLineRows(db, [row]);
     expect(listLineRows(db)).toEqual([order.includes(later) ? later : queued]);
+  }
+});
+
+/** `row` as a node of a meddle before Accept & continue sends it: no `continues` at all. */
+function withoutContinues(row: LineRow): Omit<LineRow, "continues"> {
+  const { continues: _, ...rest } = row;
+  return rest;
+}
+
+test("continues goes with queuedAt: set with it, replicated, kept by writers that omit the queue, and cleared with it", async () => {
+  const one = openDb(":memory:");
+  const two = openDb(":memory:");
+  const { seq: _, queuedAt: __, continues: ___, ...first } = line(0, 0);
+  writeLineRow(one, first);
+  const queued = setQueued(one, "p", "t", "w", QUEUED, true);
+  expect(queued).toEqual(line(0, 2, { queuedAt: QUEUED, continues: true }));
+  const { Value } = await import("typebox/value");
+  expect(Value.Check(LineRowSchema, queued)).toBe(true);
+  mergeLineRows(two, listLineRows(one));
+  expect(listLineRows(two)).toEqual([queued]);
+
+  // A write that moves the line keeps it, as it keeps the queue.
+  expect(writeLineRow(one, { ...first, commit: B.slice(0, 40) })).toMatchObject({ queuedAt: QUEUED, continues: true });
+  // Unqueued, it goes too, and a plain accept doesn't continue.
+  expect(setQueued(one, "p", "t", "w", null, true)).toMatchObject({ queuedAt: null, continues: false });
+  expect(setQueued(one, "p", "t", "w", QUEUED)).toMatchObject({ queuedAt: QUEUED, continues: false });
+  // Never without a queue, whatever a peer says.
+  expect(mergeLineRows(two, [line(0, 9, { queuedAt: null, continues: true })])).toEqual({ changed: ["p"], rejected: 0 });
+  expect(listLineRows(two)).toEqual([line(0, 9, { queuedAt: null, continues: false })]);
+  expect(mergeLineRows(two, [line(0, 10, { continues: "yes" as unknown as boolean })])).toEqual({ changed: [], rejected: 1 });
+});
+
+test("an older relay without continues doesn't clear it, and rows differing only in it settle on the one that continues", () => {
+  const db = openDb(":memory:");
+  const continuing = line(0, 4, { queuedAt: QUEUED, continues: true });
+  mergeLineRows(db, [continuing]);
+  expect(mergeLineRows(db, [withoutContinues(continuing)])).toEqual({ changed: [], rejected: 0 });
+  expect(listLineRows(db)).toEqual([continuing]);
+  for (const order of [[continuing, withoutContinues(continuing)], [withoutContinues(continuing), continuing]]) {
+    const other = openDb(":memory:");
+    for (const row of order) mergeLineRows(other, [row]);
+    expect(listLineRows(other)).toEqual([continuing]);
   }
 });
 

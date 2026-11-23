@@ -35,6 +35,8 @@ export type MeddleEvent =
    * `train_decline`, and what the user did to leave is logged as none.
    */
   | { type: "meddle"; subtype: "train_left"; reason: string }
+  /** The task's work landed on `branch` at `commit`, and the task continues there (Accept & continue). */
+  | { type: "meddle"; subtype: "landed"; branch: string; commit: string }
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
   | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput }

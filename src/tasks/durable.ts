@@ -16,7 +16,7 @@ import { HUMAN, InputQueue } from "../engine/input";
 import type { EngineInput } from "../engine/options";
 import { resultError, runTurn, type MeddleEvent, type SendNowOutcome, type TokenFault } from "../engine/session";
 import { askTitle } from "../engine/title";
-import { abandon, bookmarkForget, bookmarkSet, changeId, changesIn } from "../jj";
+import { abandon, bookmarkForget, bookmarkSet, changeId, changesIn, jj } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
 import { DESCRIBE_PROMPT, FALLBACK_EFFORT, FALLBACK_MODEL } from "../pool/settings";
@@ -162,12 +162,16 @@ export type TaskQueue = { queuedAt: string; project: string };
  */
 export type TrainTaskStatus = { taskId: string; state: "idle" | "busy" | "train" | "absent"; title: string | null };
 
-/** Why a task left the queue: the user's Unqueue; input of the user's that runs in it; its archive (or delete). */
+/**
+ * Why a task left the queue: the user's Unqueue; input of the user's that runs in it; its archive (or delete); its
+ * work landed and it continues (Accept & continue).
+ */
 export const UNQUEUED_BY_USER = "you unqueued it";
 export const UNQUEUED_BY_INPUT = "you sent it a prompt";
 export const UNQUEUED_ARCHIVED = "archived";
-/** Why a task leaves the queue when the user took it off: no news to tell, and nothing for its conversation to keep. */
-export const UNQUEUED_AS_ASKED: ReadonlySet<string> = new Set([UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED]);
+export const UNQUEUED_LANDED = "landed";
+/** Why a task leaves the queue when the user took it off, or got what was asked: no news to tell, nothing to keep. */
+export const UNQUEUED_AS_ASKED: ReadonlySet<string> = new Set([UNQUEUED_BY_USER, UNQUEUED_BY_INPUT, UNQUEUED_ARCHIVED, UNQUEUED_LANDED]);
 
 export type RunnerDeps = {
   claudePath?: string;
@@ -2292,8 +2296,9 @@ export class TaskRunner {
 
   /**
    * Checks task `taskId`'s acceptance (`acceptanceOf`) when it is live here and neither moving nor being archived, and
-   * records it. A task accepted, and idle with nothing queued, is archived with its lines released (`#archive`); one
-   * mid-turn is checked again as its turn ends (`#turnState`). A check that lacked a commit a row names is made again
+   * records it. A task accepted, and idle with nothing queued, is archived with its lines released (`#archive`), or
+   * continues on the branch when it was accepted to (`#continueOnBranch`); one mid-turn is checked again as its turn
+   * ends (`#turnState`). A check that lacked a commit a row names is made again
    * `ACCEPT_RETRY_MS` later.
    */
   async #acceptOnce(taskId: string): Promise<void> {
@@ -2338,11 +2343,80 @@ export class TaskRunner {
       this.#awaitTurnGone(taskId);
       return;
     }
+    if (projectsOf(now).some((p) => this.#ownLine(taskId, p)?.continues === true)) {
+      try {
+        await this.#continueOnBranch(taskId);
+      } catch (err) {
+        this.#log(`meddle: accept: ${taskId}'s work is accepted, but the task did not continue on its branch: ${messageOf(err)}`);
+      }
+      return;
+    }
     try {
       await this.#archive(taskId, true);
     } catch (err) {
       this.#log(`meddle: accept: ${taskId}'s work is accepted, but the task was not archived: ${messageOf(err)}`);
     }
+  }
+
+  /**
+   * Has task `taskId`, whose work is accepted, continue rather than be archived (Accept & continue: a project's own
+   * line row `continues`). On the task's prompt chain, so that a prompt sent meanwhile waits for it, and under its key;
+   * only while it is still idle with nothing queued and no turn of it in the Harness, and its work still accepted once
+   * its lines are written as they are now. Each such project's workspace then starts a new change on the project's
+   * default branch, as its rows compute it (`jj new`). That commit becomes the project's base, the manifest's and its
+   * own line row's, so the task has no work again and is no longer accepted. Then the lines are written there, the
+   * task leaves the queue, and a `landed` event tells where each project's work landed. Returns whether it did.
+   */
+  async #continueOnBranch(taskId: string): Promise<boolean> {
+    const deps = this.#replicaDeps();
+    if (deps === null) return false;
+    const self = deps.pool.identity.id;
+    return serialised(`prompt\0${taskId}`, () => serialised(taskKey(taskId), async () => {
+      const ready = (): TaskRow | null => {
+        const row = getTask(this.#db, taskId);
+        if (row === null || this.#archiving.has(taskId) || this.#closed) return null;
+        try {
+          this.#refuseArchive(row);
+        } catch {
+          return null; // a turn or a prompt came in meanwhile: checked again as its turn ends
+        }
+        return row;
+      };
+      const row = ready();
+      if (row === null || (await this.#durableTurn(taskId)) !== undefined) return false;
+      await this.#dropScheduledLines(taskId);
+      await this.#writeLinesNext(taskId);
+      const manifest = JSON.parse(row.manifest) as TaskManifest;
+      if ((await acceptanceOf(deps, manifest, (id) => this.#tipsOf(deps, id))).verdict !== "accepted") return false;
+      const landed: Array<{ p: ManifestProject; line: LineRow; branch: string; commit: string }> = [];
+      for (const p of manifest.projects) {
+        const line = this.#ownLine(taskId, p);
+        if (line === null || !line.continues) continue;
+        const project = getProject(this.#db, p.id);
+        if (project === null) throw new Error(`unknown project: ${p.id}`);
+        const branch = project.defaultBranch;
+        if (branch === null) throw new Error(`${project.name} has no default branch to continue on`);
+        landed.push({ p, line, branch, commit: await defaultBranchCommit({ ...deps, selfId: self }, project) });
+      }
+      if (landed.length === 0 || ready() === null) return false;
+      for (const { p, commit } of landed) await jj(["new", commit], join(paths(this.#cfg).task(taskId), p.workspace), this.#cfg);
+      const next: TaskManifest = {
+        ...manifest,
+        projects: manifest.projects.map((p) => {
+          const l = landed.find((x) => x.p.id === p.id);
+          return l === undefined ? p : { ...p, base: [l.commit] };
+        }),
+      };
+      await writeManifest(this.#cfg, next);
+      updateTask(this.#db, taskId, { manifest: JSON.stringify(next) });
+      notify(this.#manifestListeners, (cb) => cb(taskId, next));
+      for (const { line, commit } of landed) writeLineRow(this.#db, { ...line, base: [commit] });
+      await this.#writeLinesNext(taskId);
+      this.#leaveQueue(taskId, UNQUEUED_LANDED);
+      for (const { branch, commit } of landed) this.#record(taskId, { type: "meddle", subtype: "landed", branch, commit });
+      this.#log(`meddle: accept: ${taskId}'s work landed; it continues on ${landed.map((l) => `${l.branch} at ${l.commit.slice(0, 12)}`).join(", ")}`);
+      return true;
+    }));
   }
 
   /**
@@ -2391,7 +2465,9 @@ export class TaskRunner {
   /**
    * Accepts task `taskId`: queues it on its project's train by recording on the task's own line row, which this node
    * holds, when (`setQueued`), so the queue replicates and moves with the task. An idle or a running task can be
-   * accepted; a running one stays queued when its turn ends. Accepting a queued task changes nothing. Refused:
+   * accepted; a running one stays queued when its turn ends. Accepting a queued task changes nothing. With `continue`,
+   * the row also says that the task continues once its work lands, rather than being archived (`#continueOnBranch`).
+   * Refused:
    * - while the task is not live here, or is moving or being archived (the state's own message);
    * - a merge task: `a merge task lands with its train`;
    * - work in several projects: `accept handles one project for now; push to land the rest`;
@@ -2402,11 +2478,11 @@ export class TaskRunner {
    * One at a time with the task's prompts (their chain), so that a prompt sent just before is waiting or has run, and
    * one sent just after unqueues it.
    */
-  accept(taskId: string): Promise<void> {
-    return serialised(`prompt\0${taskId}`, () => this.#accept(taskId));
+  accept(taskId: string, options: { continue?: boolean } = {}): Promise<void> {
+    return serialised(`prompt\0${taskId}`, () => this.#accept(taskId, options.continue ?? false));
   }
 
-  async #accept(taskId: string): Promise<void> {
+  async #accept(taskId: string, continues: boolean): Promise<void> {
     const deps = this.#replicaDeps();
     if (deps === null) throw new Error("this node has no pool");
     /** Throws why the task cannot be accepted now; the manifest of one that can. Asked again once git has answered. */
@@ -2441,7 +2517,7 @@ export class TaskRunner {
     const now = this.#ownLine(taskId, p);
     if (now === null || now.queuedAt !== null) return;
     const queuedAt = new Date().toISOString();
-    setQueued(this.#db, p.id, taskId, p.name, queuedAt);
+    setQueued(this.#db, p.id, taskId, p.name, queuedAt, continues);
     notify(this.#queueListeners, (cb) => cb(taskId, { queuedAt, project: p.id }, null));
   }
 

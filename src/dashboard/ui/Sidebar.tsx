@@ -167,6 +167,9 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
                 <MenuItem title="Queues the task's work to land on its project's default branch (the merge train)"
                   onClick={() => { close(); void action.run(() => task.ref.accept({})); }}>Accept</MenuItem>
               )}
+              {offer === "accept" && (
+                <MenuItem onClick={() => { close(); void action.run(() => task.ref.accept({ continue: true })); }}>Accept &amp; continue</MenuItem>
+              )}
               {offer === "unqueue" && (
                 <MenuItem title="Takes the task off the train" onClick={() => { close(); void action.run(() => task.ref.unqueue({})); }}>Unqueue</MenuItem>
               )}

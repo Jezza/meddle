@@ -69,6 +69,11 @@ test("a task the train took off says why in its conversation", () => {
   expect(items).toEqual([{ kind: "status", text: "Left meddle's train: another task builds on this work, so it can't rebase" }]);
 });
 
+test("a task that continues once its work landed says where it landed", () => {
+  const items = buildThread([{ seq: 1, message: { type: "meddle", subtype: "landed", branch: "main", commit: "3f9a1c27e0b4".padEnd(40, "0") } }]);
+  expect(items).toEqual([{ kind: "status", text: "Landed on main at 3f9a1c27e0b4" }]);
+});
+
 test("a prompt meddle recorded keeps its attachments, and drops a bad one", () => {
   const items = buildThread([{ seq: 1, message: { type: "user", message: { role: "user", content: "look" }, parent_tool_use_id: null,
     attachments: [shot, { ...shot, name: "../x" }] } }]);

@@ -1050,7 +1050,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       interrupt: () => runner.interrupt(id),
       sendNow: async () => { await runner.sendNow(id); },
       takeBackQueued: async () => ({ prompts: await runner.takeBackQueued(id) }),
-      accept: () => runner.accept(id),
+      accept: (input) => runner.accept(id, { continue: input.continue === true }),
       unqueue: () => runner.unqueue(id, UNQUEUED_BY_USER),
       retry: () => runner.retry(id),
       approve: async ({ requestId, updatedInput }) => {

@@ -602,9 +602,10 @@ export const TaskObject = remote("meddle.task", {
          * branch. Idle and running tasks can be accepted; accepting a queued task changes nothing. Refused `nothing to
          * land: the task's work is already on <branch>`, `send or clear the waiting prompts first`, `accept handles one
          * project for now; push to land the rest`, `a merge task lands with its train`, and while the task is not live
-         * here (moved, archived, being received) or is moving.
+         * here (moved, archived, being received) or is moving. With `continue`, the task is not archived once its work
+         * lands: it continues on the branch's new commit (Accept & continue).
          */
-        accept: method(Type.Object({})),
+        accept: method(Type.Object({ continue: Type.Optional(Type.Boolean()) })),
         /**
          * Takes the task off its project's train. A task not queued stays as it is; refused while it is not live here.
          * Input of the user's that runs in an accepted task does the same (a prompt, a steer, Send now, Retry);
@@ -843,6 +844,8 @@ export const LineRowSchema = Type.Object({
   archived: Type.Boolean(),
   /** When the task was queued for the project's train, null for not queued; absent from a node of a meddle before queues. */
   queuedAt: Type.Optional(Nullable(Type.String())),
+  /** Whether the queued task continues once its work lands (Accept & continue); absent from a node of a meddle before it. */
+  continues: Type.Optional(Type.Boolean()),
 });
 
 /**

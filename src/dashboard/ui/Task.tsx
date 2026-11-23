@@ -17,7 +17,7 @@ import { AttachButton, AttachmentList, DraftChips, type Drafts, useDrafts, useFi
 import { Changes } from "./Changes";
 import { changeCount } from "./changes-model";
 import { composerKey, enters, withTakenBack } from "./composer-model";
-import { type Anchor, copyText, deleteTask, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RemovedProjects, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
+import { type Anchor, copyText, deleteTask, MenuItem, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RemovedProjects, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Chevron, Glyph, Icon, Iconoir } from "./icons";
 import { renderMarkdown } from "./markdown";
@@ -191,8 +191,12 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
 }) {
   const [renaming, setRenaming] = useState(false);
   const [restoreAt, setRestoreAt] = useState<Anchor | null>(null);
+  /** Where Accept's ▾ menu opens, while it is open. */
+  const [acceptAt, setAcceptAt] = useState<Anchor | null>(null);
   const action = useAction();
   const archived = state === "archived";
+  // Nothing to land: no change of the task's own is off the default branch (its work landed, or it has none yet).
+  const nothingToLand = changes !== null && changes.count === 0;
   const live = state === "running" || state === "waiting";
   const stateText = pendingCount > 0 ? "waiting on you" : state;
   const offer = trainOffer({ state, queued: queue === undefined ? null : queue !== null, merge, moving, projects });
@@ -243,8 +247,12 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
         )}
         {/* Unlike Archive, Accept also shows while a turn runs: a running task waits in the queue until its turn ends. */}
         {offer === "accept" && (
-          <button class="accept" disabled={action.busy} title="Queues the task's work to land on its project's default branch (the merge train)"
-            onClick={() => action.run(() => task.accept({}))}><Glyph name="merge" cls="train-ico" /> Accept</button>
+          <span class="accept-split">
+            <button class="accept" disabled={action.busy || nothingToLand} title="Queues the task's work to land on its project's default branch (the merge train)"
+              onClick={() => action.run(() => task.accept({}))}><Glyph name="merge" cls="train-ico" /> Accept</button>
+            <button class="accept more" disabled={action.busy || nothingToLand} aria-haspopup="menu"
+              onClick={(e) => setAcceptAt({ el: e.currentTarget })}>▾</button>
+          </span>
         )}
         {offer === "unqueue" && (
           <button disabled={action.busy} title="Takes the task off the train" onClick={() => action.run(() => task.unqueue({}))}>Unqueue</button>
@@ -256,6 +264,13 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
       </div>
       {restoreAt !== null && (
         <RestoreMenu task={task} nodes={nodes} holder={nodeId} anchor={restoreAt} onClose={() => setRestoreAt(null)} />
+      )}
+      {acceptAt !== null && (
+        <Popover anchor={acceptAt} onClose={() => setAcceptAt(null)}>
+          <MenuItem onClick={() => { setAcceptAt(null); void action.run(() => task.accept({ continue: true })); }}>
+            <Glyph name="merge" cls="train-ico" /> Accept &amp; continue
+          </MenuItem>
+        </Popover>
       )}
     </PaneHead>
   );

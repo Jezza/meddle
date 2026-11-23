@@ -177,6 +177,8 @@ const ADDED_COLUMNS = [
   { table: "tokens", column: "rank", type: "REAL" },
   // When a task was queued for its project's train, on the line row of the project's own line (src/pool/rows.ts); NULL for not queued.
   { table: "line_rows", column: "queued_at", type: "TEXT" },
+  // Whether a queued task continues once its work lands rather than being archived (Accept & continue); NULL for no.
+  { table: "line_rows", column: "continues", type: "INTEGER" },
 ];
 
 export function openDb(path: string): Database {

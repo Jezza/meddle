@@ -345,7 +345,7 @@ const GROUPS: Group[] = [
       },
       {
         name: "task accept",
-        usage: ["task accept <task-id>..."],
+        usage: ["task accept [--continue] <task-id>..."],
         summary: "Queue tasks on their project's merge train, which lands their work on the project's default branch.",
         details:
           "Takes any number of task ids (or unique prefixes), from any node, and prints `queued <id> on <project>'s " +

@@ -82,7 +82,7 @@ const USAGE = `usage: meddle --version
        meddle task move <id> <node> [--now] | meddle task move <id> --now | meddle task move <id> --cancel
        meddle task archive <id> | meddle task delete <id>
        meddle task restore <id> [--node <id|prefix> | --here]
-       meddle task accept <task-id>... | meddle task unqueue <task-id>...
+       meddle task accept [--continue] <task-id>... | meddle task unqueue <task-id>...
        meddle train [<project>] [--follow] | meddle train pause|resume [<project>]
        meddle service install [--dry-run]
        meddle update [--force] [--within <duration>] [<binary>...]
@@ -1312,13 +1312,14 @@ function runsOlder(nodes: readonly { nodeId: string; hostname: string }[], id: s
 /**
  * Queues each task on its project's train, on the node holding it; prints `queued <id> on <project>'s train`. A task on a
  * node older than the train is not found at all (`collectTasks`: chord refuses to bind that node's tasks), so the refusal
- * is `no such task: <id> (<node> runs an older meddle: its tasks are not listed)`.
+ * is `no such task: <id> (<node> runs an older meddle: its tasks are not listed)`. With `continues` (`--continue`),
+ * each task continues once its work lands rather than being archived.
  */
-function taskAccept(texts: string[]): Promise<number> {
+function taskAccept(texts: string[], continues: boolean): Promise<number> {
   return eachTask(texts, (text) => withTask(text, async (client, _socket, id) => {
     const task = await client.get(TaskObject, { id });
     try {
-      await task.accept({});
+      await task.accept(continues ? { continue: true } : {});
       // Accepted, so it has the one project that accept handles.
       console.log(`queued ${id} on ${task.manifest.value.projects[0]?.name ?? "its project"}'s train`);
     } finally {
@@ -1824,8 +1825,11 @@ function route(args: string[]): (() => Promise<number>) | null {
     return () => taskMove(rest[0]!, rest[1]!, rest.length === 3);
   }
   if (command === "task" && sub === "archive" && rest.length === 1) return () => taskArchive(rest[0]!);
+  if (command === "task" && sub === "accept" && rest[0] === "--continue" && rest.length >= 2 && rest.slice(1).every((t) => !t.startsWith("--"))) {
+    return () => taskAccept(rest.slice(1), true);
+  }
   if (command === "task" && (sub === "accept" || sub === "unqueue") && rest.length >= 1 && rest.every((t) => !t.startsWith("--"))) {
-    return () => (sub === "accept" ? taskAccept(rest) : taskUnqueue(rest));
+    return () => (sub === "accept" ? taskAccept(rest, false) : taskUnqueue(rest));
   }
   if (command === "task" && sub === "restore" && rest.length >= 1 && !rest[0]!.startsWith("--")) {
     const where = whereArgs(rest.slice(1));
