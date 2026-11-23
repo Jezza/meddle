@@ -11,7 +11,7 @@ import { promptEvent } from "../src/engine/session";
 import { bookmarkList, git, jj, JjError, workspaceConfigPath } from "../src/jj";
 import { shortId } from "../src/pool/ids";
 import { markRemoved } from "../src/pool/removed";
-import { listLineRows, writeBranchRow } from "../src/pool/rows";
+import { listLineRows, setQueued, writeBranchRow } from "../src/pool/rows";
 import { withProjectLocks } from "../src/projects/locks";
 import { resolveStarts } from "../src/projects/starts";
 import { NodeObject, SessionObject, TaskObject } from "../src/state/contracts";
@@ -423,6 +423,8 @@ test("stopForRemoval cuts a running turn off, drops the queue and archives", asy
     await initialised;
     expect(await A.runner.prompt(m.id, "later")).toBe("queued");
     expect(A.runner.queued(m.id)).toHaveLength(1);
+    // On the merge train's queue: the stop takes it off quietly.
+    setQueued(A.db, A.project.id, m.id, A.project.name, new Date().toISOString());
     const logged = countRows(A, m).events;
 
     removeProject(A);
@@ -441,6 +443,8 @@ test("stopForRemoval cuts a running turn off, drops the queue and archives", asy
     expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
     // Nothing more to stop: an archived task is left alone.
     expect(await A.runner.stopForRemoval(A.project.id)).toEqual({ done: [], deferred: [] });
+    // A removed project is neither applied nor taken off its queue: nothing is logged for it.
+    expect(A.logs.filter((l) => l.startsWith("meddle: apply:") || l.startsWith("meddle: queue:"))).toEqual([]);
   } finally {
     await close();
   }
@@ -457,6 +461,11 @@ test("a task of a removed project cannot be restored", async () => {
     await expect(A.runner.restore(m.id, null)).rejects.toThrow(refusal);
     await expect(A.runner.restore(m.id, "here")).rejects.toThrow(refusal);
     await expect(A.runner.restoreHere(m.id)).rejects.toThrow(refusal);
+    // A restore-move is refused by its own check too (`restore` refuses before it gets there), its `prepare` included.
+    const other = "b".repeat(64);
+    await expect(A.runner.moveTo(m.id, other, false, true)).rejects.toThrow(refusal);
+    expect(() => A.runner.checkMove(getTask(A.db, m.id)!, other, true, true)).toThrow(refusal);
+    expect(A.runner.moveState(m.id)).toBeNull();
     expect(getTask(A.db, m.id)!.state).toBe("archived");
     expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(true);
   } finally {

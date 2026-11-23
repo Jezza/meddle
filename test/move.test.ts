@@ -1435,12 +1435,15 @@ test("stopForRemoval discards a task being received and leaves a moved one", asy
     updateTask(node.db, "moved", { moved_to: "b".repeat(64) });
     standInTask(node, "archived", "archived");
     standInTask(node, "other", "idle", KEPT);
+    // A row whose manifest cannot be read names no project: it stops nothing else from being stopped.
+    insertTask(node.db, { id: "unreadable", title: "u", state: "idle", session_id: "s-u", manifest: "{", started: 1, turns: 1 });
     markStandInRemoved(node.db);
     expect(await runner.stopForRemoval(REMOVED)).toEqual({ done: ["receiving"], deferred: [] });
     expect(getTask(node.db, "receiving")).toBeNull();
     expect(getTask(node.db, "moved")).toMatchObject({ state: "moved", moved_to: "b".repeat(64) });
     expect(getTask(node.db, "archived")).toMatchObject({ state: "archived" });
     expect(getTask(node.db, "other")).toMatchObject({ state: "idle" });
+    expect(getTask(node.db, "unreadable")).toMatchObject({ state: "idle" });
     expect(node.aborted).toEqual([]);
   } finally {
     node.db.close();

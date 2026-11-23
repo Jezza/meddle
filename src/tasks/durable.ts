@@ -1793,10 +1793,12 @@ export class TaskRunner {
 
   /**
    * Applies each project of task `row` here (`applyProject`, bounded): its line rows' refs at once, not at the
-   * applier's next pass. A failure is logged (`meddle: apply: project <short> as <id> <what> failed: …`).
+   * applier's next pass. A failure is logged (`meddle: apply: project <short> as <id> <what> failed: …`). A removed
+   * project is skipped: it has nothing here to apply.
    */
   async #applyProjects(deps: ReplicaDeps, row: TaskRow, what: string): Promise<void> {
     for (const p of (JSON.parse(row.manifest) as TaskManifest).projects) {
+      if (isRemoved(this.#db, p.id)) continue;
       await applyProject(deps, p.id, APPLY_AT_TURN_END_MS).catch((err: unknown) => {
         this.#log(`meddle: apply: project ${shortId(p.id)} as ${row.id} ${what} failed: ${messageOf(err)}`);
       });
@@ -1837,7 +1839,7 @@ export class TaskRunner {
     const done: string[] = [];
     const deferred: string[] = [];
     for (const row of listTasks(this.#db)) {
-      if (!projectsOf(row).some((p) => p.id === projectId)) continue;
+      if (!manifestNames(row, projectId)) continue;
       const outcome = await this.#stopTask(row.id);
       if (outcome === "done") done.push(row.id);
       else if (outcome === "deferred") deferred.push(row.id);
@@ -2464,13 +2466,14 @@ export class TaskRunner {
 
   /**
    * Takes the task off the queue, if it is on it, and tells the listeners: whether it was. A task without a project has
-   * no queue.
+   * no queue, nor has a removed project (its rows are not written again).
    */
   #unqueue(taskId: string, reason: string): boolean {
     const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
     if (row === null) return false;
     let left = false;
     for (const p of projectsOf(row)) {
+      if (isRemoved(this.#db, p.id)) continue;
       const line = this.#ownLine(taskId, p);
       if (line === null || line.queuedAt === null) continue;
       setQueued(this.#db, p.id, taskId, p.name, null);
