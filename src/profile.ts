@@ -66,7 +66,7 @@ export async function linkProfile(configDir: string, cfg: NodeConfig): Promise<v
   const p = paths(cfg);
   await mkdir(configDir, { recursive: true });
   const links: [string, string][] = PROFILE_ENTRIES.map((entry) => [entry, join(p.profile, entry)]);
-  links.push(["plugins", p.plugins]);
+  links.push(["plugins", p.plugins], ["sessions", p.sessions]);
   for (const [name, target] of links) {
     const at = join(configDir, name);
     await rm(at, { recursive: true, force: true });

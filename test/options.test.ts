@@ -13,9 +13,9 @@ test("options match the spec", () => {
   expect(o.sessionId).toBe(manifest.sessionId); expect(o.resume).toBeUndefined();
   expect(o.cwd).toBe("/t/abc/a"); expect(o.projectConfigRoot).toBe("/t/abc/a");
   expect(o.settingSources).toEqual(["user", "project", "local"]);
-  expect(o.env).toMatchObject({ PATH: process.env.PATH, HOME: process.env.HOME, CLAUDE_CONFIG_DIR: "/t/abc/.meddle/claude", CLAUDE_CODE_PROJECT_DIR_NAME: "p1", CLAUDE_CODE_OAUTH_TOKEN: "tok", ENABLE_CLAUDEAI_MCP_SERVERS: "false", RUST_LOG: "debug", MEDDLE_FIXTURE: "/f" });
+  expect(o.env).toMatchObject({ PATH: process.env.PATH, HOME: process.env.HOME, CLAUDE_CONFIG_DIR: "/t/abc/.meddle/claude", CLAUDE_CODE_SESSION_NAME: "abc", CLAUDE_CODE_PROJECT_DIR_NAME: "p1", CLAUDE_CODE_OAUTH_TOKEN: "tok", ENABLE_CLAUDEAI_MCP_SERVERS: "false", RUST_LOG: "debug", MEDDLE_FIXTURE: "/f" });
   expect(o.env.XDG_CONFIG_HOME).toBe(process.env.XDG_CONFIG_HOME!);
-  for (const k of Object.keys(o.env)) expect(["PATH","HOME","XDG_CONFIG_HOME","CLAUDE_CONFIG_DIR","CLAUDE_CODE_PROJECT_DIR_NAME","CLAUDE_CODE_OAUTH_TOKEN","ENABLE_CLAUDEAI_MCP_SERVERS","RUST_LOG","MEDDLE_FIXTURE", ...cfg.envPassthrough]).toContain(k);
+  for (const k of Object.keys(o.env)) expect(["PATH","HOME","XDG_CONFIG_HOME","CLAUDE_CONFIG_DIR","CLAUDE_CODE_SESSION_NAME","CLAUDE_CODE_PROJECT_DIR_NAME","CLAUDE_CODE_OAUTH_TOKEN","ENABLE_CLAUDEAI_MCP_SERVERS","RUST_LOG","MEDDLE_FIXTURE", ...cfg.envPassthrough]).toContain(k);
   expect(o.settings.autoMode.allow[0]).toBe("$defaults");
   expect(o.systemPrompt).toEqual({ type: "preset", preset: "claude_code", append: "Use nextest." });
   expect(o.includePartialMessages).toBe(true); expect(o.forwardSubagentText).toBe(true); expect(o.strictMcpConfig).toBe(true);
