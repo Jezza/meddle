@@ -9,7 +9,7 @@ import { paths } from "../config";
 import { shortId } from "../pool/ids";
 import { isRemoved, listRemoved, markRemoved, removedChanges, type RemovedProject } from "../pool/removed";
 import { deleteProjectRows, listLineRows, topic } from "../pool/rows";
-import type { RosterRow } from "../pool/store";
+import { rosterName, type RosterRow } from "../pool/store";
 import { serialised } from "../serial";
 import { listTasks } from "../store/records";
 import { manifestNames, MeddleTurn, type TaskRunner, type TurnInput } from "../tasks/durable";
@@ -164,8 +164,9 @@ export async function removeProject(deps: RemovalDeps, projectId: string): Promi
   for (const member of pool.store.members()) {
     if (member.nodeId === pool.identity.id || !pool.net.isOnline(member.nodeId)) continue;
     const support = pool.removedSupport(member.nodeId);
-    if (support === "older") throw new Error(`${nodeLabel(member)} runs an older meddle`);
-    if (support === "pending") throw new Error(`${nodeLabel(member)} has not answered yet; try again`);
+    const label = nodeLabel({ nodeId: member.nodeId, hostname: rosterName(member, pool.identity.id) });
+    if (support === "older") throw new Error(`${label} runs an older meddle`);
+    if (support === "pending") throw new Error(`${label} has not answered yet; try again`);
   }
   const used = new Set(
     listLineRows(db, projectId)

@@ -25,7 +25,7 @@ import { DEFAULT_POOL_NAME, generateSecret, poolNameProblem, poolSecretProblem }
 import { poolProjects, projectLine, resolveProject, resolveRemovable } from "./pool/projects";
 import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
-import { PoolStore } from "./pool/store";
+import { PoolStore, rosterName } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
 import { isTrainEvent, resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
 import { PoolObject, ProjectObject, RemovedProjectsObject } from "./state/contracts";
@@ -289,7 +289,8 @@ async function serve(): Promise<number> {
 /** A node as update messages name it: its hostname, else its short id. */
 function nodeName(pool: PoolRuntime, id: string): string {
   const short = shortId(id);
-  const host = pool.store.row(id)?.hostname ?? "";
+  const row = pool.store.row(id);
+  const host = row === null ? "" : rosterName(row, pool.identity.id);
   return host === "" || host === short ? short : host;
 }
 
@@ -384,7 +385,8 @@ async function status(): Promise<number> {
   // Pool updates, from the update's files: also while the node is down for its swap.
   const files = updateFiles(cfg.dataDir, process.execPath);
   const { self, view } = await readState(files);
-  const roster = (await readDb(cfg, (db) => (hasPool(db) ? new PoolStore(db).roster() : []))) ?? [];
+  const roster = ((await readDb(cfg, (db) => (hasPool(db) ? new PoolStore(db).roster() : []))) ?? [])
+    .map((r) => ({ nodeId: r.nodeId, hostname: rosterName(r, self) }));
   for (const line of statusLines(buildInfo(), view, await readPending(files), self, (id) => nodeLabel(roster, id))) console.log(line);
   return 0;
 }

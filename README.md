@@ -395,7 +395,8 @@ print each id's shortest unique prefix in bold magenta: what you need to type. (
 The task commands (`task prompt`, `retry`, `move`, `archive`, `restore`, `delete`) work from any node: they act on
 the node the task lives on (or is archived on), reaching it through this node as the dashboard does. A task named by
 its whole id that lives on this node needs no other node; a prefix is looked up across every online member. Nodes are
-named by short id and hostname in what they print, such as `moving e98d79415f8e to 164ff3e5ed (Gem)`.
+named by short id and hostname in what they print, such as `moving e98d79415f8e to 164ff3e5ed (Gem)`; a machine
+that was renamed goes by its new name once its node has started again.
 
 ### Environment
 
