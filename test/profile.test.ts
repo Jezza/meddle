@@ -26,6 +26,7 @@ test("seed copies ~/.claude entries into a jj repo and links them", async () => 
   for (const e of PROFILE_ENTRIES) expect(await readlink(`${configDir}/${e}`)).toBe(`${paths(cfg).profile}/${e}`);
   expect(await readFile(`${configDir}/skills/pine/SKILL.md`, "utf8")).toContain("name: pine");
   expect(await readlink(`${configDir}/plugins`)).toBe(paths(cfg).plugins);
+  expect(await readlink(`${configDir}/sessions`)).toBe(paths(cfg).sessions);
 });
 
 test("ensurePlugins replaces the empty plugins dir from ensureDataDirs with a link to ~/.claude/plugins", async () => {

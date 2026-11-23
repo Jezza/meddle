@@ -11,6 +11,8 @@ export function paths(cfg: NodeConfig) {
   return {
     profile: join(data, "profile"),
     plugins: join(data, "plugins"),
+    /** Claude Code's registry of live sessions, shared by every task's config dir so their agents can message each other. */
+    sessions: join(data, "sessions"),
     secrets,
     /** One file per login token, named by its id (mode 600, the directory 700); `tokenFile` in token.ts names them. */
     tokensDir: join(secrets, "tokens"),
@@ -65,6 +67,7 @@ export async function ensureDataDirs(cfg: NodeConfig): Promise<void> {
     await mkdir(dir, { recursive: true });
   }
   await ensurePrivateDir(p.secrets);
+  await ensurePrivateDir(p.sessions);
 }
 
 /** The programs a task's workspaces and moves run, which must be on the node's PATH. */
