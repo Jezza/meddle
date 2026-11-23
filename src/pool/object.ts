@@ -95,6 +95,7 @@ export function nodeOf(
     limit: summary?.limit ?? 0,
     projects: (summary?.projects ?? []).filter((p) => !removed.has(p.id)),
     attachments: summary?.attachments ?? false,
+    acceptContinue: summary?.acceptContinue ?? false,
     lastSeenAt: self ? live.at : heard,
     gone: !self && gone.includes(row.nodeId),
     link: self ? null : links[row.nodeId] ?? null,

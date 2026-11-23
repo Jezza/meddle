@@ -168,7 +168,8 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
                   onClick={() => { close(); void action.run(() => task.ref.accept({})); }}>Accept</MenuItem>
               )}
               {offer === "accept" && (
-                <MenuItem onClick={() => { close(); void action.run(() => task.ref.accept({ continue: true })); }}>Accept &amp; continue</MenuItem>
+                <MenuItem disabled={nodes.find((n) => n.nodeId === task.nodeId)?.acceptContinue !== true}
+                  onClick={() => { close(); void action.run(() => task.ref.accept({ continue: true })); }}>Accept &amp; continue</MenuItem>
               )}
               {offer === "unqueue" && (
                 <MenuItem title="Takes the task off the train" onClick={() => { close(); void action.run(() => task.ref.unqueue({})); }}>Unqueue</MenuItem>

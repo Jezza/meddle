@@ -782,6 +782,8 @@ export const NodeSummarySchema = Type.Object({
   attachments: Type.Optional(Type.Boolean()),
   /** Whether the node starts a task on a merge of several commits (`Start.parents`). */
   mergeStarts: Type.Optional(Type.Boolean()),
+  /** Whether the node takes Accept & continue (`accept`'s `continue`): an older one would drop it and archive the task. */
+  acceptContinue: Type.Optional(Type.Boolean()),
 });
 
 /** One node of the pool's roster (`RosterRow`). */
@@ -878,6 +880,8 @@ export const PoolNodeSchema = Type.Object({
   projects: Type.Array(ProjectInfoSchema),
   /** Whether the node takes prompts with attachments (false for a node of an older meddle). */
   attachments: Type.Boolean(),
+  /** Whether the node takes Accept & continue (false for a node of an older meddle). */
+  acceptContinue: Type.Boolean(),
   lastSeenAt: Nullable(Type.String()),
   /**
    * Not heard of (no connection, no member reporting one, no lighthouse listing) for longer than the pool's

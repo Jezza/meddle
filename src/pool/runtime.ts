@@ -133,6 +133,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     projects: summary.projects(),
     attachments: true,
     mergeStarts: true,
+    acceptContinue: true,
   });
   let key: PoolKey | null;
   try {

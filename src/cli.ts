@@ -1316,7 +1316,9 @@ function runsOlder(nodes: readonly { nodeId: string; hostname: string }[], id: s
  * each task continues once its work lands rather than being archived.
  */
 function taskAccept(texts: string[], continues: boolean): Promise<number> {
-  return eachTask(texts, (text) => withTask(text, async (client, _socket, id) => {
+  return eachTask(texts, (text) => withTask(text, async (client, _socket, id, holder, pt) => {
+    // An older holder would drop `continue` and archive the task once its work lands.
+    if (continues && pt.nodes.find((n) => n.nodeId === holder)?.acceptContinue !== true) throw runsOlder(pt.nodes, holder);
     const task = await client.get(TaskObject, { id });
     try {
       await task.accept(continues ? { continue: true } : {});

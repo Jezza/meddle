@@ -197,6 +197,8 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
   const archived = state === "archived";
   // Nothing to land: no change of the task's own is off the default branch (its work landed, or it has none yet).
   const nothingToLand = changes !== null && changes.count === 0;
+  // A holder of an older meddle would drop `continue`, and archive the task once its work lands.
+  const noContinue = nodes.find((n) => n.nodeId === nodeId)?.acceptContinue !== true;
   const live = state === "running" || state === "waiting";
   const stateText = pendingCount > 0 ? "waiting on you" : state;
   const offer = trainOffer({ state, queued: queue === undefined ? null : queue !== null, merge, moving, projects });
@@ -250,7 +252,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
           <span class="accept-split">
             <button class="accept" disabled={action.busy || nothingToLand} title="Queues the task's work to land on its project's default branch (the merge train)"
               onClick={() => action.run(() => task.accept({}))}><Glyph name="merge" cls="train-ico" /> Accept</button>
-            <button class="accept more" disabled={action.busy || nothingToLand} aria-haspopup="menu"
+            <button class="accept more" disabled={action.busy || nothingToLand || noContinue} aria-haspopup="menu"
               onClick={(e) => setAcceptAt({ el: e.currentTarget })}>▾</button>
           </span>
         )}

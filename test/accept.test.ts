@@ -479,7 +479,7 @@ test("a task accepted to continue is not archived when a push lands its work: it
     expect(listLineRows(A.db, P.id, m.id)[0]).toMatchObject({ base: [head], queuedAt: null, continues: false });
     expect((JSON.parse(getTask(A.db, m.id)!.manifest) as { projects: Array<{ base: string[] }> }).projects[0]!.base).toEqual([head]);
     expect(A.runner.acceptance(m.id)).toBe("no");
-    const landed = listEvents(A.db, m.id).map((e) => e.message as { subtype?: string }).filter((e) => e.subtype === "landed");
+    const landed = listEvents(A.db, m.id).map((e) => e.message as Record<string, unknown>).filter((e) => e.subtype === "landed");
     expect(landed).toEqual([{ type: "meddle", subtype: "landed", branch: "main", commit: head }]);
     expect(A.logs).toContain(`meddle: accept: ${m.id}'s work landed; it continues on main at ${head.slice(0, 12)}`);
     expect(A.logs.filter((l) => l.startsWith("meddle: accept:") && !l.includes("work landed"))).toEqual([]);
@@ -491,6 +491,41 @@ test("a task accepted to continue is not archived when a push lands its work: it
     await A.runner.accept(m.id);
     await pushMain(A, P, lineHead(A, P.id, m.id, "a")!);
     await until("the task's state", () => getTask(A.db, m.id)?.state, "archived");
+  } finally {
+    await close();
+  }
+}, 60_000);
+
+test("a task accepted to continue whose work is pushed to another branch only stays queued, and continues once main has it", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const P = A.project;
+    pauseTrain(A.db, P.id, "held by the test");
+    const m = await createTask(A, { title: "t", projectIds: [P.id] });
+    const workspace = join(paths(A.cfg).task(m.id), "a");
+    await writeFile(join(workspace, "work"), "work\n");
+    await promptAndWait(A, m.id, "Reply with the single word ok.");
+    await A.runner.accept(m.id, { continue: true });
+    const head = lineHead(A, P.id, m.id, "a")!;
+    const main = await read(A.cfg, P.replica, "main");
+
+    // A branch of yours, say a PR's, has the work; main doesn't. That accepts it, but it hasn't landed on main.
+    const co = `${A.home}/co-${P.name}`;
+    await makeCheckout(A.cfg, A.id, P, co, helperEnv(A));
+    await jj(["bookmark", "create", "feature", "-r", head], co, A.cfg);
+    await jj(["git", "push", "--remote", "meddle", "-b", "feature"], co, A.cfg);
+    await until("the task's acceptance", () => A.runner.acceptance(m.id), "accepted");
+    await Bun.sleep(1000);
+    expect(getTask(A.db, m.id)?.state).toBe("idle");
+    expect(A.runner.queue(m.id)).not.toBeNull();
+    expect(await read(A.cfg, workspace, "@-")).toBe(main);
+    expect(listEvents(A.db, m.id).some((e) => (e.message as { subtype?: string }).subtype === "landed")).toBe(false);
+
+    await pushMain(A, P, head);
+    await until("the task's queue", () => A.runner.queue(m.id), null);
+    expect(getTask(A.db, m.id)?.state).toBe("idle");
+    expect(await read(A.cfg, workspace, "@-")).toBe(head);
   } finally {
     await close();
   }

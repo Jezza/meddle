@@ -145,5 +145,5 @@ test("a roster row merged from an older peer reads back with running 0, limit 0,
   store.ensurePool({ nodeId: A, hostname: "a" });
   const older = { hostname: "b", version: "0.1.0", claudeCodeVersion: "2.0.0", hostsTasks: true, taskCount: 4 };
   store.merge([row(B, older)]);
-  expect(store.row(B)?.summary).toEqual({ ...older, running: 0, limit: 0, projects: [], attachments: false, mergeStarts: false });
+  expect(store.row(B)?.summary).toEqual({ ...older, running: 0, limit: 0, projects: [], attachments: false, mergeStarts: false, acceptContinue: false });
 });

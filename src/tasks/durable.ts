@@ -162,6 +162,9 @@ export type TaskQueue = { queuedAt: string; project: string };
  */
 export type TrainTaskStatus = { taskId: string; state: "idle" | "busy" | "train" | "absent"; title: string | null };
 
+/** A project of a task accepted to continue, whose work landed on its default branch `branch`, at `commit`. */
+type Landing = { p: ManifestProject; branch: string; commit: string };
+
 /**
  * Why a task left the queue: the user's Unqueue; input of the user's that runs in it; its archive (or delete); its
  * work landed and it continues (Accept & continue).
@@ -359,6 +362,8 @@ export class TaskRunner {
   #acceptChecks = new Map<string, { again: boolean }>();
   /** Per task, the check of its acceptance made again later: the last one lacked a commit a row names. */
   #acceptRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per task, the continue on its branch tried again later (`ACCEPT_RETRY_MS`): the last one failed. */
+  #continueRetries = new Map<string, ReturnType<typeof setTimeout>>();
   #acceptanceListeners = new Set<(taskId: string, acceptance: Acceptance) => void>();
   #queueListeners = new Set<(taskId: string, queue: TaskQueue | null, reason: string | null) => void>();
   #holdsListeners = new Set<(holds: RunnerHolds) => void>();
@@ -2344,10 +2349,20 @@ export class TaskRunner {
       return;
     }
     if (projectsOf(now).some((p) => this.#ownLine(taskId, p)?.continues === true)) {
+      // A failed continue is tried again later, not at once: the line write it makes asks for another check.
+      if (this.#continueRetries.has(taskId)) return;
       try {
+        // Only once the work is on the default branch: a push of it to any branch accepts it too.
+        if ((await this.#landings(deps, taskId, JSON.parse(now.manifest) as TaskManifest)) === null) return;
         await this.#continueOnBranch(taskId);
       } catch (err) {
         this.#log(`meddle: accept: ${taskId}'s work is accepted, but the task did not continue on its branch: ${messageOf(err)}`);
+        const timer = setTimeout(() => {
+          this.#continueRetries.delete(taskId);
+          this.#checkAcceptance(taskId);
+        }, ACCEPT_RETRY_MS);
+        timer.unref?.();
+        this.#continueRetries.set(taskId, timer);
       }
       return;
     }
@@ -2359,26 +2374,47 @@ export class TaskRunner {
   }
 
   /**
-   * Has task `taskId`, whose work is accepted, continue rather than be archived (Accept & continue: a project's own
-   * line row `continues`). On the task's prompt chain, so that a prompt sent meanwhile waits for it, and under its key;
-   * only while it is still idle with nothing queued and no turn of it in the Harness, and its work still accepted once
-   * its lines are written as they are now. Each such project's workspace then starts a new change on the project's
-   * default branch, as its rows compute it (`jj new`). That commit becomes the project's base, the manifest's and its
-   * own line row's, so the task has no work again and is no longer accepted. Then the lines are written there, the
-   * task leaves the queue, and a `landed` event tells where each project's work landed. Returns whether it did.
+   * Where the work of each project of task `taskId` whose own line `continues` landed: its default branch and that
+   * branch's commit, as the rows compute it. Null when none continues, or one's work (its line's effective head) is not
+   * on its default branch, which has it only once a push of it to another branch accepted it.
+   */
+  async #landings(deps: ReplicaDeps, taskId: string, manifest: TaskManifest): Promise<Landing[] | null> {
+    const landed: Landing[] = [];
+    for (const p of manifest.projects) {
+      const line = this.#ownLine(taskId, p);
+      if (line === null || !line.continues || line.commit === null) continue;
+      const project = getProject(this.#db, p.id);
+      if (project === null || project.defaultBranch === null) return null;
+      const commit = await defaultBranchCommit({ ...deps, selfId: deps.pool.identity.id }, project);
+      const head = await effectiveHead(deps.cfg, project.replica, line.commit);
+      if (!(await containedIn(deps.cfg, project.replica, head, [commit]))) return null;
+      landed.push({ p, branch: project.defaultBranch, commit });
+    }
+    return landed.length === 0 ? null : landed;
+  }
+
+  /**
+   * Has task `taskId`, whose work is accepted and on its default branch (`#landings`), continue rather than be archived
+   * (Accept & continue: a project's own line row `continues`). On the task's prompt chain, so that a prompt sent
+   * meanwhile waits for it, and under its key; only while it is still idle with nothing queued, no turn of it in the
+   * Harness and no pool update holding work, and its work still accepted and landed once its lines are written as they
+   * are now. Each such project's workspace then starts a new change on the branch's commit (`jj new`), which becomes the
+   * project's base, the manifest's and its own line row's: the task has no work again, and is no longer accepted. The
+   * task leaves the queue, a `landed` event tells where each project's work landed, and then the lines are written
+   * there. Returns whether it did. One that stops after `jj new` is done again by the next check: the line row still
+   * names the landed work.
    */
   async #continueOnBranch(taskId: string): Promise<boolean> {
     const deps = this.#replicaDeps();
     if (deps === null) return false;
-    const self = deps.pool.identity.id;
     return serialised(`prompt\0${taskId}`, () => serialised(taskKey(taskId), async () => {
       const ready = (): TaskRow | null => {
         const row = getTask(this.#db, taskId);
-        if (row === null || this.#archiving.has(taskId) || this.#closed) return null;
+        if (row === null || this.#archiving.has(taskId) || this.#closed || this.#holds.work !== null) return null;
         try {
           this.#refuseArchive(row);
         } catch {
-          return null; // a turn or a prompt came in meanwhile: checked again as its turn ends
+          return null; // a turn, a prompt or a move came in meanwhile: checked again once it is over
         }
         return row;
       };
@@ -2388,17 +2424,8 @@ export class TaskRunner {
       await this.#writeLinesNext(taskId);
       const manifest = JSON.parse(row.manifest) as TaskManifest;
       if ((await acceptanceOf(deps, manifest, (id) => this.#tipsOf(deps, id))).verdict !== "accepted") return false;
-      const landed: Array<{ p: ManifestProject; line: LineRow; branch: string; commit: string }> = [];
-      for (const p of manifest.projects) {
-        const line = this.#ownLine(taskId, p);
-        if (line === null || !line.continues) continue;
-        const project = getProject(this.#db, p.id);
-        if (project === null) throw new Error(`unknown project: ${p.id}`);
-        const branch = project.defaultBranch;
-        if (branch === null) throw new Error(`${project.name} has no default branch to continue on`);
-        landed.push({ p, line, branch, commit: await defaultBranchCommit({ ...deps, selfId: self }, project) });
-      }
-      if (landed.length === 0 || ready() === null) return false;
+      const landed = await this.#landings(deps, taskId, manifest);
+      if (landed === null || ready() === null) return false;
       for (const { p, commit } of landed) await jj(["new", commit], join(paths(this.#cfg).task(taskId), p.workspace), this.#cfg);
       const next: TaskManifest = {
         ...manifest,
@@ -2408,13 +2435,17 @@ export class TaskRunner {
         }),
       };
       await writeManifest(this.#cfg, next);
+      // Nothing is awaited from here until the lines are written: the base, the queue and the event go together.
       updateTask(this.#db, taskId, { manifest: JSON.stringify(next) });
       notify(this.#manifestListeners, (cb) => cb(taskId, next));
-      for (const { line, commit } of landed) writeLineRow(this.#db, { ...line, base: [commit] });
-      await this.#writeLinesNext(taskId);
+      for (const { p, commit } of landed) {
+        const line = this.#ownLine(taskId, p);
+        if (line !== null) writeLineRow(this.#db, { ...line, base: [commit] });
+      }
       this.#leaveQueue(taskId, UNQUEUED_LANDED);
       for (const { branch, commit } of landed) this.#record(taskId, { type: "meddle", subtype: "landed", branch, commit });
       this.#log(`meddle: accept: ${taskId}'s work landed; it continues on ${landed.map((l) => `${l.branch} at ${l.commit.slice(0, 12)}`).join(", ")}`);
+      await this.#writeLinesNext(taskId);
       return true;
     }));
   }
@@ -2448,6 +2479,8 @@ export class TaskRunner {
     this.#setAcceptance(taskId, "no");
     clearTimeout(this.#acceptRetries.get(taskId));
     this.#acceptRetries.delete(taskId);
+    clearTimeout(this.#continueRetries.get(taskId));
+    this.#continueRetries.delete(taskId);
     this.#acceptPending.delete(taskId);
     this.#acceptPendingLogged.delete(taskId);
   }
