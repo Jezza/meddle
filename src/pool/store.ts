@@ -53,7 +53,7 @@ export type WireRosterRow = Omit<RosterRow, "summary" | "reachedAt" | "reachedAd
 };
 
 /** The one form a replicated time may take: what `new Date().toISOString()` prints. */
-const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+export const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 /** How far ahead of this node's clock a reported link may be dated and still count. */
 export const MAX_REPORT_AHEAD_MS = 5 * 60_000;
 
