@@ -15,7 +15,7 @@ import { rowChanges } from "./rows";
 import { poolKey, proofFor, verifyProof, type PoolKey } from "./secret";
 import { PoolSettings, discoveryLighthouseUrl } from "./settings";
 import { PoolStore, newestAddr, type NodeProject, type NodeSummary, type PoolIdentity, type WireAddr } from "./store";
-import { HoldFailed, PoolSync } from "./sync";
+import { HoldFailed, PoolSync, type RemovedSupport } from "./sync";
 
 export type PoolRuntime = {
   readonly identity: Identity;
@@ -65,6 +65,11 @@ export type PoolRuntime = {
    * `not connected to <shortId>` when there is none. The caller releases it when done.
    */
   peerRef<C extends AnyContract>(nodeId: string, contract: C): Promise<Ref<C>>;
+  /**
+   * Whether this node holds the peer's removed list (`held`), found the peer runs a meddle older than it (`older`), or
+   * neither yet (`pending`); see `PoolSync.removedSupport`.
+   */
+  removedSupport(peerId: string): RemovedSupport;
   stop(): Promise<void>;
 };
 
@@ -495,6 +500,7 @@ export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSumm
     refresh,
     onChange,
     peerRef,
+    removedSupport: (peerId) => sync.removedSupport(peerId),
     async stop() {
       if (stopped) return;
       stopped = true;

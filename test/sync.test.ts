@@ -7,8 +7,9 @@ import { PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
 import { addToken, listTokens, tokenFile, tokenId, tokenValue } from "../src/token";
 import { listBranchRows, settleBranchRows, waitingBranchRows, writeBranchRow, writeLineRow } from "../src/pool/rows";
+import { isRemoved, listRemoved, markRemoved } from "../src/pool/removed";
 import { HoldFailed } from "../src/pool/sync";
-import { POOL_ENV, poolSummaryOf, threeNodes, twoNodes, type PoolNode, type TappedFrame } from "./pool-helpers";
+import { POOL_ENV, linkPoolNodes, poolSummaryOf, threeNodes, twoNodes, type PoolNode, type TappedFrame } from "./pool-helpers";
 
 const C = "c".repeat(64);
 const TOKENS = ["tok2", "tok3"];
@@ -168,6 +169,46 @@ test("a branch row written on one node reaches a node it is not linked to, relay
     await until(() => JSON.stringify(waitingBranchRows(c.db, "p")) === JSON.stringify([written]));
     expect(a.net.isOnline(c.id) || c.net.isOnline(a.id)).toBe(false);
     expect([...a.errors, ...b.errors, ...c.errors].map(String)).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a removal on one node reaches the others", async () => {
+  // C is linked to no one yet: it comes online after the removal.
+  const { a, b, c, close } = await threeNodes({ links: [["a", "b"]] });
+  try {
+    await until(() => a.sync.removedSupport(b.id) === "held" && b.sync.removedSupport(a.id) === "held");
+    const entry = { id: "proj-gone", name: "gone", removedAt: "2026-11-23T10:00:00.000Z", removedBy: a.id };
+    expect(markRemoved(a.db, entry)).toBe(true);
+    await until(() => isRemoved(b.db, entry.id));
+    expect(isRemoved(c.db, entry.id)).toBe(false);
+
+    // Online later, C has it from B, as A wrote it.
+    linkPoolNodes(b, c);
+    await until(() => isRemoved(c.db, entry.id));
+    expect(listRemoved(c.db)).toEqual([entry]);
+    expect(listRemoved(b.db)).toEqual([entry]);
+    expect(c.sync.removedSupport(b.id)).toBe("held");
+    expect([...a.errors, ...b.errors, ...c.errors].map(String)).toEqual([]);
+  } finally {
+    await close();
+  }
+}, 15_000);
+
+test("a peer without the removed list still syncs and reads as older", async () => {
+  const { a, b, close } = await twoNodes({ older: "b" });
+  try {
+    await until(() => a.sync.removedSupport(b.id) === "older");
+    // Its PoolObject is held all the same: a setting set on it arrives.
+    await b.deps.setSetting("defaults.model", "opus");
+    await until(() => a.settings.rows().some((r) => r.key === "defaults.model" && r.value === "opus"));
+    expect(a.sync.removedSupport(b.id)).toBe("older");
+    expect(b.sync.removedSupport(a.id)).toBe("held");
+    // Not retried while the peer stays connected, and never reported.
+    await Bun.sleep(300);
+    expect(a.sync.removedSupport(b.id)).toBe("older");
+    expect([...a.errors, ...b.errors].map(String)).toEqual([]);
   } finally {
     await close();
   }

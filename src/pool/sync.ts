@@ -1,16 +1,18 @@
 // Pool sync: each node holds every online peer's PoolObject (peer variant) over a chord link on iroh, merges the
 // peer's roster, settings, token rows and line and branch rows into its own (and so relays them: a branch row once the
 // applier has its commit here), pulls the value of each token it lists but lacks, by id, and deletes the value of each
-// token the pool removed.
+// token the pool removed. Next to it each peer's RemovedProjectsObject is held, and its removed list merged into this
+// node's; a peer of a meddle older than it serves none, and its PoolObject is held all the same.
 import type { Database } from "bun:sqlite";
-import { createHost, type Host } from "@earendil-works/chord";
+import { createHost, isChordError, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
-import { PoolObject } from "../state/contracts";
+import { PoolObject, RemovedProjectsObject } from "../state/contracts";
 import { deleteTokenValue, hasTokenValue, listTokens, mergeTokens, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
 import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
 import { fromEndpoint, remoteAddrOf, type PoolNet } from "./net";
 import { PEER_PRINCIPAL_PREFIX } from "./object";
+import { mergeRemoved } from "./removed";
 import { mergeBranchRows, mergeLineRows } from "./rows";
 import type { PoolSettings } from "./settings";
 import type { NodeSummary, PoolStore } from "./store";
@@ -34,7 +36,10 @@ export type SyncDeps = {
   tap?: LinkTap;
   /** Self-row refresh period, default 15000. */
   refreshMs?: number;
-  /** The first wait before holding a peer's PoolObject again after a failure, default 1000 (doubling to 30 s). */
+  /**
+   * The first wait before holding a peer's PoolObject (or its RemovedProjectsObject) again after a failure, default
+   * 1000 (doubling to 30 s).
+   */
   holdRetryMs?: number;
 };
 
@@ -46,7 +51,14 @@ type PeerView = {
   tokenIds: Set<string>;
   /** Asks the peer for a token's value (aborted with the view); set once its PoolObject is held. */
   fetchToken: ((id: string) => Promise<{ value: string }>) | null;
+  /** Whether the peer's RemovedProjectsObject is held, or the peer serves none (an older meddle); `pending` until either. */
+  removed: RemovedSupport;
+  /** The next wait before holding the peer's RemovedProjectsObject again after a failure, and the timer of the try pending. */
+  removedRetry: { waitMs: number; timer: ReturnType<typeof setTimeout> | null };
 };
+
+/** How a peer stands for the removed list (`PoolSync.removedSupport`). */
+export type RemovedSupport = "held" | "older" | "pending";
 
 /** Reported when this node could not hold a peer's PoolObject (it is tried again, with backoff, while the peer is online). */
 export class HoldFailed extends Error {
@@ -83,7 +95,7 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
   return settled;
 }
 
-/** The longest wait between attempts to hold an online peer's PoolObject. */
+/** The longest wait between attempts to hold an online peer's PoolObject, or its RemovedProjectsObject. */
 const HOLD_RETRY_MAX_MS = 30_000;
 
 /** How many dropped token ids are logged at most, so that a peer sending junk cannot fill the log. */
@@ -156,6 +168,15 @@ export class PoolSync {
   }
 
   /**
+   * Whether this node holds the peer's RemovedProjectsObject (`held`), found that the peer serves none, as a meddle
+   * older than it does (`older`, until the peer reconnects), or neither yet (`pending`: also a peer offline, or whose
+   * PoolObject is not held).
+   */
+  removedSupport(peerId: string): RemovedSupport {
+    return this.views.get(peerId)?.removed ?? "pending";
+  }
+
+  /**
    * Records this node's current summary and address in its own row, and a report of each connection it holds (now,
    * at the address it sees the peer at) in that peer's row, then tells the node.
    */
@@ -221,7 +242,10 @@ export class PoolSync {
     if (this.stopped) return;
     this.cancelRetry(id, false);
     void this.drop(id);
-    const view: PeerView = { host: null, abort: new AbortController(), tokenIds: new Set(), fetchToken: null };
+    const view: PeerView = {
+      host: null, abort: new AbortController(), tokenIds: new Set(), fetchToken: null,
+      removed: "pending", removedRetry: { waitMs: this.deps.holdRetryMs ?? 1000, timer: null },
+    };
     this.views.set(id, view);
     void this.attach(id, view);
   }
@@ -283,6 +307,7 @@ export class PoolSync {
       pool.branchRows.subscribe((rows) => {
         if (current() && mergeBranchRows(this.deps.db, rows).changed.length > 0) this.deps.onChange();
       });
+      void this.holdRemoved(id, view);
     } catch (err) {
       if (!current()) return;
       // The connection the stream rode on closed (the peer went, or a connection that wins replaced it): the net says
@@ -298,6 +323,44 @@ export class PoolSync {
       this.report(new HoldFailed(id, `holding the pool of ${shortId(id)}: ${messageOf(view.abort.signal.reason ?? err)}`));
       await this.drop(id);
       this.retryHold(id);
+    }
+  }
+
+  /**
+   * Holds the peer's RemovedProjectsObject over the view's client host, once its PoolObject is held, and merges its
+   * removed list into this node's. Apart from the PoolObject hold: its failure is reported (`HoldFailed`) and tried
+   * again while the view lasts, after 1 s doubling to 30 s, and never drops the view. A peer that does not serve the
+   * type (`unavailable`, `unknown_type`) runs an older meddle: it is marked `older`, not reported, and not tried again
+   * until it reconnects.
+   */
+  private async holdRemoved(id: string, view: PeerView): Promise<void> {
+    const current = () => !this.stopped && this.views.get(id) === view;
+    if (!current() || view.host === null) return;
+    try {
+      const ref = await view.host.get(RemovedProjectsObject, {}, { signal: view.abort.signal });
+      if (!current()) return;
+      if (ref.variant !== "peer") throw new Error(`${shortId(id)} did not serve the peer variant of RemovedProjectsObject`);
+      view.removed = "held";
+      ref.removed.subscribe((rows) => {
+        if (current()) mergeRemoved(this.deps.db, rows);
+      });
+    } catch (err) {
+      // Aborted: the view was dropped, or the link it rode on closed (the net then says the peer went).
+      if (!current() || view.abort.signal.aborted) return;
+      if (isChordError(err, "unavailable") && err.reason === "unknown_type") {
+        view.removed = "older";
+        return;
+      }
+      this.report(new HoldFailed(id, `holding the removed projects of ${shortId(id)}: ${messageOf(err)}`));
+      const retry = view.removedRetry;
+      if (retry.timer !== null) return;
+      const wait = retry.waitMs;
+      retry.waitMs = Math.min(wait * 2, HOLD_RETRY_MAX_MS);
+      retry.timer = setTimeout(() => {
+        retry.timer = null;
+        void this.holdRemoved(id, view);
+      }, wait);
+      retry.timer.unref?.();
     }
   }
 
@@ -371,6 +434,8 @@ export class PoolSync {
     const view = this.views.get(id);
     if (!view) return;
     this.views.delete(id);
+    if (view.removedRetry.timer !== null) clearTimeout(view.removedRetry.timer);
+    view.removedRetry.timer = null;
     view.abort.abort(new Error(`stopped holding the pool of ${shortId(id)}`));
     if (view.host === null) return;
     const closed = view.host.close().catch((err: unknown) => this.report(err));

@@ -15,6 +15,7 @@ import { hexOf, loadOrCreateIdentity, shortId, type Identity } from "../src/pool
 import type { LinkTap } from "../src/pool/link";
 import { PoolNet, fromEndpoint, openEndpoint, toEndpointAddr, type NetDeps } from "../src/pool/net";
 import { servePool, type PoolObjectDeps } from "../src/pool/object";
+import { serveRemovedProjects } from "../src/pool/removed-object";
 import { DEFAULT_POOL_NAME, poolKey, proofFor, verifyProof, type PoolKey } from "../src/pool/secret";
 import { PoolStore, type NodeSummary } from "../src/pool/store";
 import { startPool, type PoolSummaryDeps } from "../src/pool/runtime";
@@ -88,7 +89,7 @@ export async function endpointPair(): Promise<{
 /** A frame line one node's sync links sent (`out`) or received (`in`). */
 export type TappedFrame = { direction: "in" | "out"; text: string };
 
-/** One pool node of `twoNodes`: its store, net, chord host (serving PoolObject) and sync. */
+/** One pool node of `twoNodes`: its store, net, chord host (serving PoolObject and RemovedProjectsObject) and sync. */
 export type PoolNode = {
   id: string; identity: Identity; home: string; cfg: NodeConfig; db: Database; store: PoolStore; net: PoolNet; host: Host; sync: PoolSync;
   /** The node's pool settings, applied to `cfg.poolEnv`. */
@@ -112,9 +113,11 @@ function notInThisTest(): never {
   throw new Error("not in this test");
 }
 
+/** A pool node; `serveRemoved: false` serves no RemovedProjectsObject, as a node of a meddle older than it. */
 async function poolNode(
   name: string,
   servePeers = true,
+  serveRemoved = true,
 ): Promise<{ node: PoolNode; frames: TappedFrame[]; servePeers: () => void; stopAccepting: () => void; stopRows: () => void }> {
   const home = await mkdtemp(`/tmp/meddle-pool-${name}-`);
   const cfg = loadConfig({
@@ -178,6 +181,7 @@ async function poolNode(
   };
   const host = createHost({ name: "node", self: "node", onError });
   servePool(host, deps);
+  if (serveRemoved) serveRemovedProjects(host, { db, remove: async () => notInThisTest() });
   let stopAccepting = () => {};
   const serve = () => {
     stopAccepting();
@@ -199,9 +203,12 @@ async function poolNode(
  * `framesOf(node)` collects. Each is offered the other's address unless `offerAddresses: false` (then only discovery
  * can connect them), and both dial at start. Started unless `start: false` (then call `start()`). With
  * `servePeersLater`, neither serves its PoolObject to the other until `servePeers()`, as a node still starting does.
- * `close()` stops everything and removes the homes.
+ * The node named by `older` serves no RemovedProjectsObject, as a node of an older meddle. `close()` stops everything
+ * and removes the homes.
  */
-export async function twoNodes(options: { start?: boolean; offerAddresses?: boolean; servePeersLater?: boolean } = {}): Promise<{
+export async function twoNodes(
+  options: { start?: boolean; offerAddresses?: boolean; servePeersLater?: boolean; older?: "a" | "b" } = {},
+): Promise<{
   a: PoolNode; b: PoolNode;
   framesOf(node: PoolNode): TappedFrame[];
   start(): void;
@@ -209,7 +216,7 @@ export async function twoNodes(options: { start?: boolean; offerAddresses?: bool
   close(): Promise<void>;
 }> {
   const serveNow = options.servePeersLater !== true;
-  const made = [await poolNode("a", serveNow), await poolNode("b", serveNow)] as const;
+  const made = [await poolNode("a", serveNow, options.older !== "a"), await poolNode("b", serveNow, options.older !== "b")] as const;
   const [a, b] = [made[0].node, made[1].node];
   a.store.upsert({ ...a.store.row(a.id)!, nodeId: b.id, hostname: b.summary.hostname });
   b.store.upsert({ ...b.store.row(b.id)!, nodeId: a.id, hostname: a.summary.hostname });
@@ -248,13 +255,22 @@ export async function twoNodes(options: { start?: boolean; offerAddresses?: bool
   };
 }
 
+/** Makes `x` and `y` members of each other's roster, offered each other's address and dialing each other. */
+export function linkPoolNodes(x: PoolNode, y: PoolNode): void {
+  for (const [self, other] of [[x, y], [y, x]] as const) {
+    self.store.upsert({ ...self.store.row(self.id)!, nodeId: other.id, hostname: other.summary.hostname });
+    self.net.watch(other.id);
+    self.net.offerAddress(fromEndpoint(other.net.endpoint));
+  }
+}
+
 /** A pair of `threeNodes` linked to each other. */
 export type ThreeNodeLink = readonly ["a" | "b" | "c", "a" | "b" | "c"];
 
 /**
  * Three pool nodes as `twoNodes` makes two, started. Only the nodes of each of `links` (default: every pair) are
- * members of each other's roster, offered each other's address and dialing each other; a node learns of the others
- * from its peers' rosters but never dials them. `close()` stops everything and removes the homes.
+ * linked (`linkPoolNodes`); a node learns of the others from its peers' rosters but never dials them (until a test
+ * links it). `close()` stops everything and removes the homes.
  */
 export async function threeNodes(options: { links?: readonly ThreeNodeLink[] } = {}): Promise<{
   a: PoolNode; b: PoolNode; c: PoolNode;
@@ -264,13 +280,7 @@ export async function threeNodes(options: { links?: readonly ThreeNodeLink[] } =
   const [a, b, c] = [made[0].node, made[1].node, made[2].node];
   const byName = { a, b, c };
   const links = options.links ?? [["a", "b"], ["b", "c"], ["a", "c"]];
-  for (const [x, y] of links) {
-    for (const [self, other] of [[byName[x], byName[y]], [byName[y], byName[x]]] as const) {
-      self.store.upsert({ ...self.store.row(self.id)!, nodeId: other.id, hostname: other.summary.hostname });
-      self.net.watch(other.id);
-      self.net.offerAddress(fromEndpoint(other.net.endpoint));
-    }
-  }
+  for (const [x, y] of links) linkPoolNodes(byName[x], byName[y]);
   for (const n of [a, b, c]) {
     n.net.start();
     n.sync.start();

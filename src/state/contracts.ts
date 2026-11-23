@@ -1062,6 +1062,41 @@ export const PoolObject = remote("meddle.pool", {
   },
 });
 
+/** A project on the removed list (`RemovedProject`): its id and the name it had, when it was removed and the node that removed it. */
+export const RemovedProjectSchema = Type.Object({
+  id: Type.String(), name: Type.String(), removedAt: Type.String(), removedBy: Type.String(),
+});
+
+/**
+ * The projects removed from the pool (`removed.ts`): a type of its own rather than members of `PoolObject`, so that a
+ * node binds an older peer's `PoolObject` all the same. A node of a meddle older than it does not serve it.
+ */
+export const RemovedProjectsObject = remote("meddle.removed-projects", {
+  version: 1,
+  input: Type.Object({}),
+  host: hostNamed("node"),
+  variants: {
+    /** Dashboards and the CLI (principal `local`, `cli`, …). */
+    default: {
+      state: {
+        /** The removed list, by when each project was removed, then its id. */
+        removed: Type.Array(RemovedProjectSchema),
+      },
+      methods: {
+        /** Removes project `id` from the pool and answers its entry on the removed list. */
+        remove: method(Type.Object({ id: Type.String() }), RemovedProjectSchema),
+      },
+    },
+    /** Other nodes (principal `peer:<nodeId>`), which merge the list into theirs. */
+    peer: {
+      state: {
+        /** The removed list, by when each project was removed, then its id. */
+        removed: Type.Array(RemovedProjectSchema),
+      },
+    },
+  },
+});
+
 export const UpdateStateSchema = Type.Union([
   Type.Literal("idle"), Type.Literal("staged"), Type.Literal("draining"), Type.Literal("swapped"), Type.Literal("healthy"),
   Type.Literal("failed"),

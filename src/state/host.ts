@@ -11,6 +11,7 @@ import type { PendingApproval } from "../engine/approvals";
 import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
 import { peerOf, remoteReason, servePool } from "../pool/object";
+import { serveRemovedProjects } from "../pool/removed-object";
 import type { PoolRuntime } from "../pool/runtime";
 import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
@@ -326,6 +327,13 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   const host = createHost({ name: "node", self: "node" });
   servePool(host, { ...pool.objectDeps, inputHold: deps.inputHold });
+  serveRemovedProjects(host, {
+    db,
+    inputHold: deps.inputHold,
+    remove: async () => {
+      throw new Error("not ready");
+    },
+  });
   servePeer(host, {
     cfg,
     db,
