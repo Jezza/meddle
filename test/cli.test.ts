@@ -12,8 +12,9 @@ import { pauseTrain } from "../src/train/train";
 import { updateFiles, writePending } from "../src/update/files";
 import { getTask, listTasks } from "../src/store/records";
 import { markToken, tokenId } from "../src/token";
-import { childEnv, closedPort, createTask, meddle, repoRoot } from "./helpers";
-import { linkClient, peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+import { initColocated, jj } from "../src/jj";
+import { childEnv, closedPort, createTask, meddle, replay, repoRoot, startServe } from "./helpers";
+import { linkClient, peerReady, POOL_ENV, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
 /** The env a CLI child runs with: no inherited MEDDLE_* and a port nothing listens on. */
 async function env() {
@@ -1006,3 +1007,59 @@ test("task accept, task unqueue and train pause or resume are refused while an u
     await rm(dir, { recursive: true, force: true });
   }
 }, 60_000);
+
+test("project remove removes and prints the project", async () => {
+  const dir = await mkdtemp("/tmp/meddle-cli-");
+  await mkdir(`${dir}/t`, { recursive: true });
+  for (const name of ["one", "two", "busy"]) {
+    await initColocated(`${dir}/${name}`);
+    await writeFile(`${dir}/${name}/README`, `${name}\n`);
+    await jj(["commit", "-m", "init"], `${dir}/${name}`);
+    await jj(["bookmark", "set", "main", "-r", "@-"], `${dir}/${name}`);
+  }
+  const base = {
+    HOME: dir,
+    MEDDLE_DATA_DIR: `${dir}/d`,
+    MEDDLE_TASK_ROOT: `${dir}/t`,
+    MEDDLE_CLAUDE_PATH: replay,
+    MEDDLE_CLAUDE_RUNTIME: "bun",
+    MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl`,
+    ...POOL_ENV,
+  };
+  await writeFile(`${dir}/token`, "tok\n");
+  expect((await meddle(["token", "set", "--file", `${dir}/token`], { ...base, MEDDLE_PORT: String(await closedPort()) })).code).toBe(0);
+  const node = await startServe({ ...base, MEDDLE_PORT: "0" });
+  const client = { ...base, MEDDLE_PORT: String(node.port) };
+  try {
+    const add = async (name: string) => (await meddle(["project", "add", `${dir}/${name}`, "--name", name], client)).stdout.trim();
+    const [one, two, busy] = [await add("one"), await add("two"), await add("busy")];
+
+    // By name: the line names it, and the list no longer does.
+    expect(await meddle(["project", "remove", "one"], client)).toEqual({ stdout: `removed ${shortId(one)} (one)\n`, stderr: "", code: 0 });
+    const listed = (await meddle(["project", "list"], client)).stdout;
+    expect(listed).not.toContain(one);
+    expect(listed).toContain(two);
+    // By id, once removed: the same line, and nothing else happens.
+    expect(await meddle(["project", "remove", one], client)).toEqual({ stdout: `removed ${shortId(one)} (one)\n`, stderr: "", code: 0 });
+    expect(await meddle(["project", "remove", two], client)).toEqual({ stdout: `removed ${shortId(two)} (two)\n`, stderr: "", code: 0 });
+    expect((await meddle(["project", "list"], client)).stdout).not.toContain(two);
+
+    const unknown = await meddle(["project", "remove", "nope"], client);
+    expect(unknown).toEqual({ stdout: "", stderr: "meddle: unknown project: nope\n", code: 1 });
+
+    // A project a task that is not archived uses is refused, and removable once the task is archived.
+    const created = await meddle(["task", "new", "--title", "t", "--project", busy], client);
+    expect(created.stderr).toBe("");
+    expect(created.code).toBe(0);
+    const taskId = /^task (\S+) on/.exec(created.stdout)![1]!;
+    const refused = await meddle(["project", "remove", "busy"], client);
+    expect(refused).toEqual({ stdout: "", stderr: `meddle: project busy is used by ${taskId}\n`, code: 1 });
+    expect((await meddle(["task", "archive", taskId], client)).code).toBe(0);
+    expect((await meddle(["project", "remove", "busy"], client)).stdout).toBe(`removed ${shortId(busy)} (busy)\n`);
+
+    expect((await meddle(["project", "remove"], client)).code).toBe(2);
+  } finally {
+    await node.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 120_000);

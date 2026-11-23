@@ -28,7 +28,7 @@ import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
 import { ensurePlugins, seedProfile } from "./profile";
 import { isTrainEvent, resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
-import { PoolObject, ProjectObject } from "./state/contracts";
+import { PoolObject, ProjectObject, RemovedProjectsObject } from "./state/contracts";
 import { createNodeHost, NodeObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
 import { attachCheckout, checkHelperOnPath, checkoutAt, colocate, fetchCheckout, makeCheckout, pushStart } from "./projects/checkouts";
@@ -74,6 +74,7 @@ const USAGE = `usage: meddle --version
        meddle project list
        meddle project set-default <id|name> <branch>
        meddle project status <id|name>
+       meddle project remove <id|name>
        meddle checkout <id|name> [<dir>]
        meddle task new [<prompt>] [--title <t>] [--project <id|name> [--rev <rev>] [--edit]]... [--node <id|prefix> | --here]
        meddle task list
@@ -841,6 +842,51 @@ function checkout(project: string, dir: string | undefined): Promise<number> {
   });
 }
 
+/**
+ * Removes project `project` (an id or name of the pool, or the id or id prefix of one already removed) from every node
+ * of the pool: refused `project <name> is used by <ids>` while a task of the pool that is not archived (or moved) holds
+ * it, then the node does the rest (`removeProject`). Prints `removed <short id> (<name>)`; a project already removed
+ * prints the same.
+ */
+function projectRemove(project: string): Promise<number> {
+  return withNode(async (client) => {
+    const pool = await poolView(client);
+    const list = await client.get(RemovedProjectsObject, {});
+    try {
+      if (list.variant !== "default") throw new Error("expected the default removed view");
+      const rows = poolProjects(pool.nodes.value);
+      let projectId: string | undefined;
+      let unresolved: Error | undefined;
+      try {
+        projectId = resolveProject(rows, project);
+      } catch (err) {
+        if (!(err as Error).message.startsWith("unknown project")) throw err;
+        unresolved = err as Error;
+      }
+      // A project the pool no longer lists may be on the removed list: by its id, or the start of exactly one.
+      const gone = (id: string | undefined) => list.removed.value.find((r) => r.id === id);
+      if (projectId === undefined || !rows.some((p) => p.id === projectId)) {
+        const ids = list.removed.value.map((r) => r.id);
+        const starts = ids.includes(project) ? [project] : project === "" ? [] : ids.filter((id) => id.startsWith(project));
+        if (starts.length > 1) throw new Error(`ambiguous project: ${project} (${starts.sort().join(", ")})`);
+        if (starts.length === 1) projectId = starts[0];
+        else if (unresolved !== undefined) throw unresolved;
+      }
+      const name = rows.find((p) => p.id === projectId)?.name;
+      if (name !== undefined && gone(projectId) === undefined) {
+        const used = (await collectTasks(client)).tasks.filter((t) => t.state !== "archived" && t.state !== "moved" && t.projectIds.includes(projectId!));
+        if (used.length > 0) throw new Error(`project ${name} is used by ${used.map((t) => t.id).join(", ")}`);
+      }
+      const removed = await list.remove({ id: projectId! });
+      console.log(`removed ${shortId(removed.id)} (${removed.name})`);
+      return 0;
+    } finally {
+      list.release();
+      pool.release();
+    }
+  });
+}
+
 /** One line per project of the pool, as the roster's summaries list them (`projectLine`). */
 function projectList(): Promise<number> {
   return withPool(async (pool) => {
@@ -930,7 +976,7 @@ function createTask(
 const REMOTE_TASKS_MS = 10_000;
 
 /** One task as `task list` prints it. */
-type TaskLine = { id: string; state: string; title: string; projects: string[]; createdAt: string };
+type TaskLine = { id: string; state: string; title: string; projects: string[]; projectIds: string[]; createdAt: string };
 
 /** The tasks on the node `host` serves: those that live there, then those archived there, each oldest first. */
 async function tasksOf(host: Host): Promise<TaskLine[]> {
@@ -946,7 +992,7 @@ async function tasksOf(host: Host): Promise<TaskLine[]> {
     const task = await host.get(TaskObject, { id });
     try {
       const m = task.manifest.value;
-      lines.push({ id, state: task.state.value, title: m.title, projects: m.projects.map((p) => p.name), createdAt: m.createdAt });
+      lines.push({ id, state: task.state.value, title: m.title, projects: m.projects.map((p) => p.name), projectIds: m.projects.map((p) => p.id), createdAt: m.createdAt });
     } finally {
       task.release();
     }
@@ -1760,6 +1806,7 @@ function route(args: string[]): (() => Promise<number>) | null {
     return parsed === null ? null : () => projectAdd(parsed.source, parsed.name, parsed.fetch);
   }
   if (command === "project" && sub === "set-default" && rest.length === 2) return () => projectSetDefault(rest[0]!, rest[1]!);
+  if (command === "project" && sub === "remove" && rest.length === 1) return () => projectRemove(rest[0]!);
   if (command === "checkout" && sub !== undefined && rest.length <= 1 && !sub.startsWith("--")) return () => checkout(sub, rest[0]);
   if (command === "project" && sub === "list" && rest.length === 0) return projectList;
   if (command === "project" && sub === "status" && rest.length === 1) return () => projectStatus(rest[0]!);

@@ -21,6 +21,12 @@ test("help, --help and -h print every command with what it does, on stdout", asy
   }
 });
 
+test("help lists project remove", async () => {
+  const out = await meddle(["help"], await env());
+  expect(out.stdout).toContain("  meddle project remove <id|name>\n      Remove a project from every node of the pool.");
+  expect((await meddle(["help", "project", "remove"], await env())).stdout).toStartWith("usage: meddle project remove <id|name>\n");
+});
+
 test("a command's help says what it does in full, asked either way; a group's lists its commands", async () => {
   const asked = await meddle(["help", "pool", "peer"], await env());
   const flag = await meddle(["pool", "peer", "--help"], await env());

@@ -248,6 +248,18 @@ const GROUPS: Group[] = [
           "held; jj says so, and `jj op log` gets them back. Needs the node running.",
       },
       {
+        name: "project remove",
+        usage: ["project remove <id|name>"],
+        summary: "Remove a project from every node of the pool.",
+        details:
+          "Refused while a task of the project that is not archived uses it (the message names them: archive or delete " +
+          "them first), and while a member of the pool runs an older meddle, which could not hear of it. Every node " +
+          "deletes the project's row, its service repo and memory, its line and branch rows and its train; a node that is " +
+          "offline does it when it reconnects, stopping and archiving any task of the project it still runs. Archived " +
+          "tasks of the project stay listed and cannot be restored. Checkouts are not touched. There is no undo, and no " +
+          "question first. Run again on a removed project (its id) it prints the same line. Needs the node running.",
+      },
+      {
         name: "checkout",
         usage: ["checkout <id|name> [<dir>]"],
         summary: "Clone a project from this node into a new checkout of your own.",
