@@ -34,8 +34,9 @@ export type ProjectChanges = {
   project: string;
   name: string;
   /**
-   * A local bookmark on a base commit (the project's default branch first, then any but a task's line, then a task's
-   * line), else the first base's short change id.
+   * What the line is on (`from`, or the task's base while the line is absent or conflicted), by a local bookmark the
+   * probe saw there (the project's default branch first, then any but a task's line, then another task's line), else by
+   * its short change id: once the line is rebased onto a newer default branch, that branch, not the base it started on.
    */
   start: string;
   /** Whether the line's bookmark is conflicted; its changes are then not listed. */
@@ -121,8 +122,8 @@ function baseRevset(p: ManifestProject): string {
 type ProbeRow = { name: string; conflicted: boolean; targets: string[] };
 
 /**
- * What `taskChanges` reads from in `p`: `rows`, the local bookmarks on the base commits (they name the start), the
- * task's line and the default branch, each with the commits it points at; `key`, the same twice for the same
+ * What `taskChanges` reads from in `p`: `rows`, the local bookmarks on the base commits, the task's line and the
+ * default branch (they name the start), each with the commits it points at; `key`, the same twice for the same
  * `ProjectChanges`.
  */
 export type ChangesProbe = { key: string; rows: ProbeRow[] };
@@ -163,11 +164,13 @@ export async function taskChanges(
 ): Promise<ProjectChanges> {
   const defaultBranch = options.defaultBranch ?? null;
   const { rows } = options.probe ?? await changesProbe(cfg, p, taskId, defaultBranch);
-  const lineRow = rows.find((r) => r.name === lineName(p, taskId));
-  const start = await startName(cfg, p, rows, defaultBranch);
+  const line = lineName(p, taskId);
+  const lineRow = rows.find((r) => r.name === line);
   const conflicted = lineRow?.conflicted === true;
   const at = lineRow?.targets[0];
-  if (at === undefined || conflicted) return { project: p.id, name: p.name, start, conflicted, from: null, changes: [] };
+  if (at === undefined || conflicted) {
+    return { project: p.id, name: p.name, start: await startName(cfg, p, rows, defaultBranch, line, null), conflicted, from: null, changes: [] };
+  }
   // The commits the probe saw, so that the list is the one its key stands for.
   const main = rows.find((r) => r.name === defaultBranch)?.targets ?? [];
   const range = `(${baseRevset(p)})..${at}${main.length === 0 ? "" : ` ~ ::(${main.join(" | ")})`}`;
@@ -175,6 +178,7 @@ export async function taskChanges(
     jj(["--ignore-working-copy", "log", "--no-graph", "--limit", String(CHANGES_MAX), "-r", range, "-T", CHANGE_TEMPLATE], p.replica, cfg),
     forkCommit(cfg, p, at, main),
   ]);
+  const start = await startName(cfg, p, rows, defaultBranch, line, from);
   const changes = listed.split("\n").filter(Boolean).map((row): TaskChange => {
     const [change = "", commit = "", files = "0", added = "0", removed = "0", empty = "", conflict = "", ...rest] = row.split(FIELD);
     return {
@@ -204,17 +208,22 @@ async function forkCommit(cfg: NodeConfig, p: ManifestProject, at: string, main:
 }
 
 /**
- * A local bookmark on a base commit (`defaultBranch` first, then any but a task's line, then a task's line, each by
- * name), from the probe's `rows`; else the first base's short change id.
+ * A local bookmark from the probe's `rows` on `from` (`forkCommit`), or on a base commit when it is null
+ * (`defaultBranch` first, then any but a task's line, then a task's line other than `line`, the task's own, each by
+ * name); else that commit's (the first base's) short change id. The probe lists the bookmarks on the base commits and
+ * the default branch, so that a line rebased onto the default branch is named by it.
  */
-async function startName(cfg: NodeConfig, p: ManifestProject, rows: readonly ProbeRow[], defaultBranch: string | null): Promise<string> {
+async function startName(
+  cfg: NodeConfig, p: ManifestProject, rows: readonly ProbeRow[], defaultBranch: string | null, line: string, from: string | null,
+): Promise<string> {
+  const on = from === null ? p.base : [from];
   const rank = (name: string) => (name === defaultBranch ? 0 : name.startsWith(TASK_BOOKMARKS) ? 2 : 1);
-  const named = rows.filter((r) => r.targets.some((c) => p.base.includes(c))).map((r) => r.name);
+  const named = rows.filter((r) => r.name !== line && r.targets.some((c) => on.includes(c))).map((r) => r.name);
   const first = named.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))[0];
   if (first !== undefined) return first;
-  const base = bases(p)[0];
-  if (base === undefined) return "root";
-  return (await jj(["--ignore-working-copy", "log", "--no-graph", "-r", base, "-T", "change_id.short(8)"], p.replica, cfg)).trim();
+  const commit = from ?? bases(p)[0];
+  if (commit === undefined || /^0+$/.test(commit)) return "root";
+  return (await jj(["--ignore-working-copy", "log", "--no-graph", "-r", revision(commit), "-T", "change_id.short(8)"], p.replica, cfg)).trim();
 }
 
 /**
