@@ -369,6 +369,18 @@ function Thread({ task, session, readOnly, working, turnLive, raw, agents, focus
     const el = scroller.current;
     if (el !== null && stick.current) el.scrollTop = el.scrollHeight;
   });
+  // So too when the thread's own box shrinks with nothing in it changing: the composer below grows after the thread
+  // has landed at the bottom, as it opens and with every line typed, and would cover the thread's last lines until the
+  // next render. The observer runs before the frame is painted, so no frame shows them covered.
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (el === null) return;
+    const keep = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    keep.observe(el);
+    return () => keep.disconnect();
+  }, []);
 
   // Earlier events load in one loop at a time, page by page, for as long as any of three reasons stands and earlier
   // events remain:
@@ -379,7 +391,9 @@ function Thread({ task, session, readOnly, working, turnLive, raw, agents, focus
   //   (which comes before the start) is in. The row opens as soon as they are, while the loop may go on for the rest.
   // A pick or new events while it loads lead the same loop on (it reads both afresh at each page). Each page goes
   // further back, so the loop ends. The pick standing when the view opened is not followed again. Loading above keeps
-  // the view at the bottom while you are there (`stick`).
+  // the view at the bottom while you are there (`stick`). The pages land in the thread together, when the loop ends or
+  // a pick's row is to open: one page at a time, the thread regroups and re-lands at the bottom at every page, and its
+  // text jitters for as long as a task with many agents takes to load.
   const latest = useRef(events);
   latest.current = events;
   const target = useRef(focus);
@@ -402,13 +416,20 @@ function Thread({ task, session, readOnly, working, turnLive, raw, agents, focus
     if (loading.current || (!onePage && picked() === null && (start === undefined || !missing))) return;
     loading.current = true;
     void action.run(async () => {
+      let pages: readonly LogEvent[] = [];
+      const show = () => {
+        const shown = pages;
+        if (shown.length > 0) setSeen((prev) => merged(prev, shown));
+      };
       try {
-        let pages: readonly LogEvent[] = [];
         const loaded = () => [...pages, ...latest.current];
         for (let from = start, asked = onePage; ; asked = false) {
           const pick = picked();
           const short = pick !== null && from !== undefined && (from > pick.seq || !holdsCall(loaded(), pick.holder));
-          if (pick !== null && !short) arrive(pick);
+          if (pick !== null && !short) {
+            show();
+            arrive(pick);
+          }
           if (from === undefined || !(asked || short || missingCalls(loaded()).length > 0)) break;
           const earlier = await session.loadEarlier({ beforeSeq: from, limit: EARLIER_PAGE });
           const next = earlier[0]?.seq;
@@ -417,11 +438,11 @@ function Thread({ task, session, readOnly, working, turnLive, raw, agents, focus
           if (last) setNoneEarlier(true);
           // The page you asked for shows where it lands, rather than the view staying at the bottom.
           if (asked) stick.current = false;
-          setSeen((prev) => merged(prev, earlier));
           pages = [...earlier, ...pages];
           from = last || next <= 1 ? undefined : next;
         }
       } finally {
+        show();
         loading.current = false;
         // A load that failed leaves its pick where it got to.
         const pick = picked();

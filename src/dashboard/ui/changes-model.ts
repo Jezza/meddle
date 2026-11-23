@@ -77,8 +77,7 @@ function byName(a: string, b: string): number {
   return x < y ? -1 : x > y ? 1 : a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** A change's row label: `Working copy`, else its description's first line, else its short change id. */
+/** A change's row label: its description's first line, else `Working copy` for the working copy, else its short change id. */
 export function changeLabel(c: TaskChange): string {
-  if (c.workingCopy) return "Working copy";
-  return c.description.split("\n")[0]!.trim() || c.change.slice(0, 8);
+  return c.description.split("\n")[0]!.trim() || (c.workingCopy ? "Working copy" : c.change.slice(0, 8));
 }
