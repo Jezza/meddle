@@ -60,7 +60,10 @@ type PeerView = {
 /** How a peer stands for the removed list (`PoolSync.removedSupport`). */
 export type RemovedSupport = "held" | "older" | "pending";
 
-/** Reported when this node could not hold a peer's PoolObject (it is tried again, with backoff, while the peer is online). */
+/**
+ * Reported when this node could not hold a peer's PoolObject, or its RemovedProjectsObject (each is tried again, with
+ * backoff, while the peer is online).
+ */
 export class HoldFailed extends Error {
   constructor(readonly peerId: string, message: string) {
     super(message);

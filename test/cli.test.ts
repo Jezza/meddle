@@ -594,6 +594,37 @@ test("a project is named by its id, its name, or a unique prefix of its id", asy
   expect(() => resolveProject(projects, "zz")).toThrow("unknown project: zz");
 });
 
+test("project remove names a project of the pool or a removed one, and refuses a prefix that starts both", async () => {
+  const { resolveRemovable } = await import("../src/pool/projects");
+  const projects = [
+    { id: "aaaa11112222", name: "alpha", home: "h", holders: [] },
+    { id: "cccc55556666", name: "aaab", home: "h", holders: [] },
+  ];
+  const removed = [
+    { id: "aaab33334444", name: "beta", removedAt: "2026-11-23T10:00:00.000Z", removedBy: "n" },
+    { id: "dddd77778888", name: "delta", removedAt: "2026-11-23T10:00:00.000Z", removedBy: "n" },
+    { id: "dddd99990000", name: "delta2", removedAt: "2026-11-23T10:00:00.000Z", removedBy: "n" },
+  ];
+  // A live project names itself: its tasks are checked.
+  expect(resolveRemovable(projects, removed, "alpha")).toEqual({ id: "aaaa11112222", name: "alpha" });
+  expect(resolveRemovable(projects, removed, "aaaa11112222")).toEqual({ id: "aaaa11112222", name: "alpha" });
+  expect(resolveRemovable(projects, removed, "aaaa1")).toEqual({ id: "aaaa11112222", name: "alpha" });
+  // A removed one by its id or a prefix of it alone: no name, nothing to check.
+  expect(resolveRemovable(projects, removed, "aaab33334444")).toEqual({ id: "aaab33334444", name: undefined });
+  expect(resolveRemovable(projects, removed, "aaab3")).toEqual({ id: "aaab33334444", name: undefined });
+  // A name wins over a prefix, as `resolveProject` has it.
+  expect(resolveRemovable(projects, removed, "aaab")).toEqual({ id: "cccc55556666", name: "aaab" });
+  // A prefix that starts a live id and a removed one, or two removed ones, is ambiguous.
+  expect(() => resolveRemovable(projects, removed, "aaa")).toThrow("ambiguous project: aaa (aaaa11112222, aaab33334444)");
+  expect(() => resolveRemovable(projects, removed, "dddd")).toThrow("ambiguous project: dddd (dddd77778888, dddd99990000)");
+  // An id the roster does not list yet passes through for the node to ask the members.
+  expect(resolveRemovable(projects, removed, "0123456789ab")).toEqual({ id: "0123456789ab", name: undefined });
+  expect(() => resolveRemovable(projects, removed, "zz")).toThrow("unknown project: zz");
+  // A project the roster still lists once removed: removed, nothing to check.
+  expect(resolveRemovable([...projects, { id: "aaab33334444", name: "beta", home: "h", holders: [] }], removed, "beta"))
+    .toEqual({ id: "aaab33334444", name: undefined });
+});
+
 /**
  * One pool node serving the CLI, with a checkout `co` of its project `a` cloned from it: `main` (P) there, then C (a
  * change with content on P) under the checkout's `@`, an empty change. `cli` runs `meddle` in the checkout.

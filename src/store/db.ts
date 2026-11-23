@@ -138,7 +138,7 @@ const MIGRATIONS = [
     held TEXT NOT NULL DEFAULT '{}',
     round TEXT
   )`,
-  // The projects removed from the pool (src/pool/removed.ts): add-only, the first entry for an id kept; a removed project's id is never used again.
+  // The projects removed from the pool (src/pool/removed.ts): add-only, the earliest entry for an id kept; a removed project's id is never used again.
   `CREATE TABLE IF NOT EXISTS removed_projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

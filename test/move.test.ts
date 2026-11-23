@@ -16,7 +16,7 @@ import { openDb } from "../src/store/db";
 import type { PoolRuntime } from "../src/pool/runtime";
 import type { NodeSummary } from "../src/pool/store";
 import { readArchive, runJanitor, writeArchive } from "../src/tasks/archive";
-import { TaskRunner } from "../src/tasks/durable";
+import { TaskRunner, type RunnerHooks } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
 import { markRemoved } from "../src/pool/removed";
 import { listLineRows, mergeLineRows, setQueued, writeBranchRow } from "../src/pool/rows";
@@ -1306,10 +1306,11 @@ test("a task left moving with no move in progress is live again when its node st
 }, 15_000);
 
 /**
- * A runner with a pool on a stand-in Harness whose `inspect` reports `tasks` (a task it is asked to abort leaves them):
- * what it was asked to abort, the turns it created and the lines it logged. Its rows are in an in-memory database.
+ * A runner with a pool on a stand-in Harness whose `inspect` reports `tasks` (a task it is asked to abort leaves them,
+ * unless `abortsEnd` is false): what it was asked to abort, the turns it created and the lines it logged. Its rows are
+ * in an in-memory database; `hooks` are the runner's.
  */
-async function standInRunner(tasks: unknown[]) {
+async function standInRunner(tasks: unknown[], options: { abortsEnd?: boolean; hooks?: RunnerHooks } = {}) {
   const home = await mkdtemp("/tmp/meddle-move-");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/d`, MEDDLE_TASK_ROOT: `${home}/t` });
   const db = openDb(":memory:");
@@ -1320,6 +1321,7 @@ async function standInRunner(tasks: unknown[]) {
     inspect: async () => ({ tasks }),
     abortTask: async (id: string) => {
       aborted.push(id);
+      if (options.abortsEnd === false) return "marked";
       const at = tasks.findIndex((t) => (t as { record: { id: string } }).record.id === id);
       if (at !== -1) tasks.splice(at, 1);
       return "marked";
@@ -1328,7 +1330,7 @@ async function standInRunner(tasks: unknown[]) {
   } as unknown as Harness;
   // Only what a runner reads of its pool as it starts: its id, and the peers coming online.
   const pool = { identity: { id: "a".repeat(64) }, net: { onPeer: () => () => {} } } as unknown as PoolRuntime;
-  const start = () => new TaskRunner(cfg, db, harness, { pool, log: (line) => logs.push(line) });
+  const start = () => new TaskRunner(cfg, db, harness, { pool, log: (line) => logs.push(line), ...(options.hooks === undefined ? {} : { hooks: options.hooks }) });
   return { home, db, aborted, created, logs, start };
 }
 
@@ -1469,6 +1471,24 @@ test("stopForRemoval defers a task while turns are held", async () => {
     await rm(node.home, { recursive: true, force: true });
   }
 });
+
+test("stopForRemoval gives up on a turn that does not end, and defers the task", async () => {
+  const node = await standInRunner([parkedTurn("t1")], { abortsEnd: false, hooks: { removalStopMs: 300 } });
+  try {
+    const runner = node.start();
+    standInTask(node, "t1", "running");
+    markStandInRemoved(node.db);
+    expect(await runner.stopForRemoval(REMOVED)).toEqual({ done: [], deferred: ["t1"] });
+    expect(node.aborted).toEqual(["turn-t1"]);
+    expect(node.logs).toContain("meddle: task t1: not stopped for removal: its turn did not end");
+    expect(getTask(node.db, "t1")).toMatchObject({ state: "running", archived_on: null });
+    // The reservation is released: an archive is refused for what the task is, not as one under way.
+    await expect(runner.archive("t1")).rejects.toThrow("task is running");
+  } finally {
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
+  }
+}, 5_000);
 
 test("a handoff run again after its move was rolled back here, with the task live again, rolls back instead of handing it over", async () => {
   const { A, B, close } = await twoPoolNodes();

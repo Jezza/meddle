@@ -22,7 +22,7 @@ import { findTaskPids, MetricsSampler } from "./metrics";
 import { isNodeId, loadOrCreateIdentity, shortId } from "./pool/identity";
 import { resolveId, resolveNodeId, uniquePrefixLengths } from "./pool/ids";
 import { DEFAULT_POOL_NAME, generateSecret, poolNameProblem, poolSecretProblem } from "./pool/secret";
-import { poolProjects, projectLine, resolveProject } from "./pool/projects";
+import { poolProjects, projectLine, resolveProject, resolveRemovable } from "./pool/projects";
 import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore } from "./pool/store";
@@ -258,7 +258,7 @@ async function serve(): Promise<number> {
     // to lift, after startup.
     const removal = { cfg, db, pool, runner };
     node.stopRemovedWatch = watchRemoved(removal);
-    void sweepRemoved(removal);
+    sweepRemoved(removal).catch((err: unknown) => console.error("meddle: removal sweep:", err));
     // Every project of the pool kept here, its rows applied to its service repo and view as they change.
     node.stopApplier = startApplier({ cfg, db, pool });
     node.stopTunnels = acceptDashboardStreams(pool.net, host, (id) => pool.store.isMember(id));
@@ -851,37 +851,23 @@ function checkout(project: string, dir: string | undefined): Promise<number> {
 function projectRemove(project: string): Promise<number> {
   return withNode(async (client) => {
     const pool = await poolView(client);
-    const list = await client.get(RemovedProjectsObject, {});
     try {
-      if (list.variant !== "default") throw new Error("expected the default removed view");
-      const rows = poolProjects(pool.nodes.value);
-      let projectId: string | undefined;
-      let unresolved: Error | undefined;
+      const list = await client.get(RemovedProjectsObject, {});
       try {
-        projectId = resolveProject(rows, project);
-      } catch (err) {
-        if (!(err as Error).message.startsWith("unknown project")) throw err;
-        unresolved = err as Error;
+        if (list.variant !== "default") throw new Error("expected the default removed view");
+        // A project the pool no longer lists may be on the removed list: by its id, or the start of it (`resolveRemovable`).
+        const { id, name } = resolveRemovable(poolProjects(pool.nodes.value), list.removed.value, project);
+        if (name !== undefined) {
+          const used = (await collectTasks(client)).tasks.filter((t) => t.state !== "archived" && t.state !== "moved" && t.projectIds.includes(id));
+          if (used.length > 0) throw new Error(`project ${name} is used by ${used.map((t) => t.id).join(", ")}`);
+        }
+        const removed = await list.remove({ id });
+        console.log(`removed ${shortId(removed.id)} (${removed.name})`);
+        return 0;
+      } finally {
+        list.release();
       }
-      // A project the pool no longer lists may be on the removed list: by its id, or the start of exactly one.
-      const gone = (id: string | undefined) => list.removed.value.find((r) => r.id === id);
-      if (projectId === undefined || !rows.some((p) => p.id === projectId)) {
-        const ids = list.removed.value.map((r) => r.id);
-        const starts = ids.includes(project) ? [project] : project === "" ? [] : ids.filter((id) => id.startsWith(project));
-        if (starts.length > 1) throw new Error(`ambiguous project: ${project} (${starts.sort().join(", ")})`);
-        if (starts.length === 1) projectId = starts[0];
-        else if (unresolved !== undefined) throw unresolved;
-      }
-      const name = rows.find((p) => p.id === projectId)?.name;
-      if (name !== undefined && gone(projectId) === undefined) {
-        const used = (await collectTasks(client)).tasks.filter((t) => t.state !== "archived" && t.state !== "moved" && t.projectIds.includes(projectId!));
-        if (used.length > 0) throw new Error(`project ${name} is used by ${used.map((t) => t.id).join(", ")}`);
-      }
-      const removed = await list.remove({ id: projectId! });
-      console.log(`removed ${shortId(removed.id)} (${removed.name})`);
-      return 0;
     } finally {
-      list.release();
       pool.release();
     }
   });

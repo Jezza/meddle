@@ -1,5 +1,6 @@
 // The removed list: the projects `meddle project remove` took out of the pool, carried in pool sync and relayed by every
-// node. It only grows: an id once on it stays, with the entry first written, so that every node settles on the same list.
+// node. It only grows: an id once on it stays, its entry the earliest heard of (by when it was removed, then by the node
+// that removed it), so that every node settles on the same list.
 // This file reads and writes the db and nothing else (`rows.ts` imports it), so that every check of a project can use it.
 import type { Database } from "bun:sqlite";
 import type { Subscribable } from "@earendil-works/chord";
@@ -65,7 +66,11 @@ export function markRemoved(db: Database, entry: RemovedProject): boolean {
   return inserted;
 }
 
-/** Adds the rows a peer sent that name a project not yet on the list, skipping any that is malformed; returns the ids added. */
+/**
+ * Adds the rows a peer sent that name a project not yet on the list, skipping any that is malformed, and puts a row in
+ * place of its id's entry when it was removed earlier (or at the same time, by a node of a smaller id); returns the ids
+ * added (not those whose entry was replaced).
+ */
 export function mergeRemoved(db: Database, rows: readonly RemovedProject[]): string[] {
   const ids: string[] = [];
   db.transaction(() => {
@@ -75,6 +80,11 @@ export function mergeRemoved(db: Database, rows: readonly RemovedProject[]): str
         typeof row.removedBy !== "string" || typeof row.removedAt !== "string" || !ISO_TIME.test(row.removedAt)
       ) continue;
       if (insert(db, row)) ids.push(row.id);
+      else {
+        db.query(
+          "UPDATE removed_projects SET name = ?2, removed_at = ?3, removed_by = ?4 WHERE id = ?1 AND (removed_at > ?3 OR (removed_at = ?3 AND removed_by > ?4))",
+        ).run(row.id, row.name, row.removedAt, row.removedBy);
+      }
     }
   }).immediate();
   tell(ids);

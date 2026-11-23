@@ -78,7 +78,7 @@ export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" 
  * taken for one this node must carry on. `train`: a turn of the merge train's (`trainTurn`), run in `auto` with
  * meddle's train tools, its prompt logged as meddle's; what it logged after `freshAfter` says how it went.
  */
-type TurnInput = {
+export type TurnInput = {
   taskId: string; prompt: string; attachments?: Attachment[]; freshAfter?: number; train?: { kind: TrainTurnKind };
 };
 /**
@@ -116,6 +116,8 @@ export type RunnerHooks = {
   trainTools?(taskId: string, tools: SdkMcpToolDefinition<any>[]): void;
   /** The time a move gives the target to answer `activateTask` (default 30 s). */
   callMs?: number;
+  /** The time a stop for a removed project (`stopForRemoval`) waits for each task's archive, move or turns to end (default 60 s). */
+  removalStopMs?: number;
   /**
    * Called as `trainTurn` starts, before anything else: an outcome it answers is the turn's, and no turn runs (a test
    * stands in for the agent so); undefined lets the turn run.
@@ -283,6 +285,8 @@ const ACCEPT_RETRY_MS = 15_000;
 const ACCEPT_TURN_POLL_MS = 500;
 /** How often a stop for a removed project (`stopForRemoval`) looks again for an archive, a move or a turn of the task gone. */
 const STOP_POLL_MS = 250;
+/** How long a stop for a removed project waits for a task's archive, move or turns to end before it defers the task. */
+const STOP_FOR_REMOVAL_MS = 60_000;
 
 /** The key that serialises a task's receive, import, activation and abandonment (exported for tests). */
 export function taskKey(taskId: string): string {
@@ -523,6 +527,9 @@ export class TaskRunner {
         const at = await awaitLine(deps, start.projectId, taskId, project.name, AWAIT_LINE_MS, { withBase: true });
         if (at !== start.commit) throw new Error(`the line of ${project.name} is not at ${start.commit.slice(0, 12)}`);
       }
+      // A removal merged while the lines were awaited (its entry is written without the lock): refused before the task is.
+      const late = this.#removedProblem(projectIds);
+      if (late !== null) throw new Error(late);
       const manifest = await provisionTask(this.#cfg, this.#db, {
         title: input.title, taskId, starts, ...(input.merge === undefined ? {} : { merge: input.merge }),
       });
@@ -1854,9 +1861,15 @@ export class TaskRunner {
    * its queue is dropped (the live turn's steers taken back too); a move of it is cancelled, or waited for once too late
    * to cancel; each of its turns in the Harness is aborted (`#cutTurns`); and it is archived (`#archive`, forced).
    * `deferred` when a pool update holds turns while it has one (the Harness only marks the abort then), or its row
-   * says `moving` with no move of it here (parked in `commit`: the target may have it); the reservation is released.
+   * says `moving` with no move of it here (parked in `commit`: the target may have it), or what it waits for has not
+   * ended `STOP_FOR_REMOVAL_MS` after it began (logged); the reservation is released.
    */
   async #stopTask(taskId: string): Promise<"done" | "deferred" | "left"> {
+    const deadline = Date.now() + (this.#deps.hooks?.removalStopMs ?? STOP_FOR_REMOVAL_MS);
+    const giveUp = (why: string): "deferred" => {
+      this.#log(`meddle: task ${taskId}: not stopped for removal: ${why}`);
+      return "deferred";
+    };
     for (;;) {
       const row = getTask(this.#db, taskId);
       if (row === null || row.state === "archived" || row.state === "moved") return "left";
@@ -1878,6 +1891,7 @@ export class TaskRunner {
       });
       if (reserved) break;
       // An archive under way: the task is looked at again once it is over.
+      if (Date.now() >= deadline) return giveUp("its archive did not end");
       await Bun.sleep(STOP_POLL_MS);
     }
     try {
@@ -1885,12 +1899,17 @@ export class TaskRunner {
       if (this.#isMoving(this.#row(taskId))) {
         // Refused once too late (or with no move of it here): what the move comes to is waited for all the same.
         await this.cancelMove(taskId).catch(() => {});
-        while (this.#moving.has(taskId)) await Bun.sleep(STOP_POLL_MS);
+        while (this.#moving.has(taskId)) {
+          if (Date.now() >= deadline) return giveUp("its move did not end");
+          await Bun.sleep(STOP_POLL_MS);
+        }
         const state = getTask(this.#db, taskId)?.state;
         if (state === undefined || state === "moved" || state === "archived") return "left";
         if (state === "moving") return "deferred";
       }
-      if (!(await this.#cutTurns(taskId))) return "deferred";
+      const cut = await this.#cutTurns(taskId, deadline);
+      if (cut === "held") return "deferred";
+      if (cut === "late") return giveUp("its turn did not end");
       // Steers the cut turn ended without are put back in front of the queue (`#requeueFront`).
       await this.#dropQueue(taskId);
       await this.#archive(taskId, false, { force: true });
@@ -1908,11 +1927,12 @@ export class TaskRunner {
   }
 
   /**
-   * Aborts each turn of task `taskId` the Harness holds (parked, durable or live) and waits until it holds none; the
-   * turn's reservation (`#pending`), which an aborted turn never clears, goes then. False, without waiting, when a pool
-   * update holds turns while there is one: the Harness only marks its abort, to run once it runs again.
+   * Aborts each turn of task `taskId` the Harness holds (parked, durable or live) and waits until it holds none (`cut`);
+   * the turn's reservation (`#pending`), which an aborted turn never clears, goes then. `held`, without waiting, when a
+   * pool update holds turns while there is one: the Harness only marks its abort, to run once it runs again. `late` when
+   * there is one still at `deadline`.
    */
-  async #cutTurns(taskId: string): Promise<boolean> {
+  async #cutTurns(taskId: string, deadline: number): Promise<"cut" | "held" | "late"> {
     const aborted = new Set<TaskInspection["record"]["id"]>();
     for (;;) {
       // A turn `startQueued` is creating (begun before the reservation) is in the Harness once it is made.
@@ -1926,12 +1946,13 @@ export class TaskRunner {
           aborted.add(t.record.id);
           await this.#harness.abortTask(t.record.id, BACKGROUND_CONTEXT);
         }
-        if (this.#holds.turns !== null) return false;
+        if (this.#holds.turns !== null) return "held";
       }
+      if (Date.now() >= deadline) return "late";
       await Bun.sleep(STOP_POLL_MS);
     }
     this.#pending.delete(taskId);
-    return true;
+    return "cut";
   }
 
   /**
@@ -3080,7 +3101,7 @@ export class TaskRunner {
 }
 
 /** Whether task `row`'s manifest names project `projectId`. */
-function manifestNames(row: TaskRow, projectId: string): boolean {
+export function manifestNames(row: TaskRow, projectId: string): boolean {
   try {
     return (JSON.parse(row.manifest) as TaskManifest).projects.some((p) => p.id === projectId);
   } catch {

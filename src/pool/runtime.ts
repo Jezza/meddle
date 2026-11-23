@@ -111,7 +111,7 @@ function keyOf(pool: PoolIdentity): PoolKey | null {
  * `lighthouse.url` applies live unless `MEDDLE_LIGHTHOUSE_URL` is set). Logs (`meddle: discovery: …` and
  * `meddle: pool: …`, each distinct message at most once a minute) discovery errors and why a member cannot be reached:
  * dial failures, admission timeouts, a peer that did not prove the secret, refusals that persist, a removal learned
- * from a refusal, and a peer's PoolObject that could not be held. A healthy pool logs nothing.
+ * from a refusal, and a peer's PoolObject or RemovedProjectsObject that could not be held. A healthy pool logs nothing.
  */
 export async function startPool(cfg: NodeConfig, db: Database, summary: PoolSummaryDeps, hooks: PoolHooks = {}): Promise<PoolRuntime> {
   const identity = await loadOrCreateIdentity(cfg);

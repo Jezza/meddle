@@ -4,19 +4,19 @@
 // each test starts `watchRemoved` on its nodes itself.
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { hostname } from "node:os";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry } from "@earendil-works/pi-durable";
 import { paths } from "../src/config";
 import { shortId } from "../src/pool/ids";
 import { isRemoved, listRemoved, markRemoved, mergeRemoved } from "../src/pool/removed";
-import { listLineRows } from "../src/pool/rows";
+import { listLineRows, rowChanges } from "../src/pool/rows";
 import { getProject } from "../src/projects/project";
 import { cleanupRemoved, removeProject, sweepRemoved, watchRemoved, type RemovalDeps } from "../src/projects/removal";
 import { createNodeHost } from "../src/state/host";
 import { listEvents } from "../src/store/events";
-import { getTask, queuedOf } from "../src/store/records";
+import { getTask, queuedOf, updateTask } from "../src/store/records";
 import { TaskRunner } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
 import { pauseTrain } from "../src/train/train";
@@ -173,11 +173,11 @@ test("a live task blocks removal", async () => {
     const m = await createTask(B, { title: "t", projectIds: [P] });
     await waitFor("A to hold the task's lines", () => listLineRows(A.db, P).some((r) => r.task === m.id));
     await expect(removeProject(removal(A), P)).rejects.toThrow(`project ${A.project.name} is used by ${m.id}`);
-    // A member that does not hold the removed list (an older meddle, or one not answered yet) refuses it first.
+    // A member that does not hold the removed list refuses it first: an older meddle, or one that has not answered yet.
     const older: RemovalDeps = { ...removal(A), pool: { ...A.pool, removedSupport: () => "older" } };
     await expect(removeProject(older, P)).rejects.toThrow(`${shortId(B.id)} (${hostname()}) runs an older meddle`);
     const pending: RemovalDeps = { ...removal(A), pool: { ...A.pool, removedSupport: () => "pending" } };
-    await expect(removeProject(pending, P)).rejects.toThrow(`${shortId(B.id)} (${hostname()}) runs an older meddle`);
+    await expect(removeProject(pending, P)).rejects.toThrow(`${shortId(B.id)} (${hostname()}) has not answered yet; try again`);
     expect(isRemoved(A.db, P)).toBe(false);
     expect(leftOf(A, P)).toMatchObject({ row: true, replica: true });
   } finally {
@@ -304,5 +304,54 @@ test("a removal on another node in the process does nothing here", async () => {
       n.db.close();
       await rm(n.home, { recursive: true, force: true });
     }
+  }
+}, 60_000);
+
+test("a sweep passes over a removed project with nothing left here, and cleans up one with something left", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  const told: string[] = [];
+  const off = rowChanges.subscribe((id) => told.push(id));
+  try {
+    const P = A.project.id;
+    await removeProject(removal(A), P);
+    expect(leftOf(A, P)).toEqual(NOTHING);
+    told.length = 0;
+    // Nothing of it left: no cleanup runs, so no rows are deleted (and told) again.
+    await sweepRemoved(removal(A));
+    expect(told.filter((id) => id === P)).toEqual([]);
+    // Its service repo's folder left behind: cleaned up.
+    await mkdir(paths(A.cfg).replica(P), { recursive: true });
+    await sweepRemoved(removal(A));
+    expect(existsSync(paths(A.cfg).replica(P))).toBe(false);
+    expect(told.filter((id) => id === P)).toEqual([P]);
+    expect(cleanupFailures(A)).toEqual([]);
+  } finally {
+    off();
+    await close();
+  }
+}, 60_000);
+
+test("a cleanup that deferred a task is run again until the task is stopped", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  const stop = watchRemoved(removal(A), { retryMs: 200 });
+  try {
+    const P = A.project.id;
+    const m = await createTask(A, { title: "t", projectIds: [P] });
+    // Its row says moving with no move of it here (parked in commit): the cleanup defers it.
+    updateTask(A.db, m.id, { state: "moving" });
+    markRemoved(A.db, { id: P, name: A.project.name, removedAt: new Date().toISOString(), removedBy: A.id });
+    await Bun.sleep(1000);
+    expect(leftOf(A, P)).toMatchObject({ row: true, replica: true });
+    expect(getTask(A.db, m.id)?.state).toBe("moving");
+    // The move is over, the task live here again: the next run stops it and finishes the cleanup.
+    updateTask(A.db, m.id, { state: "idle" });
+    await waitFor("the project gone once the task is stopped", () => JSON.stringify(leftOf(A, P)) === JSON.stringify(NOTHING), 10_000);
+    expect(getTask(A.db, m.id)?.state).toBe("archived");
+    expect(cleanupFailures(A)).toEqual([]);
+  } finally {
+    stop();
+    await close();
   }
 }, 60_000);

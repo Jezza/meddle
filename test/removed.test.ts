@@ -45,3 +45,25 @@ test("removedChanges tells each new id", () => {
   mergeRemoved(db, [entry("c")]);
   expect(told).toEqual(["a", "b"]);
 });
+
+test("mergeRemoved settles on the earliest entry of an id, then the one of the smaller node id, in any order", () => {
+  const early = entry("a", { name: "early", removedAt: "2026-11-23T09:00:00.000Z" });
+  const late = entry("a", { name: "late", removedAt: "2026-11-23T10:00:00.000Z" });
+  const low = entry("b", { name: "low", removedBy: "0".repeat(64) });
+  const high = entry("b", { name: "high" });
+  for (const order of [[early, late, high, low], [late, early, low, high]]) {
+    const db = openDb(":memory:");
+    const told: string[] = [];
+    const stop = removedChanges.subscribe((id) => told.push(id));
+    const added = order.flatMap((e) => mergeRemoved(db, [e]));
+    stop();
+    expect(listRemoved(db)).toEqual([early, low]);
+    // A replaced entry is not a new id.
+    expect(added).toEqual(["a", "b"]);
+    expect(told).toEqual(["a", "b"]);
+  }
+  // Both in one batch too.
+  const db = openDb(":memory:");
+  expect(mergeRemoved(db, [late, high, early, low])).toEqual(["a", "b"]);
+  expect(listRemoved(db)).toEqual([early, low]);
+});

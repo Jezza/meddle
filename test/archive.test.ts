@@ -11,7 +11,7 @@ import { promptEvent } from "../src/engine/session";
 import { bookmarkList, git, jj, JjError, workspaceConfigPath } from "../src/jj";
 import { shortId } from "../src/pool/ids";
 import { markRemoved } from "../src/pool/removed";
-import { listLineRows, setQueued, writeBranchRow } from "../src/pool/rows";
+import { listLineRows, setQueued, writeBranchRow, writeLineRow } from "../src/pool/rows";
 import { withProjectLocks } from "../src/projects/locks";
 import { resolveStarts } from "../src/projects/starts";
 import { NodeObject, SessionObject, TaskObject } from "../src/state/contracts";
@@ -488,6 +488,27 @@ test("create waits for a removal under way and then refuses", async () => {
     removeProject(A);
     held.resolve();
     await removal;
+    expect(await outcome).toContain(`project ${shortId(A.project.id)} was removed`);
+    expect(getTask(A.db, taskId)).toBeNull();
+  } finally {
+    await close();
+  }
+}, 20_000);
+
+test("create refuses a removal that landed while it waited for its line", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const taskId = newId();
+    const starts = await resolveStarts({ cfg: A.cfg, db: A.db, selfId: A.id, pool: A.pool }, taskId, [{ id: A.project.id }]);
+    // The line's row not here yet: the create waits for it, holding the project's lock.
+    const [row] = listLineRows(A.db, A.project.id, taskId);
+    A.db.query("DELETE FROM line_rows WHERE task = ?").run(taskId);
+    const outcome = A.runner.create({ title: "t", taskId, starts }).then(() => "created", (err: unknown) => String(err));
+    expect(await Promise.race([outcome, Bun.sleep(500).then(() => "waiting")])).toBe("waiting");
+    // The row arrives, and the removal with it.
+    writeLineRow(A.db, row!);
+    removeProject(A);
     expect(await outcome).toContain(`project ${shortId(A.project.id)} was removed`);
     expect(getTask(A.db, taskId)).toBeNull();
   } finally {

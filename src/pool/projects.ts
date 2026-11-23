@@ -1,6 +1,7 @@
 // The pool's projects as the roster lists them: `meddle project list` and `--project <id|name>`. Pure: they read what
 // each node's summary says (decision 6), never a peer.
 import { shortId } from "./ids";
+import type { RemovedProject } from "./removed";
 
 /** A node of the roster as `PoolObject.nodes` gives it: its status and the projects its summary lists. */
 export type ProjectHolder = { nodeId: string; status: string; projects: ReadonlyArray<{ id: string; name: string; home: string }> };
@@ -55,4 +56,22 @@ export function resolveProject(projects: readonly PoolProject[], x: string): str
   if (prefixed.length === 1) return prefixed[0]!.id;
   if (prefixed.length > 1) throw new Error(`ambiguous project: ${x} (${prefixed.map((p) => p.id).sort().join(", ")})`);
   throw new Error(`unknown project: ${x}`);
+}
+
+/**
+ * The project `x` names for `meddle project remove`: one of the pool (`resolveProject`), or one on the removed list, by
+ * its id or the start of its id; `name` is the pool's name for it, none for a removed one (nothing of it to check). A
+ * start of an id that is neither an id nor a name of the pool is refused `ambiguous project: <x> (<ids>)` when it starts
+ * several ids of the pool and the removed list together.
+ */
+export function resolveRemovable(projects: readonly PoolProject[], removed: readonly RemovedProject[], x: string): { id: string; name: string | undefined } {
+  const gone = new Set(removed.map((r) => r.id));
+  const named = (id: string) => ({ id, name: gone.has(id) ? undefined : projects.find((p) => p.id === id)?.name });
+  if (gone.has(x)) return named(x);
+  if (x !== "" && !projects.some((p) => p.id === x || p.name === x)) {
+    const starts = [...new Set([...projects.map((p) => p.id), ...gone])].filter((id) => id.startsWith(x));
+    if (starts.length > 1) throw new Error(`ambiguous project: ${x} (${starts.sort().join(", ")})`);
+    if (starts.length === 1) return named(starts[0]!);
+  }
+  return named(resolveProject(projects, x));
 }
