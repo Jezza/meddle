@@ -18,6 +18,7 @@ import type { NodeSummary } from "../src/pool/store";
 import { readArchive, runJanitor, writeArchive } from "../src/tasks/archive";
 import { TaskRunner } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
+import { markRemoved } from "../src/pool/removed";
 import { listLineRows, mergeLineRows, setQueued, writeBranchRow } from "../src/pool/rows";
 import { readManifest, sideBookmark, transcriptPath, type TaskManifest } from "../src/tasks/manifest";
 import { MOVE_NOW_FOLLOW_UP } from "../src/tasks/move";
@@ -1305,8 +1306,8 @@ test("a task left moving with no move in progress is live again when its node st
 }, 15_000);
 
 /**
- * A runner with a pool on a stand-in Harness whose `inspect` reports `tasks`: what it was asked to abort, the turns it
- * created and the lines it logged. Its rows are in an in-memory database.
+ * A runner with a pool on a stand-in Harness whose `inspect` reports `tasks` (a task it is asked to abort leaves them):
+ * what it was asked to abort, the turns it created and the lines it logged. Its rows are in an in-memory database.
  */
 async function standInRunner(tasks: unknown[]) {
   const home = await mkdtemp("/tmp/meddle-move-");
@@ -1317,7 +1318,12 @@ async function standInRunner(tasks: unknown[]) {
   const logs: string[] = [];
   const harness = {
     inspect: async () => ({ tasks }),
-    abortTask: async (id: string) => { aborted.push(id); return "marked"; },
+    abortTask: async (id: string) => {
+      aborted.push(id);
+      const at = tasks.findIndex((t) => (t as { record: { id: string } }).record.id === id);
+      if (at !== -1) tasks.splice(at, 1);
+      return "marked";
+    },
     root: async () => ({ commit: async (fn: (tx: unknown) => unknown) => fn({ createTask: (_def: unknown, input: unknown) => { created.push(input); } }) }),
   } as unknown as Harness;
   // Only what a runner reads of its pool as it starts: its id, and the peers coming online.
@@ -1370,6 +1376,91 @@ test("a move parked before the receipt is released when its node starts; one par
     expect(node.created).toHaveLength(2);
     expect(node.created).toContainEqual({ taskId: "prepare", prompt: "after prepare", attachments: [] });
     expect(node.created).toContainEqual({ taskId: "handoff", prompt: "after handoff", attachments: [] });
+  } finally {
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
+  }
+});
+
+/** The project the stand-in runner's tasks below are of, and another. */
+const REMOVED = "e".repeat(64);
+const KEPT = "f".repeat(64);
+
+/** Inserts task `id` of project `projectId` in state `state` into the stand-in runner's rows. */
+function standInTask(node: { home: string; db: ReturnType<typeof openDb> }, id: string, state: string, projectId = REMOVED): void {
+  const manifest: TaskManifest = {
+    id, title: id, sessionId: `s-${id}`, primaryProjectId: projectId, createdAt: new Date().toISOString(),
+    projects: [{ id: projectId, name: "p", replica: join(node.home, "replica"), workspace: "p", parent: "0".repeat(40), base: [], context: null }],
+  };
+  insertTask(node.db, { id, title: id, state, session_id: `s-${id}`, manifest: JSON.stringify(manifest), started: 1, turns: 1 });
+}
+
+/** A `meddle.turn` of task `taskId` the restart limit parked. */
+function parkedTurn(taskId: string) {
+  return {
+    record: { id: `turn-${taskId}`, kind: "meddle.turn", input: { taskId, prompt: "p" }, state: { status: "pending" } },
+    state: { kind: "blocked", reason: "restart_limit" },
+  };
+}
+
+function markStandInRemoved(db: ReturnType<typeof openDb>): void {
+  markRemoved(db, { id: REMOVED, name: "p", removedAt: new Date().toISOString(), removedBy: "a".repeat(64) });
+}
+
+test("stopForRemoval aborts a parked turn", async () => {
+  const node = await standInRunner([parkedTurn("t1")]);
+  try {
+    const runner = node.start();
+    standInTask(node, "t1", "running");
+    updateTask(node.db, "t1", { queued: JSON.stringify(["after it"]) });
+    markStandInRemoved(node.db);
+    expect(await runner.stopForRemoval(REMOVED)).toEqual({ done: ["t1"], deferred: [] });
+    expect(node.aborted).toEqual(["turn-t1"]);
+    expect(getTask(node.db, "t1")).toMatchObject({ state: "archived", queued: null });
+    // No turn started for what was queued.
+    expect(node.created).toEqual([]);
+  } finally {
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
+  }
+});
+
+test("stopForRemoval discards a task being received and leaves a moved one", async () => {
+  const node = await standInRunner([]);
+  try {
+    const runner = node.start();
+    standInTask(node, "receiving", "receiving");
+    updateTask(node.db, "receiving", { receiving_from: "b".repeat(64) });
+    standInTask(node, "moved", "moved");
+    updateTask(node.db, "moved", { moved_to: "b".repeat(64) });
+    standInTask(node, "archived", "archived");
+    standInTask(node, "other", "idle", KEPT);
+    markStandInRemoved(node.db);
+    expect(await runner.stopForRemoval(REMOVED)).toEqual({ done: ["receiving"], deferred: [] });
+    expect(getTask(node.db, "receiving")).toBeNull();
+    expect(getTask(node.db, "moved")).toMatchObject({ state: "moved", moved_to: "b".repeat(64) });
+    expect(getTask(node.db, "archived")).toMatchObject({ state: "archived" });
+    expect(getTask(node.db, "other")).toMatchObject({ state: "idle" });
+    expect(node.aborted).toEqual([]);
+  } finally {
+    node.db.close();
+    await rm(node.home, { recursive: true, force: true });
+  }
+});
+
+test("stopForRemoval defers a task while turns are held", async () => {
+  const node = await standInRunner([parkedTurn("t1")]);
+  try {
+    const runner = node.start();
+    runner.setHolds({ turns: "x", work: null, hosting: null });
+    standInTask(node, "t1", "running");
+    markStandInRemoved(node.db);
+    expect(await runner.stopForRemoval(REMOVED)).toEqual({ done: [], deferred: ["t1"] });
+    // Its abort is marked, to be run once the Harness runs again.
+    expect(node.aborted).toEqual(["turn-t1"]);
+    expect(getTask(node.db, "t1")).toMatchObject({ state: "running", archived_on: null });
+    // The reservation is released: an archive is refused for what the task is, not as one under way.
+    await expect(runner.archive("t1")).rejects.toThrow("task is running");
   } finally {
     node.db.close();
     await rm(node.home, { recursive: true, force: true });

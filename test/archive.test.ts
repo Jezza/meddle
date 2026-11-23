@@ -10,10 +10,13 @@ import { paths } from "../src/config";
 import { promptEvent } from "../src/engine/session";
 import { bookmarkList, git, jj, JjError, workspaceConfigPath } from "../src/jj";
 import { shortId } from "../src/pool/ids";
+import { markRemoved } from "../src/pool/removed";
 import { listLineRows, writeBranchRow } from "../src/pool/rows";
+import { withProjectLocks } from "../src/projects/locks";
+import { resolveStarts } from "../src/projects/starts";
 import { NodeObject, SessionObject, TaskObject } from "../src/state/contracts";
 import { appendEvent, listEvents } from "../src/store/events";
-import { getTask, listArchivedTasks, listLiveTasks, updateTask } from "../src/store/records";
+import { getTask, listArchivedTasks, listLiveTasks, newId, queuedOf, updateTask } from "../src/store/records";
 import { readArchive, sweepArchiveTemps, writeArchive } from "../src/tasks/archive";
 import { ALPN_POOL, StreamReader } from "../src/pool/frames";
 import { exportArchive, exportTask, importTask, type Receipt } from "../src/tasks/transfer";
@@ -395,6 +398,89 @@ test("archiving is refused while a turn runs, while prompts are queued, and whil
     updateTask(A.db, m.id, { state: "idle" });
     expect(existsSync(join(paths(A.cfg).task(m.id), "a"))).toBe(true);
     expect(getTask(A.db, m.id)!.archived_on).toBeNull();
+  } finally {
+    await close();
+  }
+}, 20_000);
+
+/** Puts project `node.project` on `node`'s removed list. */
+function removeProject(node: GitPoolNode): void {
+  markRemoved(node.db, { id: node.project.id, name: node.project.name, removedAt: new Date().toISOString(), removedBy: node.id });
+}
+
+test("stopForRemoval cuts a running turn off, drops the queue and archives", async () => {
+  const { nodes, close } = await poolNodes(1, { nodes: [{ extraEnv: { MEDDLE_FIXTURE_STALL: "1" } }] });
+  const A = nodes[0]!;
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    // By its init, the stand-in has read the prompt and stalls before its result until interrupted.
+    const initialised = new Promise<void>((res) => {
+      const off = A.runner.onEvent((id, _seq, msg) => {
+        if (id === m.id && msg.type === "system" && (msg as { subtype?: string }).subtype === "init") { off(); res(); }
+      });
+    });
+    await A.runner.prompt(m.id, "Stall.");
+    await initialised;
+    expect(await A.runner.prompt(m.id, "later")).toBe("queued");
+    expect(A.runner.queued(m.id)).toHaveLength(1);
+    const logged = countRows(A, m).events;
+
+    removeProject(A);
+    expect(await A.runner.stopForRemoval(A.project.id)).toEqual({ done: [m.id], deferred: [] });
+    const row = getTask(A.db, m.id)!;
+    expect(row.state).toBe("archived");
+    expect(queuedOf(row)).toEqual([]);
+    expect(A.runner.queued(m.id)).toEqual([]);
+    const { tasks } = await A.harness.harness.inspect(BACKGROUND_CONTEXT);
+    const turns = tasks.filter((t) => t.record.kind === "meddle.turn" && t.record.state.status !== "terminal");
+    expect(turns).toEqual([]);
+    expect(A.runner.liveQuery(m.id)).toBeNull();
+    // Its log stays readable, its archive written.
+    expect(listEvents(A.db, m.id).length).toBeGreaterThanOrEqual(logged);
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(true);
+    expect(existsSync(paths(A.cfg).task(m.id))).toBe(false);
+    // Nothing more to stop: an archived task is left alone.
+    expect(await A.runner.stopForRemoval(A.project.id)).toEqual({ done: [], deferred: [] });
+  } finally {
+    await close();
+  }
+}, 30_000);
+
+test("a task of a removed project cannot be restored", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const m = await createTask(A, { title: "t", projectIds: [A.project.id] });
+    await A.runner.archive(m.id);
+    removeProject(A);
+    const refusal = `project ${A.project.name} was removed`;
+    await expect(A.runner.restore(m.id, null)).rejects.toThrow(refusal);
+    await expect(A.runner.restore(m.id, "here")).rejects.toThrow(refusal);
+    await expect(A.runner.restoreHere(m.id)).rejects.toThrow(refusal);
+    expect(getTask(A.db, m.id)!.state).toBe("archived");
+    expect(existsSync(paths(A.cfg).archiveFile(m.id))).toBe(true);
+  } finally {
+    await close();
+  }
+}, 20_000);
+
+test("create waits for a removal under way and then refuses", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const A = nodes[0]!;
+  try {
+    const taskId = newId();
+    const starts = await resolveStarts({ cfg: A.cfg, db: A.db, selfId: A.id, pool: A.pool }, taskId, [{ id: A.project.id }]);
+    const held = Promise.withResolvers<void>();
+    const removal = withProjectLocks([A.project.id], () => held.promise);
+    const created = A.runner.create({ title: "t", taskId, starts });
+    const outcome = created.then(() => "created", (err: unknown) => String(err));
+    // Time enough for a create that does not wait to get past its checks.
+    expect(await Promise.race([outcome, Bun.sleep(500).then(() => "waiting")])).toBe("waiting");
+    removeProject(A);
+    held.resolve();
+    await removal;
+    expect(await outcome).toContain(`project ${shortId(A.project.id)} was removed`);
+    expect(getTask(A.db, taskId)).toBeNull();
   } finally {
     await close();
   }

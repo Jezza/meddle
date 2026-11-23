@@ -30,8 +30,10 @@ import { getProject, listProjects, type Project } from "../projects/project";
 import { defaultBranchCommit } from "../projects/starts";
 import { awaitLine, holdLineRows, reclaimLineRows, releaseLineRows, writeLineRows } from "../projects/lines";
 import { branchChanges, lineChanges, listLineRows, mergeLineRows, setQueued, writeLineRow, type LineRow, type LineRowIn } from "../pool/rows";
+import { withProjectLocks } from "../projects/locks";
 import { ensureServiceRepo, type ReplicaDeps } from "../projects/replicas";
 import { place, placementCandidates } from "../pool/placement";
+import { isRemoved } from "../pool/removed";
 import {
   appendEvent, lastSeq, latestEventOfType, listEventsBetween, listEventsOfKinds, listEventsTail, listPromptAttachments,
   type EventRecord,
@@ -279,6 +281,8 @@ const LINE_DEBOUNCE_MS = 5000;
 const ACCEPT_RETRY_MS = 15_000;
 /** How often an accepted idle task whose turn the Harness still holds (a failed turn) looks again for it gone. */
 const ACCEPT_TURN_POLL_MS = 500;
+/** How often a stop for a removed project (`stopForRemoval`) looks again for an archive, a move or a turn of the task gone. */
+const STOP_POLL_MS = 250;
 
 /** The key that serialises a task's receive, import, activation and abandonment (exported for tests). */
 export function taskKey(taskId: string): string {
@@ -495,7 +499,8 @@ export class TaskRunner {
    * epoch up, and applies the project (which forgets the line's remote ref now that the task's own bookmark holds it).
    * A merge task of the merge train (`merge`, on a start with parents) writes its lines from its workspace at once, so
    * that its line names the merge it starts on, not the merge's first parent. Refused for an id that is not one path
-   * segment, or that a task here already has.
+   * segment, or that a task here already has, and (`project <short id> was removed`) for a removed project: checked
+   * holding the projects' locks (`withProjectLocks`) until the task's line rows are written, so that a removal waits.
    */
   async create(input: { title: string; taskId: string; starts: Start[]; merge?: TaskManifest["merge"] }): Promise<TaskManifest> {
     const { taskId, starts } = input;
@@ -504,26 +509,37 @@ export class TaskRunner {
     if (getTask(this.#db, taskId) !== null) throw new Error(`task ${taskId} exists here`);
     if ((await pickToken(this.#cfg, this.#db)) === null) throw new Error("no usable token");
     const deps = this.#replicaDeps();
-    const names = new Map<string, string>();
-    for (const start of starts) {
-      const project = deps === null ? getProject(this.#db, start.projectId) : await ensureServiceRepo(deps, start.projectId);
-      if (project === null) throw new Error(`unknown project: ${start.projectId}`);
-      names.set(start.projectId, project.name);
-      if (deps === null) continue;
-      const at = await awaitLine(deps, start.projectId, taskId, project.name, AWAIT_LINE_MS, { withBase: true });
-      if (at !== start.commit) throw new Error(`the line of ${project.name} is not at ${start.commit.slice(0, 12)}`);
-    }
-    const manifest = await provisionTask(this.#cfg, this.#db, {
-      title: input.title, taskId, starts, ...(input.merge === undefined ? {} : { merge: input.merge }),
+    const projectIds = starts.map((s) => s.projectId);
+    // From the removed list's check to the task's line rows: a removal of one of its projects waits, or this refuses.
+    const manifest = await withProjectLocks(projectIds, async () => {
+      const removed = this.#removedProblem(projectIds);
+      if (removed !== null) throw new Error(removed);
+      const names = new Map<string, string>();
+      for (const start of starts) {
+        const project = deps === null ? getProject(this.#db, start.projectId) : await ensureServiceRepo(deps, start.projectId);
+        if (project === null) throw new Error(`unknown project: ${start.projectId}`);
+        names.set(start.projectId, project.name);
+        if (deps === null) continue;
+        const at = await awaitLine(deps, start.projectId, taskId, project.name, AWAIT_LINE_MS, { withBase: true });
+        if (at !== start.commit) throw new Error(`the line of ${project.name} is not at ${start.commit.slice(0, 12)}`);
+      }
+      const manifest = await provisionTask(this.#cfg, this.#db, {
+        title: input.title, taskId, starts, ...(input.merge === undefined ? {} : { merge: input.merge }),
+      });
+      if (deps !== null) {
+        const self = deps.pool.identity.id;
+        for (const start of starts) {
+          const name = names.get(start.projectId)!;
+          const row = listLineRows(this.#db, start.projectId, taskId).find((r) => r.name === name);
+          if (row !== undefined && row.commit !== null) {
+            writeLineRow(this.#db, { ...row, holder: self, epoch: row.epoch + 1 });
+          }
+        }
+      }
+      return manifest;
     });
     if (deps !== null) {
-      const self = deps.pool.identity.id;
       for (const start of starts) {
-        const name = names.get(start.projectId)!;
-        const row = listLineRows(this.#db, start.projectId, taskId).find((r) => r.name === name);
-        if (row !== undefined && row.commit !== null) {
-          writeLineRow(this.#db, { ...row, holder: self, epoch: row.epoch + 1 });
-        }
         await applyProject(deps, start.projectId, APPLY_AT_TURN_END_MS).catch((err: unknown) => {
           this.#log(`meddle: apply: project ${shortId(start.projectId)} as ${taskId} was created failed: ${messageOf(err)}`);
         });
@@ -1087,6 +1103,8 @@ export class TaskRunner {
     const turn = await this.#durableTurn(taskId);
     if (turn !== undefined && isParked(turn)) {
       if (this.#holds.turns !== null) throw new Error(this.#holds.turns);
+      // A stop for a removed project aborts it (`stopForRemoval`).
+      if (this.#archiving.has(taskId)) throw new Error("task is being archived");
       await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
       this.#inputRuns(taskId);
       return;
@@ -1378,6 +1396,8 @@ export class TaskRunner {
    * never starts from a stale row; gets a service repo of each project, sets the task's bookmarks from its line rows
    * (`#takeLines`, the commits fetched by id), and provisions the task at them as `receiving`. Writes no row: the rows
    * stay `from`'s until the task is activated here, and a receive abandoned or refused leaves none of this node's.
+   * Refused `project <short id> was removed` for a removed project: checked holding the projects' locks
+   * (`withProjectLocks`) until the task's row is written, so that a removal waits.
    */
   async receiveTask(
     manifest: TaskManifest, from: string, version: string, lineRows: readonly LineRowIn[],
@@ -1406,23 +1426,28 @@ export class TaskRunner {
         await this.#clearLeftovers(manifest);
       }
       const projects = new Set(manifest.projects.map((p) => p.id));
-      mergeLineRows(this.#db, lineRows.filter((r) => r.task === taskId && projects.has(r.project)));
-      /** The repos this receive set the task's bookmarks in: forgotten there again when it fails. */
-      const fetched: string[] = [];
-      try {
-        const parents: Record<string, string> = {};
-        for (const p of manifest.projects) {
-          const project = await ensureServiceRepo(deps, p.id);
-          fetched.push(project.replica);
-          parents[p.id] = await this.#takeLines(deps, project, taskId, p.name);
+      // From the removed list's check to the task's row: a removal of one of its projects waits, or this refuses.
+      return withProjectLocks<{ ok: true } | { ok: false; reason: string }>([...projects], async () => {
+        const removed = this.#removedProblem(projects);
+        if (removed !== null) return { ok: false, reason: removed };
+        mergeLineRows(this.#db, lineRows.filter((r) => r.task === taskId && projects.has(r.project)));
+        /** The repos this receive set the task's bookmarks in: forgotten there again when it fails. */
+        const fetched: string[] = [];
+        try {
+          const parents: Record<string, string> = {};
+          for (const p of manifest.projects) {
+            const project = await ensureServiceRepo(deps, p.id);
+            fetched.push(project.replica);
+            parents[p.id] = await this.#takeLines(deps, project, taskId, p.name);
+          }
+          await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "receiving");
+          updateTask(this.#db, taskId, { receiving_from: from });
+          return { ok: true };
+        } catch (err) {
+          for (const replica of fetched) await this.#forgetBookmarks(replica, taskId).catch(() => {});
+          return { ok: false, reason: messageOf(err) };
         }
-        await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "receiving");
-        updateTask(this.#db, taskId, { receiving_from: from });
-        return { ok: true };
-      } catch (err) {
-        for (const replica of fetched) await this.#forgetBookmarks(replica, taskId).catch(() => {});
-        return { ok: false, reason: messageOf(err) };
-      }
+      });
     });
   }
 
@@ -1702,24 +1727,28 @@ export class TaskRunner {
    * task no longer accepted is left idle and in place (false). Otherwise it is archived as by hand, and once its folder
    * is gone, each line a branch contains is released (`releaseLineRows`): the branch holds that work. Every other line
    * (a side line no branch contains) stays held here and archived, as a manual archive leaves it. Returns whether
-   * the task was archived.
+   * the task was archived. `force` (`stopForRemoval`, which holds the reservation already and made the task's turns
+   * terminal) archives the task whatever holds, turn or queue it has; it releases the reservation all the same.
    */
-  async #archive(taskId: string, accepted: boolean): Promise<boolean> {
-    if (this.#holds.work !== null) throw new Error(this.#holds.work);
+  async #archive(taskId: string, accepted: boolean, opts: { force?: boolean } = {}): Promise<boolean> {
+    const force = opts.force ?? false;
+    if (!force && this.#holds.work !== null) throw new Error(this.#holds.work);
     const deps = this.#replicaDeps();
     if (deps === null) throw new Error("this node has no pool");
     const self = deps.pool.identity.id;
-    if (this.#archiving.has(taskId)) throw new Error("task is being archived");
-    this.#refuseArchive(this.#row(taskId));
+    if (!force) {
+      if (this.#archiving.has(taskId)) throw new Error("task is being archived");
+      this.#refuseArchive(this.#row(taskId));
+    }
     // Reserved before the first await: no prompt, queued turn or move starts meanwhile. Under the task's key, so a
     // restore or delete waits until the folder is gone.
     this.#archiving.add(taskId);
     let archived = false;
     try {
       archived = await serialised(taskKey(taskId), async () => {
-        if ((await this.#durableTurn(taskId)) !== undefined) throw new Error("task is running");
+        if (!force && (await this.#durableTurn(taskId)) !== undefined) throw new Error("task is running");
         const row = this.#row(taskId);
-        this.#refuseArchive(row);
+        if (!force) this.#refuseArchive(row);
         // On the task's chain of writes, after any in flight; one its last turn's tool calls scheduled is dropped.
         await this.#dropScheduledLines(taskId);
         /** The lines to release: those a branch contains, read from the rows as archived. */
@@ -1774,6 +1803,18 @@ export class TaskRunner {
     }
   }
 
+  /** `project <short id> was removed` for the first of `projectIds` on the removed list, or null. */
+  #removedProblem(projectIds: Iterable<string>): string | null {
+    for (const id of projectIds) if (isRemoved(this.#db, id)) return `project ${shortId(id)} was removed`;
+    return null;
+  }
+
+  /** Throws `project <name> was removed` (the name its manifest gives) when a project of task `row` was removed: no restore. */
+  #refuseRestoreRemoved(row: TaskRow): void {
+    const removed = projectsOf(row).find((p) => isRemoved(this.#db, p.id));
+    if (removed !== undefined) throw new Error(`project ${removed.name} was removed`);
+  }
+
   /** Throws why task `row` cannot be archived now, as `archive` says. */
   #refuseArchive(row: TaskRow): void {
     if (this.#isMoving(row)) throw new Error("task is moving");
@@ -1784,6 +1825,113 @@ export class TaskRunner {
     if (queuedOf(row).length > 0) throw new Error("task has queued prompts");
   }
 
+  // ─── stopping the tasks of a removed project ───
+
+  /**
+   * Stops each task here whose manifest names project `projectId`, which was removed (`meddle project remove`'s
+   * cleanup), and answers those it stopped (`done`) and those it cannot stop now (`deferred`): an archived or moved
+   * task is left alone, and one being received is discarded (`#discard`), so that its sender cannot make it live here.
+   * Any other is cut off and archived where it is (`#stopTask`). The caller holds no project's lock.
+   */
+  async stopForRemoval(projectId: string): Promise<{ done: string[]; deferred: string[] }> {
+    const done: string[] = [];
+    const deferred: string[] = [];
+    for (const row of listTasks(this.#db)) {
+      if (!projectsOf(row).some((p) => p.id === projectId)) continue;
+      const outcome = await this.#stopTask(row.id);
+      if (outcome === "done") done.push(row.id);
+      else if (outcome === "deferred") deferred.push(row.id);
+    }
+    return { done, deferred };
+  }
+
+  /**
+   * Stops task `taskId` for `stopForRemoval`: `left` when there is nothing to stop (gone, archived or moved, at once or
+   * once its archive or move under way is over). Otherwise it is reserved as an archive reserves it (`#archiving`, on
+   * the task's prompt chain, after any prompt in flight), so that no prompt, turn or move of it starts from then on;
+   * its queue is dropped (the live turn's steers taken back too); a move of it is cancelled, or waited for once too late
+   * to cancel; each of its turns in the Harness is aborted (`#cutTurns`); and it is archived (`#archive`, forced).
+   * `deferred` when a pool update holds turns while it has one (the Harness only marks the abort then), or its row
+   * says `moving` with no move of it here (parked in `commit`: the target may have it); the reservation is released.
+   */
+  async #stopTask(taskId: string): Promise<"done" | "deferred" | "left"> {
+    for (;;) {
+      const row = getTask(this.#db, taskId);
+      if (row === null || row.state === "archived" || row.state === "moved") return "left";
+      if (row.state === "receiving") {
+        const discarded = await serialised(taskKey(taskId), async () => {
+          const now = getTask(this.#db, taskId);
+          if (now?.state !== "receiving") return false;
+          await this.#discard(now);
+          return true;
+        });
+        if (discarded) return "done";
+        continue;
+      }
+      // On the prompt chain: a prompt in flight is queued or has started its turn by then, and any later one is refused.
+      const reserved = await serialised(`prompt\0${taskId}`, async () => {
+        if (this.#archiving.has(taskId)) return false;
+        this.#archiving.add(taskId);
+        return true;
+      });
+      if (reserved) break;
+      // An archive under way: the task is looked at again once it is over.
+      await Bun.sleep(STOP_POLL_MS);
+    }
+    try {
+      await this.#dropQueue(taskId);
+      if (this.#isMoving(this.#row(taskId))) {
+        // Refused once too late (or with no move of it here): what the move comes to is waited for all the same.
+        await this.cancelMove(taskId).catch(() => {});
+        while (this.#moving.has(taskId)) await Bun.sleep(STOP_POLL_MS);
+        const state = getTask(this.#db, taskId)?.state;
+        if (state === undefined || state === "moved" || state === "archived") return "left";
+        if (state === "moving") return "deferred";
+      }
+      if (!(await this.#cutTurns(taskId))) return "deferred";
+      // Steers the cut turn ended without are put back in front of the queue (`#requeueFront`).
+      await this.#dropQueue(taskId);
+      await this.#archive(taskId, false, { force: true });
+      return "done";
+    } finally {
+      this.#archiving.delete(taskId);
+    }
+  }
+
+  /** Drops what task `taskId` has been sent and not started on: its live turn's steers Claude Code has not taken, and its queue. */
+  async #dropQueue(taskId: string): Promise<void> {
+    await this.#live.get(taskId)?.takeBack();
+    updateTask(this.#db, taskId, { queued: null });
+    this.#emitQueued(taskId);
+  }
+
+  /**
+   * Aborts each turn of task `taskId` the Harness holds (parked, durable or live) and waits until it holds none; the
+   * turn's reservation (`#pending`), which an aborted turn never clears, goes then. False, without waiting, when a pool
+   * update holds turns while there is one: the Harness only marks its abort, to run once it runs again.
+   */
+  async #cutTurns(taskId: string): Promise<boolean> {
+    const aborted = new Set<TaskInspection["record"]["id"]>();
+    for (;;) {
+      // A turn `startQueued` is creating (begun before the reservation) is in the Harness once it is made.
+      if (!this.#starting.has(taskId)) {
+        const { tasks } = await this.#harness.inspect(BACKGROUND_CONTEXT);
+        const turns = tasks.filter((t) => t.record.kind === MeddleTurn.definition.name
+          && (t.record.input as TurnInput).taskId === taskId && t.record.state.status !== "terminal");
+        if (turns.length === 0) break;
+        for (const t of turns) {
+          if (aborted.has(t.record.id)) continue;
+          aborted.add(t.record.id);
+          await this.#harness.abortTask(t.record.id, BACKGROUND_CONTEXT);
+        }
+        if (this.#holds.turns !== null) return false;
+      }
+      await Bun.sleep(STOP_POLL_MS);
+    }
+    this.#pending.delete(taskId);
+    return true;
+  }
+
   /**
    * Restores task `taskId`, archived on this node, here: the task's bookmarks come back from its line rows, held here
    * (`#takeLines`), and each project's workspace starts on its project's line; the folder is provisioned from the
@@ -1791,9 +1939,11 @@ export class TaskRunner {
    * slot). The row is `idle` again, no longer archived, its lines' rows live again (`holdLineRows`, then applied here),
    * and the archive is deleted. No other node is asked anything but for the files of its prompts, which are written
    * under the task again without waiting (`#rewriteAttachments`). On failure, what it made is taken off again and the
-   * task stays archived. While it runs, another restore of the task is refused (`task is being restored`).
+   * task stays archived. While it runs, another restore of the task is refused (`task is being restored`). Refused
+   * `project <name> was removed` for a task of a removed project.
    */
   async restoreHere(taskId: string): Promise<TaskManifest> {
+    this.#refuseRestoreRemoved(this.#row(taskId));
     const deps = this.#replicaDeps();
     if (deps === null) throw new Error("this node has no pool");
     if (this.#restoring.has(taskId)) throw new Error("task is being restored");
@@ -1818,34 +1968,40 @@ export class TaskRunner {
       if (this.#moving.has(taskId)) throw new Error("task is moving");
       if (row.state !== "archived") throw new Error(`task is ${row.state}`);
       if (row.archived_on !== self) throw new Error(`task is archived on ${shortId(row.archived_on ?? "another node")}`);
-      const manifest = await this.reopenReleasedLines(taskId);
-      const file = paths(this.#cfg).archiveFile(taskId);
-      const archive = await readArchive(file);
-      // What a node that stopped while archiving it left.
-      await this.#clearLeftovers(manifest);
-      let restored: TaskManifest;
-      try {
-        const parents: Record<string, string> = {};
-        for (const p of manifest.projects) {
-          const project = getProject(this.#db, p.id);
-          if (project === null) throw new Error(`unknown project: ${p.id}`);
-          parents[p.id] = await this.#takeLines(deps, project, taskId, p.name);
+      const projectIds = projectsOf(row).map((p) => p.id);
+      // From the removed list's check to the task's line rows: a removal of one of its projects waits, or this refuses.
+      return withProjectLocks(projectIds, async () => {
+        const removed = this.#removedProblem(projectIds);
+        if (removed !== null) throw new Error(removed);
+        const manifest = await this.reopenReleasedLines(taskId);
+        const file = paths(this.#cfg).archiveFile(taskId);
+        const archive = await readArchive(file);
+        // What a node that stopped while archiving it left.
+        await this.#clearLeftovers(manifest);
+        let restored: TaskManifest;
+        try {
+          const parents: Record<string, string> = {};
+          for (const p of manifest.projects) {
+            const project = getProject(this.#db, p.id);
+            if (project === null) throw new Error(`unknown project: ${p.id}`);
+            parents[p.id] = await this.#takeLines(deps, project, taskId, p.name);
+          }
+          restored = await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "idle", { keepRow: true });
+          await unpackArchiveFiles(this.#cfg, taskId, archive);
+          await adoptTranscriptSlot(this.#cfg, this.#db, restored);
+          updateTask(this.#db, taskId, { state: "idle", archived_on: null, archived_at: null, manifest: JSON.stringify(restored) });
+        } catch (err) {
+          // Back to what an archived task has here: no folder, no workspace, no task bookmarks.
+          await releaseFolder(this.#cfg, this.#db, taskId).catch(() => {});
+          throw err;
         }
-        restored = await provisionFromManifest(this.#cfg, this.#db, manifest, parents, "idle", { keepRow: true });
-        await unpackArchiveFiles(this.#cfg, taskId, archive);
-        await adoptTranscriptSlot(this.#cfg, this.#db, restored);
-        updateTask(this.#db, taskId, { state: "idle", archived_on: null, archived_at: null, manifest: JSON.stringify(restored) });
-      } catch (err) {
-        // Back to what an archived task has here: no folder, no workspace, no task bookmarks.
-        await releaseFolder(this.#cfg, this.#db, taskId).catch(() => {});
-        throw err;
-      }
-      holdLineRows(this.#db, self, taskId);
-      await this.#applyProjects(deps, this.#row(taskId), "was restored");
-      await rm(file, { force: true });
-      this.#emitState(taskId, "idle");
-      void this.#rewriteAttachments(taskId);
-      return restored;
+        holdLineRows(this.#db, self, taskId);
+        await this.#applyProjects(deps, this.#row(taskId), "was restored");
+        await rm(file, { force: true });
+        this.#emitState(taskId, "idle");
+        void this.#rewriteAttachments(taskId);
+        return restored;
+      });
     });
   }
 
@@ -1896,13 +2052,15 @@ export class TaskRunner {
    * here (`restoreHere`); another node's id moves it there from its archive (a `meddle.move` with `fromArchive`, refused
    * first as `checkMove` says); null lets placement pick the node over the roster, as for a new task of the manifest's
    * projects (the primary's home first). Resolves with the node once the restore is done here, or once the move has
-   * started (`onMove` and `onState` tell how it goes).
+   * started (`onMove` and `onState` tell how it goes). Refused `project <name> was removed` for a task of a removed
+   * project.
    */
   async restore(taskId: string, node: string | null): Promise<{ nodeId: string }> {
     const pool = this.#pool;
     if (pool === undefined) throw new Error("this node has no pool");
     const self = pool.identity.id;
     const row = this.#row(taskId);
+    this.#refuseRestoreRemoved(row);
     if (this.#restoring.has(taskId)) throw new Error("task is being restored");
     if (this.#moving.has(taskId)) throw new Error("task is moving");
     if (this.#holds.work !== null) throw new Error(this.#holds.work);
@@ -2281,7 +2439,7 @@ export class TaskRunner {
   queue(taskId: string): TaskQueue | null {
     const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
     if (row === null) return null;
-    for (const p of queueProjects(row)) {
+    for (const p of projectsOf(row)) {
       const line = this.#ownLine(taskId, p);
       if (line !== null && line.queuedAt !== null) return { queuedAt: line.queuedAt, project: p.id };
     }
@@ -2312,7 +2470,7 @@ export class TaskRunner {
     const row = this.#pool === undefined ? null : getTask(this.#db, taskId);
     if (row === null) return false;
     let left = false;
-    for (const p of queueProjects(row)) {
+    for (const p of projectsOf(row)) {
       const line = this.#ownLine(taskId, p);
       if (line === null || line.queuedAt === null) continue;
       setQueued(this.#db, p.id, taskId, p.name, null);
@@ -2441,12 +2599,14 @@ export class TaskRunner {
    * member, offline or hosts no tasks, the two report different or unknown Claude Code versions, or the task has a
    * prompt with attachments queued and `to` does not say it takes them (an older meddle would drop them). With
    * `fromArchive` (a restore-move) it is the other way round: the task must be archived here, or (`own`, a rerun of
-   * `prepare`) moving with its row still naming this node as where it is archived.
+   * `prepare`) moving with its row still naming this node as where it is archived, and none of its projects removed
+   * (`project <name> was removed`, `own` too).
    */
   checkMove(row: TaskRow, to: string, own = false, fromArchive = false): void {
     refuseReceiving(row);
     refuseMoved(row);
     if (fromArchive) {
+      this.#refuseRestoreRemoved(row);
       const self = this.#pool?.identity.id;
       // `prepare` runs again after it marked the task moving (a restart before its checkpoint).
       const rerun = own && row.state === "moving" && row.archived_on !== null && row.archived_on === self;
@@ -2927,10 +3087,10 @@ function manifestNames(row: TaskRow, projectId: string): boolean {
 
 /** The `tasks.queued` value that holds `prompts`: null for none, else each one's `queueEntry`. */
 /**
- * The projects of task `row` whose lines can carry its queue: its manifest's, none for a task without a project (a row
+ * The projects of task `row`'s manifest (their lines can carry its queue): none for a task without a project (a row
  * whose manifest names no `projects` at all included).
  */
-function queueProjects(row: TaskRow): ManifestProject[] {
+function projectsOf(row: TaskRow): ManifestProject[] {
   return (JSON.parse(row.manifest) as Partial<TaskManifest>).projects ?? [];
 }
 
