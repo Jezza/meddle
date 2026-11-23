@@ -1,5 +1,5 @@
 // Files on a prompt as the dashboard handles them: pure, so it is tested without a DOM.
-import { type Attachment, cleanName, INLINE_IMAGE_TYPES, pastedName } from "../../blobs/attachment";
+import { type Attachment, attachmentProblem, cleanName, INLINE_IMAGE_TYPES, pastedName } from "../../blobs/attachment";
 
 /**
  * A file in the composer, from when it is picked until the prompt is sent: uploading, then done with its `attachment`,
@@ -42,6 +42,80 @@ export function readyToSend(text: string, drafts: Draft[]): boolean {
 /** The uploaded drafts' attachments, in the order they were added. */
 export function draftAttachments(drafts: Draft[]): Attachment[] {
   return drafts.flatMap((d) => (d.state === "done" && d.attachment !== null ? [d.attachment] : []));
+}
+
+/** Where composers' files are kept across reloads: the page's localStorage. */
+export type DraftStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
+/**
+ * Each composer's files by its draft key (`new.<project>`, `task.<id>`), kept as `useDraft` keeps its text: they outlive
+ * the view they were added in (another view opened meanwhile), and an upload still going when that view goes settles
+ * here all the same. The uploaded files' attachments are also kept in `storage` under `meddle.draft.<key>.files`, so a
+ * reload puts them back, previewed from the node; a file still uploading (or failed) when the page goes goes with it.
+ */
+export class ComposerFiles {
+  readonly #drafts = new Map<string, Draft[]>();
+  readonly #listeners = new Map<string, Set<() => void>>();
+  #lastId = 0;
+
+  constructor(readonly storage: DraftStorage | null) {}
+
+  /** The files the composer under `key` holds, the same array until they change. */
+  get(key: string): Draft[] {
+    let drafts = this.#drafts.get(key);
+    if (drafts === undefined) {
+      drafts = this.#read(key).map((a) => this.restored(a));
+      this.#drafts.set(key, drafts);
+    }
+    return drafts;
+  }
+
+  /** A new draft, its id unique among every composer's. */
+  draft(over: Pick<Draft, "name" | "type" | "size" | "preview" | "state" | "attachment">): Draft {
+    return { id: ++this.#lastId, error: null, ...over };
+  }
+
+  /** An attachment back in a composer, already uploaded, its thumbnail the file on the node. */
+  restored(a: Attachment): Draft {
+    return this.draft({ name: a.name, type: a.type, size: a.size, preview: shownInline(a.type) ? blobUrl(a) : null, state: "done", attachment: a });
+  }
+
+  /** Changes the files under `key`, keeping the uploaded ones in storage, and tells its subscribers. */
+  update(key: string, change: (all: Draft[]) => Draft[]) {
+    const next = change(this.get(key));
+    this.#drafts.set(key, next);
+    this.#write(key, draftAttachments(next));
+    this.#listeners.get(key)?.forEach((cb) => cb());
+  }
+
+  /** `cb` runs whenever the files under `key` change. Returns the unsubscribe. */
+  subscribe(key: string, cb: () => void): () => void {
+    let set = this.#listeners.get(key);
+    if (set === undefined) this.#listeners.set(key, (set = new Set()));
+    set.add(cb);
+    return () => { set.delete(cb); };
+  }
+
+  /** The attachments kept under `key`; none for anything this cannot read, and a bad one is left out. */
+  #read(key: string): Attachment[] {
+    try {
+      const kept: unknown = JSON.parse(this.storage?.getItem(`meddle.draft.${key}.files`) ?? "[]");
+      if (!Array.isArray(kept)) return [];
+      return kept.filter((a) => attachmentProblem(a) === null).map(({ hash, name, type, size }: Attachment) => ({ hash, name, type, size }));
+    } catch {
+      return [];
+    }
+  }
+
+  #write(key: string, attachments: Attachment[]) {
+    const name = `meddle.draft.${key}.files`;
+    try {
+      if (attachments.length === 0) this.storage?.removeItem(name);
+      else this.storage?.setItem(name, JSON.stringify(attachments));
+    } catch {
+      // a private window, or storage full: the files last as long as the page
+    }
+  }
 }
 
 /**

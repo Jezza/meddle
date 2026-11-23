@@ -39,9 +39,9 @@ function NewTaskForm({ hosts, node, pool, index, projectId, open }: {
   const [chosen, setChosen] = useState<string[]>(() => (projectId === null ? [] : [projectId]));
   /** Where each project starts that does not start on its default branch. */
   const [starts, setStarts] = useState<Readonly<Record<string, Picked>>>({});
-  // A prompt left unstarted is there again on coming back to a new task under the same project (or none).
+  // A prompt left unstarted, its files too, is there again on coming back to a new task under the same project (or none).
   const [prompt, setPrompt] = useDraft(`new.${projectId ?? ""}`);
-  const drafts = useDrafts();
+  const drafts = useDrafts(`new.${projectId ?? ""}`);
   const defaults = useValue(pool.defaults);
   /** The model and effort picked; null while they are the pool's defaults. */
   const [chosenModel, setChosenModel] = useState<string | null>(null);
@@ -81,6 +81,7 @@ function NewTaskForm({ hosts, node, pool, index, projectId, open }: {
     });
     if (ok && created !== undefined) {
       setPrompt("");
+      drafts.clear();
       open(created.nodeId, created.taskId);
     }
   };
