@@ -331,6 +331,7 @@
   .graph .bm { font-size: 11.5px; line-height: 18px; border-radius: 4px; padding: 0 6px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .graph .bm.line { background: var(--tint-blue-bg); color: var(--tint-blue); }
   .graph .bm.branch { background: var(--hover); color: var(--fg); }
+  .graph .bm.branch.default { background: var(--accent-soft); color: var(--accent); }
   .graph .bm.branch.flag { color: var(--warn); }
   .graph .bm.behind { background: none; border: 1px dashed var(--line-strong); color: var(--muted); }
   .graph .at { min-width: 0; font-size: 11px; color: var(--muted); }
@@ -598,6 +599,11 @@
   .pill.add { background: none; border: 1px dashed var(--line-strong); color: var(--muted); }
   select.pill { appearance: none; -webkit-appearance: none; padding-right: 8px; cursor: pointer; field-sizing: content; }
   .pill .x { background: none; border: none; padding: 0 0 0 2px; color: var(--muted); }
+  /* Where a new task's project starts, on its pill: muted while it is the default branch. */
+  .pill .start { background: none; border: none; padding: 0; font-size: 12px; color: var(--muted); }
+  .pill .start:hover:not(:disabled) { background: none; color: var(--fg); }
+  .pill .start.moved { color: var(--fg); }
+  .pill .start.warn { color: var(--warn); }
 
   /* ─── menus ─── */
   .popover { position: fixed; z-index: 50; min-width: 180px; max-width: min(380px, calc(100vw - 16px)); background: var(--raised); border: 1px solid var(--line-strong); border-radius: 7px; box-shadow: var(--shadow); padding: 5px 0; font-size: 12.5px; }
@@ -610,6 +616,19 @@
   .menu-sep { border-top: 1px solid var(--line); margin: 5px 0; }
   .menu-note { padding: 4px 12px; color: var(--muted); }
   .menu-item.on { background: var(--accent-soft); }
+  .menu-note.error { color: var(--bad); }
+  /* The start popover: a field, then hints, each a commit with its branches and lines as the graph draws them. */
+  .start-pop { width: 366px; max-width: calc(100vw - 32px); }
+  .start-field { padding: 4px 12px 6px; }
+  .start-field input { width: 100%; font: 12.5px ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }
+  .hint .menu-label { flex: 1; min-width: 0; overflow: hidden; }
+  .hint .bm { flex: none; max-width: 170px; overflow: hidden; text-overflow: ellipsis; font-size: 11.5px; line-height: 18px; border-radius: 4px; padding: 0 6px; }
+  .hint .bm.branch { background: var(--hover); color: var(--fg); }
+  .hint.on .bm.branch { background: var(--sel); }
+  .hint .bm.line { background: var(--tint-blue-bg); color: var(--tint-blue); }
+  .hint .cid { flex: none; font: 11.5px ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; color: var(--muted); }
+  .hint .desc { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--fg-soft); }
+  .hint mark { color: var(--fg); background: var(--accent-soft); font-weight: 600; border-radius: 2px; }
   .menu-check { width: 12px; flex: none; color: var(--accent); }
   .menu-two { display: flex; flex-direction: column; min-width: 0; }
   .menu-desc { color: var(--muted); font-size: 11.5px; white-space: normal; }

@@ -1376,10 +1376,12 @@ is done and ends with its report. Above the composer, while the task has subagen
 ones first with their current step, then how the others ended (done, stopped or failed), each with its tools, tokens
 and time. The list folds to one line, which the browser remembers; picking an agent opens its row in the thread,
 loading earlier events first when the row is not loaded yet. New task opens an empty composer: its projects (the one
-it was opened under, more added with ＋ project), the node (Automatic, the default, or a chosen online node that hosts tasks; see
+it was opened under, more added with ＋ project), each with where it starts after its name (its default branch, muted,
+until another is picked: click it, then type or pick a branch, a task's line or any revision; hints search the
+project's graph, and what matches nothing there is resolved by the node), the node (Automatic, the default, or a chosen online node that hosts tasks; see
 [Where a new task runs](#where-a-new-task-runs)), its model and effort (the pool's defaults until changed) and its
 first prompt; Start creates it and opens it. A project's page
-(its name in the sidebar) shows its home; its branches, the default one marked, each at its commit, a conflicted one
+(its name in the sidebar) shows its home; its graph, the default branch's pill tinted; its branches, the default one marked, each at its commit, a conflicted one
 flagged with its siblings (`meddle/conflict/<b>/<id>@meddle`) and how to resolve it, as `meddle project status`
 prints them (see [Branches](#branches)); the nodes holding a copy with their service repos' bookmarks; and its
 tasks. A task whose work a pushed branch contains in only some of its projects shows as partly accepted. ＋ beside

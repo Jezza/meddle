@@ -112,7 +112,7 @@ function Body({ hosts, pool, node, index, view, open, update }: {
   switch (view.name) {
     case "home": return <Home hosts={hosts} pool={pool} index={index} open={open} />;
     case "task": return <TaskView key={`${view.nodeId}/${view.id}`} hosts={hosts} pool={pool} nodeId={view.nodeId} taskId={view.id} tab={view.tab} />;
-    case "new": return <NewTask hosts={hosts} pool={pool} projectId={view.projectId} open={open} />;
+    case "new": return <NewTask hosts={hosts} pool={pool} index={index} projectId={view.projectId} open={open} />;
     case "project": return <ProjectPage key={view.id} hosts={hosts} pool={pool} index={index} id={view.id} tab={view.tab} />;
     case "add-project": return <AddProject node={node} />;
     case "node": return <NodePage key={view.nodeId} hosts={hosts} pool={pool} index={index} nodeId={view.nodeId} update={update} />;
@@ -133,7 +133,7 @@ function Home({ hosts, pool, index, open }: { hosts: Hosts; pool: PoolRef; index
     if (go) location.replace(hashOf({ name: "task", nodeId: waiting.nodeId, id: waiting.id }));
   }, [go, waiting?.nodeId, waiting?.id]);
   if (go) return <PaneHead><span class="muted">Opening…</span></PaneHead>;
-  return <NewTask hosts={hosts} pool={pool} projectId={null} open={open} />;
+  return <NewTask hosts={hosts} pool={pool} index={index} projectId={null} open={open} />;
 }
 
 // ─── notifications ───

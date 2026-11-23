@@ -32,7 +32,7 @@ export function Graph({ rows, defaultBranch, nodeName, contextFailed, taskOf, ol
           <div class="g-row" title={row.commit.commit}>
             {row.labels.map((l) => (
               <Fragment key={JSON.stringify(l.bookmark)}>
-                <Pill label={l} taskOf={taskOf} />
+                <Pill label={l} taskOf={taskOf} defaultBranch={defaultBranch} />
                 <At label={l} nodeName={nodeName} contextFailed={contextFailed} />
               </Fragment>
             ))}
@@ -87,11 +87,18 @@ function Rail({ width, row, laid }: { width: number; row: Row; laid: Laid }) {
   );
 }
 
-/** A bookmark: a task's line (its title, linked) or a branch; dashed when behind, warned when not pushed. */
-function Pill({ label, taskOf }: { label: Label; taskOf: GraphProps["taskOf"] }) {
+/**
+ * A bookmark: a task's line (its title, linked) or a branch, the default branch tinted; dashed when behind, warned when
+ * not pushed.
+ */
+function Pill({ label, taskOf, defaultBranch }: { label: Label; taskOf: GraphProps["taskOf"]; defaultBranch: string | null }) {
   const b = label.bookmark;
   const behind = label.behind !== null ? " behind" : "";
-  if (b.kind === "branch") return <span class={`bm branch${behind}${label.notPushed ? " flag" : ""}`}>{b.name}</span>;
+  if (b.kind === "branch") {
+    const isDefault = b.name === defaultBranch;
+    return <span class={`bm branch${isDefault ? " default" : ""}${behind}${label.notPushed ? " flag" : ""}`}
+      title={isDefault ? "default branch" : undefined}>{b.name}</span>;
+  }
   const task = taskOf(b.task);
   return task === null
     ? <span class={`bm line${behind}`}>task {b.task.slice(0, 8)}</span>

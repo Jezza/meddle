@@ -72,6 +72,13 @@ export function Popover({ anchor, onClose, children, wide = false }: { anchor: A
   useLayoutEffect(() => {
     const box = ref.current;
     if (box === null) return;
+    place(box);
+    // Content that changes size (a list filtered as it is typed) is placed again: one above its anchor stays above it.
+    const resized = new ResizeObserver(() => place(box));
+    resized.observe(box);
+    return () => resized.disconnect();
+  }, [anchor]);
+  const place = (box: HTMLDivElement) => {
     const { width, height } = box.getBoundingClientRect();
     let left: number;
     let top: number;
@@ -85,8 +92,8 @@ export function Popover({ anchor, onClose, children, wide = false }: { anchor: A
     const margin = 8;
     left = Math.max(margin, Math.min(left, innerWidth - width - margin));
     top = Math.max(margin, Math.min(top, innerHeight - height - margin));
-    setAt({ left, top });
-  }, [anchor]);
+    setAt((was) => (was?.left === left && was.top === top ? was : { left, top }));
+  };
   useEffect(() => {
     const down = (e: MouseEvent) => { if (ref.current !== null && !ref.current.contains(e.target as Node)) onClose(); };
     const key = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };

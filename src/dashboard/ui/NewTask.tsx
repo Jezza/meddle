@@ -1,6 +1,6 @@
-// A new task: the composer is the form. Its projects (the one it was opened under, more added), the node (Automatic,
-// where placement picks, or one that hosts tasks), and its first prompt with its files; Start creates it through this
-// node and opens it.
+// A new task: the composer is the form. Its projects (the one it was opened under, more added), each with where it
+// starts (its default branch unless another is picked), the node (Automatic, where placement picks, or one that hosts
+// tasks), and its first prompt with its files; Start creates it through this node and opens it.
 import type { Host, Ref } from "@earendil-works/chord";
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
@@ -12,10 +12,13 @@ import { composerKey } from "./composer-model";
 import { type Anchor, MenuItem, ModelPicker, NodeDot, nodeMeta, PaneHead, type PoolRef, Popover, Unavailable } from "./common";
 import { projectChoices } from "./pool-model";
 import type { Open } from "./routes";
+import type { PoolIndex } from "./sources";
+import { type Picked, StartLabel, StartPopover } from "./Start";
+import { defaultBranchOf } from "./start-model";
 
 type NodeRef = Ref<typeof NodeObject>;
 
-export function NewTask({ hosts, pool, projectId, open }: { hosts: Hosts; pool: PoolRef; projectId: string | null; open: Open }) {
+export function NewTask({ hosts, pool, index, projectId, open }: { hosts: Hosts; pool: PoolRef; index: PoolIndex; projectId: string | null; open: Open }) {
   const host = hosts.selfHost;
   const node = useObject(host, NodeObject, {});
   const nodes = useValue(pool.nodes);
@@ -24,14 +27,18 @@ export function NewTask({ hosts, pool, projectId, open }: { hosts: Hosts; pool: 
   if (canHost.length === 0) return <>{head}<p class="pane-note muted">No online node hosts tasks.</p></>;
   if (node.error !== undefined) return <>{head}<p class="pane-note error">{node.error}</p></>;
   if (node.ref === undefined) return <>{head}<div class="pane-note"><Unavailable status={hosts.status(hosts.selfId)} /></div></>;
-  return <NewTaskForm key={projectId ?? ""} hosts={hosts} node={node.ref} pool={pool} projectId={projectId} open={open} />;
+  return <NewTaskForm key={projectId ?? ""} hosts={hosts} node={node.ref} pool={pool} index={index} projectId={projectId} open={open} />;
 }
 
-function NewTaskForm({ hosts, node, pool, projectId, open }: { hosts: Hosts; node: NodeRef; pool: PoolRef; projectId: string | null; open: Open }) {
+function NewTaskForm({ hosts, node, pool, index, projectId, open }: {
+  hosts: Hosts; node: NodeRef; pool: PoolRef; index: PoolIndex; projectId: string | null; open: Open;
+}) {
   const nodes = useValue(pool.nodes);
   const projects = projectChoices(nodes);
   const canHost = nodes.filter((n) => n.status === "member" && n.online && n.hostsTasks);
   const [chosen, setChosen] = useState<string[]>(() => (projectId === null ? [] : [projectId]));
+  /** Where each project starts that does not start on its default branch. */
+  const [starts, setStarts] = useState<Readonly<Record<string, Picked>>>({});
   // A prompt left unstarted is there again on coming back to a new task under the same project (or none).
   const [prompt, setPrompt] = useDraft(`new.${projectId ?? ""}`);
   const drafts = useDrafts();
@@ -43,7 +50,7 @@ function NewTaskForm({ hosts, node, pool, projectId, open }: { hosts: Hosts; nod
   const effort = chosenEffort ?? defaults.effort;
   /** The node picked; null for Automatic. */
   const [picked, setPicked] = useState<string | null>(null);
-  const [menu, setMenu] = useState<{ kind: "project" | "node"; anchor: Anchor } | null>(null);
+  const [menu, setMenu] = useState<{ kind: "project" | "node"; anchor: Anchor } | { kind: "start"; id: string; anchor: Anchor } | null>(null);
   const action = useAction();
   const input = useRef<HTMLTextAreaElement>(null);
   useEffect(() => input.current?.focus(), []);
@@ -57,13 +64,18 @@ function NewTaskForm({ hosts, node, pool, projectId, open }: { hosts: Hosts; nod
   const ready = readyToSend(prompt, drafts.drafts);
   const nameOf = (id: string) => projects.find((p) => p.id === id)?.name ?? id;
   const lead = chosen.length === 0 ? null : nameOf(chosen[0]!);
+  const titleOf = (task: string) => index.tasks.find((t) => t.id === task && !t.archived)?.title ?? null;
+  const setStart = (id: string, picked: Picked | null) => {
+    const { [id]: _, ...rest } = starts;
+    setStarts(picked === null ? rest : { ...rest, [id]: picked });
+  };
 
   const start = async () => {
     if (!ready || action.busy) return;
     let created: { taskId: string; nodeId: string } | undefined;
     const ok = await action.run(async () => {
       const { manifest, nodeId } = await node.createTask({
-        projects: chosen.map((id) => ({ id })), node: where?.nodeId ?? null, prompt, attachments: draftAttachments(drafts.drafts), model, effort,
+        projects: chosen.map((id) => (starts[id] === undefined ? { id } : { id, rev: starts[id].rev })), node: where?.nodeId ?? null, prompt, attachments: draftAttachments(drafts.drafts), model, effort,
       });
       created = { taskId: manifest.id, nodeId };
     });
@@ -92,7 +104,9 @@ function NewTaskForm({ hosts, node, pool, projectId, open }: { hosts: Hosts; nod
         <div class="composer-row">
           {chosen.map((id) => (
             <span key={id} class="pill">◉ {nameOf(id)}
-              <button class="x" title="Remove" onClick={() => setChosen(chosen.filter((c) => c !== id))}>×</button>
+              <StartLabel picked={starts[id]} defaultBranch={defaultBranchOf(nodes, id)}
+                onOpen={(el) => setMenu({ kind: "start", id, anchor: { el, above: true } })} />
+              <button class="x" title="Remove" onClick={() => { setChosen(chosen.filter((c) => c !== id)); setStart(id, null); }}>×</button>
             </span>
           ))}
           <button class="pill add" disabled={projects.length === chosen.length} onClick={(e) => setMenu({ kind: "project", anchor: { el: e.currentTarget, above: true } })}>＋ project</button>
@@ -117,6 +131,11 @@ function NewTaskForm({ hosts, node, pool, projectId, open }: { hosts: Hosts; nod
             <MenuItem key={p.id} title={p.id} onClick={() => { setChosen([...chosen, p.id]); setMenu(null); }}>{p.name}</MenuItem>
           ))}
         </Popover>
+      )}
+      {menu?.kind === "start" && (
+        <StartPopover key={menu.id} hosts={hosts} nodes={nodes} projectId={menu.id} defaultBranch={defaultBranchOf(nodes, menu.id)}
+          title={titleOf} anchor={menu.anchor} onClose={() => setMenu(null)}
+          onPick={(picked) => { setStart(menu.id, picked); setMenu(null); }} />
       )}
       {menu?.kind === "node" && (
         <Popover anchor={menu.anchor} onClose={() => setMenu(null)} wide>
