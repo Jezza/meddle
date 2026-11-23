@@ -206,6 +206,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
             <strong title={title}>{title}</strong>
             {!archived && !moving && state !== "moved" && <button class="icon" title="Rename" onClick={() => setRenaming(true)}>✎</button>}
           </>}
+        <CopyId id={task.manifest.value.id} shown="" />
         <StateDot state={state} waiting={pendingCount > 0} />
         <span class="muted state-text">{stateText}</span>
         {partly && (
@@ -1195,18 +1196,22 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
 
 /** A project's line: its change id, which copies the whole id when clicked; `conflicted`; or nothing before it has one. */
 function Revision({ line }: { line: ProjectLine }) {
+  if (line.conflicted) return <span class="rev flag" title="Its bookmark points at several changes">conflicted</span>;
+  if (line.changeId === null) return null;
+  return <CopyId id={line.changeId} shown={line.changeId.slice(0, 8)} />;
+}
+
+/** `shown` (else all of `id`; "" for just the icon), which copies the whole id when clicked and ticks for a moment once it has. */
+function CopyId({ id, shown = id }: { id: string; shown?: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
     const t = setTimeout(() => setCopied(false), 1500);
     return () => clearTimeout(t);
   }, [copied]);
-  if (line.conflicted) return <span class="rev flag" title="Its bookmark points at several changes">conflicted</span>;
-  if (line.changeId === null) return null;
-  const id = line.changeId;
   return (
     <button class="rev" title={`Copy ${id}`} onClick={() => void copyText(id).then(setCopied)}>
-      {id.slice(0, 8)}<Iconoir name={copied ? "check" : "copy"} />
+      {shown}<Iconoir name={copied ? "check" : "copy"} />
     </button>
   );
 }

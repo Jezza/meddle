@@ -133,7 +133,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
   return (
     <>
       <a class={`side-row trow${indent ? " indent" : ""}${selected ? " sel" : ""}${task.archived ? " archived" : ""}`} href={href}
-        onContextMenu={openMenu} title={task.projects.map((p) => p.name).join(", ") || undefined}>
+        onContextMenu={openMenu} title={[task.id, task.projects.map((p) => p.name).join(", ")].filter((l) => l !== "").join("\n")}>
         <StateDot state={task.state} waiting={waitsOnYou(task)} />
         {renaming
           ? <RenameInput value={task.title} onDone={() => setRenaming(false)} onSave={(title) => action.run(() => task.ref.rename({ title }))} />
