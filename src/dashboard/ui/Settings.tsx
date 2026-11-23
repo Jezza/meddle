@@ -38,8 +38,8 @@ function PoolSection({ pool }: { pool: PoolRef }) {
       </dl>
       <p class="muted">
         {poolId === ""
-          ? <>This node is alone until a pool secret is set on it: run <code>meddle pool secret</code> there, with the same secret as on the other nodes.</>
-          : <>Every node given this pool's name and secret (<code>meddle pool secret</code>) finds the others through the lighthouse and is a member once it proves the secret to them. The secret itself never passes through the dashboard.</>}
+          ? <>Join with <code>meddle pool secret</code></>
+          : <>Add a node with <code>meddle pool secret</code></>}
       </p>
       <h3>Members</h3>
       {action.error !== null && <p class="error">{action.error}</p>}
@@ -65,7 +65,6 @@ function PoolSection({ pool }: { pool: PoolRef }) {
                 {n.status === "removed" && n.nodeId !== selfId && (
                   <button
                     disabled={action.busy}
-                    title="Make it a member again, for the whole pool"
                     onClick={() => void action.run(() => pool.allow({ nodeId: n.nodeId }))}
                   >Allow again</button>
                 )}
@@ -96,11 +95,10 @@ function PoolSettings({ pool }: { pool: PoolRef }) {
     <>
       <h3>Pool settings</h3>
       <p class="muted">
-        Every member holds these settings, and every member's dashboard shows their values: never put a secret in one
-        (an <code>env.</code> value reaches every task's Claude Code and every jj run). Login tokens are kept apart, below.
+        Don't store secrets here.
       </p>
       {unset.error !== null && <p class="error">{unset.error}</p>}
-      {settings.length === 0 ? <p class="muted">Nothing set: every node uses its own defaults.</p> : (
+      {settings.length === 0 ? <p class="muted">Nothing set</p> : (
         <table>
           <thead><tr><th>Key</th><th>Value</th><th>Set by</th><th></th></tr></thead>
           <tbody>
@@ -168,7 +166,7 @@ function tokenState(t: { status: string; until: string | null; detail: string | 
 
 /** A token's latest reading on this node: its 5-hour and 7-day meters with their resets, and how old it is. */
 function TokenUsage({ reading, now }: { reading: UsageReading | undefined; now: number }) {
-  if (reading === undefined) return <span class="muted">No data yet: no turn on this node has used it.</span>;
+  if (reading === undefined) return <span class="muted">No data</span>;
   const windows = [["5h", reading.fiveHour], ["7d", reading.sevenDay]] as const;
   return (
     <div class="token-usage">
@@ -213,12 +211,10 @@ function TokenSection({ pool, node }: { pool: PoolRef; node: NodeRef }) {
                     <>
                       <button
                         disabled={action.busy || i === 0}
-                        title="Try it before the one above, for the whole pool"
                         onClick={() => void action.run(() => pool.moveToken({ id: t.id, before: tokens[i - 1]!.id }))}
                       >Up</button>
                       <button
                         disabled={action.busy || i === tokens.length - 1}
-                        title="Try it after the one below, for the whole pool"
                         onClick={() => void action.run(() => pool.moveToken({ id: t.id, after: tokens[i + 1]!.id }))}
                       >Down</button>
                     </>
@@ -226,7 +222,6 @@ function TokenSection({ pool, node }: { pool: PoolRef; node: NodeRef }) {
                   {t.status !== "ok" && (
                     <button
                       disabled={action.busy}
-                      title="Mark it usable again, for the whole pool"
                       onClick={() => void action.run(() => pool.enableToken({ id: t.id }))}
                     >Enable</button>
                   )}
@@ -237,11 +232,7 @@ function TokenSection({ pool, node }: { pool: PoolRef; node: NodeRef }) {
         </table>
       )}
       <p class="muted">
-        Claude Code OAuth tokens are added on a node with <code>meddle token add</code> and shared with the pool; turns use
-        the first usable one in this order. Their values never pass through the dashboard: it shows only what is listed
-        here. Up and Down change the order (<code>meddle token move</code>), and Enable marks an exhausted or disabled
-        token usable again, both for the whole pool. Usage is the latest reading turns on this node got for each token:
-        the share of its 5-hour and 7-day plan limits used. A token only ever used on another node has none here.
+        Add with <code>meddle token add</code>. Turns use the first usable one.
       </p>
     </>
   );

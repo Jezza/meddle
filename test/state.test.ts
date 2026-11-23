@@ -386,7 +386,7 @@ test("a turn whose result is an error is notified as failed", async () => {
     const task = await client.get(TaskObject, { id: manifest.id });
     await task.prompt({ text: "Reply with the single word ok." });
     const notes = await until(node.notifications, (n) => n.some((x) => x.taskId === manifest.id && x.kind === "failed"));
-    expect(notes.filter((x) => x.taskId === manifest.id).map(({ kind, text }) => ({ kind, text }))).toEqual([{ kind: "failed", text: "Turn ended: error_max_turns" }]);
+    expect(notes.filter((x) => x.taskId === manifest.id).map(({ kind, text }) => ({ kind, text }))).toEqual([{ kind: "failed", text: "Turn failed: error_max_turns" }]);
     await until(task.state, (s) => s === "idle");
     task.release();
     node.release();
@@ -1042,7 +1042,7 @@ test("leaving the train raises a train notice, and what the user did to leave ra
 
     const notes = await until(node.notifications, (ns) => trainNotes(ns).length > 0);
     // Only the decline is told: the unqueues before it, as the user's, said nothing.
-    expect(trainNotes(notes)).toEqual([{ taskId: leaver.id, text: "Add l.txt left meddle's train: main already has this", action: "accept" }]);
+    expect(trainNotes(notes)).toEqual([{ taskId: leaver.id, text: "Add l.txt left the queue: main already has this", action: "accept" }]);
     expect(n.runner.queue(leaver.id)).toBeNull();
     node.release();
   } finally {
@@ -1070,13 +1070,13 @@ test("a task that sits out raises a notice with Retry, and again each time it si
     await n.runner.accept(t.id);
 
     const notes = await until(node.notifications, (ns) => trainNotes(ns).length > 0);
-    expect(trainNotes(notes)).toEqual([{ taskId: t.id, text: "Add x.txt is sitting out: its describe turn failed: the agent gave up", action: "retry" }]);
+    expect(trainNotes(notes)).toEqual([{ taskId: t.id, text: "Add x.txt is blocked: its describe turn failed: the agent gave up", action: "retry" }]);
     expect(project.train.value.queued).toEqual([{ taskId: t.id, state: "sitting out", reason: "its describe turn failed: the agent gave up" }]);
 
     // Retry clears the entry; it sits out again, and that is a new condition: told again, the first still showing.
     await project.retry({ taskId: t.id });
     const again = await until(node.notifications, (ns) => trainNotes(ns).length === 2);
-    expect(trainNotes(again).map((x) => x.text)).toEqual(Array(2).fill("Add x.txt is sitting out: its describe turn failed: the agent gave up"));
+    expect(trainNotes(again).map((x) => x.text)).toEqual(Array(2).fill("Add x.txt is blocked: its describe turn failed: the agent gave up"));
 
     await project.retry({ taskId: t.id });
     await until(project.train, (s) => s.queued.length === 0);

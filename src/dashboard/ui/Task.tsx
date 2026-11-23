@@ -44,7 +44,7 @@ const EARLIER_PAGE = 200;
 const ARRIVAL_MARGIN = 8;
 /** Lines added and removed, at most, for a change's row to open by itself and show its diff. */
 const SMALL_DIFF = 12;
-const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
+const MOVE_NOW_WARNING = "Interrupts the turn; background shells and subagents stop";
 
 // Links in the thread's text open in a new tab, never in place of the dashboard.
 DOMPurify.addHook("afterSanitizeAttributes", (el) => {
@@ -216,13 +216,13 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
         <StateDot state={state} waiting={pendingCount > 0} />
         <span class="muted state-text">{stateText}</span>
         {partly && (
-          <span class="muted state-text" title="A pushed branch contains this task's work for some of its projects; it is archived once every project's is">
+          <span class="muted state-text">
             · partly accepted
           </span>
         )}
         {queue != null && (
           <a class="muted state-text" href={hashOf({ name: "train", projectId: queue.project, task: task.manifest.value.id })}
-            title="Accepted, and waiting on its project's train: open the train">
+            title="Open train">
             · <Glyph name="merge" cls="train-ico" /> queued
           </a>
         )}
@@ -237,28 +237,27 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
               href={hashOf({ name: "task", nodeId, id: task.manifest.value.id, tab: "changes" })}>Changes{changes.count > 0 && ` ${changes.count}`}</a>
           </nav>
         )}
-        {!changes?.on && <button class={raw ? "on" : ""} aria-pressed={raw} title="Show every event, those the thread does not know included" onClick={onRaw}>Raw</button>}
+        {!changes?.on && <button class={raw ? "on" : ""} aria-pressed={raw} title="All events" onClick={onRaw}>Raw</button>}
         {live && <button disabled={moving || action.busy} onClick={() => action.run(() => task.interrupt({}))}>■ Interrupt</button>}
         {/* Retry runs a parked turn (one that crashed the node too often) again, or carries on an idle task's last turn (interrupted or failed). */}
         {(live ? pendingCount === 0 : state === "idle") && !moving && (
-          <button disabled={action.busy} title={live ? "Runs a parked turn again" : "Carries on the last turn, e.g. one you interrupted"} onClick={() => action.run(() => task.retry({}))}>↻ Retry</button>
+          <button disabled={action.busy} onClick={() => action.run(() => task.retry({}))}>↻ Retry</button>
         )}
         {/* Only an idle task archives; the node says why it refuses one (queued prompts, a home offline, …). */}
         {state === "idle" && !moving && (
-          <button disabled={action.busy} title="Removes the task's folder from this node and keeps its log; Restore brings it back"
-            onClick={() => action.run(() => task.archive({}))}>▣ Archive</button>
+          <button disabled={action.busy} onClick={() => action.run(() => task.archive({}))}>▣ Archive</button>
         )}
         {/* Unlike Archive, Accept also shows while a turn runs: a running task waits in the queue until its turn ends. */}
         {offer === "accept" && (
           <span class="accept-split">
-            <button class="accept" disabled={action.busy || nothingToLand} title="Queues the task's work to land on its project's default branch (the merge train)"
+            <button class="accept" disabled={action.busy || nothingToLand}
               onClick={() => action.run(() => task.accept({}))}><Glyph name="merge" cls="train-ico" /> Accept</button>
             <button class="accept more" disabled={action.busy || nothingToLand || noContinue} aria-haspopup="menu"
               onClick={(e) => setAcceptAt({ el: e.currentTarget })}>▾</button>
           </span>
         )}
         {offer === "unqueue" && (
-          <button disabled={action.busy} title="Takes the task off the train" onClick={() => action.run(() => task.unqueue({}))}>Unqueue</button>
+          <button disabled={action.busy} onClick={() => action.run(() => task.unqueue({}))}>Unqueue</button>
         )}
         {archived && <>
           <button disabled={action.busy || noRestore !== null} title={noRestore ?? undefined} onClick={(e) => setRestoreAt({ el: e.currentTarget })}>Restore ▾</button>
@@ -282,10 +281,10 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
 /** What a move is doing at each step, in words. */
 function moveText(phase: string, to: string): string {
   switch (phase) {
-    case "prepare": return `Moving to ${to} once the current turn ends`;
-    case "handoff": return `Moving to ${to}: sending the task`;
-    case "commit": return `Moving to ${to}: ${to} is taking over`;
-    case "cleanup": return `Moved to ${to}: cleaning up here`;
+    case "prepare": return `Moving to ${to} after this turn`;
+    case "handoff": return `Moving to ${to}: sending`;
+    case "commit": return `Moving to ${to}: handing over`;
+    case "cleanup": return `Moved to ${to}: cleaning up`;
     default: return `Moving to ${to}`;
   }
 }
@@ -306,8 +305,7 @@ function MoveBanner({ task, move, to }: { task: TaskRef; move: { to: string; pha
       <span class="banner-actions">
         {waiting && <button disabled={action.busy} title={MOVE_NOW_WARNING} onClick={() => action.run(() => task.moveNow({}))}>Move now</button>}
         {cancellable && (
-          <button disabled={action.busy} title="Calls the move off: the task stays on this node, its turn untouched"
-            onClick={() => action.run(() => task.cancelMove({}))}>Cancel</button>
+          <button disabled={action.busy} onClick={() => action.run(() => task.cancelMove({}))}>Cancel</button>
         )}
       </span>
     </div>
@@ -602,7 +600,7 @@ function ShownView({ item }: { item: ShownItem }) {
     case "user":
       if (item.by !== "meddle") return <PromptBody text={item.text} attachments={item.attachments} />;
       // The merge train's prompt: meddle sent it, not you.
-      return <><div class="by" title="The merge train asked this">meddle</div><PromptBody text={item.text} attachments={item.attachments} /></>;
+      return <><div class="by" title="Merge train">meddle</div><PromptBody text={item.text} attachments={item.attachments} /></>;
     case "assistant":
       // Thinking alongside text is not shown; thinking on its own is, closed.
       return item.text !== "" ? <Markdown text={item.text} /> : <Thinking text={item.thinking ?? ""} />;
@@ -643,7 +641,7 @@ function TurnEnd({ text, at }: { text: string; at: string | undefined }) {
   useTick(10_000);
   const when = at === undefined ? NaN : Date.parse(at);
   return (
-    <div class={`turn-end${text.startsWith("Turn ended") ? " bad" : ""}`} title={Number.isNaN(when) ? undefined : new Date(when).toLocaleString()}>
+    <div class={`turn-end${text.startsWith("Turn failed") ? " bad" : ""}`} title={Number.isNaN(when) ? undefined : new Date(when).toLocaleString()}>
       <i /><span>{text}{!Number.isNaN(when) && ` · ${ago(Date.now() - when)} ago`}</span><i />
     </div>
   );
@@ -990,7 +988,7 @@ function PromptText({ text }: { text: string }) {
 /** A prompt the task was sent and has not started on: it joins the thread where Claude takes it. */
 function Queued({ prompt }: { prompt: Prompt }) {
   return (
-    <div class="msg you queued" title="Claude takes it at its next step, or once it is done with the current one; Ctrl+Enter in an empty box sends it now; ↑ or Esc in the box takes it back to edit">
+    <div class="msg you queued">
       <PromptBody text={prompt.text} attachments={prompt.attachments} />
       <span class="tag">queued</span>
     </div>
@@ -1014,7 +1012,7 @@ function FailedMessage({ task, failed, disabled, onSent, onEdit }: {
         <Iconoir name="warning" /><span>Not sent: {action.error ?? failed.error}</span>
         <span class="failed-acts">
           <button disabled={disabled || action.busy} onClick={retry}>{action.busy ? "Retrying…" : "Retry"}</button>
-          <button disabled={action.busy} onClick={onEdit} title="Put it back in the box">Edit</button>
+          <button disabled={action.busy} onClick={onEdit}>Edit</button>
         </span>
       </div>
     </div>
@@ -1117,7 +1115,7 @@ function Composer({ task, running, anyQueued, disabled, text, setText, drafts, b
           rows={1}
           disabled={disabled}
           value={text}
-          placeholder={disabled ? "Moving: prompts wait until it lands" : anyQueued && !touch ? "↑ to edit queued messages" : running ? `Message Claude: it takes it at its next step${touch ? "" : " · Ctrl+Enter sends now"}…` : "Reply…"}
+          placeholder={disabled ? "Moving…" : anyQueued && !touch ? "↑ to edit queued messages" : running ? "Queue message to Claude" : "Message Claude"}
           onInput={(e) => setText(e.currentTarget.value)}
           onKeyDown={(e) => {
             const field = e.currentTarget;
@@ -1187,7 +1185,7 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
       {ctx !== null && <UsageMeter meter={ctx} />}
       {limits.length > 0
         ? limits.map((m) => <UsageMeter key={m.label} meter={m} class="bar-item" />)
-        : <span class="bar-item" title="No turn on this node has read the plan usage of the login it uses next">5h / 7d: no data</span>}
+        : <span class="bar-item">5h / 7d: no data</span>}
       <span class="bar-gap" />
       {archived ? (
         <span class="bar-item" title={nodeId}>⌂ archived on {archivedOn ?? hostname}</span>

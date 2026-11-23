@@ -87,7 +87,7 @@ test("a turn's end carries when it was logged", () => {
   ]);
   expect(items).toEqual([
     { kind: "status", text: "Turn finished · 2 turns · 1.5 s · $0.0100", at: "2026-11-17T10:00:00.000Z" },
-    { kind: "status", text: "Turn ended: error_during_execution" },
+    { kind: "status", text: "Turn failed: error_during_execution" },
   ]);
 });
 
@@ -555,8 +555,8 @@ test("the main session's own background call whose notice never came reads stopp
 });
 
 test("a stopped agent's row says it stopped before it reported, and a failed one that it failed, with its notice's text", () => {
-  expect(agentEndNote(false, false, undefined)).toBe("Stopped before it reported");
-  expect(agentEndNote(false, true, "")).toBe("Stopped before it reported: the session ended");
+  expect(agentEndNote(false, false, undefined)).toBe("Stopped");
+  expect(agentEndNote(false, true, "")).toBe("Stopped with the session");
   expect(agentEndNote(true, false, "API Error: 529 overloaded")).toBe("Failed: API Error: 529 overloaded");
   expect(agentEndNote(true, false, "")).toBe("Failed");
   expect(agentEndNote(true, false, undefined)).toBe("Failed");

@@ -5,7 +5,7 @@ import { hashOf, viewOf } from "../src/dashboard/ui/routes";
 import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/dashboard/ui/agents-model";
 import type { AgentEntry } from "../src/state/contracts";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, restoreBlocked, uniqueTasks, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
-import { mergeStatus, resumeLabel, trainColumns, trainError, trainOffer, type TrainView } from "../src/dashboard/ui/train-model";
+import { mergeStatus, pausedText, queuedChip, resumeLabel, trainColumns, trainError, trainOffer, type TrainView } from "../src/dashboard/ui/train-model";
 import { highlight, renderMarkdown, renderPrompt } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
@@ -820,8 +820,13 @@ test("trainColumns: no round, a paused train, an empty one", () => {
   expect(paused).toEqual({ queued: [{ taskId: "a", title: "A", state: "queued" }], round: null, paused: "you paused it" });
 });
 
-test("resumeLabel: Resume after the user's pause, Retry after the train's own", () => {
+test("resumeLabel, pausedText and queuedChip: Resume and Paused after the user's pause, Retry and Stuck after the train's own; chips in the page's words", () => {
   expect(resumeLabel("you paused it")).toBe("Resume");
+  expect(pausedText("you paused it")).toBe("Paused");
+  expect(pausedText("the merge agent got stuck")).toBe("Stuck");
+  expect(queuedChip("sitting out")).toBe("blocked");
+  expect(queuedChip("waiting for gem")).toBe("gem offline");
+  expect(queuedChip("describing")).toBe("describing");
   expect(resumeLabel("the merge agent gave no verdict after 3 follow-ups")).toBe("Retry");
 });
 
@@ -850,7 +855,7 @@ test("trainOffer: Accept for an idle or running task, Unqueue for a queued one, 
 
 test("mergeStatus: what the merge task's card says it is doing", () => {
   expect(mergeStatus("checking", null)).toBe("starting");
-  expect(mergeStatus("checking", "running")).toBe("running its checks");
+  expect(mergeStatus("checking", "running")).toBe("running");
   expect(mergeStatus("checking", "waiting")).toBe("waiting on you");
   expect(mergeStatus("checking", "idle")).toBe("verifying");
   expect(mergeStatus("landing", "idle")).toBe("landing");
@@ -858,7 +863,7 @@ test("mergeStatus: what the merge task's card says it is doing", () => {
 
 test("trainError: a home older than the train is said to run an older meddle, any other error shows as it came", () => {
   const older = "upgrade_required: contract_mismatch: meddle.project@1 does not cover the consumer's description (default.train missing or of another kind)";
-  expect(trainError(older, "gem")).toBe("gem runs an older meddle: it has no train.");
-  expect(trainError("not_in_variant: train", "gem")).toBe("gem runs an older meddle: it has no train.");
+  expect(trainError(older, "gem")).toBe("gem runs an older meddle");
+  expect(trainError("not_in_variant: train", "gem")).toBe("gem runs an older meddle");
   expect(trainError("connection reset", "gem")).toBe("connection reset");
 });

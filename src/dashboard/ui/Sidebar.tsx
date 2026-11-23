@@ -49,7 +49,7 @@ export function Sidebar({ pool, index, view, selfId, onHide, onNavigate }: {
               <span class="folder">▸</span><span class="title">{p.name}</span>
               {/* Its train: how many tasks are queued, or, while none are, "Train" on hover or focus. Not stopped, so the drawer closes. */}
               <button class={`train-mark${p.queued > 0 ? " busy" : ""}${trainSelected(p.id) ? " sel" : ""}`}
-                title={`${p.name}'s merge train: the tasks accepted to land on its default branch`}
+                title="Merge train"
                 onClick={(e) => { e.preventDefault(); location.hash = hashOf({ name: "train", projectId: p.id }); }}>
                 <Glyph name="merge" />{p.queued > 0 ? p.queued : "Train"}
               </button>
@@ -139,7 +139,7 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
           ? <RenameInput value={task.title} onDone={() => setRenaming(false)} onSave={(title) => action.run(() => task.ref.rename({ title }))} />
           : <span class="title">{task.merge && <Glyph name="merge" cls="merge-mark" />}{task.title}</span>}
         {task.queued && task.projects.length === 1 && (
-          <button class="queued-mark" title="Queued on its project's train: open the train"
+          <button class="queued-mark" title="Open train"
             onClick={(e) => { e.preventDefault(); e.stopPropagation(); location.hash = trainHref; }}><Glyph name="merge" /></button>
         )}
         {task.pending > 0 && <span class="badge">{task.pending}</span>}
@@ -164,20 +164,18 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
           ) : (
             <>
               {offer === "accept" && (
-                <MenuItem title="Queues the task's work to land on its project's default branch (the merge train)"
-                  onClick={() => { close(); void action.run(() => task.ref.accept({})); }}>Accept</MenuItem>
+                <MenuItem onClick={() => { close(); void action.run(() => task.ref.accept({})); }}>Accept</MenuItem>
               )}
               {offer === "accept" && (
                 <MenuItem disabled={nodes.find((n) => n.nodeId === task.nodeId)?.acceptContinue !== true}
                   onClick={() => { close(); void action.run(() => task.ref.accept({ continue: true })); }}>Accept &amp; continue</MenuItem>
               )}
               {offer === "unqueue" && (
-                <MenuItem title="Takes the task off the train" onClick={() => { close(); void action.run(() => task.ref.unqueue({})); }}>Unqueue</MenuItem>
+                <MenuItem onClick={() => { close(); void action.run(() => task.ref.unqueue({})); }}>Unqueue</MenuItem>
               )}
               <MenuItem disabled={moving} onClick={() => { close(); setRenaming(true); }}>Rename</MenuItem>
               <MenuItem disabled={moving} onClick={() => setMenu({ kind: "move", anchor: menu.anchor })} meta={nameOf(task.nodeId)}>Move to…</MenuItem>
-              <MenuItem disabled={task.state !== "idle" || moving} title="Removes the task's folder from its node and keeps its log; Restore brings it back"
-                onClick={() => { close(); void action.run(() => task.ref.archive({})); }}>Archive</MenuItem>
+              <MenuItem disabled={task.state !== "idle" || moving} onClick={() => { close(); void action.run(() => task.ref.archive({})); }}>Archive</MenuItem>
             </>
           )}
         </Popover>

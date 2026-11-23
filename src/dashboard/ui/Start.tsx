@@ -20,7 +20,7 @@ const RESOLVE_MS = 300;
 export function StartLabel({ picked, defaultBranch, onOpen }: { picked: Picked | undefined; defaultBranch: string | null; onOpen(el: HTMLElement): void }) {
   const open = (e: { currentTarget: HTMLElement }) => onOpen(e.currentTarget);
   if (picked !== undefined) return <button class="start moved" title={picked.title} onClick={open}>· {picked.label}</button>;
-  if (defaultBranch === null) return <button class="start warn" title="No default branch: pick a start" onClick={open}>· no default</button>;
+  if (defaultBranch === null) return <button class="start warn" title="No default branch" onClick={open}>· no default</button>;
   return <button class="start" title="Default branch" onClick={open}>· {defaultBranch}</button>;
 }
 

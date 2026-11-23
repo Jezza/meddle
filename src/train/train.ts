@@ -981,7 +981,7 @@ class Conductor {
         live();
         // A turn the hold refused is no failure of the task's.
         if (round.heldTasks.has(taskId) || !this.#sitOut(project, taskId, reason)) return;
-        noticeTopic.tell({ projectId, taskId, kind: "sitting", text: `${title} is sitting out: ${reason}` });
+        noticeTopic.tell({ projectId, taskId, kind: "sitting", text: `${title} is blocked: ${reason}` });
       },
       holdBack: async (taskId, notice) => {
         live();

@@ -355,7 +355,7 @@ function tokenFaultText(m: Message): string {
 }
 
 function resultText(m: Message): string {
-  const parts = [m.subtype === "success" ? "Turn finished" : `Turn ended: ${String(m.subtype)}`];
+  const parts = [m.subtype === "success" ? "Turn finished" : `Turn failed: ${String(m.subtype)}`];
   if (typeof m.num_turns === "number") parts.push(`${m.num_turns} turns`);
   if (typeof m.duration_ms === "number") parts.push(`${(m.duration_ms / 1000).toFixed(1)} s`);
   if (typeof m.total_cost_usd === "number") parts.push(`$${m.total_cost_usd.toFixed(4)}`);
@@ -627,7 +627,7 @@ export function callRuns(entry: AgentEntry["state"] | undefined, own: boolean, a
  */
 export function agentEndNote(failed: boolean, orphaned: boolean, notice: string | undefined): string {
   if (failed) return notice === undefined || notice === "" ? "Failed" : `Failed: ${notice}`;
-  return orphaned ? "Stopped before it reported: the session ended" : "Stopped before it reported";
+  return orphaned ? "Stopped with the session" : "Stopped";
 }
 
 /**

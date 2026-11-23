@@ -141,7 +141,7 @@ function NewTaskForm({ hosts, node, pool, index, projectId, open }: {
       {menu?.kind === "node" && (
         <Popover anchor={menu.anchor} onClose={() => setMenu(null)} wide>
           <div class="menu-head">Run on</div>
-          <MenuItem onClick={() => { setPicked(null); setMenu(null); }} meta="placement picks">Automatic</MenuItem>
+          <MenuItem onClick={() => { setPicked(null); setMenu(null); }}>Automatic</MenuItem>
           {canHost.map((n) => (
             <MenuItem key={n.nodeId} title={n.nodeId} onClick={() => { setPicked(n.nodeId); setMenu(null); }} meta={nodeMeta(n)}>
               <NodeDot node={n} /> {n.hostname}

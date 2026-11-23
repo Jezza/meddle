@@ -31,8 +31,8 @@ export function PaneHead({ children }: { children: ComponentChildren }) {
 
 /** Why an online node's objects cannot be had right now (`Hosts.for` gave no host). */
 export function Unavailable({ status }: { status: HostStatus }) {
-  if (status === "incompatible") return <p class="flag">Incompatible version: this dashboard cannot talk to it. Upgrade the older node.</p>;
-  if (status === "backoff") return <p class="muted">Unreachable; retrying shortly.</p>;
+  if (status === "incompatible") return <p class="flag">Incompatible version: update the older node</p>;
+  if (status === "backoff") return <p class="muted">Unreachable, retrying…</p>;
   return <p class="muted">Connecting…</p>;
 }
 
@@ -188,8 +188,7 @@ export function MoveMenu({ task, nodes, from, anchor, onClose }: {
       <div class="menu-sep" />
       <div class="seg" role="radiogroup">
         <button class={now ? "" : "on"} onClick={() => setNow(false)}>After this turn</button>
-        <button class={now ? "on" : ""} title="Interrupts the running turn. Background shells and subagents on this node stop and do not travel."
-          onClick={() => setNow(true)}>Now (interrupts)</button>
+        <button class={now ? "on" : ""} title="Background shells and subagents stop" onClick={() => setNow(true)}>Now (interrupts)</button>
       </div>
       {action.error !== null && <div class="menu-note error">{action.error}</div>}
     </Popover>
@@ -217,9 +216,9 @@ export function RestoreMenu({ task, nodes, holder, anchor, onClose, onRestored }
   return (
     <Popover anchor={anchor} onClose={onClose} wide>
       <div class="menu-head">Restore on</div>
-      <MenuItem disabled={action.busy} onClick={() => void restore(null)} meta="placement picks">Automatic</MenuItem>
+      <MenuItem disabled={action.busy} onClick={() => void restore(null)}>Automatic</MenuItem>
       {self !== undefined && (
-        <MenuItem disabled={action.busy} title={self.nodeId} onClick={() => void restore(self.nodeId)} meta="holds its archive">
+        <MenuItem disabled={action.busy} title={self.nodeId} onClick={() => void restore(self.nodeId)} meta="archived here">
           <NodeDot node={self} /> {self.hostname}
         </MenuItem>
       )}
@@ -239,7 +238,7 @@ export function RestoreMenu({ task, nodes, holder, anchor, onClose, onRestored }
  * Delete and the sidebar's alike. Run it in a `useAction`.
  */
 export async function deleteTask(task: Ref<typeof TaskObject>, title: string, open: boolean): Promise<void> {
-  if (!confirm(`Delete "${title}", its log and its archive? This cannot be undone.`)) return;
+  if (!confirm(`Delete "${title}" and its log? This can't be undone.`)) return;
   await task.delete({});
   if (open) location.hash = hashOf({ name: "home" });
 }

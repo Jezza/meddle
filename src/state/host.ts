@@ -405,7 +405,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     // A task the train took off its queue says so; one the user took off (Unqueue, a prompt, an archive) is no news.
     self.on("trainLeaves", queueChanges, ({ taskId, reason }, ctx) => {
       if (reason === null || UNQUEUED_AS_ASKED.has(reason)) return;
-      notify(ctx, { taskId, kind: "train", text: `${getTask(db, taskId)?.title ?? taskId} left meddle's train: ${reason}`, action: "accept" });
+      notify(ctx, { taskId, kind: "train", text: `${getTask(db, taskId)?.title ?? taskId} left the queue: ${reason}`, action: "accept" });
     });
     // A task of a train homed here that sits out, or is held back, says so, once for each new condition (the conductor
     // tells once). A process holds several nodes in tests and every one hears of every train, so only the home's own
@@ -426,7 +426,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
         // A turn its token failed says so in the `token_fault` that follows (or reruns with the next token): one
         // notification, not a `failed` as well.
         if (error === null) notify(ctx, { taskId, kind: "finished", text: "Turn finished" });
-        else if (!faulted.has(taskId)) notify(ctx, { taskId, kind: "failed", text: `Turn ended: ${error}` });
+        else if (!faulted.has(taskId)) notify(ctx, { taskId, kind: "failed", text: `Turn failed: ${error}` });
       } else if (m.type === "meddle" && m.subtype === "turn_started") {
         faulted.delete(taskId);
       } else if (m.type === "meddle" && m.subtype === "turn_failed") {

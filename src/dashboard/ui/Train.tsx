@@ -11,7 +11,7 @@ import { Glyph } from "./icons";
 import { projectChoices } from "./pool-model";
 import { hashOf } from "./routes";
 import { type ListedTask, type PoolIndex, type ProjectRef, useOptionalTrain } from "./sources";
-import { mergeStatus, resumeLabel, trainColumns, trainError, type TrainView } from "./train-model";
+import { mergeStatus, pausedText, queuedChip, resumeLabel, trainColumns, trainError, type TrainView } from "./train-model";
 
 /** The Queued column's state chips: what the train is doing to a task is blue, a task that waits on you or a node is amber. */
 function tone(state: string): string {
@@ -41,7 +41,7 @@ export function TrainPage({ hosts, pool, index, projectId, highlight }: {
     };
     return (
       <div class="train">
-        <TrainHead name={listed.name} projectId={projectId}><span class="flag train-wait">waiting for {homeName}</span></TrainHead>
+        <TrainHead name={listed.name} projectId={projectId}><span class="flag train-wait">{homeName} offline</span></TrainHead>
         <Board state={state} index={index} highlight={highlight} project={null} />
       </div>
     );
@@ -87,11 +87,10 @@ function TrainLive({ project, name, projectId, homeName, index, highlight }: {
       <TrainHead name={name} projectId={projectId} branch={branch}>
         {action.error !== null && <span class="error train-error" title={action.error}>{action.error}</span>}
         {state.paused === null ? (
-          <button disabled={action.busy} title="Holds the train: turns already running finish, but nothing lands and no new round starts until you resume it"
-            onClick={() => action.run(() => project.pause({}))}>Pause</button>
+          <button disabled={action.busy} onClick={() => action.run(() => project.pause({}))}>Pause</button>
         ) : (
           <>
-            <span class="flag train-wait" title={state.paused}>Paused: {state.paused}</span>
+            <span class="flag train-wait" title={pausedText(state.paused) === "Stuck" ? state.paused : undefined}>{pausedText(state.paused)}</span>
             <button class="primary" disabled={action.busy} onClick={() => action.run(() => project.resume({}))}>{resumeLabel(state.paused)}</button>
           </>
         )}
@@ -119,7 +118,7 @@ function Board({ state, index, highlight, project }: { state: TrainView; index: 
     </Row>
   );
   const off = (taskId: string) => live.has(taskId) && (
-    <button class="link" disabled={action.busy} title="Takes the task off the train" onClick={() => action.run(async () => { await unqueue(taskId); })}>Unqueue</button>
+    <button class="link" disabled={action.busy} onClick={() => action.run(async () => { await unqueue(taskId); })}>Unqueue</button>
   );
   return (
     <>
@@ -127,12 +126,12 @@ function Board({ state, index, highlight, project }: { state: TrainView; index: 
       <div class="train-board">
         <section class="train-col">
           <div class="train-colhead">Queued</div>
-          {columns.queued.length === 0 && <p class="train-empty">Nothing waiting.</p>}
+          {columns.queued.length === 0 && <p class="train-empty">Nothing queued</p>}
           {columns.queued.map((t) => row(t.taskId, t.title, null, (
             <>
-              <span class={`train-chip${tone(t.state)}`} title={reason.get(t.taskId) ?? undefined}>{t.state}</span>
+              <span class={`train-chip${tone(t.state)}`} title={reason.get(t.taskId) ?? undefined}>{queuedChip(t.state)}</span>
               {t.state === "sitting out" && project !== null && (
-                <button class="link" disabled={action.busy} title={reason.get(t.taskId) ?? "Lets the train try the task again"}
+                <button class="link" disabled={action.busy} title={reason.get(t.taskId) ?? undefined}
                   onClick={() => action.run(() => project.retry({ taskId: t.taskId }))}>Retry</button>
               )}
               {off(t.taskId)}
@@ -141,7 +140,7 @@ function Board({ state, index, highlight, project }: { state: TrainView; index: 
         </section>
         <section class="train-col round">
           <div class="train-colhead">This round</div>
-          {columns.round === null ? <p class="train-empty">No round under way.</p> : (
+          {columns.round === null ? <p class="train-empty">No round</p> : (
             <>
               <div class="train-steps">
                 {columns.round.steps.map((s) => <span key={s.name} class={s.now ? "current" : s.done ? "finished" : ""}>{s.done ? "✓ " : ""}{s.name}</span>)}

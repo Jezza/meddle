@@ -48,13 +48,13 @@ export function trainColumns(state: TrainView, tasks: ReadonlyMap<string, { titl
 }
 
 /**
- * What the merge task's card says it is doing: starting (no task of it is listed yet), running its checks (a turn runs),
+ * What the merge task's card says it is doing: starting (no task of it is listed yet), running (its checking turn runs),
  * waiting on you, or verifying (its turn ended, and the train checks what it left); landing once the branch moves.
  */
 export function mergeStatus(step: string, taskState: string | null): string {
   if (step === "landing") return "landing";
   if (taskState === null) return "starting";
-  if (taskState === "running") return "running its checks";
+  if (taskState === "running") return "running";
   if (taskState === "waiting") return "waiting on you";
   return "verifying";
 }
@@ -65,7 +65,7 @@ export function mergeStatus(step: string, taskState: string | null): string {
  * run an older meddle; any other error is shown as it came.
  */
 export function trainError(error: string, home: string): string {
-  return /upgrade_required|contract_mismatch|not_in_variant/.test(error) ? `${home} runs an older meddle: it has no train.` : error;
+  return /upgrade_required|contract_mismatch|not_in_variant/.test(error) ? `${home} runs an older meddle` : error;
 }
 
 /**
@@ -73,6 +73,18 @@ export function trainError(error: string, home: string): string {
  * (its merge agent got stuck), which the page offers a Retry for.
  */
 const PAUSED_BY_USER = "you paused it";
+
+/** The head's flag for a paused train: Paused after the user's pause, Stuck after the train's own (its reason on hover). */
+export function pausedText(paused: string): "Paused" | "Stuck" {
+  return paused === PAUSED_BY_USER ? "Paused" : "Stuck";
+}
+
+/** A queued task's chip, from the state the train gives it: its node offline, blocked until Retry, or what is done to it. */
+export function queuedChip(state: string): string {
+  if (state.startsWith("waiting for ")) return `${state.slice("waiting for ".length)} offline`;
+  const words: Record<string, string> = { "turn running": "running", "rebasing onto main": "rebasing", "in the batch": "in this round", "sitting out": "blocked" };
+  return words[state] ?? state;
+}
 
 /** The button that lets a paused train carry on: Resume after the user's pause, Retry after the train's own. */
 export function resumeLabel(paused: string): "Resume" | "Retry" {
