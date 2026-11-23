@@ -119,11 +119,11 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   const showChanges = switchable && tab === "changes";
   /** Shows every event in the thread, the ones it otherwise leaves out included. */
   const [raw, setRaw] = useState(false);
-  // What the composer holds, its text and its files, here so that a failed prompt's Edit can put them back. Its text is
-  // kept by task id, so that it is still there after another task (or a reload), and follows the task when it moves to
+  // What the composer holds, its text and its files, here so that a failed prompt's Edit can put them back. Both are
+  // kept by task id, so that they are still there after another task (or a reload), and follow the task when it moves to
   // another node.
   const [draft, setDraft] = useDraft(`task.${manifest.id}`);
-  const drafts = useDrafts();
+  const drafts = useDrafts(`task.${manifest.id}`);
   const box = useRef<HTMLTextAreaElement>(null);
   /** Prompts the task could not be sent: this page's own, so they go with it. */
   const [failed, setFailed] = useState<Failed[]>([]);

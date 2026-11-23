@@ -3,7 +3,7 @@
 // names it on by hash; the node a prompt goes to fetches what it lacks.
 import { useEffect, useRef, useState } from "preact/hooks";
 import { type Attachment, MAX_BLOB_BYTES } from "../../blobs/attachment";
-import { blobUrl, carriesFiles, type Draft, nameFor, pastedFiles, shownInline, sizeText } from "./attach-model";
+import { blobUrl, carriesFiles, ComposerFiles, type Draft, nameFor, pastedFiles, shownInline, sizeText } from "./attach-model";
 import { errorText } from "./hooks";
 import { Iconoir } from "./icons";
 
@@ -11,8 +11,18 @@ export type Drafts = {
   drafts: Draft[];
   add(files: File[]): void;
   remove(id: number): void;
+  clear(): void;
   restore(attachments: Attachment[]): void;
 };
+
+/** Every composer's files, for as long as the page is open (and the uploaded ones in localStorage beyond). */
+const composerFiles = new ComposerFiles((() => {
+  try {
+    return localStorage;
+  } catch {
+    return null;
+  }
+})());
 
 /** Frees a draft's preview when the page made it from the file; a restored draft's is the file's URL on the node. */
 function revoke(d: Draft) {
@@ -20,20 +30,23 @@ function revoke(d: Draft) {
 }
 
 /**
- * The files a composer holds, each uploaded as it is added; an image previews from the file itself until it is removed
- * or the composer goes. A file with no type goes as `application/octet-stream`. `restore` puts a prompt's
- * attachments back, already uploaded.
+ * The files the composer under draft key `key` holds (`ComposerFiles`), each uploaded as it is added; an image previews
+ * from the file itself until it is removed. A file with no type goes as `application/octet-stream`. `restore` puts a
+ * prompt's attachments back, already uploaded.
  */
-export function useDrafts(): Drafts {
-  const [drafts, setDrafts] = useState<Draft[]>([]);
-  // What the drafts are now, for revoking their previews outside a render.
-  const latest = useRef(drafts);
-  latest.current = drafts;
-  const lastId = useRef(0);
-  useEffect(() => () => latest.current.forEach(revoke), []);
+export function useDrafts(key: string): Drafts {
+  const drafts = composerFiles.get(key);
+  const [, render] = useState(0);
+  useEffect(() => {
+    const off = composerFiles.subscribe(key, () => render((n) => n + 1));
+    // A change between the render and now has told no one.
+    if (composerFiles.get(key) !== drafts) render((n) => n + 1);
+    return off;
+  }, [key]);
+  const change = (fn: (all: Draft[]) => Draft[]) => composerFiles.update(key, fn);
 
   // A draft removed meanwhile is not there to settle: its upload's answer is dropped.
-  const settle = (id: number, change: Partial<Draft>) => setDrafts((all) => all.map((d) => (d.id === id ? { ...d, ...change } : d)));
+  const settle = (id: number, to: Partial<Draft>) => change((all) => all.map((d) => (d.id === id ? { ...d, ...to } : d)));
   const upload = async (d: Draft, file: File) => {
     try {
       // Refused here rather than sent: the node would refuse it after reading what it is sent.
@@ -46,9 +59,6 @@ export function useDrafts(): Drafts {
       settle(d.id, { state: "failed", error: errorText(err) });
     }
   };
-  const draftOf = (over: Pick<Draft, "name" | "type" | "size" | "preview" | "state" | "attachment">): Draft =>
-    ({ id: ++lastId.current, error: null, ...over });
-
   return {
     drafts,
     add(files) {
@@ -56,20 +66,23 @@ export function useDrafts(): Drafts {
       const added = files.map((file) => {
         const type = file.type || "application/octet-stream";
         const preview = shownInline(type) ? URL.createObjectURL(file) : null;
-        return draftOf({ name: nameFor(file, at), type, size: file.size, preview, state: "uploading", attachment: null });
+        return composerFiles.draft({ name: nameFor(file, at), type, size: file.size, preview, state: "uploading", attachment: null });
       });
-      setDrafts((all) => [...all, ...added]);
+      change((all) => [...all, ...added]);
       added.forEach((d, i) => void upload(d, files[i]!));
     },
     remove(id) {
-      const gone = latest.current.find((d) => d.id === id);
+      const gone = composerFiles.get(key).find((d) => d.id === id);
       if (gone !== undefined) revoke(gone);
-      setDrafts((all) => all.filter((d) => d.id !== id));
+      change((all) => all.filter((d) => d.id !== id));
+    },
+    clear() {
+      composerFiles.get(key).forEach(revoke);
+      change(() => []);
     },
     restore(attachments) {
-      const back = attachments.map((a) =>
-        draftOf({ name: a.name, type: a.type, size: a.size, preview: shownInline(a.type) ? blobUrl(a) : null, state: "done", attachment: a }));
-      setDrafts((all) => [...all, ...back]);
+      const back = attachments.map((a) => composerFiles.restored(a));
+      change((all) => [...all, ...back]);
     },
   };
 }
