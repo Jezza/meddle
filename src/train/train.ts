@@ -129,9 +129,15 @@ class HeldUp extends Error {
 
 // ─── the trains table ───
 
+/** The commands a task's agent named to run the tests covering its work, and the tip of its work they were named for. */
+export type TestList = { tip: string; tests: string[] };
+
 /** A project's train as the `trains` table keeps it. */
-type TrainRow = { paused: string | null; sitting: Record<string, string>; held: Record<string, string>; round: SavedStep | null };
-type TrainRecord = { paused: string | null; sitting: string; held: string; round: string | null };
+type TrainRow = {
+  paused: string | null; sitting: Record<string, string>; held: Record<string, string>; round: SavedStep | null;
+  tests: Record<string, TestList>;
+};
+type TrainRecord = { paused: string | null; sitting: string; held: string; round: string | null; tests: string };
 
 function parsed<T>(text: string | null, fallback: T): T {
   if (text === null) return fallback;
@@ -143,9 +149,12 @@ function parsed<T>(text: string | null, fallback: T): T {
 }
 
 function readTrain(db: Database, projectId: string): TrainRow {
-  const r = db.query<TrainRecord, [string]>("SELECT paused, sitting, held, round FROM trains WHERE project = ?").get(projectId);
-  if (r === null) return { paused: null, sitting: {}, held: {}, round: null };
-  return { paused: r.paused, sitting: parsed(r.sitting, {}), held: parsed(r.held, {}), round: parsed<SavedStep | null>(r.round, null) };
+  const r = db.query<TrainRecord, [string]>("SELECT paused, sitting, held, round, tests FROM trains WHERE project = ?").get(projectId);
+  if (r === null) return { paused: null, sitting: {}, held: {}, round: null, tests: {} };
+  return {
+    paused: r.paused, sitting: parsed(r.sitting, {}), held: parsed(r.held, {}), round: parsed<SavedStep | null>(r.round, null),
+    tests: parsed(r.tests, {}),
+  };
 }
 
 const changeTopic = topic<string>();
@@ -187,17 +196,20 @@ function updateTrain(db: Database, projectId: string, change: (t: TrainRow) => T
   const t = db.transaction(() => {
     const t = change(readTrain(db, projectId));
     db.query(
-      `INSERT INTO trains (project, paused, sitting, held, round) VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO trains (project, paused, sitting, held, round, tests) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT (project) DO UPDATE SET
-         paused = excluded.paused, sitting = excluded.sitting, held = excluded.held, round = excluded.round`,
-    ).run(projectId, t.paused, JSON.stringify(t.sitting), JSON.stringify(t.held), t.round === null ? null : JSON.stringify(t.round));
+         paused = excluded.paused, sitting = excluded.sitting, held = excluded.held, round = excluded.round, tests = excluded.tests`,
+    ).run(
+      projectId, t.paused, JSON.stringify(t.sitting), JSON.stringify(t.held), t.round === null ? null : JSON.stringify(t.round),
+      JSON.stringify(t.tests),
+    );
     return t;
   }).immediate();
   updateTopic.tell(projectId);
   return t;
 }
 
-function without(entries: Record<string, string>, drop: (taskId: string) => boolean): Record<string, string> {
+function without<T>(entries: Record<string, T>, drop: (taskId: string) => boolean): Record<string, T> {
   return Object.fromEntries(Object.entries(entries).filter(([taskId]) => !drop(taskId)));
 }
 
@@ -210,6 +222,19 @@ function without(entries: Record<string, string>, drop: (taskId: string) => bool
 export function pauseTrain(db: Database, projectId: string, reason: string | null): void {
   updateTrain(db, projectId, (t) => ({ ...t, paused: reason }));
   tell(projectId);
+}
+
+/**
+ * Records that task `taskId`'s agent named `tests` to run the tests covering its work at `tip` (`ready`), for project
+ * `projectId`'s train to hand the merge agent. A list is good for its tip only, and goes when the task leaves the queue.
+ */
+export function saveTrainTests(db: Database, projectId: string, taskId: string, tip: string, tests: string[]): void {
+  updateTrain(db, projectId, (t) => ({ ...t, tests: { ...t.tests, [taskId]: { tip, tests: [...tests] } } }));
+}
+
+/** The test lists project `projectId`'s train keeps (`saveTrainTests`), by task id. */
+export function trainTests(db: Database, projectId: string): Record<string, TestList> {
+  return readTrain(db, projectId).tests;
 }
 
 /** Retry for task `taskId` of project `projectId`'s train: it no longer sits out, and a round starts. */
@@ -788,13 +813,15 @@ class Conductor {
     }
   }
 
-  /** Drops what project `project`'s train keeps of tasks no longer queued (sitting out, held back). */
+  /** Drops what project `project`'s train keeps of tasks no longer queued (sitting out, held back, test lists). */
   #prune(project: Project): void {
     const train = readTrain(this.#db, project.id);
     const queued = new Set(queueOf(this.#db, project).map((r) => r.task));
     const gone = (taskId: string) => !queued.has(taskId);
-    if (!Object.keys(train.sitting).some(gone) && !Object.keys(train.held).some(gone)) return;
-    updateTrain(this.#db, project.id, (t) => ({ ...t, sitting: without(t.sitting, gone), held: without(t.held, gone) }));
+    if (![train.sitting, train.held, train.tests].some((entries) => Object.keys(entries).some(gone))) return;
+    updateTrain(this.#db, project.id, (t) => ({
+      ...t, sitting: without(t.sitting, gone), held: without(t.held, gone), tests: without(t.tests, gone),
+    }));
   }
 
   // ─── a round ───
@@ -983,6 +1010,10 @@ class Conductor {
         if (round.heldTasks.has(taskId) || !this.#sitOut(project, taskId, reason)) return;
         noticeTopic.tell({ projectId, taskId, kind: "sitting", text: `${title} is blocked: ${reason}` });
       },
+      saveTests: async (taskId, tip, tests) => {
+        live();
+        saveTrainTests(this.#db, projectId, taskId, tip, tests);
+      },
       holdBack: async (taskId, notice) => {
         live();
         round.reheld.add(taskId);
@@ -1069,6 +1100,7 @@ class Conductor {
       rows = waiting();
     }
     const B = round.B ?? await defaultBranchCommit(this.#startDeps(), project);
+    const lists = readTrain(this.#db, project.id).tests;
     const out: Candidate[] = [];
     for (const r of rows) {
       const s = status.get(r.task);
@@ -1080,6 +1112,7 @@ class Conductor {
       out.push({
         taskId: r.task, title, tip, base: [...r.base], workspace: r.holder === self ? this.#workspaceOf(project, r.task) : null,
         size: await sizeOf(this.#cfg, project.replica, B, tip),
+        tests: lists[r.task]?.tip === tip ? [...lists[r.task]!.tests] : null,
       });
     }
     if (round.first) {

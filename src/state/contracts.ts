@@ -63,7 +63,7 @@ export const TrainTaskStatusSchema = Type.Object({
 
 /** How a train turn went (`TrainTurnOutcome`). */
 export const TrainTurnOutcomeSchema = Type.Union([
-  Type.Object({ kind: Type.Literal("done") }),
+  Type.Object({ kind: Type.Literal("done"), tests: Type.Optional(Type.Array(Type.String())) }),
   Type.Object({ kind: Type.Literal("declined"), reason: Type.String() }),
   Type.Object({ kind: Type.Literal("blamed"), task: Type.String(), reason: Type.String() }),
   Type.Object({ kind: Type.Literal("failed"), reason: Type.String() }),

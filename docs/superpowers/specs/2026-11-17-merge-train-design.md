@@ -1,5 +1,8 @@
 # The merge train: accept tasks, and meddle lands them on main
 
+> Changed since: tasks are prepared in one turn (rebase, squash, describe, `ready(tests)`), and the merge agent runs
+> the tests they name. See [2026-11-24-train-prepare-turn-design.md](2026-11-24-train-prepare-turn-design.md).
+
 ## Why
 
 Getting a task's work onto `main` is one decision, but today it takes a procedure of a dozen or more jj steps, and

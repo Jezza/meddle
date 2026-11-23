@@ -10,10 +10,12 @@ import { workspaceImmutableHeads } from "../tasks/provision";
 
 /**
  * A task as a round sees it: its work's `tip` (its line's effective head, `effectiveHead`), the commits it was started
- * from (`base`), the workspace holding it on this node (`null` when the task is on another node), and the `size` of
- * its work (`sizeOf`).
+ * from (`base`), the workspace holding it on this node (`null` when the task is on another node), the `size` of its
+ * work (`sizeOf`), and the commands its agent named to run the tests covering it (`tests`, for this tip; null when none).
  */
-export type Candidate = { taskId: string; title: string; tip: string; base: string[]; workspace: string | null; size: number };
+export type Candidate = {
+  taskId: string; title: string; tip: string; base: string[]; workspace: string | null; size: number; tests: string[] | null;
+};
 
 /**
  * What landing a task would land, in `B..tip`, as the spec's step 1 sorts it (commit ids, the oldest first):

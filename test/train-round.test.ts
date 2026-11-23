@@ -5,18 +5,28 @@ import { loadConfig } from "../src/config";
 import { abandon, bookmarkSet, commitOf, commitsIn, initColocated, jj } from "../src/jj";
 import type { LineRow } from "../src/pool/rows";
 import type { Candidate } from "../src/train/batch";
-import { describePrompt, mergeTitle, rebasePrompt } from "../src/train/prompts";
+import { mergeTitle, preparePrompt } from "../src/train/prompts";
 import { BatchChanged, NodeOffline, runRound, TaskGone, type RoundDeps, type RoundStep } from "../src/train/round";
 import type { TrainTurnKind, TrainTurnOutcome } from "../src/train/tools";
 
 const DESCRIBE = "Add a description (4-7 words) to your revision(s).";
+
+/** The prepare turn onto `main` of a task whose work is all its own, opening with the merge agent's `report` if any. */
+const prepare = (main: string, report?: string) =>
+  preparePrompt({ main, rewrite: "squash", describe: true, conflicted: [], ...(report === undefined ? {} : { report }) }, DESCRIBE);
 const LINES = ["one", "two", "three", "four", "five", "six", "seven"].map((l) => `${l}\n`);
 
 /** `LINES` with line `n` (1-based) replaced by `text`. */
 const edited = (n: number, text: string) => LINES.map((l, i) => (i === n - 1 ? `${text}\n` : l)).join("");
 
-/** A task as the fake queue keeps it: its title and size, its base, and whether it is queued, archived or sitting out. */
-type Task = { id: string; title: string; size: number; base: string[]; queued: boolean; archived: boolean; sitting: boolean };
+/**
+ * A task as the fake queue keeps it: its title and size, its base, whether it is queued, archived or sitting out, and
+ * the test list its agent named, with the tip it was named for.
+ */
+type Task = {
+  id: string; title: string; size: number; base: string[]; queued: boolean; archived: boolean; sitting: boolean;
+  tests: { tip: string; tests: string[] } | null;
+};
 
 /** What a train turn does in the repo, and how it ends (`done` when it says nothing). */
 type Behaviour = (turn: { taskId: string; kind: TrainTurnKind; text: string }) => Promise<TrainTurnOutcome | void>;
@@ -46,10 +56,15 @@ async function fixture() {
   const tasks = new Map<string, Task>();
   const line = (id: string) => `meddle/task/${id}/p`;
   const tipOf = (id: string) => commitOf(repo, line(id));
-  /** Task `id`, titled `Task <id>` unless said otherwise, whose line is at `tip`; queued unless said otherwise. */
+  /**
+   * Task `id`, titled `Task <id>` unless said otherwise, whose line is at `tip`; queued, and with the test list
+   * `bun test` for `tip`, unless said otherwise.
+   */
   const task = async (id: string, tip: string, over: Partial<Task> = {}) => {
     await bookmarkSet(repo, line(id), tip);
-    tasks.set(id, { id, title: `Task ${id}`, size: 1, base: [B], queued: true, archived: false, sitting: false, ...over });
+    tasks.set(id, {
+      id, title: `Task ${id}`, size: 1, base: [B], queued: true, archived: false, sitting: false, tests: { tip, tests: ["bun test"] }, ...over,
+    });
   };
 
   /** Every call that changes something, in order, as `<call> <task>`. */
@@ -65,6 +80,8 @@ async function fixture() {
   const satOut: Array<[string, string]> = [];
   const heldBack: Array<[string, string]> = [];
   const steps: RoundStep[] = [];
+  /** The test lists the round kept, by task. */
+  const saved: Array<[string, string[]]> = [];
   /** The tasks whose node is offline, and its name: a call for them rejects. */
   const offline = new Map<string, string>();
   const gone = new Set<string>();
@@ -79,7 +96,9 @@ async function fixture() {
       const out: Candidate[] = [];
       for (const t of tasks.values()) {
         if (!t.queued || t.archived || t.sitting) continue;
-        out.push({ taskId: t.id, title: t.title, tip: await tipOf(t.id), base: t.base, workspace: null, size: t.size });
+        const tip = await tipOf(t.id);
+        const tests = t.tests !== null && t.tests.tip === tip ? t.tests.tests : null;
+        out.push({ taskId: t.id, title: t.title, tip, base: t.base, workspace: null, size: t.size, tests });
       }
       return out;
     },
@@ -111,7 +130,8 @@ async function fixture() {
       const outcome = await behaviour?.({ taskId, kind, text });
       // Snapshot what the turn did to the files.
       await jj(["status"], repo);
-      return outcome ?? { kind: "done" };
+      // An agent that did as asked names its tests.
+      return outcome ?? (kind === "merge" ? { kind: "done" } : { kind: "done", tests: ["bun test"] });
     },
     async head(taskId) {
       if (gone.has(taskId)) throw new TaskGone(taskId);
@@ -152,6 +172,11 @@ async function fixture() {
     async holdBack(taskId, notice) {
       heldBack.push([taskId, notice]);
     },
+    async saveTests(taskId, tip, tests) {
+      saved.push([taskId, tests]);
+      const t = tasks.get(taskId);
+      if (t !== undefined) t.tests = { tip, tests };
+    },
     async checkpoint(step) {
       steps.push(step);
     },
@@ -159,7 +184,7 @@ async function fixture() {
   const run = (resume?: RoundStep) => runRound(deps, cfg, repo, DESCRIBE, resume);
   return {
     repo, cfg, B, on, task, tasks, tipOf, line, deps, run, log, turns, created, discarded, advances, abandoned, left, declines, satOut,
-    heldBack, steps, offline, gone, act: (id: string, f: Behaviour) => behaviours.set(id, f),
+    heldBack, steps, saved, offline, gone, act: (id: string, f: Behaviour) => behaviours.set(id, f),
     /** Makes `advance` refuse with `text` (null: as usual), with `main` where it is. */
     refuse: (text: string | null) => { refuse.with = text; },
     /** The merge task's head now (the repo's `@`). */
@@ -233,7 +258,7 @@ test("a conflicting task gets a rebase turn after the batch lands", async () => 
   // The rebased task can go in the next round: another one starts.
   expect(await run()).toEqual({ landed: fresh, again: true, paused: null });
   expect(advances).toEqual([[M, fresh]]);
-  expect(turns).toEqual([{ taskId: "t2", kind: "rebase", text: rebasePrompt(fresh) }]);
+  expect(turns).toEqual([{ taskId: "t2", kind: "rebase", text: prepare(fresh) }]);
   expect(log).toEqual(["advance", "turn t2"]);
   expect(satOut).toEqual([]);
   expect(steps.at(-1)).toEqual({ step: "rebasing", batch: ["t2"], mergeTask: null });
@@ -247,7 +272,7 @@ test("a rebase turn that leaves the work conflicting sits the task out", async (
 
   expect(await run()).toEqual({ landed: fresh, again: false, paused: null });
   expect(turns.map((t) => [t.taskId, t.kind])).toEqual([["t2", "rebase"]]);
-  expect(satOut).toEqual([["t2", expect.stringContaining("still doesn't merge cleanly")]]);
+  expect(satOut).toEqual([["t2", "its work isn't on main after its prepare turn"]]);
 });
 
 test("decline takes a task off", async () => {
@@ -263,7 +288,7 @@ test("decline takes a task off", async () => {
   });
 
   expect(await run()).toEqual({ landed: clean, again: false, paused: null });
-  expect(turns).toEqual([{ taskId: "t1", kind: "describe", text: describePrompt(DESCRIBE, []) }]);
+  expect(turns).toEqual([{ taskId: "t1", kind: "describe", text: prepare(B) }]);
   expect(left).toEqual([["t1", "main already does this"]]);
   // Only recorded: the user may have accepted it again since.
   expect(declines).toEqual(["t1"]);
@@ -295,8 +320,8 @@ test("a describe turn that leaves a revision undescribed sits the task out", asy
 });
 
 
-test("a described task lands in the round that described it, told which changes conflict", async () => {
-  const { repo, B, on, task, line, tipOf, run, turns, steps, advances, describe, act } = await fixture();
+test("a prepared task lands in the round that prepared it, squashed and described", async () => {
+  const { repo, B, on, task, line, tipOf, run, turns, steps, advances, act } = await fixture();
   const draft = await on(B, "", { "g.txt": "more g\n" });
   const left = await on(draft, "left", { "f.txt": edited(3, "L") });
   const right = await on(B, "right", { "f.txt": edited(3, "R") });
@@ -305,32 +330,32 @@ test("a described task lands in the round that described it, told which changes 
   const [conflicted] = await commitsIn(repo, merge);
   expect(conflicted!.conflict).toBe(true);
   act("t1", async () => {
-    // The agent describes its draft and resolves the merge's conflict.
-    await describe(draft, "Add more g");
-    await jj(["edit", line("t1")], repo);
-    await Bun.write(`${repo}/f.txt`, edited(3, "L and R"));
+    // The agent resolves the merge's conflict, and squashes its work into one described revision on main.
+    const one = await on(B, "Add more g, both sides", { "g.txt": "more g\n", "f.txt": edited(3, "L and R") });
+    await bookmarkSet(repo, line("t1"), one);
   });
 
   const result = await run();
   const tip = await tipOf("t1");
   expect(result).toEqual({ landed: tip, again: false, paused: null });
-  expect(turns).toEqual([{ taskId: "t1", kind: "describe", text: describePrompt(DESCRIBE, [conflicted!.changeId]) }]);
+  expect(turns).toEqual([{ taskId: "t1", kind: "describe", text: prepare(B) }]);
   expect(steps[0]).toEqual({ step: "describing", batch: ["t1"], mergeTask: null });
   expect(advances).toEqual([[B, tip]]);
 });
 
-test("the train abandons a task's empty leftovers itself", async () => {
-  const { B, on, task, tipOf, run, abandoned, turns, advances } = await fixture();
-  const first = await on(B, "first", { "g.txt": "first\n" });
-  const empty = await on(first, "");
-  const second = await on(empty, "second", { "f.txt": edited(2, "TWO") });
-  await task("t1", second);
+test("the train abandons a task's empty leftovers itself, and its test list follows", async () => {
+  const { B, on, task, tipOf, run, abandoned, turns, advances, saved } = await fixture();
+  const empty = await on(B, "");
+  const first = await on(empty, "first", { "g.txt": "first\n" });
+  await task("t1", first);
 
   const result = await run();
   const tip = await tipOf("t1");
   expect(abandoned).toEqual([["t1", [empty]]]);
+  // No turn: its list is kept for the work the abandoning left.
   expect(turns).toEqual([]);
-  expect(tip).not.toBe(second);
+  expect(saved).toEqual([["t1", ["bun test"]]]);
+  expect(tip).not.toBe(first);
   expect(result).toEqual({ landed: tip, again: false, paused: null });
   expect(advances).toEqual([[B, tip]]);
 });
@@ -384,8 +409,108 @@ test("a stacked pair lands once", async () => {
   expect(heldBack).toEqual([]);
 });
 
+test("a task of several revisions gets a prepare turn and lands as one", async () => {
+  const { repo, B, on, task, line, tipOf, run, turns, advances, satOut, saved, act } = await fixture();
+  const first = await on(B, "first", { "g.txt": "first\n" });
+  const second = await on(first, "second", { "f.txt": edited(2, "TWO") });
+  await task("t1", second);
+  act("t1", async () => {
+    // The agent squashes its two revisions into one.
+    const one = await on(B, "First and second", { "g.txt": "first\n", "f.txt": edited(2, "TWO") });
+    await bookmarkSet(repo, line("t1"), one);
+    return { kind: "done", tests: ["bun test test/two.test.ts"] };
+  });
+
+  const result = await run();
+  const tip = await tipOf("t1");
+  expect(turns).toEqual([{ taskId: "t1", kind: "describe", text: prepare(B) }]);
+  expect(satOut).toEqual([]);
+  expect(saved).toEqual([["t1", ["bun test test/two.test.ts"]]]);
+  expect(result).toEqual({ landed: tip, again: false, paused: null });
+  expect(advances).toEqual([[B, tip]]);
+});
+
+test("a task without a test list for its tip is prepared, and the merge agent gets the list it named", async () => {
+  const { B, on, task, run, turns, satOut, act } = await fixture();
+  // t1 has no list; t2's list is for another tip, so stale.
+  await task("t1", await on(B, "fix one", { "f.txt": edited(1, "ONE") }), { size: 2, tests: null });
+  await task("t2", await on(B, "fix seven", { "f.txt": edited(7, "SEVEN") }), { tests: { tip: B, tests: ["bun test old"] } });
+  act("t1", async () => ({ kind: "done", tests: ["bun test test/one.test.ts"] }));
+  act("t2", async () => ({ kind: "done", tests: ["bun test test/seven.test.ts"] }));
+
+  const result = await run();
+  expect(result.landed).not.toBeNull();
+  expect(satOut).toEqual([]);
+  expect(turns.slice(0, 2).map((t) => [t.taskId, t.kind, t.text])).toEqual([["t1", "describe", prepare(B)], ["t2", "describe", prepare(B)]]);
+  const merge = turns.find((t) => t.kind === "merge")!;
+  expect(merge.text).toContain("Task t1 (t1): `bun test test/one.test.ts`; Task t2 (t2): `bun test test/seven.test.ts`.");
+});
+
+test("a prepare turn that doesn't call ready sits the task out", async () => {
+  const { B, on, task, run, satOut, advances, act } = await fixture();
+  await task("t1", await on(B, "fix one", { "f.txt": edited(1, "ONE") }), { tests: null });
+  act("t1", async () => ({ kind: "done" }));
+
+  expect(await run()).toEqual({ landed: null, again: false, paused: null });
+  expect(satOut).toEqual([["t1", "its prepare turn didn't call ready"]]);
+  expect(advances).toEqual([]);
+});
+
+test("a prepare turn that leaves several revisions sits the task out", async () => {
+  const { B, on, task, run, satOut, advances } = await fixture();
+  const first = await on(B, "first", { "g.txt": "first\n" });
+  await task("t1", await on(first, "second", { "f.txt": edited(2, "TWO") }));
+
+  expect(await run()).toEqual({ landed: null, again: false, paused: null });
+  expect(satOut).toEqual([["t1", "its work is still 2 revisions after its prepare turn"]]);
+  expect(advances).toEqual([]);
+});
+
+test("a resumed round asks again a task whose test list was lost", async () => {
+  const { B, on, task, run, turns, satOut } = await fixture();
+  const tip = await on(B, "fix one", { "f.txt": edited(1, "ONE") });
+  await task("t1", tip, { tests: null });
+
+  // Its prepare turn ran before a restart; what it named was not kept.
+  expect(await run({ step: "describing", batch: ["t1"], mergeTask: null })).toEqual({ landed: tip, again: false, paused: null });
+  expect(turns.map((t) => [t.taskId, t.kind])).toEqual([["t1", "describe"]]);
+  expect(satOut).toEqual([]);
+});
+
+test("a round resumed from a describe step of before the prepare turn asks again a task its old turn left unsquashed", async () => {
+  const { B, on, task, run, turns, satOut } = await fixture();
+  // Its old describe turn described two revisions, and named no tests.
+  const first = await on(B, "first", { "g.txt": "first\n" });
+  await task("t1", await on(first, "second", { "f.txt": edited(2, "TWO") }), { tests: null });
+
+  await run({ step: "describing", batch: ["t1"], mergeTask: null });
+  // Not sat out for what the old turn never asked: prepared, which (as its agent does nothing) sits it out now.
+  expect(turns.map((t) => [t.taskId, t.kind, t.text])).toEqual([["t1", "describe", prepare(B)]]);
+  expect(satOut).toEqual([["t1", "its work is still 2 revisions after its prepare turn"]]);
+});
+
+test("a task holding another's work keeps it, and the task it builds on is asked only for its tests", async () => {
+  const { B, on, task, run, turns, satOut, advances } = await fixture();
+  const lower = await on(B, "lower", { "f.txt": edited(2, "TWO") });
+  // The upper task started on the lower one's line, and has two revisions of its own.
+  const upper1 = await on(lower, "upper one", { "g.txt": "upper\n" });
+  const upper = await on(upper1, "upper two", { "f.txt": edited(2, "TWO").replace("seven", "SEVEN") });
+  await task("tl", lower, { size: 2, tests: null });
+  await task("tu", upper, { size: 4, base: [lower], tests: null });
+
+  expect(await run()).toEqual({ landed: upper, again: false, paused: null });
+  const base = { main: B, conflicted: [] };
+  expect(turns.map((t) => [t.taskId, t.text])).toEqual([
+    ["tl", preparePrompt({ ...base, rewrite: "none", describe: false }, DESCRIBE)],
+    ["tu", preparePrompt({ ...base, rewrite: "keep", describe: false }, DESCRIBE)],
+  ]);
+  // Not sat out for its two revisions: they hold the lower task's work.
+  expect(satOut).toEqual([]);
+  expect(advances).toEqual([[B, upper]]);
+});
+
 test("blame drops the culprit and lands the rest", async () => {
-  const { repo, B, on, task, run, created, discarded, advances, turns, log, head, act } = await fixture();
+  const { repo, cfg, B, on, task, line, run, created, discarded, advances, turns, log, saved, act } = await fixture();
   const tip1 = await on(B, "first", { "f.txt": edited(1, "ONE") });
   const tip2 = await on(B, "second", { "f.txt": edited(4, "FOUR") });
   const tip3 = await on(B, "third", { "g.txt": "third\n" });
@@ -396,18 +521,27 @@ test("blame drops the culprit and lands the rest", async () => {
     if (taskId === "m1") return { kind: "blamed", task: "Task t2", reason: "test four fails" };
     await jj(["describe", "-m", "Merge first and third"], repo);
   });
+  act("t2", async () => {
+    // The agent fixes its work on the main that landed, and names the test it fixed.
+    const fixed = await on("main", "second, fixed", { "f.txt": LINES.map((l, i) => (i === 0 ? "ONE\n" : i === 3 ? "FOUR, fixed\n" : l)).join("") });
+    await bookmarkSet(repo, line("t2"), fixed);
+    return { kind: "done", tests: ["bun test test/four.test.ts"] };
+  });
 
   const result = await run();
-  const L = await head();
+  // What landed (the merge task's head, before the fix turn moved the repo's `@`).
+  const [L] = await commitsIn(repo, advances[0]![1], cfg);
   // The culprit's fix turn ends: it can go in the next round.
-  expect(result).toEqual({ landed: L.commitId, again: true, paused: null });
+  expect(result).toEqual({ landed: L!.commitId, again: true, paused: null });
   expect(created.map((c) => [c.batch, c.parents])).toEqual([[["t1", "t2", "t3"], [tip1, tip2, tip3]], [["t1", "t3"], [tip1, tip3]]]);
   expect(discarded).toEqual(["m1"]);
-  expect(advances).toEqual([[B, L.commitId]]);
-  expect(L.parents).toEqual([tip1, tip3]);
-  // The fix turn opens with what the merge agent reported, and asks for a rebase onto the main that landed.
-  expect(turns.at(-1)).toEqual({ taskId: "t2", kind: "fix", text: rebasePrompt(L.commitId, "test four fails") });
+  expect(advances).toEqual([[B, L!.commitId]]);
+  expect(L!.parents).toEqual([tip1, tip3]);
+  // The fix turn opens with what the merge agent reported, and asks for a rebase onto the main that landed; the tests
+  // its agent named are kept for its fixed work.
+  expect(turns.at(-1)).toEqual({ taskId: "t2", kind: "fix", text: prepare(L!.commitId, "test four fails") });
   expect(log).toEqual(["create m1", "turn m1", "discard m1", "create m2", "turn m2", "advance", "turn t2"]);
+  expect(saved).toEqual([["t2", ["bun test test/four.test.ts"]]]);
 });
 
 test("a frozen task that needs a rebase leaves", async () => {
@@ -655,7 +789,7 @@ test("a batch whose real merge conflicts puts its smallest task back, and that o
   expect(await run()).toEqual({ landed: null, again: true, paused: null });
   expect(created.map((c) => c.batch)).toEqual([["t1", "t2"], ["t2"]]);
   expect(discarded).toEqual(["m1", "m2"]);
-  expect(turns).toEqual([{ taskId: "t2", kind: "rebase", text: rebasePrompt(renamed) }]);
+  expect(turns).toEqual([{ taskId: "t2", kind: "rebase", text: prepare(renamed) }]);
   expect(steps.at(-1)).toEqual({ step: "rebasing", batch: ["t2"], mergeTask: null });
 
   expect(await run()).toEqual({ landed: rebased, again: false, paused: null });
@@ -673,8 +807,8 @@ test("a task whose real merge conflicts, and that isn't on main after its rebase
 
   expect(await run()).toEqual({ landed: null, again: false, paused: null });
   expect(discarded).toEqual(["m1"]);
-  expect(turns).toEqual([{ taskId: "t1", kind: "rebase", text: rebasePrompt(renamed) }]);
-  expect(satOut).toEqual([["t1", expect.stringContaining("still doesn't merge cleanly")]]);
+  expect(turns).toEqual([{ taskId: "t1", kind: "rebase", text: prepare(renamed) }]);
+  expect(satOut).toEqual([["t1", "its work isn't on main after its prepare turn"]]);
   expect(advances).toEqual([]);
 });
 
@@ -690,9 +824,9 @@ test("a lasting refusal pauses the train, after the turns the round owes", async
   expect(advances).toEqual([]);
   // The merge task never outlives its batch, and the task to rebase still gets its turn onto main as it is.
   expect(discarded).toEqual(["m1"]);
-  expect(turns.at(-1)).toEqual({ taskId: "t2", kind: "rebase", text: rebasePrompt(M) });
+  expect(turns.at(-1)).toEqual({ taskId: "t2", kind: "rebase", text: prepare(M) });
   expect(log.slice(-3)).toEqual(["advance", "discard m1", "turn t2"]);
-  expect(satOut).toEqual([["t2", expect.stringContaining("still doesn't merge cleanly")]]);
+  expect(satOut).toEqual([["t2", "its work isn't on main after its prepare turn"]]);
   expect(steps.at(-1)).toEqual({ step: "rebasing", batch: ["t2"], mergeTask: null });
 });
 

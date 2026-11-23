@@ -42,7 +42,7 @@ async function fixture() {
     return { row: row(id, tip, base), workspace };
   };
   const candidate = (taskId: string, tip: string, over: Partial<Candidate> = {}): Candidate =>
-    ({ taskId, title: taskId, tip, base: [B], workspace: null, size: 1, ...over });
+    ({ taskId, title: taskId, tip, base: [B], workspace: null, size: 1, tests: null, ...over });
   return { repo, cfg, B, on, row, task, candidate };
 }
 

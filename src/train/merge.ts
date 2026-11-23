@@ -90,7 +90,7 @@ export async function checkBatch(
   }
   const change = start.changeId;
   const tasks = batch.map(label);
-  let text = mergePrompt(tasks, change, input.prompt);
+  let text = mergePrompt(batch.map((c) => ({ task: label(c), tests: c.tests })), change, input.prompt);
 
   for (let followUps = 0; ; followUps++) {
     const outcome = await deps.turn(taskId, "merge", text);

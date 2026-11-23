@@ -1,7 +1,7 @@
-// One round of the merge train (the spec's "A round"): the queued, eligible tasks are made pushable (describe turns,
-// leftovers abandoned), a batch of them that merges cleanly with the branch is picked, checked by a merge task when it has
-// two heads or more, and landed by moving the branch; then the tasks that no longer merge cleanly with it get rebase
-// turns, and a task the merge agent blamed a fix turn. What the round does to the world goes through `RoundDeps`, so
+// One round of the merge train (the spec's "A round"): the queued, eligible tasks are prepared (prepare turns that
+// rebase, squash and describe their work and name its tests; leftovers abandoned), a batch of them that merges cleanly
+// with the branch is picked, checked by a merge task when it has two heads or more, and landed by moving the branch;
+// then the tasks that no longer merge cleanly with it, and a task the merge agent blamed, get prepare turns onto it. What the round does to the world goes through `RoundDeps`, so
 // the conductor that runs it (`meddle.train`) decides where tasks live and how they are reached.
 import type { NodeConfig } from "../config";
 import { trialMerge } from "../git/merge-tree";
@@ -9,9 +9,9 @@ import { changesIn } from "../jj";
 import type { LineRow } from "../pool/rows";
 import { gitGraph } from "../projects/applier";
 import type { Graph } from "../projects/branches";
-import { classify, mergeParents, ownWork, pickBatch, type Candidate } from "./batch";
+import { classify, mergeParents, ownWork, pickBatch, type Candidate, type Classified } from "./batch";
 import { checkBatch, type MergeDeps, type MergeVerdict } from "./merge";
-import { describePrompt, rebasePrompt } from "./prompts";
+import { preparePrompt, type Rewrite } from "./prompts";
 import { declineReason, type TrainTurnKind } from "./tools";
 
 /**
@@ -69,6 +69,8 @@ export class BatchChanged extends Error {
  *   records it then (the user may have accepted it again since);
  * - `sitOut`: a task stays queued but not eligible until Retry, saying why;
  * - `holdBack`: a task stays queued but is not eligible this round, with the notice to show;
+ * - `saveTests`: records the commands a task's agent named (`ready`) to run the tests covering its work at `tip`, which
+ *   `candidates` answers as the task's `tests` while its tip is that;
  * - `checkpoint`: where the round is (`RoundStep`), for the train's page and for a round resumed after a restart or Retry.
  */
 export type RoundDeps = MergeDeps & {
@@ -82,6 +84,7 @@ export type RoundDeps = MergeDeps & {
   leave(taskId: string, reason: string, declined: boolean): Promise<void>;
   sitOut(taskId: string, reason: string): Promise<void>;
   holdBack(taskId: string, notice: string): Promise<void>;
+  saveTests(taskId: string, tip: string, tests: string[]): Promise<void>;
   checkpoint(step: RoundStep): Promise<void>;
 };
 
@@ -107,9 +110,11 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  * node's repo of the project, and `prompt` the `describe.prompt` setting.
  *
  * 1. What each task would land, `B..tip`, must be pushable (`classify`): its leftovers are abandoned, and a task with
- *    undescribed or conflicted commits of its own gets a describe turn (all such turns at once), and must be pushable
- *    after it. A task with such commits it may not change leaves, naming them; a task holding work of a task that isn't
- *    queued is held back; a task holding a queued task's work goes only with it.
+ *    undescribed or conflicted commits of its own, several revisions to squash, or no test list for its tip gets a
+ *    prepare turn (a `describe` turn; all such turns at once): rebased onto `B` and squashed into one revision as its
+ *    work allows (`Rewrite`), described, with the tests covering it named (`ready`, kept by `saveTests`). What the turn
+ *    left undone sits it out. A task with such commits it may not change leaves, naming them; a task holding work of a
+ *    task that isn't queued is held back; a task holding a queued task's work goes only with it.
  * 2. A batch is picked (`pickBatch`); a task that doesn't merge cleanly with `B` is to rebase.
  * 3. A batch with two heads or more is checked by a merge task (`checkBatch`; never for one head). A task it blames
  *    leaves the batch, with the tasks holding its work, for a fix turn, and a fresh merge task checks the rest. A batch
@@ -123,10 +128,10 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  *    stale lands. If it is still at `B`, the refusal is one that lasts as long as nothing changes (the branch is
  *    conflicted or behind its rows, the node takes no input, the merge isn't in the replica): the train pauses with it,
  *    after step 5, rather than check the same batch again and again.
- * 5. After landing (or straight away, if nothing landed), each task to rebase gets a rebase turn onto the branch's new
- *    commit, and each blamed task a fix turn opening with the merge agent's report, all at once. A task whose own commits
- *    another task has built on can't rebase, and leaves. A rebase turn must leave the work merging cleanly, and, for a
- *    task whose merge only jj found unclean (git can't tell), on the branch's commit.
+ * 5. After landing (or straight away, if nothing landed), each task to rebase gets a prepare turn (`rebase`) onto the
+ *    branch's new commit, and each blamed task one (`fix`) opening with the merge agent's report, all at once. A task
+ *    whose own commits another task has built on can't rebase, and leaves. The turn must leave the work on the branch's
+ *    commit as one described revision, or, for work holding another task's or started off main, merging cleanly with it.
  *
  * A train turn that fails (or can't be run) or ends without doing its job sits its task out (`waiting for <node>` when
  * the node is offline); a decline makes it leave. The round's tasks are those of its first `candidates`: a task queued
@@ -137,7 +142,7 @@ export type RoundResult = { landed: string | null; again: boolean; paused: strin
  * discarded unless its merge landed or it is gone (`TaskGone`), so the check starts afresh; when its head can't be read
  * for another reason, the round rejects before it checkpoints anything, so the checkpoint still names it for the next.
  * The tasks it names as describing or rebasing had their turns: one that is eligible again but still needs what its turn
- * was for sits out rather than being asked again. Then the round starts over. A failure of `deps` (but a task's turn or abandon) or of reading the repo rejects.
+ * was for sits out rather than being asked again, unless all it lacks is its test list, which the restart may have lost. Then the round starts over. A failure of `deps` (but a task's turn or abandon) or of reading the repo rejects.
  */
 export async function runRound(deps: RoundDeps, cfg: NodeConfig, repo: string, prompt: string, resume?: RoundStep): Promise<RoundResult> {
   const round = new Round(deps, cfg, repo, prompt, await deps.branch());
@@ -169,18 +174,29 @@ type Snapshot = { candidates: Map<string, Candidate>; lines: LineRow[]; queued: 
 
 /**
  * What step 1 makes of a task: ready to land (`needs`: the queued tasks whose work it holds), work to do first (leftovers
- * to abandon, the prompt of a describe turn), or out of the round (what put it out is done).
+ * to abandon, the prompt of a prepare turn), or out of the round (what put it out is done).
  */
 type Settled =
   | { kind: "ready"; c: Candidate; needs: string[] }
-  | { kind: "work"; c: Candidate; leftovers: string[]; describe: string | null }
+  | { kind: "work"; c: Candidate; leftovers: string[]; prepare: string | null }
   | { kind: "out" };
+
+/**
+ * Whether a task had its prepare turn when step 1 settles it: not (`no`), in this round (`now`), or before the round was
+ * resumed (`resumed`: its turn ran, but what it named may have been lost to a restart or a hold).
+ */
+type Turned = "no" | "now" | "resumed";
+
+/** How a prepare turn may change a task's work (`Rewrite`), and how many revisions of its own it has, leftovers aside. */
+type Shape = { rewrite: Rewrite; revisions: number };
 
 /** A task the merge agent blamed, and what it reported. */
 type Blamed = { c: Candidate; report: string };
 
 const FROZEN = "another task builds on this work, so it can't rebase";
 const STILL_CONFLICTS = "its work still doesn't merge cleanly with main after its rebase turn";
+const NOT_READY = "its prepare turn didn't call ready";
+const OFF_MAIN = "its work isn't on main after its prepare turn";
 
 class Round {
   /** `RoundResult.again`. */
@@ -190,8 +206,6 @@ class Round {
   readonly #needs = new Map<string, string[]>();
   /** The tasks that left the queue in this round. */
   readonly #left = new Set<string>();
-  /** The tasks to rebase because jj's merge of their work with `B` isn't clean, though git's trial merge is. */
-  readonly #unclean = new Set<string>();
   #lines: LineRow[] = [];
   readonly #graph: Graph;
 
@@ -228,30 +242,35 @@ class Round {
     await this.deps.discard(taskId);
   }
 
-  /** Step 1 for the tasks of `s` (`turned`: those that had a describe turn already): fills `ready`. */
-  async describe(s: Snapshot, turned: ReadonlySet<string>): Promise<void> {
+  /** Step 1 for the tasks of `s` (`asked`: those that had a prepare turn before the round was resumed): fills `ready`. */
+  async describe(s: Snapshot, asked: ReadonlySet<string>): Promise<void> {
     const ready = new Map<string, Extract<Settled, { kind: "ready" }>>();
     const work: Array<Extract<Settled, { kind: "work" }>> = [];
     for (const c of s.candidates.values()) {
-      const r = await this.#settle(c, s, turned.has(c.taskId));
+      const r = await this.#settle(c, s, asked.has(c.taskId) ? "resumed" : "no");
       if (r.kind === "ready") ready.set(c.taskId, r);
       else if (r.kind === "work") work.push(r);
     }
 
     if (work.length > 0) {
-      const describing = work.filter((w) => w.describe !== null).map((w) => w.c.taskId);
-      await this.deps.checkpoint({ step: "describing", batch: describing, mergeTask: null });
+      const preparing = work.filter((w) => w.prepare !== null).map((w) => w.c.taskId);
+      await this.deps.checkpoint({ step: "describing", batch: preparing, mergeTask: null });
       const fixed = await Promise.all(work.map((w) => this.#fix(w)));
       // Every task is read again: those fixed have changed, and any may have left meanwhile.
       const fresh = await this.read();
-      // The tasks still in the round after their fix, and whether they had a describe turn.
+      // The tasks still in the round after their fix, and whether they had a prepare turn; the tests a turn named are
+      // kept for the work it left.
       const back = new Map<string, boolean>();
-      work.forEach((w, i) => {
-        if (fixed[i] !== null) back.set(w.c.taskId, fixed[i]!);
-      });
+      for (const [i, w] of work.entries()) {
+        const f = fixed[i];
+        if (f === null || f === undefined) continue;
+        back.set(w.c.taskId, f.turned);
+        const c = fresh.candidates.get(w.c.taskId);
+        if (c !== undefined && f.tests !== null) await this.#saveTests(c, f.tests);
+      }
       for (const id of [...ready.keys(), ...back.keys()]) {
         const c = fresh.candidates.get(id);
-        const r = c === undefined ? null : await this.#settle(c, fresh, back.get(id) === true);
+        const r = c === undefined ? null : await this.#settle(c, fresh, back.get(id) === true ? "now" : "no");
         if (r?.kind === "ready") {
           ready.set(id, r);
           continue;
@@ -260,7 +279,7 @@ class Round {
         if (r?.kind === "work") {
           // It changed since it was read (its agent left empty revisions, or its work was changed outside a turn): it
           // goes in the next round.
-          if (r.describe === null) await this.#fix(r);
+          if (r.prepare === null) await this.#fix(r);
           this.again = true;
         }
       }
@@ -286,8 +305,14 @@ class Round {
     }
   }
 
-  /** What step 1 makes of candidate `c`; after a describe turn (`turned`), commits still to fix sit it out. */
-  async #settle(c: Candidate, s: Snapshot, turned: boolean): Promise<Settled> {
+  /**
+   * What step 1 makes of candidate `c`. A task needs a prepare turn when it has undescribed or conflicted revisions of
+   * its own, several revisions it may squash, or no test list for its tip. After its turn (`now`), what it left
+   * undone sits it out (`#problem`). A task whose turn ran before the round was resumed (`resumed`) sits out only for
+   * revisions still undescribed or conflicted, which any turn asked for: what else it lacks (its test list, lost to a
+   * restart or a hold; a squash or rebase an older meddle's turn didn't ask for) it is asked for again.
+   */
+  async #settle(c: Candidate, s: Snapshot, turned: Turned): Promise<Settled> {
     const k = await classify(this.cfg, this.repo, this.B, c, s.queued, s.lines);
     if (k.unfixable.length > 0) {
       const names = await this.#changes(k.unfixable.map((u) => u.commit));
@@ -299,18 +324,35 @@ class Round {
       await this.#holdBack(c, outside.taskId);
       return { kind: "out" };
     }
-    if (k.toFix.length === 0 && k.leftovers.length === 0) return { kind: "ready", c, needs: k.foreign.map((f) => f.taskId) };
-    if (k.toFix.length > 0 && turned) {
-      const names = (await this.#changes(k.toFix)).map(short);
-      await this.#sitOut(c.taskId, `${names.join(", ")} ${names.length === 1 ? "is" : "are"} still undescribed or conflicted after its describe turn`);
+    const shape = await this.#shape(c, this.B, s.lines, k, 1);
+    const needs = k.foreign.map((f) => f.taskId);
+    const problem = turned === "no" ? null : await this.#problem(c, this.B, shape, k, turned === "resumed");
+    // A turn before a resume may have been one of an older meddle, which asked only for descriptions: it sits out for
+    // those alone, and is asked again for the rest.
+    if (problem !== null && (turned === "now" || k.toFix.length > 0)) {
+      await this.#sitOut(c.taskId, problem);
       return { kind: "out" };
     }
-    const describe = k.toFix.length === 0 ? null : describePrompt(this.prompt, await this.#changes(k.conflicted));
-    return { kind: "work", c, leftovers: k.leftovers, describe };
+    const turn = turned === "now"
+      ? false
+      : turned === "resumed"
+      ? c.tests === null || problem !== null
+      : k.toFix.length > 0 || c.tests === null || (isSquash(shape.rewrite) && shape.revisions > 1);
+    if (!turn && k.leftovers.length === 0) return { kind: "ready", c, needs };
+    const prepare = turn
+      ? preparePrompt(
+        { main: this.B, rewrite: shape.rewrite, describe: k.toFix.length > 0, conflicted: await this.#changes(k.conflicted) },
+        this.prompt,
+      )
+      : null;
+    return { kind: "work", c, leftovers: k.leftovers, prepare };
   }
 
-  /** Abandons `w`'s leftovers, then gives it its describe turn: whether it had one, or null when that put it out. */
-  async #fix(w: Extract<Settled, { kind: "work" }>): Promise<boolean | null> {
+  /**
+   * Abandons `w`'s leftovers, then gives it its prepare turn: whether it had one and the tests it named, or null when
+   * that put it out. A task the train only abandoned leftovers of keeps its test list, for the work as it is now.
+   */
+  async #fix(w: Extract<Settled, { kind: "work" }>): Promise<{ turned: boolean; tests: string[] | null } | null> {
     if (w.leftovers.length > 0) {
       try {
         await this.deps.abandonLeftovers(w.c.taskId, w.leftovers);
@@ -319,8 +361,53 @@ class Round {
         return null;
       }
     }
-    if (w.describe === null) return false;
-    return (await this.#turn(w.c.taskId, "describe", w.describe)) ? true : null;
+    if (w.prepare === null) {
+      const now = (await this.deps.candidates()).find((c) => c.taskId === w.c.taskId);
+      if (w.c.tests !== null && now !== undefined && now.tip !== w.c.tip) await this.#saveTests(now, w.c.tests);
+      return { turned: false, tests: null };
+    }
+    const ended = await this.#turn(w.c.taskId, "describe", w.prepare);
+    return ended === null ? null : { turned: true, tests: ended.tests };
+  }
+
+  /**
+   * How a prepare turn onto `main` may change `c`'s work (`Shape`), `k` being what it would land (`classify`): not at all
+   * when another task builds on it (`lines`: the project's line rows), nor in step 1 when it holds another task's work
+   * (`keep`), which step 5 rebases; work that started off main is squashed where it is in step 1, and rebased in step 5;
+   * the rest is rebased and squashed.
+   */
+  async #shape(c: Candidate, main: string, lines: readonly LineRow[], k: Classified, step: 1 | 5): Promise<Shape> {
+    const own = await ownWork(this.cfg, this.repo, main, c, lines);
+    const revisions = own.filter((x) => !k.leftovers.includes(x.commitId)).length;
+    if (own.some((x) => !x.mutable)) return { rewrite: "none", revisions };
+    if (k.foreign.length > 0) return { rewrite: step === 1 ? "keep" : "rebase", revisions };
+    for (const b of c.base) {
+      if (!(await this.#graph.isAncestor(b, main).catch(() => false))) return { rewrite: step === 1 ? "squash-here" : "rebase", revisions };
+    }
+    return { rewrite: "squash", revisions };
+  }
+
+  /**
+   * What `c`'s prepare turn onto `main` left undone, as its sitting out says, or null: no test list (unless `resumed`,
+   * where a lost list is asked for again), work to squash that isn't on main, work to rebase that doesn't merge cleanly
+   * with it, revisions still undescribed or conflicted (`k`), or several revisions left to squash.
+   */
+  async #problem(c: Candidate, main: string, shape: Shape, k: Classified, resumed: boolean): Promise<string | null> {
+    if (!resumed && c.tests === null) return NOT_READY;
+    if (shape.rewrite === "squash" && !(await this.#graph.isAncestor(main, c.tip))) return OFF_MAIN;
+    if (shape.rewrite === "rebase" && (await this.#conflicts(main, c.tip))) return STILL_CONFLICTS;
+    if (k.toFix.length > 0) {
+      const names = (await this.#changes(k.toFix)).map(short);
+      return `${names.join(", ")} ${names.length === 1 ? "is" : "are"} still undescribed or conflicted after its prepare turn`;
+    }
+    if (isSquash(shape.rewrite) && shape.revisions > 1) return `its work is still ${shape.revisions} revisions after its prepare turn`;
+    return null;
+  }
+
+  /** Keeps the tests `c`'s agent named for its work as it is now (`c.tip`). */
+  async #saveTests(c: Candidate, tests: string[]): Promise<void> {
+    await this.deps.saveTests(c.taskId, c.tip, tests);
+    c.tests = tests;
   }
 
   /** Step 2 (`pickBatch`). Work git can't trial merge with `B` at all sits its task out, and the rest are picked again. */
@@ -364,7 +451,6 @@ class Round {
           // The batch is the biggest first: the smallest task waits for a later round, unless nothing would be left.
           const others = this.#without(rest, rest.at(-1)!.taskId);
           if (others.length === 0) {
-            for (const c of rest) this.#unclean.add(c.taskId);
             rebase.push(...rest);
             return { landed: null };
           }
@@ -457,39 +543,61 @@ class Round {
   }
 
   /**
-   * Step 5: rebase turns onto `main` (the branch's commit now) for `toRebase`, fix turns for `blamed`, all at once. A task
-   * `asked` had its rebase turn already (a round resumed): still to rebase, it sits out.
+   * Step 5: prepare turns onto `main` (the branch's commit now) for `toRebase` (`rebase` turns) and `blamed` (`fix` turns,
+   * opening with what the merge agent reported), all at once; a task whose own work another task has built on can't
+   * rebase, and leaves. Each is read again after its turn, against `main` and the line rows now, and what it left undone
+   * sits it out (`#problem`). A task `asked` had its turn already (a round resumed): as in step 1, only revisions still
+   * undescribed or conflicted sit it out, and it is asked again for the rest.
    */
   async rebase(main: string, toRebase: Candidate[], blamed: Blamed[], asked: ReadonlySet<string>): Promise<void> {
-    const turns: Array<{ c: Candidate; kind: "rebase" | "fix"; text: string }> = [];
+    const lines = await this.deps.lines();
+    const shapeOf = async (c: Candidate) => {
+      const k = await classify(this.cfg, this.repo, main, c, new Set(), lines);
+      return { k, shape: await this.#shape(c, main, lines, k, 5) };
+    };
+    const turns: Array<{ c: Candidate; kind: "rebase" | "fix"; rewrite: Rewrite; text: string }> = [];
+    const asTurn = (c: Candidate, kind: "rebase" | "fix", rewrite: Rewrite, report?: string) => turns.push({
+      c, kind, rewrite,
+      text: preparePrompt({ main, rewrite, describe: true, conflicted: [], ...(report === undefined ? {} : { report }) }, this.prompt),
+    });
     for (const c of toRebase) {
-      if (asked.has(c.taskId)) await this.#sitOut(c.taskId, STILL_CONFLICTS);
-      else if (await this.#frozen(c)) await this.#leave(c.taskId, FROZEN);
-      else turns.push({ c, kind: "rebase", text: rebasePrompt(main) });
+      const { k, shape } = await shapeOf(c);
+      if (shape.rewrite === "none") {
+        await this.#leave(c.taskId, FROZEN);
+      } else if (asked.has(c.taskId)) {
+        // As in step 1, only what every turn asked for sits it out; the rest it is asked for again.
+        const problem = await this.#problem(c, main, shape, k, true);
+        if (problem !== null && k.toFix.length > 0) await this.#sitOut(c.taskId, problem);
+        else if (problem !== null || c.tests === null) asTurn(c, "rebase", shape.rewrite);
+        else this.again = true;
+      } else {
+        asTurn(c, "rebase", shape.rewrite);
+      }
     }
     for (const { c, report } of blamed) {
-      if (await this.#frozen(c)) await this.#leave(c.taskId, FROZEN);
-      else turns.push({ c, kind: "fix", text: rebasePrompt(main, report) });
+      const { shape } = await shapeOf(c);
+      if (shape.rewrite === "none") await this.#leave(c.taskId, FROZEN);
+      else asTurn(c, "fix", shape.rewrite, report);
     }
     if (turns.length === 0) return;
 
     await this.deps.checkpoint({ step: "rebasing", batch: turns.map((t) => t.c.taskId), mergeTask: null });
     const ended = await Promise.all(turns.map((t) => this.#turn(t.c.taskId, t.kind, t.text)));
-    if (!ended.includes(true)) return;
-    const now = new Map((await this.deps.candidates()).map((c) => [c.taskId, c]));
+    if (ended.every((e) => e === null)) return;
+    const [now, fresh] = await Promise.all([this.deps.candidates(), this.deps.lines()]);
+    const byId = new Map(now.map((c) => [c.taskId, c]));
     for (const [i, t] of turns.entries()) {
-      const c = now.get(t.c.taskId);
-      if (!ended[i] || c === undefined) continue;
-      const still = t.kind === "rebase"
-        && ((await this.#conflicts(main, c.tip)) || (this.#unclean.has(c.taskId) && !(await this.#graph.isAncestor(main, c.tip))));
-      if (still) await this.#sitOut(c.taskId, STILL_CONFLICTS);
+      const c = byId.get(t.c.taskId);
+      const e = ended[i];
+      if (e === null || e === undefined || c === undefined) continue;
+      if (e.tests !== null) await this.#saveTests(c, e.tests);
+      const k = await classify(this.cfg, this.repo, main, c, new Set(), fresh);
+      const own = await ownWork(this.cfg, this.repo, main, c, fresh);
+      const shape: Shape = { rewrite: t.rewrite, revisions: own.filter((x) => !k.leftovers.includes(x.commitId)).length };
+      const problem = await this.#problem(c, main, shape, k, false);
+      if (problem !== null) await this.#sitOut(c.taskId, problem);
       else this.again = true;
     }
-  }
-
-  /** Whether any of `c`'s own commits is immutable in its workspace: another task has built on them. */
-  async #frozen(c: Candidate): Promise<boolean> {
-    return (await ownWork(this.cfg, this.repo, this.B, c, this.#lines)).some((k) => !k.mutable);
   }
 
   /** Whether `tip` doesn't merge cleanly with `main` (work git can't trial merge is the next round's to find). */
@@ -501,24 +609,27 @@ class Round {
     }
   }
 
-  /** Gives task `taskId` a train turn: whether it ended as asked. A decline makes the task leave; a failure sits it out. */
-  async #turn(taskId: string, kind: TrainTurnKind, text: string): Promise<boolean> {
+  /**
+   * Gives task `taskId` a train turn: the tests its agent named (`ready`) when it ended as asked, or null when it didn't.
+   * A decline makes the task leave; a failure sits it out.
+   */
+  async #turn(taskId: string, kind: TrainTurnKind, text: string): Promise<{ tests: string[] | null } | null> {
     let outcome;
     try {
       outcome = await this.deps.turn(taskId, kind, text);
     } catch (err) {
       await this.#sitOut(taskId, failure(err, `its ${kind} turn could not run`));
-      return false;
+      return null;
     }
     if (outcome.kind === "declined") {
       await this.#leave(taskId, declineReason(outcome.reason), true);
-      return false;
+      return null;
     }
     if (outcome.kind === "failed") {
       await this.#sitOut(taskId, `its ${kind} turn failed: ${outcome.reason}`);
-      return false;
+      return null;
     }
-    return true;
+    return { tests: outcome.kind === "done" ? outcome.tests ?? null : null };
   }
 
   /** The change ids of `commits` (commit ids), in their order. */
@@ -558,6 +669,11 @@ function failure(err: unknown, what: string): string {
 
 function messageOf(err: unknown): string {
   return (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+}
+
+/** Whether a task's work is to be squashed into one revision. */
+function isSquash(rewrite: Rewrite): boolean {
+  return rewrite === "squash" || rewrite === "squash-here";
 }
 
 /** A change id as a notice names it: its first 12 characters, as unambiguous as jj needs in practice. */
