@@ -347,7 +347,7 @@ one, and sets a key picked from the table below (an `env.` key with the name typ
 | `limits.running` | How many turns a node runs at once before placement treats it as full (a non-negative integer; `0`, the default, is unlimited). A node that sets `MEDDLE_MAX_RUNNING` uses its own instead. |
 | `roster.forget` | How long, in seconds, a member may go unheard of before a node counts it gone ([Addresses and forgetting](#addresses-and-forgetting)): `0` never, else at least `60`; `900` (three lighthouse announce TTLs) when unset. A node that sets `MEDDLE_FORGET_MS` uses its own instead. |
 | `defaults.model`, `defaults.effort` | The model, and the effort (`low`, `medium`, `high`, `xhigh` or `max`), of a turn whose task chose none, and what the dashboard picks for a new task; unset, `opus` and `medium`. A model cannot be set empty. |
-| `describe.prompt` | One line (no newline, at most 4096 characters) that the merge train gives an agent to describe its work: a task whose revisions land undescribed gets it as a turn of its own (see [The merge train](#the-merge-train)), and the merge agent gets it for the merge it checked. `Add a description (4-7 words) to your revision(s).` when unset or empty. Every project task's `CLAUDE.md` also asks the agent to describe each revision it makes (`jj describe`), and a turn rewrites the task's `CLAUDE.md` at its start when it differs from what meddle generates, so tasks made earlier ask it too. |
+| `describe.prompt` | One line (no newline, at most 4096 characters) that the merge train gives an agent to describe its work: a task whose revisions land undescribed gets it as a turn of its own (see [The merge train](#the-merge-train)), and the merge agent gets it for the merge it checked. `Add a description (4-7 words) to your revision(s).` when unset or empty. A prepare turn asks for it after squashing the task's revisions into one. Every project task's `CLAUDE.md` also asks the agent to describe each revision it makes (`jj describe`), and a turn rewrites the task's `CLAUDE.md` at its start when it differs from what meddle generates, so tasks made earlier ask it too. |
 | `update.within` | How long a rollout has, from its start, to be confirmed before it fails and rolls back ([Updating the pool](#updating-the-pool)): a duration such as `90s`, `30m` or `1h`; `30m` when unset. `meddle update --within` overrides it for one rollout. |
 | `update.health` | How long each node has, from its swap, to report healthy on the new build: a duration of at least `30s`; `2m` when unset. A rollout takes the value it starts with. |
 
@@ -878,12 +878,35 @@ a train turn finishes, or Retry or Resume is pressed. Its batch is fixed once pi
 the next round, which starts as soon as this one lands or fails. With `B` the branch's commit, a round goes through
 five steps. Its **eligible** tasks are the queued ones that are idle, on an online node and not in a train turn.
 
-1. **Describing.** Landing a task lands every commit between `B` and its work, and each must push as it is: no
+1. **Preparing.** Landing a task lands every commit between `B` and its work, and each must push as it is: no
    conflicts, and no empty commit without a description. The train abandons the empty, undescribed revisions an agent
-   left behind itself. For a revision with no description, or with conflicts, the task gets a turn of its own (all such
-   turns at once): `Before your work lands on main: `, then (when any are conflicted) `resolve the conflicts in
-   <changes>, then `, then the `describe.prompt` setting (`Add a description (4-7 words) to your revision(s).` unless
-   set). Some of the commits are not the task's own:
+   left behind itself. A task lands as one revision of its own, and names the tests that cover it, so a task with a
+   revision with no description or with conflicts, with several revisions of its own, or with no test list for its
+   work as it is gets a **prepare turn** (all such turns at once). With `<P>` the `describe.prompt` setting (`Add a
+   description (4-7 words) to your revision(s).` unless set), it is:
+
+   `Before your work lands on main: rebase it onto main (<B>) and fix any conflicts, run the tests your change affects
+   (not the full suite), squash your revisions into one, then <P> Then call ready with the commands that run those
+   tests. If your change no longer makes sense on main, because something it relies on is gone or has changed
+   meaning, call decline with the reason.`
+
+   `ready(tests)` is a tool every train turn of a task has: the commands that run the tests covering its change (`bun
+   test test/foo.test.ts`, say), at least one. The train keeps them with the task's work as it is, and the merge agent
+   runs them (step 3); a task that changes after (its revisions rewritten outside a train turn) is asked again. The
+   train abandoning its leftovers keeps them. Work the turn may not rewrite is asked less:
+   - work that started on a revision not on main (below) is squashed where it is: `Before your work lands on main: `,
+     then (when any are conflicted) `resolve the conflicts in <changes>, `, then `run the tests your change affects (not
+     the full suite), squash your revisions into one, then <P> Then call ready …`;
+   - work that holds another task's (below) is neither rebased nor squashed: `Before your work lands on main: it holds
+     another task's work, so don't rebase or squash it. `, then (when it has revisions to fix) `Resolve the conflicts
+     in <changes>, then ` (when any are conflicted) and `<P> `, then `Run the tests your change affects (not the full
+     suite), then call ready with the commands that run them. If your change no longer makes sense on main, …`;
+   - work another task has built on, the same, opening `another task builds on your revisions, so don't rebase or
+     squash them.`
+
+   After the turn the task must have done it: a test list, its own revisions described and without conflicts, and,
+   where it was asked to squash, one revision, on `B` when it was asked to rebase. Some of the commits are not the
+   task's own:
    - The revision it started from, and what is below it (your `@` for a task started in a checkout, or what `--rev`
      named), land with the task, since you chose that start. They must still push: one that is undescribed or
      conflicted is not the task's to change, so the task leaves the queue, naming the commit and why. So does a task
@@ -907,7 +930,10 @@ five steps. Its **eligible** tasks are the queued ones that are idle, on an onli
      starts on a new commit with those parents, titled `Merge <task titles>`. Its first prompt is `Check that <tasks>
      work together on main. Merged cleanly as <change>. Run the typecheck and the tests that cover what they change;
      don't run the full suite, and don't change any files. If a test fails, call blame with the task responsible and
-     what failed. Otherwise: ` and the `describe.prompt` setting. The train never runs the full suite. `blame(task,
+     what failed. Otherwise: ` and the `describe.prompt` setting. With the test lists the tasks' agents named, `Run the
+     typecheck and the tests that cover what they change;` reads `Their agents name the tests that cover their changes:
+     <task>: `<command>`, …; <task>: …. Run the typecheck, those tests, and any others the combination needs;`. The
+     train never runs the full suite. `blame(task,
      reason)` is a tool only a merge task has. If the agent blames a task, that task leaves the batch for a fix turn
      (step 5), the merge task is archived and deleted, and the round starts over with the rest of the batch and a fresh
      merge task. Otherwise the train checks that the merge task's head is the merge itself, with a description, no
@@ -923,26 +949,31 @@ five steps. Its **eligible** tasks are the queued ones that are idle, on an onli
    only as a fast-forward. If someone pushed since `B`, the move is refused, the round starts over against the new
    commit, and a batch that still merges cleanly is checked again. Each landed task is then accepted as a push accepts
    it: archived, its line released. So is the merge task.
-5. **Rebasing.** After landing, or straight away when nothing landed, each task marked to rebase gets a turn: `main
-   moved on, and your work no longer merges cleanly with it. Rebase onto main (<commit>), fix the conflicts, run the
-   tests your changes affect (not the full suite), and keep each revision described. If your change no longer makes
-   sense on main, because something it relies on is gone or has changed meaning, call decline with the reason.` A
-   task the merge agent blamed gets the same turn, opening with what the agent reported. A task rebases only its own
-   revisions: when another task has built on them it leaves the queue saying so. A task marked to rebase because only
-   jj's merge conflicts (step 3) must end its turn with its work on `<commit>`. `decline(reason)` is a tool every train
-   turn of a task has (describing, rebasing, fixing), and the merge task's turns don't; calling it takes the task off
-   the queue, with the reason shown. When a train turn ends the task is eligible again, and the next round starts.
+5. **Rebasing.** After landing, or straight away when nothing landed, each task marked to rebase gets a prepare turn
+   onto the branch's commit now (`<commit>`), as in step 1. A task the merge agent blamed gets the same turn, opening
+   with `The merge agent that checked your work together with other tasks on main reported: <report>`. Work that holds
+   another task's, or started off main, is asked instead to `rebase your own revisions onto main (<commit>) and fix any
+   conflicts, run the tests your change affects (not the full suite), then <P> Then call ready …`, without squashing.
+   A task rebases only its own revisions: when another task has built on them it leaves the queue saying so. The turn
+   must leave the task's work on `<commit>` as one described revision with a test list, or, where it wasn't to squash,
+   merging cleanly with it. `decline(reason)` is a tool every train turn of a task has (preparing, rebasing, fixing),
+   and the merge task's turns don't; calling it takes the task off the queue, with the reason shown. When a train turn
+   ends the task is eligible again, and the next round starts.
 
 Every train turn runs in `auto` permission mode, whatever the task's own mode is; the task's own mode is untouched for
-your turns. `decline` and `blame` need no approval. A train turn shows in the task's conversation like any prompt, marked
+your turns. `decline`, `ready` and `blame` need no approval. A train turn shows in the task's conversation like any prompt, marked
 as meddle's. While one runs on a task, what you send to it waits for the task's next turn, and Send now has nothing to
 send into it; the message runs when the train lets go, and takes the task off the queue then (above). A task in the
 batch being checked is not held: a message to it runs at once, which takes it off the queue and stops the check, as
 Unqueue does (above).
 
 **Sitting out.** A task whose train turn fails (after meddle's own reruns for tokens), or ends without doing its job
-(revisions still undescribed or conflicted, or still not merging cleanly with the branch after the rebase, or not on
-it when only jj's merge conflicted), stays queued but is not eligible: it sits out. The train page shows it as
+(`its prepare turn didn't call ready`, revisions still undescribed or conflicted, `its work isn't on main after its
+prepare turn`, `its work is still <n> revisions after its prepare turn`, or still not merging cleanly with the branch
+where it wasn't to squash), stays queued but is not eligible: it sits out. A round that a restart or a pool update cut
+off sits a task whose turn ran out only for revisions still undescribed or conflicted, and asks it again for the rest:
+a test list the round lost, or a squash or rebase that an older meddle's turn, before an update, didn't ask for. A task held by a node
+running a meddle older than `ready` can't name its tests, so it sits out until that node is updated. The train page shows it as
 `sitting out`, and a notice gives the reason, with Retry (also on its row). Only Retry brings it back (Unqueue takes
 it off the train instead), so the train never sends the same prompt round after round. A task whose node is offline
 sits out too, as `waiting for <node>`, and comes back by itself when the node does.
@@ -980,8 +1011,8 @@ round: checking
 ```
 
 A task's state is `queued`, `turn running` (its own turn; shown for tasks on the home's own node, other nodes' show as
-`queued`), `describing`, `rebasing onto main` (a train turn of that step), `in the batch`, `sitting out` or `waiting for
-<node>`; for a task that sits out or is held back the reason follows the state. The round's step is `describing`,
+`queued`), `describing` (a prepare turn of step 1), `rebasing onto main` (a train turn of step 5), `in the batch`,
+`sitting out` or `waiting for <node>`; for a task that sits out or is held back the reason follows the state. The round's step is `describing`,
 `picking`, `checking`, `landing` or `rebasing`. `nothing queued` when there is none. `<project>` is an id or a name;
 without one it is the project of the checkout you are in, else the pool's only project (a project named `pause` or
 `resume` is given by its id). With `--follow` it prints again each time something changes, a blank line between, and

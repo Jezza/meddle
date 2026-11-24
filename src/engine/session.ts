@@ -28,6 +28,8 @@ export type MeddleEvent =
   | { type: "meddle"; subtype: "train_turn"; kind: TrainTurnKind; text: string; after: number }
   /** The task's agent called meddle's `decline` tool in a train turn. */
   | { type: "meddle"; subtype: "train_decline"; reason: string }
+  /** The task's agent called meddle's `ready` tool in a train turn, naming the commands that run the tests covering its change. */
+  | { type: "meddle"; subtype: "train_ready"; tests: string[] }
   /** The merge agent called meddle's `blame` tool, naming the task responsible. */
   | { type: "meddle"; subtype: "train_blame"; task: string; reason: string }
   /**
@@ -64,10 +66,15 @@ export type MeddleEvent =
     retried?: true;
   };
 
-/** Whether `m` is one of the train's events (`train_turn`, `train_decline`, `train_blame`, `train_left`): none ends a turn. */
+/**
+ * Whether `m` is one of the train's events (`train_turn`, `train_decline`, `train_ready`, `train_blame`, `train_left`):
+ * none ends a turn.
+ */
 export function isTrainEvent(m: { type?: unknown; subtype?: unknown }): boolean {
-  return m.type === "meddle"
-    && (m.subtype === "train_turn" || m.subtype === "train_decline" || m.subtype === "train_blame" || m.subtype === "train_left");
+  return m.type === "meddle" && (
+    m.subtype === "train_turn" || m.subtype === "train_decline" || m.subtype === "train_ready" || m.subtype === "train_blame"
+    || m.subtype === "train_left"
+  );
 }
 
 /**

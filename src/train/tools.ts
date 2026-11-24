@@ -11,22 +11,23 @@ import { resultError, tokenFaultNotice, type MeddleEvent } from "../engine/sessi
 export type TrainTurnKind = "describe" | "rebase" | "fix" | "merge";
 
 /**
- * How a train turn went: it ended as asked (`done`), the task's agent called `decline`, the merge agent called `blame`,
- * or the turn did not end well (`failed`: an error result, a failure, an abort).
+ * How a train turn went: it ended as asked (`done`, with the `tests` the task's agent named by calling `ready`, if it
+ * did), the task's agent called `decline`, the merge agent called `blame`, or the turn did not end well (`failed`: an
+ * error result, a failure, an abort).
  */
 export type TrainTurnOutcome =
-  | { kind: "done" }
+  | { kind: "done"; tests?: string[] }
   | { kind: "declined"; reason: string }
   | { kind: "blamed"; task: string; reason: string }
   | { kind: "failed"; reason: string };
 
 /** The names Claude Code knows meddle's train tools by: allowed without asking (`allowedTools`). */
-export const TRAIN_TOOLS = ["mcp__meddle__decline", "mcp__meddle__blame"] as const;
+export const TRAIN_TOOLS = ["mcp__meddle__decline", "mcp__meddle__ready", "mcp__meddle__blame"] as const;
 
 /**
- * The tools of a train turn of `kind`: `blame(task, reason)` for the merge task's turns, `decline(reason)` for a task's.
- * A call is told to `record` as a `train_decline` or `train_blame` event; the turn's outcome is read from those
- * (`trainOutcome`), so it survives a restart.
+ * The tools of a train turn of `kind`: `blame(task, reason)` for the merge task's turns, `decline(reason)` and
+ * `ready(tests)` for a task's. A call is told to `record` as a `train_decline`, `train_ready` or `train_blame` event; the
+ * turn's outcome is read from those (`trainOutcome`), so it survives a restart.
  */
 export function trainToolList(kind: TrainTurnKind, record: (e: MeddleEvent) => void): SdkMcpToolDefinition<any>[] {
   if (kind === "merge") {
@@ -44,16 +45,31 @@ export function trainToolList(kind: TrainTurnKind, record: (e: MeddleEvent) => v
       },
     )];
   }
-  return [tool(
-    "decline",
-    "Call this when meddle's request no longer makes sense for your change, for example because something it relies on " +
-      "is gone from main or has changed meaning. Your task leaves the merge train's queue, with your reason shown to the user.",
-    { reason: z.string().describe("Why your change no longer makes sense on main") },
-    async ({ reason }) => {
-      record({ type: "meddle", subtype: "train_decline", reason });
-      return { content: [{ type: "text", text: "Declined. meddle takes the task off the merge train's queue; end your turn." }] };
-    },
-  )];
+  return [
+    tool(
+      "decline",
+      "Call this when meddle's request no longer makes sense for your change, for example because something it relies on " +
+        "is gone from main or has changed meaning. Your task leaves the merge train's queue, with your reason shown to the user.",
+      { reason: z.string().describe("Why your change no longer makes sense on main") },
+      async ({ reason }) => {
+        record({ type: "meddle", subtype: "train_decline", reason });
+        return { content: [{ type: "text", text: "Declined. meddle takes the task off the merge train's queue; end your turn." }] };
+      },
+    ),
+    tool(
+      "ready",
+      "Call this once your work is ready to land, rebased, squashed and described as asked: name the commands that run " +
+        "the tests covering your change, so the merge agent runs them too.",
+      {
+        tests: z.array(z.string().min(1)).min(1)
+          .describe("Shell commands that run the tests covering your change, e.g. bun test test/foo.test.ts"),
+      },
+      async ({ tests }) => {
+        record({ type: "meddle", subtype: "train_ready", tests });
+        return { content: [{ type: "text", text: "Ready. End your turn." }] };
+      },
+    ),
+  ];
 }
 
 /** An in-process MCP server named `meddle` with the tools of a train turn of `kind` (`trainToolList`). */
@@ -75,10 +91,12 @@ export function declineReason(reason: string): string {
  * How a train turn went, from the events it logged, oldest first (from its first `turn_started` to its end; a rerun after
  * a restart or a token fault is the same turn): the first `train_decline` or `train_blame` in them, whatever came after;
  * else how its last attempt ended: a `result` (`done`, or `failed` with its error), a `turn_failed`, a `turn_aborted`,
- * or a `token_fault` that did not rerun it. A turn that logged none of these failed without a result.
+ * or a `token_fault` that did not rerun it. A turn that logged none of these failed without a result. A `done` carries
+ * the tests of the last `train_ready`, from any attempt: a rerun is told not to redo finished work.
  */
 export function trainOutcome(events: readonly unknown[]): TrainTurnOutcome {
   let end: TrainTurnOutcome | null = null;
+  let tests: string[] | undefined;
   for (const e of events) {
     const m = (e ?? {}) as { type?: unknown; subtype?: unknown; [key: string]: unknown };
     if (m.type === "result") {
@@ -92,6 +110,9 @@ export function trainOutcome(events: readonly unknown[]): TrainTurnOutcome {
         return { kind: "declined", reason: str(m.reason) };
       case "train_blame":
         return { kind: "blamed", task: str(m.task), reason: str(m.reason) };
+      case "train_ready":
+        if (Array.isArray(m.tests)) tests = m.tests.filter((t): t is string => typeof t === "string");
+        break;
       case "turn_started":
         end = null; // another attempt: how the one before ended is not how the turn did
         break;
@@ -106,6 +127,7 @@ export function trainOutcome(events: readonly unknown[]): TrainTurnOutcome {
         break;
     }
   }
+  if (end?.kind === "done" && tests !== undefined) return { kind: "done", tests };
   return end ?? { kind: "failed", reason: "the turn ended without a result" };
 }
 

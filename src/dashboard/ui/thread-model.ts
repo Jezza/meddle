@@ -305,6 +305,11 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
       case "train_decline":
         top.push({ kind: "status", text: `Declined: ${str(m.reason)}` });
         return;
+      case "train_ready": {
+        const tests = Array.isArray(m.tests) ? m.tests.filter((t): t is string => typeof t === "string") : [];
+        top.push({ kind: "status", text: `Tests: ${tests.join(", ")}` });
+        return;
+      }
       case "train_blame":
         top.push({ kind: "status", text: `Blamed ${str(m.task)}: ${str(m.reason)}` });
         return;

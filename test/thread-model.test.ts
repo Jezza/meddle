@@ -52,6 +52,7 @@ test("the train's prompt shows as a prompt marked as meddle's; its tools' calls 
     { seq: 3, message: { type: "meddle", subtype: "train_decline", reason: "the API it fixes is gone" } },
     { seq: 4, message: { type: "meddle", subtype: "train_turn", kind: "merge", text: "Check that A and B work together on main. …" } },
     { seq: 5, message: { type: "meddle", subtype: "train_blame", task: "A", reason: "test/a.test.ts fails" } },
+    { seq: 6, message: { type: "meddle", subtype: "train_ready", tests: ["bun test a", "bun test b"] } },
   ]);
   expect(items).toEqual([
     { kind: "status", text: "Turn resumed" },
@@ -59,6 +60,7 @@ test("the train's prompt shows as a prompt marked as meddle's; its tools' calls 
     { kind: "status", text: "Declined: the API it fixes is gone" },
     { kind: "user", text: "Check that A and B work together on main. …", attachments: [], by: "meddle" },
     { kind: "status", text: "Blamed A: test/a.test.ts fails" },
+    { kind: "status", text: "Tests: bun test a, bun test b" },
   ]);
 });
 

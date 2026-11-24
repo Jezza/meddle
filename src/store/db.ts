@@ -130,7 +130,7 @@ const MIGRATIONS = [
   )`,
   // Each project's merge train as its home runs it (src/train/train.ts): why it is paused (NULL: it runs); the tasks
   // sitting out and those held back, each a JSON object of task id to reason; and where its round is (a JSON
-  // `RoundStep`), NULL when no round is under way or left unfinished.
+  // `RoundStep`), NULL when no round is under way or left unfinished. Its `tests` column is added below.
   `CREATE TABLE IF NOT EXISTS trains (
     project TEXT PRIMARY KEY,
     paused TEXT,
@@ -179,6 +179,9 @@ const ADDED_COLUMNS = [
   { table: "line_rows", column: "queued_at", type: "TEXT" },
   // Whether a queued task continues once its work lands rather than being archived (Accept & continue); NULL for no.
   { table: "line_rows", column: "continues", type: "INTEGER" },
+  // The commands each queued task's agent named to run its tests (`ready`), as a JSON object of task id to the tip they
+  // were named for and the commands.
+  { table: "trains", column: "tests", type: "TEXT NOT NULL DEFAULT '{}'" },
 ];
 
 export function openDb(path: string): Database {

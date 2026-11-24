@@ -22,7 +22,7 @@ import { listTokens } from "../src/token";
 import { defaultBranchCommit } from "../src/projects/starts";
 import type { Notification } from "../src/state/contracts";
 import { UNQUEUED_ARCHIVED, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER } from "../src/tasks/durable";
-import { pauseTrain, trainNotices, trainState, trainUpdates } from "../src/train/train";
+import { pauseTrain, saveTrainTests, trainNotices, trainState, trainUpdates } from "../src/train/train";
 
 /** Resolves with the first value of `readable` (the current one included) that satisfies `pred`. */
 function until<T>(readable: { subscribe(cb: (value: T) => void): () => void }, pred: (value: T) => boolean): Promise<T> {
@@ -1064,7 +1064,7 @@ test("a task that sits out raises a notice with Retry, and again each time it si
       const ws = workspaceOf(n, taskId);
       await jj(["describe", "-m", "Add x"], ws, n.cfg);
       await n.runner.writeTaskLines(taskId);
-      return { kind: "done" };
+      return { kind: "done", tests: ["bun test"] };
     };
     const t = await taskWithWork(n, P, "x.txt", { undescribed: true });
     await n.runner.accept(t.id);
@@ -1142,6 +1142,8 @@ test("a held-back task whose entry clears while it stays queued is told again wh
     const other = await taskWithWork(n, P, "a.txt");
     const mine = await taskWithWork(n, P, "b.txt", { onTopOf: other.tip });
     await n.runner.accept(mine.id);
+    // Its work is ready as it is: as its agent's prepare turn would have, it names its tests.
+    saveTrainTests(n.db, P, mine.id, mine.tip, ["bun test"]);
     await until(node.notifications, (ns) => trainNotes(ns).some((x) => x.text === TEXT));
     expect(heldOf(n, P)).toEqual({ [mine.id]: TEXT });
 
@@ -1178,6 +1180,8 @@ test("the project serves the train state and pauses", async () => {
 
     const t = await taskWithWork(n, P, "x.txt");
     await n.runner.accept(t.id);
+    // Its work is ready as it is: as its agent's prepare turn would have, it names its tests.
+    saveTrainTests(n.db, P, t.id, t.tip, ["bun test"]);
     // Queued, and held: no round starts while it is paused.
     expect(await until(project.train, (s) => s.queued.length === 1)).toEqual({
       paused: "you paused it", round: null, queued: [{ taskId: t.id, state: "queued", reason: null }],

@@ -36,8 +36,8 @@ async function fixture() {
   const tip1 = await on(B, "first task", { "f.txt": edited(1, "ONE") });
   const tip2 = await on(B, "second task", { "f.txt": edited(7, "SEVEN") });
   const batch: Candidate[] = [
-    { taskId: "t1", title: "Fix one", tip: tip1, base: [B], workspace: null, size: 2 },
-    { taskId: "t2", title: "Fix seven", tip: tip2, base: [B], workspace: null, size: 1 },
+    { taskId: "t1", title: "Fix one", tip: tip1, base: [B], workspace: null, size: 2, tests: ["bun test one"] },
+    { taskId: "t2", title: "Fix seven", tip: tip2, base: [B], workspace: null, size: 1, tests: null },
   ];
 
   const turns: Turn[] = [];
@@ -86,7 +86,7 @@ test("a described clean merge is ready", async () => {
   // One turn, with the spec's prompt: the tasks as the agent can name them, and the change the merge is.
   expect(turns).toEqual([{
     taskId: "m1", kind: "merge",
-    text: mergePrompt(["Fix one (t1)", "Fix seven (t2)"], merge.changeId, DESCRIBE),
+    text: mergePrompt([{ task: "Fix one (t1)", tests: ["bun test one"] }, { task: "Fix seven (t2)", tests: null }], merge.changeId, DESCRIBE),
   }]);
   expect(discarded).toEqual([]);
 });
@@ -207,7 +207,7 @@ test("a failed turn is stuck with its reason, and a decline too", async () => {
 test("a batch that doesn't merge cleanly is unclean, with no merge task made", async () => {
   const { repo, B, batch, created, run } = await fixture();
   const clash = await commitOfClash(repo, B);
-  const clashing: Candidate = { taskId: "t3", title: "Clash", tip: clash, base: [B], workspace: null, size: 1 };
+  const clashing: Candidate = { taskId: "t3", title: "Clash", tip: clash, base: [B], workspace: null, size: 1, tests: null };
 
   expect(await run({ batch: [...batch, clashing] })).toEqual({ kind: "unclean" });
   expect(created).toEqual([]);
@@ -220,7 +220,7 @@ test("a batch git merges cleanly but jj doesn't (a rename) is unclean: its merge
   await rm(`${repo}/f.txt`);
   await Bun.write(`${repo}/h.txt`, LINES.join(""));
   await jj(["commit", "-m", "rename f"], repo);
-  const renamed: Candidate = { taskId: "t3", title: "Rename f", tip: await commitOf(repo, "@-"), base: [B], workspace: null, size: 3 };
+  const renamed: Candidate = { taskId: "t3", title: "Rename f", tip: await commitOf(repo, "@-"), base: [B], workspace: null, size: 3, tests: null };
 
   expect(await run({ batch: [renamed, batch[1]!] })).toEqual({ kind: "unclean" });
   expect(created).toHaveLength(1);

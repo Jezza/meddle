@@ -21,7 +21,7 @@ import { TaskRunner, UNQUEUED_BY_INPUT, UNQUEUED_BY_USER } from "../src/tasks/du
 import { openHarness } from "../src/tasks/harness";
 import type { TaskManifest } from "../src/tasks/manifest";
 import type { TrainTurnKind, TrainTurnOutcome } from "../src/train/tools";
-import { forgetTrain, pauseTrain, retryTask, trainState } from "../src/train/train";
+import { forgetTrain, pauseTrain, retryTask, saveTrainTests, trainState, trainTests } from "../src/train/train";
 import { claudeCodeVersion } from "../src/version";
 import { startApplier } from "../src/projects/applier";
 import { createTask, replay } from "./helpers";
@@ -133,13 +133,28 @@ async function restart(n: GitPoolNode): Promise<void> {
 }
 
 /**
- * Accepts `taskIds` on node `n`, all before a round of project `P`'s train can pick any of them: the train is paused
- * meanwhile, then resumed.
+ * Accepts `tasks` on node `n`, all before a round of project `P`'s train can pick any of them: the train is paused
+ * meanwhile, then resumed. Each gets a test list for its tip (`withTests`), as a prepare turn would have left it.
  */
-async function acceptAll(n: GitPoolNode, P: string, taskIds: string[]): Promise<void> {
+async function acceptAll(n: GitPoolNode, P: string, tasks: Array<{ id: string; tip: string }>): Promise<void> {
   pauseTrain(n.db, P, "accepting");
-  for (const id of taskIds) await n.runner.accept(id);
+  for (const t of tasks) await n.runner.accept(t.id);
+  withTests(n, P, tasks);
   pauseTrain(n.db, P, null);
+}
+
+/**
+ * Gives `tasks`, queued on project `P`'s train run by node `home`, a test list for their tips, as their agents' prepare
+ * turns would have: work that is ready as it is (described, one revision on main) then needs no turn. One whose tip
+ * changes later (an undescribed one, once described) gets its prepare turn all the same.
+ */
+function withTests(home: GitPoolNode, P: string, tasks: Array<{ id: string; tip: string }>): void {
+  for (const t of tasks) saveTrainTests(home.db, P, t.id, t.tip, ["bun test"]);
+}
+
+/** Answers node `n`'s task turns as an agent whose work is ready as it is would: it changes nothing and names its tests. */
+function readyAgents(n: GitPoolNode): void {
+  n.hooks.trainTurn = async (_taskId, kind) => (kind === "merge" ? undefined : { kind: "done", tests: ["bun test"] });
 }
 
 /** The `meddle.train` tasks live in node `n`'s Harness. */
@@ -169,6 +184,7 @@ test("a queued task triggers a round on the home only", async () => {
     const P = A.project.id;
     await waitFor("A's project in B's roster", () => B.store.row(A.id)?.summary?.projects?.some((p) => p.id === P) === true);
     // A task on B, of A's project: B holds its line and its queue, A runs the train.
+    readyAgents(B);
     const t = await taskWithWork(B, P, "x.txt");
     await B.runner.accept(t.id);
     stops.push(...appliers(A, B));
@@ -196,7 +212,7 @@ test("pause holds landing and survives a restart", async () => {
     const merge = fakeMerge(n, { stall: true });
     const t1 = await taskWithWork(n, P, "x.txt");
     const t2 = await taskWithWork(n, P, "y.txt");
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     await merge.reached;
     // Paused while the merge agent checks: its turn finishes, and nothing lands.
     pauseTrain(n.db, P, "you paused it");
@@ -238,7 +254,7 @@ test("a restart mid-round leaves at most one live merge task", async () => {
     const P = n.project.id;
     const t1 = await taskWithWork(n, P, "x.txt");
     const t2 = await taskWithWork(n, P, "y.txt");
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     await merge.reached;
     const first = merge.tasks[0]!;
     const round = trainState(n.db, P).round!;
@@ -277,7 +293,7 @@ test("a push during checking restarts the round against the new main", async () 
     const merge = fakeMerge(n, { stall: true });
     const t1 = await taskWithWork(n, P, "x.txt");
     const t2 = await taskWithWork(n, P, "y.txt");
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     await merge.reached;
 
     // Someone pushes to main from a checkout while the merge agent checks the batch.
@@ -319,7 +335,7 @@ test("unqueueing a batch task stops the check at once", async () => {
     const P = n.project.id;
     const t1 = await taskWithWork(n, P, "x.txt");
     const t2 = await taskWithWork(n, P, "y.txt");
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     await waitFor("the merge agent's turn", () => runningMergeTask(n) !== undefined);
     const m = runningMergeTask(n)!;
     expect(trainState(n.db, P).round).toMatchObject({ step: "checking", mergeTask: m });
@@ -345,13 +361,13 @@ test("a message to a batch task during the check stops it too", async () => {
   const { nodes, close } = await poolNodes(1, { extraEnv: { MEDDLE_FIXTURE_STALL: "1" } });
   const n = nodes[0]!;
   const left: Array<[string, string | null]> = [];
-  let t1: { id: string } | null = null;
+  let t1: { id: string; tip: string } | null = null;
   try {
     const P = n.project.id;
     n.runner.onQueue((taskId, queue, reason) => { if (queue === null) left.push([taskId, reason]); });
     t1 = await taskWithWork(n, P, "x.txt");
     const t2 = await taskWithWork(n, P, "y.txt");
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     await waitFor("the merge agent's turn", () => runningMergeTask(n) !== undefined);
     const m = runningMergeTask(n)!;
 
@@ -386,7 +402,7 @@ test("a batch task that leaves just as the merge turn fails by itself pauses not
       await n.runner.unqueue(t1.id, UNQUEUED_BY_USER);
       return { kind: "failed", reason: "the agent crashed" };
     };
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     // No stuck pause: the round starts over without t1, and t2 lands as it is.
     await waitFor("t2 to land", async () => (await mainOf(n, P)) === t2.tip);
     expect(trainState(n.db, P).paused).toBeNull();
@@ -416,6 +432,7 @@ test("unqueueing a batch task stops a check on another node too", async () => {
     await B.runner.accept(t2.id);
     stops.push(...appliers(A, B));
     await waitFor("both queued on A", () => trainState(A.db, P).queued.length === 2);
+    withTests(A, P, [t1, t2]);
     pauseTrain(A.db, P, null);
     await waitFor("the merge agent's turn on B", () => runningMergeTask(B) !== undefined);
     const m = runningMergeTask(B)!;
@@ -434,6 +451,25 @@ test("unqueueing a batch task stops a check on another node too", async () => {
   }
 }, 180_000);
 
+test("a task's test list is kept with its tip, and dropped when it leaves the queue", async () => {
+  const { nodes, close } = await poolNodes(1);
+  const n = nodes[0]!;
+  try {
+    const P = n.project.id;
+    // Paused: no round runs meanwhile.
+    pauseTrain(n.db, P, "held for the test");
+    const t = await taskWithWork(n, P, "x.txt");
+    await n.runner.accept(t.id);
+    saveTrainTests(n.db, P, t.id, t.tip, ["bun test test/x.test.ts"]);
+    expect(trainTests(n.db, P)).toEqual({ [t.id]: { tip: t.tip, tests: ["bun test test/x.test.ts"] } });
+
+    await n.runner.unqueue(t.id, UNQUEUED_BY_USER);
+    await waitFor("the list dropped", () => trainTests(n.db, P)[t.id] === undefined);
+  } finally {
+    await close();
+  }
+}, 120_000);
+
 test("retry brings a sitting-out task back", async () => {
   const { nodes, close } = await poolNodes(1);
   const n = nodes[0]!;
@@ -450,7 +486,7 @@ test("retry brings a sitting-out task back", async () => {
       await jj(["describe", "-m", "Add x"], ws, n.cfg);
       described = await commitOf(ws, "@", n.cfg);
       await n.runner.writeTaskLines(taskId);
-      return { kind: "done" };
+      return { kind: "done", tests: ["bun test"] };
     };
     const t = await taskWithWork(n, P, "x.txt", { undescribed: true });
     const before = await mainOf(n, P);
@@ -520,12 +556,12 @@ test("a pool update that holds turns before the merge turn holds the round up: n
         await jj(["describe", "-m", "Add y"], workspaceOf(n, taskId), n.cfg);
         await n.runner.writeTaskLines(taskId);
         described.resolve();
-        return { kind: "done" };
+        return { kind: "done", tests: ["bun test"] };
       },
     });
     const t1 = await taskWithWork(n, P, "x.txt");
     const t2 = await taskWithWork(n, P, "y.txt", { undescribed: true });
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     await described.promise;
     await waitFor("the round to end", async () => (await liveTrains(n)).length === 0);
     // Held up: not paused, nothing sitting out, no merge task made, and nothing keeps the update's drain waiting.
@@ -560,8 +596,8 @@ test("a turn a pool update's hold refuses sits no task out, and the round carrie
     const t2 = await taskWithWork(n, P, "y.txt");
     const others: string[] = [];
     // The merge agent blames t1, which gets a fix turn after t2 lands; the update's hold comes during the check.
-    const merge = fakeMerge(n, { stall: true, blame: t1.id, others: async (_id, kind) => { others.push(kind); return { kind: "done" }; } });
-    await acceptAll(n, P, [t1.id, t2.id]);
+    const merge = fakeMerge(n, { stall: true, blame: t1.id, others: async (_id, kind) => { others.push(kind); return { kind: "done", tests: ["bun test"] }; } });
+    await acceptAll(n, P, [t1, t2]);
     await merge.reached;
     n.runner.setHolds({ turns: HELD, work: null, hosting: null });
     merge.release();
@@ -600,7 +636,7 @@ test("a holder whose turns a pool update holds refuses the train's turn as held:
       if (B.runner.holds().turns !== null) return undefined;
       await jj(["describe", "-m", "Add x"], workspaceOf(B, taskId), B.cfg);
       await B.runner.writeTaskLines(taskId);
-      return { kind: "done" };
+      return { kind: "done", tests: ["bun test"] };
     };
     const t = await taskWithWork(B, P, "x.txt", { undescribed: true });
     B.runner.setHolds({ turns: HELD, work: null, hosting: null });
@@ -637,6 +673,7 @@ test("a merge task placed on another node is reached there, whatever the home's 
     await B.runner.accept(t2.id);
     stops.push(...appliers(A, B));
     await waitFor("both queued on A", () => trainState(A.db, P).queued.length === 2);
+    withTests(A, P, [t1, t2]);
     const merge = fakeMerge(B);
 
     // B's rows of the first merge task never reach A: A's only row of it is the start A wrote, held by A.
@@ -698,7 +735,7 @@ test("a hold that starts during a step of several turns refuses each of the rest
         described.push(taskId);
         await jj(["describe", "-m", `Describe ${taskId}`], workspaceOf(n, taskId), n.cfg);
         await n.runner.writeTaskLines(taskId);
-        return { kind: "done" };
+        return { kind: "done", tests: ["bun test"] };
       },
     });
     const tasks = [
@@ -707,7 +744,7 @@ test("a hold that starts during a step of several turns refuses each of the rest
       await taskWithWork(n, P, "z.txt", { undescribed: true }),
     ];
     const ids = tasks.map((t) => t.id);
-    await acceptAll(n, P, ids);
+    await acceptAll(n, P, tasks);
     await waitFor("the first describe turn", () => described.length === 1);
     await waitFor("the round to end", async () => (await liveTrains(n)).length === 0);
     // Only the turn that ran counts as asked; the two refused ones neither sit out nor count.
@@ -724,9 +761,10 @@ test("a hold that starts during a step of several turns refuses each of the rest
     expect(await mainOf(n, P)).toBe(before);
 
     // The hold lifts: the round resumes by itself, the two refused tasks get their describe turns, and the batch lands.
+    // The first is asked again too: the tests it named were lost with the round the hold cut off.
     n.runner.setHolds(NO_HOLDS);
     await waitFor("main to land the batch", async () => (await commitsIn(n.project.replica, await mainOf(n, P), n.cfg))[0]!.parents.length === 3);
-    expect([...described].sort()).toEqual([...ids].sort());
+    expect([...described].sort()).toEqual([...ids, described[0]!].sort());
     expect(merge.tasks).toHaveLength(1);
     await waitFor("every task archived", () => ids.every((id) => getTask(n.db, id)?.state === "archived"));
   } finally {
@@ -758,7 +796,7 @@ test("forgetting a project's train aborts its round and keeps its row gone", asy
     const merge = fakeMerge(n, { stall: true });
     const t1 = await taskWithWork(n, P, "x.txt");
     const t2 = await taskWithWork(n, P, "y.txt");
-    await acceptAll(n, P, [t1.id, t2.id]);
+    await acceptAll(n, P, [t1, t2]);
     await merge.reached;
     const [round] = await liveTrainIds(n);
     expect(round).toBeDefined();

@@ -350,8 +350,9 @@ const GROUPS: Group[] = [
         details:
           "Takes any number of task ids (or unique prefixes), from any node, and prints `queued <id> on <project>'s " +
           "train` for each; accepting a task that is queued changes nothing. The train runs on the project's home: it " +
-          "has each task's revisions described and merging cleanly with the default branch (a task that doesn't gets a " +
-          "turn of its own to describe or rebase them), has tasks that land together checked by a merge task, and then " +
+          "has each task's work rebased, squashed into one described revision and its tests named (a task that needs it " +
+          "gets a turn of its own to do that), has tasks that land together checked by a merge task, which runs those " +
+          "tests, and then " +
           "moves the default branch to the result, which archives the tasks. A running task can be accepted; its turn " +
           "goes on. A task leaves the train again when you unqueue it, send it a prompt (or steer or retry it) or " +
           "archive it, or when the train gives up on it; the dashboard then says why. Watch the train with `train`. " +

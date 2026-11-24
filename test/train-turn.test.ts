@@ -16,12 +16,15 @@ import { listEvents } from "../src/store/events";
 import { getTask, queuedOf } from "../src/store/records";
 import { CARRY_ON_PROMPT, TaskRunner, type RunnerHooks } from "../src/tasks/durable";
 import { openHarness } from "../src/tasks/harness";
-import { describePrompt, mergePrompt, mergeTitle, rebasePrompt } from "../src/train/prompts";
+import { mergePrompt, mergeTitle, preparePrompt } from "../src/train/prompts";
 import { TRAIN_TOOLS, trainOutcome, trainToolList, trainTools } from "../src/train/tools";
 import type { SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { pauseTrain } from "../src/train/train";
 import { createTask, replay, setupNode } from "./helpers";
 import { peerReady, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+
+/** A prepare turn's prompt onto `main`, as the train sends it. */
+const prepare = (main: string) => preparePrompt({ main, rewrite: "squash", describe: true, conflicted: [] }, DESCRIBE_PROMPT);
 
 /**
  * `poolNodes`, each node's train of its project paused: these tests queue tasks and drive their turns themselves, so no
@@ -87,12 +90,12 @@ test("train turns force auto and get meddle's tools; the user's next turn has th
     expect(seen).toHaveLength(1);
     const train = seen[0]!;
     expect(train.permissionMode).toBe("auto");
-    expect(train.allowedTools).toEqual(["mcp__meddle__decline", "mcp__meddle__blame"]);
+    expect(train.allowedTools).toEqual(["mcp__meddle__decline", "mcp__meddle__ready", "mcp__meddle__blame"]);
     expect(train.extraMcpServers?.meddle).toMatchObject({ type: "sdk", name: "meddle" });
     const options = buildOptions({ ...train, prompt: noPrompt, canUseTool: deny, onPermissionDenied: () => {} });
     expect(options.permissionMode).toBe("auto");
     expect(options.mcpServers?.meddle).toBe(train.extraMcpServers!.meddle!);
-    expect(options.allowedTools).toEqual(["mcp__meddle__decline", "mcp__meddle__blame"]);
+    expect(options.allowedTools).toEqual(["mcp__meddle__decline", "mcp__meddle__ready", "mcp__meddle__blame"]);
     // The task's own mode is untouched.
     expect(node.runner.settings(m.id).permissionMode).toBe("default");
     // The train's prompt is logged as meddle's, not as a prompt of the user's.
@@ -119,10 +122,10 @@ test("train turns force auto and get meddle's tools; the user's next turn has th
 test("the tools record their calls, and a train turn's outcome is read from what it logged", async () => {
   const recorded: MeddleEvent[] = [];
   const record = (e: MeddleEvent) => { recorded.push(e); };
-  // `decline` for a task's turns, `blame` for the merge task's.
-  for (const kind of ["describe", "rebase", "fix"] as const) expect(trainToolList(kind, record).map((t) => t.name)).toEqual(["decline"]);
+  // `decline` and `ready` for a task's turns, `blame` for the merge task's.
+  for (const kind of ["describe", "rebase", "fix"] as const) expect(trainToolList(kind, record).map((t) => t.name)).toEqual(["decline", "ready"]);
   expect(trainToolList("merge", record).map((t) => t.name)).toEqual(["blame"]);
-  expect(TRAIN_TOOLS).toEqual(["mcp__meddle__decline", "mcp__meddle__blame"]);
+  expect(TRAIN_TOOLS).toEqual(["mcp__meddle__decline", "mcp__meddle__ready", "mcp__meddle__blame"]);
   const server = trainTools("rebase", record);
   expect(server).toMatchObject({ type: "sdk", name: "meddle" });
   expect(server.instance).toBeDefined();
@@ -139,7 +142,7 @@ test("the tools record their calls, and a train turn's outcome is read from what
 
   const start = [
     { type: "meddle", subtype: "turn_started", at: "", resume: true },
-    { type: "meddle", subtype: "train_turn", kind: "rebase", text: rebasePrompt("0123abcd") },
+    { type: "meddle", subtype: "train_turn", kind: "rebase", text: prepare("0123abcd") },
     { type: "system", subtype: "init" },
   ];
   const success = { type: "result", subtype: "success", is_error: false };
@@ -152,6 +155,19 @@ test("the tools record their calls, and a train turn's outcome is read from what
   expect(trainOutcome([...start, { type: "meddle", subtype: "turn_aborted", at: "" }])).toEqual({ kind: "failed", reason: "the turn was aborted" });
   expect(trainOutcome([...start, recorded[0], { type: "meddle", subtype: "turn_failed", at: "", error: "Error: boom" }])).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
   expect(trainOutcome([...start])).toEqual({ kind: "failed", reason: "the turn ended without a result" });
+
+  // `ready` names the tests: the turn is done with them, the last call counting, across a rerun too (it is told not to
+  // redo finished work); a decline still wins, and a turn that failed after it failed.
+  const [, ready] = trainToolList("describe", record);
+  await ready!.handler({ tests: ["bun test test/a.test.ts"] }, {});
+  expect(recorded[2]).toEqual({ type: "meddle", subtype: "train_ready", tests: ["bun test test/a.test.ts"] });
+  expect(isTrainEvent(recorded[2]!)).toBe(true);
+  const readied = (tests: string[]) => ({ type: "meddle", subtype: "train_ready", tests });
+  expect(trainOutcome([...start, readied(["a"]), success])).toEqual({ kind: "done", tests: ["a"] });
+  expect(trainOutcome([...start, readied(["a"]), readied(["b"]), success])).toEqual({ kind: "done", tests: ["b"] });
+  expect(trainOutcome([...start, readied(["a"]), recorded[0], success])).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+  expect(trainOutcome([...start, readied(["a"]), ...start, success])).toEqual({ kind: "done", tests: ["a"] });
+  expect(trainOutcome([...start, readied(["a"]), { type: "meddle", subtype: "turn_aborted", at: "" }])).toEqual({ kind: "failed", reason: "the turn was aborted" });
   // The train's events end no turn; a task it took off meanwhile changes nothing of how the turn went.
   const left = { type: "meddle", subtype: "train_left", reason: "another task builds on this work, so it can't rebase" };
   for (const e of [start[1]!, recorded[0]!, recorded[1]!, left]) expect(isTrainEvent(e)).toBe(true);
@@ -184,7 +200,7 @@ test("prompts sent during a train turn wait for it: queued, not steered; the tas
     const left: string[] = [];
     A.runner.onQueue((id, queue, reason) => { if (id === m.id && queue === null) left.push(String(reason)); });
 
-    const outcome = A.runner.trainTurn(m.id, "describe", describePrompt(DESCRIBE_PROMPT, []));
+    const outcome = A.runner.trainTurn(m.id, "describe", prepare("0123abcd"));
     // Sent while the train's turn is pending: it waits.
     expect(await A.runner.prompt(m.id, "First.")).toBe("queued");
     await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
@@ -197,7 +213,7 @@ test("prompts sent during a train turn wait for it: queued, not steered; the tas
     expect(await A.runner.sendNow(m.id)).toBe("nothing_waiting");
     // Asked again for the same kind, the train joins the turn running; another kind waits its turn.
     const joined = A.runner.trainTurn(m.id, "describe", "Asked again.");
-    await expect(A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"))).rejects.toThrow("task is running");
+    await expect(A.runner.trainTurn(m.id, "rebase", prepare("0123abcd"))).rejects.toThrow("task is running");
     // A mode the user picks is kept for their turns, and does not reach the train's.
     const live = spyOn(A.runner.liveQuery(m.id)!, "setPermissionMode");
     await A.runner.setPermissionMode(m.id, "plan");
@@ -209,7 +225,7 @@ test("prompts sent during a train turn wait for it: queued, not steered; the tas
 
     expect(await outcome).toEqual({ kind: "done" });
     expect(await joined).toEqual({ kind: "done" });
-    expect(trainTurns(A.db, m.id).map((e) => e.text)).toEqual([describePrompt(DESCRIBE_PROMPT, [])]);
+    expect(trainTurns(A.db, m.id).map((e) => e.text)).toEqual([prepare("0123abcd")]);
     // Then they run, one turn each, after the train's: the first to start takes the task off the queue.
     await until("the user's prompts", () => userPrompts(A.db, m.id), ["First.", "Second."], 30_000);
     await until("the state", () => A.runner.state(m.id), "idle", 30_000);
@@ -251,7 +267,7 @@ test("a decline takes the task off its queue as it is logged, with no call waiti
     const { m, queuedAt, left, decline } = await acceptedTask(A);
     expect(queuedAt()).not.toBeNull();
     // The call that starts the turn is dropped, as one cut off by a restart (or a lost link) would be.
-    void A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    void A.runner.trainTurn(m.id, "rebase", prepare("0123abcd"));
     await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
     await decline("the API it fixes is gone");
     // The turn still runs, so no call has heard how it went: the decline itself took the task off.
@@ -267,14 +283,14 @@ test("a decline takes the task off its queue as it is logged, with no call waiti
     // Asked again for that turn, the train is told of the decline; the agent is not prompted again.
     const turns = () => messages(A.db, m.id).filter((e) => e.subtype === "turn_started").length;
     expect(turns()).toBe(1);
-    expect(await A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"))).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
+    expect(await A.runner.trainTurn(m.id, "rebase", prepare("0123abcd"))).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
     expect(turns()).toBe(1);
     expect(trainTurns(A.db, m.id)).toHaveLength(1);
     expect(left).toEqual(["the API it fixes is gone"]);
     // Accepted again, the task is the train's again: it asks afresh.
     await A.runner.accept(m.id);
-    expect(await A.runner.trainTurn(m.id, "rebase", rebasePrompt("4567cdef"))).toEqual({ kind: "done" });
-    expect(trainTurns(A.db, m.id).map((e) => e.text)).toEqual([rebasePrompt("0123abcd"), rebasePrompt("4567cdef")]);
+    expect(await A.runner.trainTurn(m.id, "rebase", prepare("4567cdef"))).toEqual({ kind: "done" });
+    expect(trainTurns(A.db, m.id).map((e) => e.text)).toEqual([prepare("0123abcd"), prepare("4567cdef")]);
     expect(queuedAt()).not.toBeNull();
   } finally {
     await close();
@@ -286,15 +302,15 @@ test("the agent's reason stands however the turn's end, the calls that join it a
   const A = nodes[0]!;
   try {
     const { m, queuedAt, left, decline } = await acceptedTask(A);
-    const outcome = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    const outcome = A.runner.trainTurn(m.id, "rebase", prepare("0123abcd"));
     await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
     // A call joins before the decline; a prompt sent meanwhile waits for the turn, which ends with it waiting.
-    const before = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    const before = A.runner.trainTurn(m.id, "rebase", prepare("0123abcd"));
     expect(await A.runner.prompt(m.id, "Meanwhile.")).toBe("queued");
     await decline("the API it fixes is gone");
     expect(left).toEqual(["the API it fixes is gone"]);
     // A call that joins after the decline hears it too.
-    const after = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    const after = A.runner.trainTurn(m.id, "rebase", prepare("0123abcd"));
 
     for (const call of [outcome, before, after]) expect(await call).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
     expect(queuedAt()).toBeNull();
@@ -314,7 +330,7 @@ test("a task accepted again while its declining turn finishes stays queued: the 
   const A = nodes[0]!;
   try {
     const { m, queuedAt, left, decline } = await acceptedTask(A);
-    const outcome = A.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    const outcome = A.runner.trainTurn(m.id, "rebase", prepare("0123abcd"));
     await until("the train's live turn", () => A.runner.liveQuery(m.id) !== null, true);
     await decline("the API it fixes is gone");
     expect(queuedAt()).toBeNull();
@@ -334,24 +350,59 @@ test("a task accepted again while its declining turn finishes stays queued: the 
 }, 90_000);
 
 test("the prompts match the spec copy", () => {
-  expect(describePrompt(DESCRIBE_PROMPT, [])).toBe("Before your work lands on main: Add a description (4-7 words) to your revision(s).");
-  expect(describePrompt(DESCRIBE_PROMPT, ["kxqzlmno"])).toBe(
-    "Before your work lands on main: resolve the conflicts in kxqzlmno, then Add a description (4-7 words) to your revision(s).",
+  const check =
+    "Run the typecheck and the tests that cover what they change; don't run the full suite, and don't change any files. If a test fails, call blame with the task responsible and what failed. Otherwise: Add a description (4-7 words) to your revision(s).";
+  // Without test lists: the typecheck and the tests that cover the change.
+  expect(mergePrompt([{ task: "Fix login", tests: null }, { task: "Add search", tests: null }], "vnnpplvq", DESCRIBE_PROMPT)).toBe(
+    `Check that Fix login and Add search work together on main. Merged cleanly as vnnpplvq. ${check}`,
   );
-  expect(describePrompt("Describe your work.", ["kxqzlmno", "vnnpplvq", "wtsoyrmz"])).toBe(
-    "Before your work lands on main: resolve the conflicts in kxqzlmno, vnnpplvq and wtsoyrmz, then Describe your work.",
+  const abc = ["A", "B", "C"].map((task) => ({ task, tests: null }));
+  expect(mergePrompt(abc, "vnnpplvq", "Describe it.")).toStartWith("Check that A, B and C work together on main.");
+  // With them: each task's commands, then those and any others the combination needs.
+  const listed =
+    "Run the typecheck, those tests, and any others the combination needs; don't run the full suite, and don't change any files. If a test fails, call blame with the task responsible and what failed. Otherwise: Add a description (4-7 words) to your revision(s).";
+  expect(mergePrompt(
+    [{ task: "A (t1)", tests: ["bun test a", "bun test b"] }, { task: "B (t2)", tests: ["bun test c"] }], "kx", DESCRIBE_PROMPT,
+  )).toBe(
+    "Check that A (t1) and B (t2) work together on main. Merged cleanly as kx. Their agents name the tests that cover their changes: " +
+      `A (t1): \`bun test a\`, \`bun test b\`; B (t2): \`bun test c\`. ${listed}`,
   );
-  const rebase =
-    "main moved on, and your work no longer merges cleanly with it. Rebase onto main (0123abcd), fix the conflicts, run the tests your changes affect (not the full suite), and keep each revision described. If your change no longer makes sense on main, because something it relies on is gone or has changed meaning, call decline with the reason.";
-  expect(rebasePrompt("0123abcd")).toBe(rebase);
-  // The fix turn opens with what the merge agent reported.
-  expect(rebasePrompt("0123abcd", "test/login.test.ts fails: expected 200, got 500")).toBe(
-    `The merge agent that checked your work together with other tasks on main reported: test/login.test.ts fails: expected 200, got 500\n\n${rebase}`,
+  // Only the tasks with a list are named.
+  expect(mergePrompt([{ task: "A (t1)", tests: ["bun test a"] }, { task: "B (t2)", tests: null }], "kx", DESCRIBE_PROMPT))
+    .toContain("changes: A (t1): `bun test a`. Run the typecheck, those tests,");
+
+  // The prepare turn: rebase, squash, describe and `ready`, as the task's work allows.
+  const P = DESCRIBE_PROMPT;
+  const D = "If your change no longer makes sense on main, because something it relies on is gone or has changed meaning, call decline with the reason.";
+  const T = "Run the tests your change affects (not the full suite), then call ready with the commands that run them.";
+  const base = { main: "abc", describe: true, conflicted: [] as string[] };
+  expect(preparePrompt({ ...base, rewrite: "squash" }, P)).toBe(
+    `Before your work lands on main: rebase it onto main (abc) and fix any conflicts, run the tests your change affects (not the full suite), squash your revisions into one, then ${P} Then call ready with the commands that run those tests. ${D}`,
   );
-  expect(mergePrompt(["Fix login", "Add search"], "vnnpplvq", DESCRIBE_PROMPT)).toBe(
-    "Check that Fix login and Add search work together on main. Merged cleanly as vnnpplvq. Run the typecheck and the tests that cover what they change; don't run the full suite, and don't change any files. If a test fails, call blame with the task responsible and what failed. Otherwise: Add a description (4-7 words) to your revision(s).",
+  expect(preparePrompt({ ...base, rewrite: "squash-here" }, P)).toBe(
+    `Before your work lands on main: run the tests your change affects (not the full suite), squash your revisions into one, then ${P} Then call ready with the commands that run those tests. ${D}`,
   );
-  expect(mergePrompt(["A", "B", "C"], "vnnpplvq", "Describe it.")).toStartWith("Check that A, B and C work together on main.");
+  // Not rebased, it is told which of its revisions are conflicted.
+  expect(preparePrompt({ ...base, rewrite: "squash-here", conflicted: ["k1"] }, P)).toBe(
+    `Before your work lands on main: resolve the conflicts in k1, run the tests your change affects (not the full suite), squash your revisions into one, then ${P} Then call ready with the commands that run those tests. ${D}`,
+  );
+  expect(preparePrompt({ ...base, rewrite: "rebase" }, P)).toBe(
+    `Before your work lands on main: rebase your own revisions onto main (abc) and fix any conflicts, run the tests your change affects (not the full suite), then ${P} Then call ready with the commands that run those tests. ${D}`,
+  );
+  expect(preparePrompt({ ...base, rewrite: "keep", conflicted: ["k1", "k2"] }, P)).toBe(
+    `Before your work lands on main: it holds another task's work, so don't rebase or squash it. Resolve the conflicts in k1 and k2, then ${P} ${T} ${D}`,
+  );
+  expect(preparePrompt({ ...base, rewrite: "none" }, P)).toBe(
+    `Before your work lands on main: another task builds on your revisions, so don't rebase or squash them. ${P} ${T} ${D}`,
+  );
+  // Nothing to describe: no describe prompt.
+  expect(preparePrompt({ ...base, rewrite: "none", describe: false }, P)).toBe(
+    `Before your work lands on main: another task builds on your revisions, so don't rebase or squash them. ${T} ${D}`,
+  );
+  // A blamed task's turn opens with what the merge agent reported.
+  expect(preparePrompt({ ...base, rewrite: "squash", report: "test four fails" }, P)).toBe(
+    `The merge agent that checked your work together with other tasks on main reported: test four fails\n\n${preparePrompt({ ...base, rewrite: "squash" }, P)}`,
+  );
   expect(mergeTitle(["Fix login", "Add search"])).toBe("Merge Fix login, Add search");
 });
 
@@ -363,7 +414,7 @@ test("trainTurn runs on another node, through PeerObject.trainTurn", async () =>
     const peer = await A.pool.peerRef(B.id, PeerObject);
     try {
       if (peer.variant !== "peer") throw new Error("not the peer variant");
-      const text = rebasePrompt("0123abcd");
+      const text = prepare("0123abcd");
       expect(await peer.trainTurn({ taskId: m.id, kind: "rebase", text })).toEqual({ kind: "done" });
       expect(trainTurns(B.db, m.id)).toEqual([{ type: "meddle", subtype: "train_turn", kind: "rebase", text, after: expect.any(Number) }]);
       expect(B.runner.state(m.id)).toBe("idle");
@@ -386,7 +437,7 @@ test("a train turn cut off by a restart: asking again joins its rerun, whose out
     if (id === m.id && msg.type === "system" && msg.subtype === "init") res();
   }));
   // The first process stalls before the result; the agent declines; then the process goes.
-  void node.runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd")).catch(() => {});
+  void node.runner.trainTurn(m.id, "rebase", prepare("0123abcd")).catch(() => {});
   await initialised;
   await tools!.find((t) => t.name === "decline")!.handler({ reason: "the API it fixes is gone" }, {});
   await node.harness.close();
@@ -400,13 +451,13 @@ test("a train turn cut off by a restart: asking again joins its rerun, whose out
     hooks: { engineInput: (id, input) => { if (id === m.id) seen.push(input); } },
   });
   try {
-    const again = runner.trainTurn(m.id, "rebase", rebasePrompt("0123abcd"));
+    const again = runner.trainTurn(m.id, "rebase", prepare("0123abcd"));
     await Bun.sleep(100);
     runner.resumeHarness();
     expect(await again).toEqual({ kind: "declined", reason: "the API it fixes is gone" });
     // One train turn, run twice: no second turn started for the second call; the rerun was the train's too.
     expect(messages(db, m.id).filter((e) => e.subtype === "turn_started")).toHaveLength(2);
-    expect(trainTurns(db, m.id).map((e) => e.text)).toEqual([rebasePrompt("0123abcd"), CARRY_ON_PROMPT]);
+    expect(trainTurns(db, m.id).map((e) => e.text)).toEqual([prepare("0123abcd"), CARRY_ON_PROMPT]);
     expect(seen.map((s) => s.permissionMode)).toEqual(["auto"]);
     expect(runner.state(m.id)).toBe("idle");
   } finally {
