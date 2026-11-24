@@ -44,7 +44,8 @@
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body { margin: 0; font: 13.5px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); overflow: hidden; }
-  #app { height: 100%; }
+  /* As tall as what shows: a phone's browser hides its toolbar as the page scrolls, and 100% stays the height with it. */
+  body, #app { height: 100%; height: 100dvh; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   code, pre, kbd { font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }
@@ -557,7 +558,8 @@
   .composer.drop { border-style: dashed; border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft), var(--composer)); }
   .composer .attachments { padding: 8px 10px 0; }
   .att.pic { padding-left: 0; overflow: hidden; }
-  .att-thumb { width: 48px; height: 100%; object-fit: cover; flex: none; }
+  .att-open { display: block; align-self: stretch; flex: none; }
+  .att-thumb { display: block; width: 48px; height: 100%; object-fit: cover; }
   .att.uploading .att-thumb { opacity: 0.5; }
   .att-spin { width: 13px; height: 13px; flex: none; color: var(--muted); }
   .att.failed { border-color: var(--bad); }
@@ -572,6 +574,9 @@
   .bar > * { flex: none; }
   .bar > .bar-item { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bar > .bar-gap { flex: 1 1 0; }
+  /* The node and the task's settings stay together: on a phone they wrap to a row of their own, on its right. */
+  .bar > .bar-end { display: flex; align-items: center; gap: 14px; margin-left: auto; min-width: 0; }
+  .bar-end > .bar-item { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   /* The projects never shrink: a name stays whole up to 16ch, and below 760px of bar they collapse to the pill. */
   .bar > .bar-projects { display: flex; align-items: center; gap: 14px; }
   .bar-entry { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -676,9 +681,11 @@
     .ask { margin-left: 0; }
     .head-actions button { padding: 3px 7px; }
     .page { padding: 8px 14px 40px; }
-    .bar { overflow-x: auto; }
+    .bar { flex-wrap: wrap; }
+    .bar > .bar-end { flex: 0 1 auto; }
     .bar > .bar-item:not(:first-child), .bar > .bar-sep { display: none; }
     .task > .pane-head, .project > .pane-head { flex-wrap: wrap; }
+    .task > .pane-head > .head-actions { flex: 1 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; row-gap: 6px; }
     .changes { flex-direction: column; overflow-y: auto; }
     .chg-list { flex: none; max-width: none; border-right: none; border-bottom: 1px solid var(--line); overflow: visible; }
     .chg-tree { display: none; }

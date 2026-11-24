@@ -1244,12 +1244,14 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
         ? limits.map((m) => <UsageMeter key={m.label} meter={m} class="bar-item" />)
         : <span class="bar-item">5h / 7d: no data</span>}
       <span class="bar-gap" />
-      {archived ? (
-        <span class="bar-item" title={nodeId}>⌂ archived on {archivedOn ?? hostname}</span>
-      ) : (
-        <button class="pill" disabled={moving} title={`${nodeId}\nMove to another node`} onClick={(e) => setMoveAt({ el: e.currentTarget, above: true })}>⌂ {hostname} ▾</button>
-      )}
-      {!archived && <Settings task={task} node={node} pool={pool} disabled={moving} />}
+      <span class="bar-end">
+        {archived ? (
+          <span class="bar-item" title={nodeId}>⌂ archived on {archivedOn ?? hostname}</span>
+        ) : (
+          <button class="pill" disabled={moving} title={`${nodeId}\nMove to another node`} onClick={(e) => setMoveAt({ el: e.currentTarget, above: true })}>⌂ {hostname} ▾</button>
+        )}
+        {!archived && <Settings task={task} node={node} pool={pool} disabled={moving} />}
+      </span>
       {moveAt !== null && <MoveMenu task={task} nodes={nodes} from={nodeId} anchor={moveAt} onClose={() => setMoveAt(null)} />}
       {projectsAt !== null && (
         <Popover anchor={projectsAt} onClose={() => setProjectsAt(null)} wide>

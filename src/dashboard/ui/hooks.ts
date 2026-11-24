@@ -17,6 +17,29 @@ export function clientHost(socket: WebSocket, onMismatch: () => void): Host {
   });
 }
 
+/** A chord client host with no upstream yet: `selfUpstream` gives it this node's `/ws`, and gives it again. */
+export function bareClientHost(): Host {
+  return createHost({ name: "browser", self: "browser", kind: "client" });
+}
+
+/**
+ * `host`'s link to this node over `/ws`, opened again whenever its socket closes. `onMismatch` runs (and no socket is
+ * opened again) when the node speaks another link protocol.
+ */
+export function selfUpstream(host: Host, onMismatch: () => void): Upstream {
+  return new Upstream({
+    connect(events) {
+      const socket = nodeSocket("/ws");
+      socket.addEventListener("open", () => events.opened());
+      socket.addEventListener("close", () => events.closed());
+      host.connect(webSocketLink(socket), { principal: "node", onProtocolMismatch: () => events.mismatch() });
+    },
+    mismatch: onMismatch,
+    now: () => Date.now(),
+    schedule: (fn, ms) => { setTimeout(fn, ms); },
+  });
+}
+
 /** What a node's host is doing: none yet (`idle`), its socket opening or open, waiting to retry, or never again. */
 export type HostStatus = "idle" | "connecting" | "open" | "backoff" | "incompatible";
 
@@ -34,6 +57,86 @@ const BACKOFF_FIRST_MS = 1000;
 const BACKOFF_MAX_MS = 30_000;
 /** A socket open at least this long counts as a success: the next failure backs off from the start again. */
 const STABLE_MS = 10_000;
+
+/** How long to wait before the next socket after `failures` failed ones in a row. */
+const backoffMs = (failures: number) => Math.min(BACKOFF_FIRST_MS * 2 ** failures, BACKOFF_MAX_MS);
+
+export type UpstreamDeps = {
+  /** Opens a socket to this node as the host's upstream link, reporting its open and close and a protocol mismatch. */
+  connect(events: HostEvents): void;
+  mismatch(): void;
+  now(): number;
+  schedule(fn: () => void, ms: number): void;
+};
+
+/**
+ * This node's own link (`/ws`), opened again when its socket closes, after the same backoff as `Hosts`, or at once on
+ * `wake` (the page shown again, the network back). The host's references keep their values meanwhile and re-hold over
+ * the new link; calls wait for it. `open` holds from the start until a socket closes, and again once one opens;
+ * `onChange` hears it change.
+ */
+export class Upstream {
+  readonly #deps: UpstreamDeps;
+  readonly #listeners = new Set<() => void>();
+  #open = true;
+  #attempt = 0;
+  #openedAt: number | null = null;
+  #failures = 0;
+  #waiting = false;
+  #incompatible = false;
+
+  constructor(deps: UpstreamDeps) {
+    this.#deps = deps;
+    this.#connect();
+  }
+
+  get open(): boolean {
+    return this.#open;
+  }
+
+  /** Opens a socket now if one is waiting out its backoff. */
+  wake(): void {
+    if (this.#waiting) this.#connect();
+  }
+
+  onChange(cb: () => void): () => void {
+    this.#listeners.add(cb);
+    return () => { this.#listeners.delete(cb); };
+  }
+
+  #connect(): void {
+    const attempt = ++this.#attempt;
+    const current = () => attempt === this.#attempt && !this.#incompatible;
+    this.#waiting = false;
+    this.#openedAt = null;
+    this.#deps.connect({
+      opened: () => {
+        if (!current()) return;
+        this.#openedAt = this.#deps.now();
+        this.#set(true);
+      },
+      closed: () => {
+        if (!current()) return;
+        const stable = this.#openedAt !== null && this.#deps.now() - this.#openedAt >= STABLE_MS;
+        if (stable) this.#failures = 0;
+        this.#waiting = true;
+        this.#deps.schedule(() => { if (attempt === this.#attempt && this.#waiting) this.#connect(); }, backoffMs(this.#failures++));
+        this.#set(false);
+      },
+      mismatch: () => {
+        if (!current()) return;
+        this.#incompatible = true;
+        this.#deps.mismatch();
+      },
+    });
+  }
+
+  #set(open: boolean): void {
+    if (open === this.#open) return;
+    this.#open = open;
+    for (const cb of this.#listeners) cb();
+  }
+}
 
 /** The browser's `HostsDeps`: a socket to `/ws/node/<nodeId>` and a client host over it. */
 const browserDeps: HostsDeps = {
@@ -116,7 +219,7 @@ export class Hosts {
     host.close().catch(() => {});
     const entry = { status: "backoff", failures: failures + 1 } as const;
     this.#set(nodeId, entry);
-    const delay = Math.min(BACKOFF_FIRST_MS * 2 ** failures, BACKOFF_MAX_MS);
+    const delay = backoffMs(failures);
     this.#deps.schedule(() => {
       if (this.#entries.get(nodeId) === entry) this.#set(nodeId, { status: "idle", failures: entry.failures });
     }, delay);

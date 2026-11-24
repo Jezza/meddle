@@ -105,13 +105,16 @@ const BACK_POLL_MS = 2000;
 /**
  * What covers the dashboard while the pool swaps and awaits confirmation: each participant's state and health deadline,
  * and the rollout's own. When this node's socket closed (it restarted onto the new build, or back), the page reloads
- * once the node answers again.
+ * once the node answers again, or its socket opens again first.
  */
 export function Blind({ update, name, connected }: { update: UpdateView; name(id: string): string; connected: boolean }) {
   const now = useNow(1000);
   const covering = blinded(update);
+  const dropped = useRef(false);
   useEffect(() => {
+    if (connected && dropped.current) location.reload();
     if (connected || !covering) return;
+    dropped.current = true;
     const timer = setInterval(() => {
       fetch("/", { cache: "no-store" }).then((res) => { if (res.ok) location.reload(); }, () => {});
     }, BACK_POLL_MS);

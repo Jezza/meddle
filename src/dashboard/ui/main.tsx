@@ -4,7 +4,7 @@ import type { Host, Ref } from "@earendil-works/chord";
 import { type ComponentChildren, render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { NodeObject, PoolObject, ProjectObject, type Notification } from "../../state/contracts";
-import { clientHost, Hosts, nodeSocket, store, stored, useAction, useObject, useValue } from "./hooks";
+import { bareClientHost, Hosts, selfUpstream, store, stored, useAction, useObject, useValue } from "./hooks";
 import { BuildAlerts, Nav, PaneHead, type PoolRef, RemovedProjects } from "./common";
 import { NewTask } from "./NewTask";
 import { NodePage } from "./NodePage";
@@ -27,17 +27,20 @@ const NO_ALERTS: ReadonlyMap<string, string> = new Map();
 // A file dropped beside a composer (or on one that takes none) would otherwise replace the dashboard with it.
 guardDrops(document);
 
-const socket = nodeSocket("/ws");
+const host = bareClientHost();
 // This node's own server changed its link protocol (it was upgraded): a reload picks up its new bundle.
-const host = clientHost(socket, () => location.reload());
+const upstream = selfUpstream(host, () => location.reload());
+// A phone drops a background page's socket: once the page shows again (or the network is back), don't wait out a backoff.
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") upstream.wake(); });
+addEventListener("online", () => upstream.wake());
 
 const NARROW = "(max-width: 760px)";
 const SIDEBAR_KEY = "meddle.sidebar.hidden";
 
 function App({ host }: { host: Host }) {
   const [view, setView] = useState<View>(() => viewOf(location.hash));
-  const [connected, setConnected] = useState(true);
-  useEffect(() => socket.addEventListener("close", () => setConnected(false)), []);
+  const [connected, setConnected] = useState(upstream.open);
+  useEffect(() => upstream.onChange(() => setConnected(upstream.open)), []);
   useEffect(() => {
     const follow = () => setView(viewOf(location.hash));
     addEventListener("hashchange", follow);
@@ -46,7 +49,7 @@ function App({ host }: { host: Host }) {
   const pool = useObject(host, PoolObject, {});
   const node = useObject(host, NodeObject, {});
   const error = pool.error ?? node.error ?? (pool.ref !== undefined && pool.ref.variant !== "default" ? "unexpected pool view" : undefined);
-  const notice = !connected ? "Disconnected from the node. Reload the page once it is running again." : error;
+  const notice = !connected ? "Disconnected from the node. Reconnecting…" : error;
   if (pool.ref === undefined || pool.ref.variant !== "default" || node.ref === undefined) {
     return <div class="boot">{notice === undefined ? <p class="muted">Connecting…</p> : <p class="error">{notice}</p>}</div>;
   }

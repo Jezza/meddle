@@ -125,7 +125,10 @@ export function useFileTarget(onFiles: (files: File[]) => void, on: boolean) {
   };
 }
 
-/** The composer's files in a row: an image as its thumbnail, any other file by name and size; each with a ×. */
+/**
+ * The composer's files in a row: an image as its thumbnail that opens it full size in a new tab (from the node once it
+ * is uploaded), any other file by name and size; each with a ×.
+ */
 export function DraftChips({ drafts, onRemove }: { drafts: Draft[]; onRemove(id: number): void }) {
   if (drafts.length === 0) return null;
   return (
@@ -134,7 +137,11 @@ export function DraftChips({ drafts, onRemove }: { drafts: Draft[]; onRemove(id:
         <span key={d.id} class={`att ${d.state}${d.preview !== null ? " pic" : ""}`}
           title={d.state === "failed" ? `${d.name}: ${d.error}` : `${d.name} · ${sizeText(d.size)}`}>
           {d.preview !== null
-            ? <img class="att-thumb" src={d.preview} alt={d.name} />
+            ? (
+              <a class="att-open" href={d.attachment !== null ? blobUrl(d.attachment) : d.preview} target="_blank" rel="noopener noreferrer">
+                <img class="att-thumb" src={d.preview} alt={d.name} />
+              </a>
+            )
             : <><Iconoir name="attachment" /><span class="att-name">{d.name}</span><span class="att-size">{sizeText(d.size)}</span></>}
           {d.state === "uploading" && <Spinner />}
           {d.state === "failed" && <span class="att-bad"><Iconoir name="warning" /><span class="sr">not uploaded: {d.error}</span></span>}
