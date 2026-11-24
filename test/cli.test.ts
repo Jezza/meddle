@@ -161,6 +161,10 @@ test("token add, set, list, enable, remove and status work on the database, with
   expect(await meddle(["token", "enable", "again"], env)).toEqual({ stdout: `enabled ${a} (again)\n`, stderr: "", code: 0 });
   expect((await meddle(["token", "list"], env)).stdout).toEndWith(`active: ${a}\n`);
 
+  expect(await meddle(["token", "rename", "again", "work"], env)).toEqual({ stdout: `renamed ${a} (work)\n`, stderr: "", code: 0 });
+  expect(await meddle(["token", "rename", a, "again"], env)).toEqual({ stdout: `renamed ${a} (again)\n`, stderr: "", code: 0 });
+  expect(await meddle(["token", "rename", "nope", "x"], env)).toEqual({ stdout: "", stderr: "meddle: no such token: nope\n", code: 1 });
+
   expect(await meddle(["token", "remove", "again"], env)).toEqual({ stdout: `removed ${a} (again)\n`, stderr: "", code: 0 });
   expect(existsSync(`${dir}/d/secrets/tokens/${a}`)).toBe(false);
   const after = (await meddle(["token", "list"], env)).stdout.trimEnd().split("\n");

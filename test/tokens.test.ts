@@ -9,7 +9,7 @@ import { ensureDataDirs, loadConfig, paths } from "../src/config";
 import { NodeObject, PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
 import {
-  TOKEN_ID, addToken, enableToken, listTokens, markToken, mergeTokens, migrateLegacyToken, moveToken, pickToken,
+  TOKEN_ID, addToken, enableToken, listTokens, markToken, mergeTokens, migrateLegacyToken, moveToken, pickToken, renameToken,
   removeToken, sweepTokenValues, tokenFile, tokenId, tokenValue, writeTokenValue, type TokenMeta,
 } from "../src/token";
 import { linkClient, twoNodes, twoPoolNodes } from "./pool-helpers";
@@ -142,6 +142,27 @@ test("remove deletes the value file and keeps a removed row; add again revives i
   expect((await removeToken(cfg, db, c.id)).id).toBe(c.id);
   expect(existsSync(tokenFile(cfg, b.id))).toBe(true);
   expect(listTokens(db).map((t) => t.id)).toEqual([b.id, a.id]);
+});
+
+test("rename names a token by id or label, keeps its place, and refuses a bad label or an ambiguous one", async () => {
+  const { cfg, db } = await node();
+  const a = await addToken(cfg, db, "tok-a", { label: "a", setBy: A, now: T1 });
+  const b = await addToken(cfg, db, "tok-b", { label: "b", setBy: A, now: T2 });
+
+  expect(renameToken(db, "a", "work", T3)).toMatchObject({ id: a.id, label: "work", rank: a.rank, updatedAt: T3 });
+  expect(renameToken(db, b.id, "home", T3)).toMatchObject({ id: b.id, label: "home" });
+  expect(listTokens(db).map((t) => t.label)).toEqual(["work", "home"]);
+  // The same label again writes nothing.
+  expect(renameToken(db, "work", "work", T4)).toMatchObject({ updatedAt: T3 });
+
+  expect(() => renameToken(db, "work", "")).toThrow("invalid token label");
+  expect(() => renameToken(db, "work", "x".repeat(65))).toThrow("invalid token label");
+  expect(() => renameToken(db, "work", "x\u001b[2J")).toThrow("invalid token label");
+  expect(() => renameToken(db, "nope", "y")).toThrow("no such token: nope");
+  renameToken(db, "home", "work");
+  expect(() => renameToken(db, "work", "z")).toThrow("ambiguous token label: work");
+  await removeToken(cfg, db, a.id);
+  expect(() => renameToken(db, a.id, "z")).toThrow(`no such token: ${a.id}`);
 });
 
 test("a removed token added again goes to the end of the list, keeping when it was set and its expiry", async () => {

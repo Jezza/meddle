@@ -119,6 +119,7 @@ bun run src/cli.ts token add --file <path> [--label <l>]
 bun run src/cli.ts token list                             # or token status
 bun run src/cli.ts token remove <id|label>
 bun run src/cli.ts token enable <id|label>
+bun run src/cli.ts token rename <id|label> <label>
 bun run src/cli.ts token move <id|label> --before <id|label>   # or --after <id|label>
 ```
 
@@ -127,10 +128,11 @@ The dashboard's Settings view lists the same tokens, in order. Its Enable button
 Adding and removing stay on the CLI, so a value never passes through the dashboard.
 
 A token's id is the first 16 hex characters of the SHA-256 of its value, so the same token added twice, on one node
-or on two, is listed once. Adding it again with `--label` renames it and leaves it where it is in the order. Adding a
+or on two, is listed once. `token rename` renames a token without its value, as does adding it again with `--label`;
+either leaves it where it is in the order. Adding a
 removed token brings it back at the end of the list, keeping when it was first set (and so its expiry).
 Without `--label` a token is named after the first 8 characters of its id; a label is at most 64 characters. `token
-add` prints `token <id> (<label>)`, and `token set` is the same command. `remove` and `enable` take a full id or a
+add` prints `token <id> (<label>)`, and `token set` is the same command. `remove`, `enable` and `rename` take a full id or a
 label; a label two tokens share is refused (`ambiguous token label`), so name the token by its id then.
 
 The order is each token's rank, kept apart from when it was set. A new token goes last: its rank is the time it was

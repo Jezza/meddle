@@ -295,6 +295,23 @@ export function enableToken(db: Database, idOrLabel: string, now?: string): Toke
 }
 
 /**
+ * Names a token (full id or label) `label`, leaving it where it is in the order. Throws `invalid token label`,
+ * `ambiguous token label: <l>` or `no such token: <x>`.
+ */
+export function renameToken(db: Database, idOrLabel: string, label: string, now?: string): TokenMeta {
+  if (!labelOk(label)) {
+    throw new Error(`invalid token label: at most ${MAX_TOKEN_LABEL} characters, none of them control characters`);
+  }
+  const at = now ?? new Date().toISOString();
+  return db.transaction(() => {
+    const local = findToken(db, idOrLabel);
+    if (local.label === label) return local;
+    write(db, { ...local, label, updatedAt: after(at, local.updatedAt) });
+    return tokenRow(db, local.id)!;
+  }).immediate();
+}
+
+/**
  * Sets token `id`'s status (`exhausted` until a time, `disabled`, or `ok`); null when there is no such row. Throws
  * `invalid token mark` for anything a peer would drop: a status other than the three, an `until` that is not an ISO
  * time (`Date.toISOString`) or null, a `detail` over 256 characters or with control characters.

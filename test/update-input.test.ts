@@ -186,6 +186,7 @@ test("every CLI command that writes is refused while a swap is in progress, befo
     ["token", "set", "--file", `${dir}/tok`],
     ["token", "remove", "work"],
     ["token", "enable", "work"],
+    ["token", "rename", "work", "home"],
     ["token", "move", "work", "--before", "home"],
     ["config", "set", "jj.user", "Lab"],
     ["config", "unset", "jj.user"],

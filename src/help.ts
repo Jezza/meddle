@@ -120,7 +120,7 @@ const GROUPS: Group[] = [
         summary: "Add a Claude Code login token (from `claude setup-token`), on stdin or from a file.",
         details:
           "Never takes the token as an argument: paste it and end with Ctrl-D, or give --file. --label names it (else the " +
-          "first 8 characters of its id); adding the same token again with a label renames it. Tokens are shared with the " +
+          "first 8 characters of its id); `token rename` renames it. Tokens are shared with the " +
           "pool, and a turn uses the first usable one in order: a new token goes last, as does a removed one added " +
           "again; `token move` changes the order. `token set` is the same command. " +
           "Works with or without the node running. Prints `token <id> (<label>)`.",
@@ -144,6 +144,14 @@ const GROUPS: Group[] = [
         usage: ["token enable <id|label>"],
         summary: "Make an exhausted or disabled token usable again.",
         details: "Takes a full id or a label. The dashboard's Enable button does the same.",
+      },
+      {
+        name: "token rename",
+        usage: ["token rename <id|label> <label>"],
+        summary: "Rename a token, across the pool.",
+        details:
+          "Takes a full id or a label. A label is at most 64 characters, with no control characters. Works with or " +
+          "without the node running. Prints `renamed <id> (<label>)`.",
       },
       {
         name: "token move",

@@ -39,7 +39,8 @@ import { TaskRunner, type RunnerDeps } from "./tasks/durable";
 import { openHarness } from "./tasks/harness";
 import { olderHolder, trainArgs, trainProjectChoice, trainText, type TrainArgs, type TrainView } from "./train/surface";
 import {
-  addToken, enableToken, listTokens, migrateLegacyToken, moveToken, pickToken, removeToken, sweepTokenValues, findToken,
+  addToken, enableToken, listTokens, migrateLegacyToken, moveToken, pickToken, removeToken, renameToken, sweepTokenValues,
+  findToken,
   type TokenMeta,
 } from "./token";
 import { ensureClaude } from "./claude-code";
@@ -69,6 +70,7 @@ const USAGE = `usage: meddle --version
        meddle token add [--file <path>] [--label <l>] | meddle token set [--file <path>] [--label <l>]
        meddle token list | meddle token status | meddle token remove <id|label> | meddle token enable <id|label>
        meddle token move <id|label> --before <id|label> | meddle token move <id|label> --after <id|label>
+       meddle token rename <id|label> <label>
        meddle config set <key> <value> | meddle config unset <key> | meddle config list
        meddle project add <path-or-url> [--name <n>] [--no-fetch]
        meddle project list
@@ -496,6 +498,16 @@ async function tokenEnable(idOrLabel: string): Promise<number> {
   const enabled = await withDb(cfg, (db) => enableToken(db, idOrLabel));
   await tokensChanged();
   console.log(`enabled ${enabled.id} (${enabled.label})`);
+  return 0;
+}
+
+/** Names a token (its full id or its label) anew here, and tells the running node. */
+async function tokenRename(idOrLabel: string, label: string): Promise<number> {
+  const cfg = loadConfig();
+  if (!existsSync(paths(cfg).db)) throw new Error(`no such token: ${idOrLabel}`);
+  const renamed = await withDb(cfg, (db) => renameToken(db, idOrLabel, label));
+  await tokensChanged();
+  console.log(`renamed ${renamed.id} (${renamed.label})`);
   return 0;
 }
 
@@ -1784,6 +1796,7 @@ function route(args: string[]): (() => Promise<number>) | null {
   if (command === "token" && (sub === "list" || sub === "status") && rest.length === 0) return tokenList;
   if (command === "token" && sub === "remove" && rest.length === 1) return () => tokenRemove(rest[0]!);
   if (command === "token" && sub === "enable" && rest.length === 1) return () => tokenEnable(rest[0]!);
+  if (command === "token" && sub === "rename" && rest.length === 2) return () => tokenRename(rest[0]!, rest[1]!);
   if (command === "token" && sub === "move" && rest.length === 3 && !rest[0]!.startsWith("--")) {
     const [idOrLabel, flag, anchor] = rest as [string, string, string];
     if (flag === "--before") return () => tokenMove(idOrLabel, { before: anchor });
