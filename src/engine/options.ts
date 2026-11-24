@@ -127,6 +127,8 @@ export function buildOptions(i: EngineInput): Options {
     additionalDirectories: [paths(i.cfg).taskAttachments(i.manifest.id)],
     settingSources,
     permissionMode: i.permissionMode ?? "auto",
+    // Without it Claude Code refuses `bypassPermissions`: starting in it, or switching to it mid-turn (`setPermissionMode`).
+    allowDangerouslySkipPermissions: true,
     settings: composeSettings(i.contexts, i.projectSettings),
     systemPrompt: append === ""
       ? { type: "preset", preset: "claude_code" }

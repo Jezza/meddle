@@ -9,7 +9,7 @@ test("options match the spec", () => {
   const manifest = { id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: "p1", createdAt: "", projects: [{ id: "p1", name: "a", replica: "/r/a", workspace: "a", parent: "root()", base: ["0000000000000000000000000000000000000000"], context: null }] };
   const common = { cfg, manifest, projectSettings: [], token: "tok", prompt: (async function*(){})(), canUseTool: async () => ({ behavior: "deny" as const, message: "x" }), onPermissionDenied: () => {}, sessionStore: {} as any };
   const o: any = buildOptions({ ...common, contexts: [{ ...DEFAULT_CONTEXT, env: { RUST_LOG: "debug" }, instructions: "Use nextest." }], resume: false, extraEnv: { MEDDLE_FIXTURE: "/f" }, claudePath: "/x/replay.ts" });
-  expect(o.permissionMode).toBe("auto");
+  expect(o.permissionMode).toBe("auto"); expect(o.allowDangerouslySkipPermissions).toBe(true);
   expect(o.sessionId).toBe(manifest.sessionId); expect(o.resume).toBeUndefined();
   expect(o.cwd).toBe("/t/abc/a"); expect(o.projectConfigRoot).toBe("/t/abc/a");
   expect(o.settingSources).toEqual(["user", "project", "local"]);
