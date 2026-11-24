@@ -1,5 +1,6 @@
 // The thread a task's event log renders as: pure, so it is tested without a DOM or a link.
-import { type Attachment, attachmentProblem } from "../../blobs/attachment";
+import { type Attachment, attachmentProblem, type PeerFrom } from "../../blobs/attachment";
+import { taskTarget } from "../../engine/task-target";
 import { type AgentEntry, isProgress, type Live } from "../../state/contracts";
 import type { DiffRow, Hunk } from "./diff-model";
 
@@ -10,6 +11,8 @@ export type ThreadItem =
    */
   | { kind: "user"; text: string; attachments: Attachment[]; by?: "meddle" }
   | { kind: "assistant"; text: string; thinking?: string }
+  /** A message from another task's agent (`peer_message`), as Claude Code took it into the turn. */
+  | { kind: "peer"; from: PeerFrom; text: string }
   | {
     kind: "tool";
     name: string;
@@ -29,6 +32,9 @@ export type ThreadItem =
     reports?: string[];
     /** On a `SendMessage` call that resumed an agent: the `toolUseId` of that agent's own row. */
     resumes?: string;
+    /** On a `SendMessage` call to a task: its id; `failed` once its result says it was not sent. */
+    messageTo?: string;
+    failed?: boolean;
   }
   | { kind: "question"; toolUseId: string; questions: unknown }
   | { kind: "denied"; toolName: string; reason?: string; reasonType?: string }
@@ -86,6 +92,8 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
         addAssistant(m, listFor(m.parent_tool_use_id));
         break;
       case "user":
+        // Claude Code's echo of a message from another task: meddle logged it as it was taken (`peer_message`).
+        if (m.isReplay === true && (m.origin as { kind?: unknown } | undefined)?.kind === "peer") break;
         addUser(m, listFor(m.parent_tool_use_id));
         break;
       case "system":
@@ -133,6 +141,8 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
           parent!.reports = [...(parent!.reports ?? []), report];
         } else {
           const tool: ToolItem = { kind: "tool", name: str(block.name), input: block.input, toolUseId, children: [] };
+          const to = block.name === "SendMessage" ? taskTarget((block.input as { to?: unknown } | undefined)?.to) : null;
+          if (to !== null) tool.messageTo = to;
           tools.set(toolUseId, tool);
           list.push(tool);
           if (list === top) topTools.add(toolUseId);
@@ -154,6 +164,7 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
         if (tool !== undefined) {
           const result = (m.tool_use_result ?? {}) as { agentId?: unknown; structuredPatch?: unknown; originalFile?: unknown };
           tool.result = { text: contentText(block.content), isError: block.is_error === true };
+          if (tool.messageTo !== undefined) tool.failed = tool.result.isError || !sentOk(tool.result.text);
           const patch = hunks(result.structuredPatch);
           if (patch.length > 0) tool.result.patch = patch;
           if (typeof result.originalFile === "string") tool.result.original = textLines(result.originalFile);
@@ -204,6 +215,9 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
         return;
       case "init":
         // The bar beneath the thread shows the model.
+        return;
+      case "peer_message_hold":
+        // A message from another task held for a moment; one that stays held says so in its receipt.
         return;
       default:
         top.push(unknown(m));
@@ -278,6 +292,12 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
       case "token_fault":
         top.push({ kind: "status", text: tokenFaultText(m) });
         return;
+      case "peer_message":
+        top.push({ kind: "peer", from: peerFromOf(m.from), text: str(m.text) });
+        return;
+      case "peer_receipt":
+        top.push({ kind: "status", text: `Message ${str(m.status)}` });
+        return;
       case "train_turn":
         // The train's prompt starts the turn as yours would, marked as meddle's.
         top.push({ kind: "user", text: str(m.text), attachments: [], by: "meddle" });
@@ -341,6 +361,21 @@ const NOT_REPORTED = "This agent has not reported yet";
 function unknown(m: Message): ThreadItem {
   const type = typeof m.subtype === "string" ? `${String(m.type)}:${m.subtype}` : String(m.type);
   return { kind: "unknown", type, raw: m };
+}
+
+/** A logged message's sender, its fields as strings. */
+function peerFromOf(from: unknown): PeerFrom {
+  const f = (from ?? {}) as { taskId?: unknown; nodeId?: unknown; title?: unknown };
+  return { taskId: str(f.taskId), nodeId: str(f.nodeId), title: str(f.title) };
+}
+
+/** Whether a `SendMessage` result (`{"success": …}` as text) says it was sent. */
+function sentOk(text: string): boolean {
+  try {
+    return (JSON.parse(text) as { success?: unknown }).success === true;
+  } catch {
+    return false;
+  }
 }
 
 /** A `token_fault`: which token failed the turn and how, and whether the turn goes on with another login. */

@@ -6,7 +6,7 @@ import type { Host, Ref } from "@earendil-works/chord";
 import DOMPurify from "dompurify";
 import { createContext, type RefObject } from "preact";
 import { type Dispatch, type StateUpdater, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import type { Attachment, Prompt } from "../../blobs/attachment";
+import type { Attachment, PeerFrom, Prompt } from "../../blobs/attachment";
 import { type AgentEntry, type Live as LiveState, NodeObject, SessionObject, TaskObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { errorText, type Hosts, useAction, useDraft, useNow, useObject, useTick, useValue } from "./hooks";
@@ -148,7 +148,7 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
         <Thread task={task} session={session} readOnly={archived} working={state === "running"} turnLive={live || state === "moving"} raw={raw}
           agents={agents} focus={focus} setFocus={setFocus} after={<>
           {pending.map((p) => <PendingPanel key={p.requestId} task={task} pending={p} />)}
-          {queued.map((prompt, i) => <Queued key={i} prompt={prompt} />)}
+          {queued.map((prompt, i) => <Queued key={i} task={task} prompt={prompt} />)}
           {!archived && failed.map((f) => (
             <FailedMessage key={f.id} task={task} failed={f} disabled={moving} onSent={() => dropFailed(f.id)} onEdit={() => editFailed(f)} />
           ))}
@@ -320,7 +320,7 @@ type Block = { who: "user" | "claude" | "status"; items: ShownItem[] };
 function blocksOf(items: readonly ShownItem[]): Block[] {
   const out: Block[] = [];
   for (const item of items) {
-    const who = item.kind === "user" ? "user" : item.kind === "status" ? "status" : "claude";
+    const who = item.kind === "user" || item.kind === "peer" ? "user" : item.kind === "status" ? "status" : "claude";
     const last = out.at(-1);
     if (last !== undefined && last.who === who && who !== "user") last.items.push(item);
     else out.push({ who, items: [item] });
@@ -522,8 +522,9 @@ function BlockView({ block, children }: { block: Block; children?: preact.Compon
   const items = <Items items={block.items} />;
   if (block.who === "status") return <div class="status-block">{items}{children}</div>;
   if (block.who === "user") {
-    const meddle = block.items[0]?.kind === "user" && block.items[0].by === "meddle";
-    return <div class={meddle ? "msg you meddle" : "msg you"}>{items}</div>;
+    const first = block.items[0];
+    const meddle = first?.kind === "user" && first.by === "meddle";
+    return <div class={meddle ? "msg you meddle" : first?.kind === "peer" ? "msg you peer" : "msg you"}>{items}</div>;
   }
   return <div class="msg claude">{items}{children}</div>;
 }
@@ -601,6 +602,9 @@ function ShownView({ item }: { item: ShownItem }) {
       if (item.by !== "meddle") return <PromptBody text={item.text} attachments={item.attachments} />;
       // The merge train's prompt: meddle sent it, not you.
       return <><div class="by" title="Merge train">meddle</div><PromptBody text={item.text} attachments={item.attachments} /></>;
+    case "peer":
+      // Another task's agent wrote it: under that task's name, leading to it.
+      return <><div class="by"><PeerName from={item.from} /></div><PromptBody text={item.text} attachments={[]} /></>;
     case "assistant":
       // Thinking alongside text is not shown; thinking on its own is, closed.
       return item.text !== "" ? <Markdown text={item.text} /> : <Thinking text={item.thinking ?? ""} />;
@@ -688,7 +692,44 @@ function ExploredRow({ steps }: { steps: Explored["steps"] }) {
  * most `SMALL_DIFF` lines. A `SendMessage` that resumed an agent is a `Message` row leading to the agent's own.
  */
 function ToolRow({ tool }: { tool: ToolItem }) {
+  if (tool.messageTo !== undefined) return <TaskMessageRow tool={tool} to={tool.messageTo} />;
   return tool.resumes !== undefined ? <MessageRow tool={tool} resumes={tool.resumes} /> : <CallRow tool={tool} />;
+}
+
+/** A message's sender, by its task's title, leading to that task. */
+function PeerName({ from }: { from: PeerFrom }) {
+  return <a href={hashOf({ name: "task", nodeId: from.nodeId, id: from.taskId })} title={from.taskId}>{from.title || from.taskId}</a>;
+}
+
+/**
+ * A `SendMessage` to another task: one line, "Message to <its id>" and the message's summary, red once its result
+ * says it was not sent (the result, open, says why).
+ */
+function TaskMessageRow({ tool, to }: { tool: ToolItem; to: string }) {
+  const input = (tool.input ?? {}) as Record<string, unknown>;
+  const running = isRunning(tool);
+  const failed = tool.failed === true;
+  const summary = typeof input.summary === "string" ? input.summary : "";
+  return (
+    <details class={`step${failed ? " bad" : running ? " live" : ""}`} data-call={tool.toolUseId} open={failed}>
+      <summary title={typeof input.message === "string" ? input.message : undefined}>
+        <Chevron /><Icon name={running ? "running" : failed ? "failed" : "agent"} /><StateText running={running} failed={failed} />
+        <span class="verb">Message</span>
+        <span class="target plain">to {to}{summary !== "" && <span class="muted"> · {summary}</span>}</span>
+      </summary>
+      {tool.result !== undefined && <div class="step-body"><pre class="out">{resultMessage(tool.result.text)}</pre></div>}
+    </details>
+  );
+}
+
+/** What a `SendMessage` result said (its `message`), or its text as it is. */
+function resultMessage(text: string): string {
+  try {
+    const { message } = JSON.parse(text) as { message?: unknown };
+    return typeof message === "string" ? message : text;
+  } catch {
+    return text;
+  }
 }
 
 /**
@@ -986,7 +1027,23 @@ function PromptText({ text }: { text: string }) {
 }
 
 /** A prompt the task was sent and has not started on: it joins the thread where Claude takes it. */
-function Queued({ prompt }: { prompt: Prompt }) {
+function Queued({ task, prompt }: { task: TaskRef; prompt: Prompt }) {
+  const action = useAction();
+  if (prompt.peer !== undefined) {
+    // Another task's message: not yours to take back, only to drop.
+    return (
+      <div class="msg you peer queued">
+        <div class="by"><PeerName from={prompt.peer} /></div>
+        <PromptBody text={prompt.text} attachments={[]} />
+        <div class="failed-line">
+          <span class="tag">queued</span>
+          <span class="failed-acts">
+            <button disabled={action.busy} onClick={() => void action.run(() => task.dropQueued({ entry: prompt }))}>Drop</button>
+          </span>
+        </div>
+      </div>
+    );
+  }
   return (
     <div class="msg you queued">
       <PromptBody text={prompt.text} attachments={prompt.attachments} />

@@ -28,6 +28,10 @@ export function paths(cfg: NodeConfig) {
     taskManifest: (taskId: string) => join(task(taskId), ".meddle", "task.json"),
     /** Where the files attached to a task's prompts are put for its agent to read (they live on in `blobs`). */
     taskAttachments: (taskId: string) => join(task(taskId), ".meddle", "attachments"),
+    /** The sockets tasks' Claude Codes listen on for messages from other tasks, and meddle's for their receipts (mode 700). */
+    socks: join(data, "socks"),
+    /** Where task `taskId`'s Claude Code listens for messages (`--messaging-socket-path`). */
+    taskSocket: (taskId: string) => join(data, "socks", `${taskId}.sock`),
     /** Prepended to `PATH` for every jj meddle runs (never an agent's): it holds the git remote helper. */
     bin,
     binHelper: join(bin, "git-remote-meddle"),
@@ -68,6 +72,7 @@ export async function ensureDataDirs(cfg: NodeConfig): Promise<void> {
   }
   await ensurePrivateDir(p.secrets);
   await ensurePrivateDir(p.sessions);
+  await ensurePrivateDir(p.socks);
 }
 
 /** The programs a task's workspaces and moves run, which must be on the node's PATH. */

@@ -8,8 +8,22 @@ export const AttachmentSchema = Type.Object({
 });
 export type Attachment = Type.Static<typeof AttachmentSchema>;
 
-export const PromptSchema = Type.Object({ text: Type.String(), attachments: Type.Array(AttachmentSchema) });
+/** Who sent a message another task's agent wrote: the sending task, the node holding it, and its title then. */
+export const PeerFromSchema = Type.Object({ taskId: Type.String(), nodeId: Type.String(), title: Type.String() });
+export type PeerFrom = Type.Static<typeof PeerFromSchema>;
+
+/** `peer`: the prompt is a message from another task's agent (`PeerFrom`), never with attachments. */
+export const PromptSchema = Type.Object({
+  text: Type.String(), attachments: Type.Array(AttachmentSchema), peer: Type.Optional(PeerFromSchema),
+});
 export type Prompt = Type.Static<typeof PromptSchema>;
+/** A message from another task's agent, queued or delivered as a prompt is. */
+export type PeerPrompt = Prompt & { peer: PeerFrom };
+
+/** Whether `p` is a message from another task's agent. */
+export function isPeerPrompt(p: Prompt): p is PeerPrompt {
+  return p.peer !== undefined;
+}
 
 /** The largest file a blob store takes, in bytes. */
 export const MAX_BLOB_BYTES = 64 * 1024 * 1024;
@@ -83,18 +97,30 @@ export function attachmentProblem(a: unknown): string | null {
 export function promptOf(entry: unknown): Prompt {
   if (typeof entry === "string") return { text: entry, attachments: [] };
   if (typeof entry === "object" && entry !== null) {
-    const { text, attachments } = entry as Record<string, unknown>;
+    const { text, attachments, peer } = entry as Record<string, unknown>;
     const valid = Array.isArray(attachments) && attachments.every((a) => attachmentProblem(a) === null);
-    if (typeof text === "string" && valid) {
-      return { text, attachments: (attachments as Attachment[]).map(({ hash, name, type, size }) => ({ hash, name, type, size })) };
+    const from = peer === undefined ? undefined : peerFromOf(peer);
+    if (typeof text === "string" && valid && from !== null) {
+      const refs = (attachments as Attachment[]).map(({ hash, name, type, size }) => ({ hash, name, type, size }));
+      return from === undefined ? { text, attachments: refs } : { text, attachments: refs, peer: from };
     }
   }
   throw new Error("bad queued prompt");
 }
 
-/** The entry to queue `p` as: its text alone when it has no attachments, so an older meddle reads it. */
+/** A message's sender as its three fields, or null when `peer` is not one. */
+function peerFromOf(peer: unknown): PeerFrom | null {
+  if (typeof peer !== "object" || peer === null) return null;
+  const { taskId, nodeId, title } = peer as Record<string, unknown>;
+  return typeof taskId === "string" && typeof nodeId === "string" && typeof title === "string" ? { taskId, nodeId, title } : null;
+}
+
+/**
+ * The entry to queue `p` as: its text alone when it has no attachments and is not a message, so an older meddle reads
+ * it.
+ */
 export function queueEntry(p: Prompt): string | Prompt {
-  return p.attachments.length === 0 ? p.text : p;
+  return p.attachments.length === 0 && p.peer === undefined ? p.text : p;
 }
 
 /**

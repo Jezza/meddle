@@ -198,6 +198,8 @@ test("PeerObject.createTaskAt (and the train's calls) refuses a peer that is not
       abandonLeftovers: async () => { created.push("abandonLeftovers"); },
       unqueue: async () => { created.push("unqueue"); },
       discardMergeTask: async () => { created.push("discardMergeTask"); },
+      listLive: () => { created.push("listLive"); return []; },
+      message: async () => { created.push("message"); return "waking" as const; },
     },
   });
   const [down, up] = memoryLinkPair();
@@ -220,6 +222,8 @@ test("PeerObject.createTaskAt (and the train's calls) refuses a peer that is not
       () => peer.abandonLeftovers({ taskId, commits: ["1".repeat(40)] }),
       () => peer.unqueueTask({ taskId, reason: "r" }),
       () => peer.discardTask({ taskId }),
+      () => peer.tasks({}),
+      () => peer.message({ to: taskId, from: { taskId: "111111111111", nodeId: "n", title: "t" }, text: "hi" }),
     ]) {
       refusal = null;
       await call().catch((err: unknown) => { refusal = err; });

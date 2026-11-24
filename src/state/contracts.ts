@@ -1,7 +1,7 @@
 // The node's chord objects: what the dashboard and the CLI watch and steer over a link.
 import Type from "typebox";
 import { hostNamed, local, method, remote } from "@earendil-works/chord";
-import { AttachmentSchema, PromptSchema } from "../blobs/attachment";
+import { AttachmentSchema, PeerFromSchema, PromptSchema } from "../blobs/attachment";
 
 const Nullable = <S extends Type.TSchema>(schema: S) => Type.Union([schema, Type.Null()]);
 
@@ -598,6 +598,11 @@ export const TaskObject = remote("meddle.task", {
          */
         takeBackQueued: method(Type.Object({}), Type.Object({ prompts: Type.Array(PromptSchema) })),
         /**
+         * Drops a message from another task's agent queued for the task (`entry`, as `queuedPrompts` lists it): it is
+         * not the user's to take back. Refused when no such message is queued. A node older than this method has none.
+         */
+        dropQueued: method(Type.Object({ entry: PromptSchema })),
+        /**
          * Accepts the task: queues it on its project's train, where its work waits to land on the project's default
          * branch. Idle and running tasks can be accepted; accepting a queued task changes nothing. Refused `nothing to
          * land: the task's work is already on <branch>`, `send or clear the waiting prompts first`, `accept handles one
@@ -995,6 +1000,20 @@ export const PeerObject = remote("meddle.peer", {
          * (`TaskRunner.discardMergeTask`; a member only). Refused for a task that is no merge task.
          */
         discardTask: method(Type.Object({ taskId: Type.String() })),
+        /**
+         * The tasks held here that another task's agent can message (`TaskRunner.listLive`; a member only): live, not a
+         * merge task. What a node's `Messenger` lists for `ListAgents`. A node older than this method has none.
+         */
+        tasks: method(Type.Object({}), Type.Array(Type.Object({ id: Type.String(), title: Type.String(), state: Type.String() }))),
+        /**
+         * Hands a message from task `from`'s agent to task `to`'s here (`TaskRunner.message`; a member only): written
+         * into its running turn, a turn started for it, or queued for its next. Refused as that refuses. A node older
+         * than this method has none.
+         */
+        message: method(
+          Type.Object({ to: Type.String(), from: PeerFromSchema, text: Type.String() }),
+          Type.Union([Type.Literal("delivered"), Type.Literal("waking"), Type.Literal("queued")]),
+        ),
       },
     },
   },

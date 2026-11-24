@@ -1,18 +1,22 @@
 import { existsSync } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createServer, type Server } from "node:net";
+import { randomBytes } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import type { PermissionMode, Query, SDKMessage, SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
-import { attachmentProblem, promptOf, queueEntry, type Attachment, type Prompt } from "../blobs/attachment";
+import { attachmentProblem, isPeerPrompt, promptOf, queueEntry, type Attachment, type PeerFrom, type PeerPrompt, type Prompt } from "../blobs/attachment";
 import { materialize, promptContent } from "../blobs/content";
 import { BlobFetcher } from "../blobs/pool";
 import { BlobStore } from "../blobs/store";
 import { Approvals } from "../engine/approvals";
 import { HUMAN, InputQueue } from "../engine/input";
+import { PeerInbox } from "../engine/peer-inbox";
+import { findSocket, type PeerSocket } from "../engine/peer-socket";
 import type { EngineInput } from "../engine/options";
 import { resultError, runTurn, type MeddleEvent, type SendNowOutcome, type TokenFault } from "../engine/session";
 import { askTitle } from "../engine/title";
@@ -22,6 +26,7 @@ import { shortId } from "../pool/ids";
 import { DESCRIBE_PROMPT, FALLBACK_EFFORT, FALLBACK_MODEL } from "../pool/settings";
 import { dedupe } from "../pool/report";
 import type { PoolRuntime } from "../pool/runtime";
+import { Messenger } from "./messenger";
 import { applyProject } from "../projects/applier";
 import { loadProjectSettings, parseContext, withTaskRules } from "../projects/context";
 import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
@@ -80,6 +85,13 @@ export type TaskState = "idle" | "running" | "waiting" | "receiving" | "moving" 
  */
 export type TurnInput = {
   taskId: string; prompt: string; attachments?: Attachment[]; freshAfter?: number; train?: { kind: TrainTurnKind };
+  /**
+   * Messages from other tasks' agents, written into the turn's Claude Code through its socket. With them, an empty
+   * `prompt` with no attachments is none: the turn is the messages' alone, and Claude Code starts it as it takes them.
+   */
+  messages?: PeerPrompt[];
+  /** With `messages`: the seq the task's log was at when the turn was made; a rerun counts what was taken after it. */
+  messagesAfter?: number;
 };
 /**
  * Where a turn is. `tokenRetries`: how often `run` was entered again after the turn's token failed it (at most once). A
@@ -275,6 +287,8 @@ type LiveTurn = {
   state: "running" | "waiting";
   /** A turn of the train's: the user's prompts wait for it, and Send now has nothing to send into it. */
   train?: TrainTurnKind;
+  /** The messages from other tasks' agents written into the turn (`message`). */
+  inbox: PeerInbox;
 };
 
 /** How long a turn interrupted by a "move now" has to end before it is closed. */
@@ -326,6 +340,15 @@ export class TaskRunner {
   #pending = new Set<string>();
   /** The queued prompt `startQueued` is starting a task's turn with, until it has left `queued`. */
   #starting = new Map<string, Prompt>();
+  /**
+   * Tasks whose last turn of messages alone failed: their queued messages wait for the next turn something else starts
+   * (a prompt, or a new message), rather than starting one that would fail the same way.
+   */
+  #parkedMessages = new Set<string>();
+  /** What carries this node's tasks' messages (`#messengerNow`), with the pool it was made for. */
+  #messenger: { messenger: Messenger; pool: PoolRuntime | undefined } | undefined;
+  /** The socket Claude Code sends its receipts for messages to (`#messageSocket`), once listening. */
+  #receipts: { path: string; server: Server } | undefined;
   #eventListeners = new Set<(taskId: string, seq: number, message: SDKMessage | MeddleEvent) => void>();
   #stateListeners = new Set<(taskId: string, state: TaskState) => void>();
   #queuedListeners = new Set<(taskId: string) => void>();
@@ -497,6 +520,8 @@ export class TaskRunner {
   /** Stops checking whether tasks' work is accepted, and drops the checks scheduled for later. */
   close(): void {
     this.#closed = true;
+    this.#receipts?.server.close();
+    this.#receipts = undefined;
     this.#stopAcceptance?.();
     this.#stopAcceptance = undefined;
     for (const timer of this.#acceptRetries.values()) clearTimeout(timer);
@@ -612,8 +637,163 @@ export class TaskRunner {
     return serialised(`prompt\0${taskId}`, () => this.#prompt(taskId, text, attachments));
   }
 
+  /**
+   * Delivers a message from another task's agent (`from`) to the task's agent, as Claude Code's own peers do: written
+   * into its running turn's Claude Code through its socket (`"delivered"`), or, when the task is idle, a turn started
+   * for it alone, which Claude Code runs as it takes it (`"waking"`). Queued for the task's next turn (`"queued"`) when
+   * that turn is the train's, has had its `result`, or when the task takes no turn now (prompts queued ahead, a turn
+   * pending, a pool update's hold, a move whose queue it joins). Refused as `prompt` is. A message is never the user's
+   * input: it does not take the task off the train's queue.
+   */
+  message(taskId: string, from: PeerFrom, text: string): Promise<"delivered" | "waking" | "queued"> {
+    return serialised(`prompt\0${taskId}`, () => this.#message(taskId, { text, attachments: [], peer: from }));
+  }
+
+  async #message(taskId: string, p: PeerPrompt): Promise<"delivered" | "waking" | "queued"> {
+    if (this.#refusePrompt(taskId, p) === "travels") {
+      this.#enqueue(taskId, p);
+      return "queued";
+    }
+    // Something new to say: the task's parked messages go with it.
+    this.#parkedMessages.delete(taskId);
+    const row = this.#row(taskId);
+    let stale = false;
+    if (row.state === "running" || row.state === "waiting") {
+      const live = this.#live.get(taskId);
+      if (live !== undefined) {
+        // Not into a turn of the train's, nor one whose input closed with its `result`: it would never take it.
+        if (live.train !== undefined || live.queue.ended) {
+          await this.#enqueueNext(taskId, p);
+          return "queued";
+        }
+        live.inbox.push(p);
+        this.#emitQueued(taskId);
+        return "delivered";
+      }
+      const turn = await this.#durableTurn(taskId);
+      if (turn !== undefined && isParked(turn) && this.#holds.turns === null) await this.#harness.retryTask(turn.record.id, BACKGROUND_CONTEXT);
+      if (turn !== undefined) {
+        await this.#enqueueNext(taskId, p);
+        return "queued";
+      }
+      stale = true;
+    }
+    if (queuedOf(this.#row(taskId)).length > 0 || this.#pending.has(taskId) || this.#holds.turns !== null) {
+      if (stale) this.#setState(taskId, "idle");
+      await this.#enqueueNext(taskId, p);
+      return "queued";
+    }
+    this.#pending.add(taskId);
+    try {
+      if (stale) this.#setState(taskId, "idle");
+      await this.#createTurn({ taskId, prompt: "", messages: [p], messagesAfter: lastSeq(this.#db, taskId) });
+    } catch (err) {
+      this.#pending.delete(taskId);
+      throw err;
+    }
+    return "waking";
+  }
+
+  /**
+   * The tasks held here that another task's agent can message: live (not archived, moved away or being received), not a
+   * merge task. What `PeerObject.tasks` answers.
+   */
+  listLive(): Array<{ id: string; title: string; state: string }> {
+    return listLiveTasks(this.#db)
+      .filter((t) => t.state !== "archived" && t.state !== "moved" && t.state !== "receiving")
+      .filter((t) => (JSON.parse(t.manifest) as TaskManifest).merge === undefined)
+      .map((t) => ({ id: t.id, title: t.title, state: t.state }));
+  }
+
+  /**
+   * Drops the first message from another task's agent queued for the task that equals `entry` (its text and sender);
+   * throws `not a queued message` when none is queued. A prompt of the user's is taken back (`takeBackQueued`), never
+   * dropped.
+   */
+  dropQueued(taskId: string, entry: Prompt): Promise<void> {
+    return serialised(`prompt\0${taskId}`, async () => {
+      this.#refuseElsewhere(taskId);
+      let found = false;
+      this.#db.transaction(() => {
+        const queued = queuedOf(this.#row(taskId));
+        const at = queued.findIndex((q) => isPeerPrompt(q) && Bun.deepEquals(q, entry));
+        if (at === -1) return;
+        found = true;
+        updateTask(this.#db, taskId, { queued: queuedColumn([...queued.slice(0, at), ...queued.slice(at + 1)]) });
+      })();
+      if (!found) throw new Error("not a queued message");
+      this.#emitQueued(taskId);
+    });
+  }
+
+  /** What carries this node's tasks' messages: made again once the runner has a pool. */
+  #messengerNow(): Messenger {
+    if (this.#messenger === undefined || this.#messenger.pool !== this.#pool) {
+      const pool = this.#pool;
+      const messenger = new Messenger({
+        selfId: pool?.identity.id ?? "",
+        runner: this,
+        ...(pool === undefined ? {} : { pool }),
+        holderOf: (id) => listLineRows(this.#db, undefined, id)[0]?.holder ?? null,
+      });
+      this.#messenger = { messenger, pool };
+    }
+    return this.#messenger.messenger;
+  }
+
+  /** A turn's inbox for the messages written into its Claude Code, which listens at the task's socket (`#engineInput`). */
+  #inboxFor(taskId: string): PeerInbox {
+    const sessions = join(paths(this.#cfg).taskConfig(taskId), "sessions");
+    const socket = paths(this.#cfg).taskSocket(taskId);
+    return new PeerInbox((signal) => findSocket(sessions, socket, { signal }), (session) => this.#messageSocket(session));
+  }
+
+  /**
+   * The socket Claude Code sends its receipts for messages to: one per runner, listening beside the first session
+   * socket written to (Claude Code sends them only to a socket in its own socket dir). A receipt is logged on the task
+   * whose live turn wrote the message; one that says it was dropped, expired or refused fails that message.
+   */
+  #messageSocket(session: PeerSocket): string {
+    if (this.#receipts !== undefined) return this.#receipts.path;
+    const path = join(dirname(session.path), `${process.pid}-${randomBytes(4).toString("hex")}.sock`);
+    const server = createServer((c) => {
+      let buf = "";
+      c.on("data", (chunk) => { buf += chunk.toString(); });
+      c.on("end", () => { for (const line of buf.split("\n")) this.#receipt(line); });
+      c.on("error", () => {});
+    });
+    server.on("error", (err) => this.#log(`meddle: messages: the receipt socket failed: ${messageOf(err)}`));
+    server.listen(path);
+    server.unref();
+    this.#receipts = { path, server };
+    return path;
+  }
+
+  /** Handles one line Claude Code sent the receipt socket (see `#messageSocket`); anything else is ignored. */
+  #receipt(line: string): void {
+    let f: { type?: unknown; action?: unknown; orig_msg_id?: unknown; status?: unknown; reason?: unknown };
+    try {
+      f = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (f.type !== "control" || f.action !== "peer_message_status" || typeof f.orig_msg_id !== "string" || typeof f.status !== "string") return;
+    const uuid = f.orig_msg_id;
+    for (const [taskId, live] of this.#live) {
+      if (!live.inbox.untaken().some((u) => u.uuid === uuid)) continue;
+      this.#record(taskId, {
+        type: "meddle", subtype: "peer_receipt", uuid, status: f.status,
+        ...(typeof f.reason === "string" ? { reason: f.reason } : {}),
+      });
+      if (f.status === "dropped" || f.status === "expired" || f.status === "refused") live.inbox.fail(uuid, `the message was ${f.status}`);
+      return;
+    }
+  }
+
   async #prompt(taskId: string, text: string, attachments: Attachment[]): Promise<"turn" | "queued"> {
     await this.#ensureAttachments(attachments);
+    // A prompt starts a turn the task's parked messages go into.
+    this.#parkedMessages.delete(taskId);
     // Whatever else a caller put on an attachment never reaches meddle's records (the queue, a turn's input, the log).
     const refs = attachments.map(({ hash, name, type, size }) => ({ hash, name, type, size }));
     const p: Prompt = { text, attachments: refs };
@@ -842,13 +1022,19 @@ export class TaskRunner {
     const row = getTask(this.#db, taskId);
     if (row === null || row.state !== "idle" || this.#moving.has(taskId) || this.#pending.has(taskId) || this.#live.has(taskId)) return;
     if (this.#archiving.has(taskId) || this.#holds.turns !== null) return;
-    const [head] = queuedOf(row);
-    if (head === undefined) return;
+    // One turn takes the messages at the head of the queue and the prompt after them, if any.
+    const run = headRun(queuedOf(row));
+    if (run.length === 0) return;
+    const head = run.find((p) => !isPeerPrompt(p));
+    const messages = run.filter(isPeerPrompt);
+    // Messages whose last turn failed wait for a turn something else starts.
+    if (head === undefined && this.#parkedMessages.has(taskId)) return;
     this.#pending.add(taskId);
-    this.#starting.set(taskId, head);
+    if (head !== undefined) this.#starting.set(taskId, head);
     try {
       await this.#createTurn({
-        taskId, prompt: head.text, attachments: head.attachments,
+        taskId, prompt: head?.text ?? "", attachments: head?.attachments ?? [],
+        ...(messages.length > 0 ? { messages, messagesAfter: lastSeq(this.#db, taskId) } : {}),
         ...(options.freshAfter === undefined ? {} : { freshAfter: options.freshAfter }),
       });
     } catch (err) {
@@ -857,23 +1043,28 @@ export class TaskRunner {
       throw err;
     }
     // This is the one taker, kept single by `#pending`; meanwhile a prompt may join the tail, or the steers a turn
-    // ended without the front, so the first prompt equal to it (text and attachments) goes.
+    // ended without the front, so the first entry equal to each it took (text, attachments, sender) goes.
     this.#db.transaction(() => {
-      const queued = queuedOf(this.#row(taskId));
-      const at = queued.findIndex((q) => Bun.deepEquals(q, head));
-      const rest = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
+      let rest = queuedOf(this.#row(taskId));
+      for (const taken of run) {
+        const at = rest.findIndex((q) => Bun.deepEquals(q, taken));
+        if (at !== -1) rest = [...rest.slice(0, at), ...rest.slice(at + 1)];
+      }
       updateTask(this.#db, taskId, { queued: queuedColumn(rest) });
     })();
     this.#starting.delete(taskId);
-    // The prompt runs now: sent after the task was accepted (`accept` refuses while one waits), it changes what was accepted.
-    this.#inputRuns(taskId);
+    // A prompt runs now: sent after the task was accepted (`accept` refuses while one waits), it changes what was
+    // accepted. Messages alone change nothing the user accepted.
+    if (head !== undefined) this.#inputRuns(taskId);
     this.#emitQueued(taskId);
   }
 
   /** What the task has been sent and not started on, oldest first: its live turn's untaken steers, then its queue. */
   queued(taskId: string): Prompt[] {
-    const live = this.#live.get(taskId)?.queue.untaken().map((u) => u.prompt) ?? [];
-    return [...live, ...queuedOf(this.#row(taskId))];
+    const turn = this.#live.get(taskId);
+    const live = turn?.queue.untaken().map((u) => u.prompt) ?? [];
+    const messages = turn?.inbox.untaken().map((u) => u.prompt) ?? [];
+    return [...live, ...messages, ...queuedOf(this.#row(taskId))];
   }
 
   /** Called whenever what `queued` answers for a task changes. */
@@ -1009,8 +1200,9 @@ export class TaskRunner {
       const queued = queuedOf(this.#row(taskId));
       // as `startQueued` does, the first prompt equal to the one starting (text and attachments) stays
       const at = starting === undefined ? -1 : queued.findIndex((q) => Bun.deepEquals(q, starting));
-      later = at === -1 ? queued : [...queued.slice(0, at), ...queued.slice(at + 1)];
-      updateTask(this.#db, taskId, { queued: queuedColumn(at === -1 ? [] : [queued[at]!]) });
+      // Messages from other tasks are not the user's to take back: they stay, in order.
+      later = queued.filter((q, i) => i !== at && !isPeerPrompt(q));
+      updateTask(this.#db, taskId, { queued: queuedColumn(queued.filter((q, i) => i === at || isPeerPrompt(q))) });
     })();
     this.#emitQueued(taskId);
     return [...live, ...later];
@@ -1208,22 +1400,33 @@ export class TaskRunner {
       }
       // Without a session to resume, a rerun has nothing to carry on from and sends the prompt again.
       const carryOn = resume && (cutOff === "token" || cutOff === "restart"); // meddle's words, not the person's
-      const prompt: Prompt = carryOn && cutOff === "token" ? { text: TOKEN_RETRY_PROMPT, attachments: [] }
-        : carryOn ? { text: CARRY_ON_PROMPT, attachments: [] }
-        : { text: input.prompt, attachments: input.attachments ?? [] };
+      const messages = input.messages ?? [];
+      // A turn of messages alone has no prompt of its own. A rerun writes again only the messages Claude Code did not
+      // take since the turn was made (taken ones are in its session), and carries on once it took any.
+      const ownPrompt = !(messages.length > 0 && input.prompt === "" && (input.attachments ?? []).length === 0);
+      const toWrite = cutOff === null ? messages : notTaken(this.#db, taskId, input.messagesAfter ?? input.freshAfter ?? 0, messages);
+      const delivered = carryOn && toWrite.length < messages.length;
+      const prompt: Prompt | undefined = carryOn && (ownPrompt || delivered)
+        ? { text: cutOff === "token" ? TOKEN_RETRY_PROMPT : CARRY_ON_PROMPT, attachments: [] }
+        : ownPrompt ? { text: input.prompt, attachments: input.attachments ?? [] }
+        : undefined;
       // Claude Code is given the task's attachments folder as an additional directory, so it exists for every turn.
       const attachmentsDir = paths(this.#cfg).taskAttachments(taskId);
       await mkdir(attachmentsDir, { recursive: true });
-      const content = await promptContent(this.blobs.store, attachmentsDir, prompt);
+      const content = prompt === undefined ? undefined : await promptContent(this.blobs.store, attachmentsDir, prompt);
       const queue = new InputQueue();
+      const inbox = this.#inboxFor(taskId);
+      const own = new Set(toWrite.map((m) => inbox.push(m)));
+      let threw = false;
+      let ownLeft: Prompt[] = [];
       let fault = null as TokenFault | null; // set by onTokenFault, as `done` settles
       const train = input.train?.kind;
       const { query, done, sendNow, takeBack } = runTurn({
         input: await this.#engineInput(taskId, manifest, resume, picked.value, train),
-        prompt,
-        content,
+        ...(prompt === undefined ? {} : { prompt, content: content! }),
+        inbox,
         ...(train === undefined ? {} : { train: { kind: train, after: input.freshAfter ?? 0 } }),
-        ...(carryOn || train !== undefined ? {} : { origin: HUMAN }), // a train turn's prompt is meddle's too
+        ...(carryOn || train !== undefined || prompt === undefined ? {} : { origin: HUMAN }), // a train turn's prompt is meddle's too
         db: this.#db,
         approvals: this.approvals,
         queue,
@@ -1238,11 +1441,12 @@ export class TaskRunner {
             this.#log(`meddle: tokens: could not keep token ${picked.id}'s usage reading: ${messageOf(err)}`);
           }
           notify(this.#eventListeners, (cb) => cb(taskId, seq, m));
-          if (m.type === "user") this.#emitQueued(taskId); // a steer it took is logged
+          // A steer, or a message, it took is logged.
+          if (m.type === "user" || (m.type === "meddle" && m.subtype === "peer_message")) this.#emitQueued(taskId);
         },
         onTokenFault: (f) => { fault = f; },
       });
-      this.#live.set(taskId, { query, queue, sendNow, takeBack, state: "running", ...(train === undefined ? {} : { train }) });
+      this.#live.set(taskId, { query, queue, sendNow, takeBack, inbox, state: "running", ...(train === undefined ? {} : { train }) });
       notify(this.#liveListeners, (cb) => cb(taskId));
       let result: Awaited<typeof done>;
       try {
@@ -1250,24 +1454,39 @@ export class TaskRunner {
       } catch (err) {
         // A turn that ended without a result after its token failed it fails as before; the token is marked all the same.
         if (fault !== null) await this.#markFault(picked.id, fault).catch(() => {});
+        // Its messages wait for a turn something else starts: one of them alone would likely fail the same way.
+        if (!ownPrompt && !context.abortSignal?.aborted) this.#parkedMessages.add(taskId);
+        threw = true;
         throw err;
       } finally {
-        // Steers Claude Code did not take wait for the next turn. The task stays in `#primaries` until `finish` has
-        // synced its memory.
-        this.#requeueFront(taskId, queue.untaken().map((u) => u.prompt));
+        // Steers and messages sent in meanwhile that Claude Code did not take wait for the next turn. The turn's own
+        // messages it did not take do too once the turn failed, but not when it was cut short: its rerun writes them
+        // (`notTaken`); after a result, whether it reruns decides (below). The task stays in `#primaries` until
+        // `finish` has synced its memory.
+        const left = inbox.untaken();
+        ownLeft = left.filter((u) => own.has(u.uuid)).map((u) => u.prompt);
+        const others = [...queue.untaken().map((u) => u.prompt), ...left.filter((u) => !own.has(u.uuid)).map((u) => u.prompt)];
+        const cutShort = context.abortSignal?.aborted === true;
+        this.#requeueFront(taskId, threw && !cutShort ? [...ownLeft, ...others] : others);
         this.#live.delete(taskId);
         notify(this.#liveListeners, (cb) => cb(taskId));
         this.#emitQueued(taskId);
       }
-      if (fault === null) return "done";
+      // A turn that is done hands back its own messages Claude Code did not take; one that reruns writes them again.
+      const finished = (): "done" => {
+        this.#requeueFront(taskId, ownLeft);
+        this.#emitQueued(taskId);
+        return "done";
+      };
+      if (fault === null) return finished();
       const marked = await this.#markFault(picked.id, fault);
       // Only a turn that failed reruns (a limit Claude Code retried past still ends in a success).
-      if (resultError(result) === null) return "done";
+      if (resultError(result) === null) return finished();
       const next = await pickToken(this.#cfg, this.#db);
       const another = next !== null && next.id !== picked.id;
       const rerun = retries === 0 && another;
       this.#record(taskId, tokenFaultEvent(picked, marked, rerun, !rerun && another));
-      if (!rerun) return "done";
+      if (!rerun) return finished();
       await this.#deps.hooks?.afterTokenFault?.(taskId);
       return "rerun";
     } catch (err) {
@@ -3146,8 +3365,18 @@ export class TaskRunner {
       sessionStore: this.#sessionStore,
       resume,
     };
+    input.messagingSocket = paths(this.#cfg).taskSocket(taskId);
     // With a pool, the task's lines follow its agent's work (`#filesChanged`).
     if (this.#pool !== undefined) input.onFilesChanged = () => this.#filesChanged(taskId);
+    // Its agent messages other tasks, anywhere in the pool, through Claude Code's own tools; a train turn's does not.
+    if (train === undefined) {
+      const messenger = this.#messengerNow();
+      input.messaging = {
+        selfId: taskId,
+        directory: () => messenger.directory(),
+        send: (to, text) => messenger.send({ taskId, nodeId: this.#pool?.identity.id ?? "", title: this.#row(taskId).title }, to, text),
+      };
+    }
     const chosen = getTaskSettings(this.#db, taskId);
     const { permissionMode } = chosen;
     input.model = chosen.model ?? this.#defaultModel();
@@ -3274,6 +3503,32 @@ function lastTurnCutOff(db: Database, taskId: string, afterSeq: number): "token"
   if (m.type !== "meddle") return null;
   if (m.subtype === "token_fault") return m.rerun === true ? "token" : null;
   return m.subtype === "turn_started" || m.subtype === "turn_aborted" ? "restart" : null;
+}
+
+/**
+ * What the task's next turn takes from its queue: the messages from other tasks at its head and the prompt after them,
+ * if any; just the first prompt when there are none.
+ */
+function headRun(queued: Prompt[]): Prompt[] {
+  let n = 0;
+  while (n < queued.length && isPeerPrompt(queued[n]!)) n++;
+  return queued.slice(0, Math.min(n + 1, queued.length));
+}
+
+/**
+ * Of a turn's own `messages`, those Claude Code has not taken (logged as `peer_message`) since seq `afterSeq`, when the
+ * turn was made: matched by sender and text, each logged message accounting for one.
+ */
+function notTaken(db: Database, taskId: string, afterSeq: number, messages: PeerPrompt[]): PeerPrompt[] {
+  const taken = listEventsOfKinds(db, taskId, ["meddle:peer_message"])
+    .filter((e) => e.seq > afterSeq)
+    .map((e) => e.message as { from?: { taskId?: unknown }; text?: unknown });
+  return messages.filter((m) => {
+    const at = taken.findIndex((t) => t.from?.taskId === m.peer.taskId && t.text === m.text);
+    if (at === -1) return true;
+    taken.splice(at, 1);
+    return false;
+  });
 }
 
 /** The `token_fault` event for the token a turn ran with (null: none was usable). */

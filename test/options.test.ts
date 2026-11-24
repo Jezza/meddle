@@ -41,6 +41,24 @@ test("Claude Code may read the task's attachments directory without asking", () 
   expect(o.additionalDirectories).toEqual(["/t/abc/.meddle/attachments"]);
 });
 
+test("a task's messaging socket is the path its Claude Code listens on", () => {
+  const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
+  const manifest = { id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: null, createdAt: "", projects: [] };
+  const common = { cfg, manifest, contexts: [], projectSettings: [], token: "tok", prompt: (async function*(){})(), canUseTool: async () => ({ behavior: "deny" as const, message: "x" }), onPermissionDenied: () => {}, sessionStore: {} as any, resume: false };
+  expect((buildOptions({ ...common, messagingSocket: "/d/socks/abc.sock" }) as any).extraArgs).toEqual({ "messaging-socket-path": "/d/socks/abc.sock" });
+  expect((buildOptions(common) as any).extraArgs).toBeUndefined();
+});
+test("messaging hooks join the file hook", () => {
+  const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
+  const manifest = { id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: null, createdAt: "", projects: [] };
+  const common = { cfg, manifest, contexts: [], projectSettings: [], token: "tok", prompt: (async function*(){})(), canUseTool: async () => ({ behavior: "deny" as const, message: "x" }), onPermissionDenied: () => {}, sessionStore: {} as any, resume: false };
+  const messaging = { selfId: "abc", directory: async () => [], send: async () => ({ ok: false as const, reason: "x" }) };
+  const o: any = buildOptions({ ...common, onFilesChanged: () => {}, messaging });
+  expect(o.hooks.PreToolUse.map((h: any) => h.matcher)).toEqual(["SendMessage"]);
+  expect(o.hooks.PostToolUse.map((h: any) => h.matcher)).toEqual(["Edit|Write|Bash", "SendMessage|ListAgents"]);
+  expect(o.hooks.PermissionDenied).toHaveLength(1);
+  expect((buildOptions(common) as any).hooks.PreToolUse).toBeUndefined();
+});
 test("with onFilesChanged, a PostToolUse hook for Edit, Write and Bash calls it and lets the agent go on; without, there is none", async () => {
   const cfg = loadConfig({ HOME: "/h", MEDDLE_DATA_DIR: "/d", MEDDLE_TASK_ROOT: "/t" });
   const manifest = { id: "abc", title: "t", sessionId: "11111111-1111-4111-8111-111111111111", primaryProjectId: null, createdAt: "", projects: [] };

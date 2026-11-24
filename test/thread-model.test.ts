@@ -561,3 +561,41 @@ test("a stopped agent's row says it stopped before it reported, and a failed one
   expect(agentEndNote(true, false, "")).toBe("Failed");
   expect(agentEndNote(true, false, undefined)).toBe("Failed");
 });
+
+const peerFrom = { taskId: "bbbbbbbbbbbb", nodeId: "n2", title: "Quiet fox" };
+test("a peer message is its own item with its sender", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "meddle", subtype: "turn_started", at: "", resume: false } },
+    { seq: 2, message: { type: "meddle", subtype: "peer_message", from: peerFrom, text: "hi", uuid: "u1" } },
+  ]);
+  expect(items).toEqual([{ kind: "peer", from: peerFrom, text: "hi" }]);
+});
+test("a SendMessage to a task id names the task", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "tu1", name: "SendMessage", input: { to: "cccccccccccc [3fa9c1]", message: "hi", summary: "ask" } }] }, parent_tool_use_id: null } },
+    { seq: 2, message: { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: [{ type: "text", text: '{"success":true,"message":"Sent to Other (cccccccccccc)."}' }] }] }, parent_tool_use_id: null } },
+    { seq: 3, message: { type: "assistant", message: { id: "m2", content: [{ type: "tool_use", id: "tu2", name: "SendMessage", input: { to: "researcher", message: "hi" } }] }, parent_tool_use_id: null } },
+  ]);
+  expect(items[0]).toMatchObject({ kind: "tool", messageTo: "cccccccccccc", failed: false });
+  expect((items[1] as ToolItem).messageTo).toBeUndefined();
+});
+test("a failed SendMessage to a task is marked failed", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "assistant", message: { id: "m1", content: [{ type: "tool_use", id: "tu1", name: "SendMessage", input: { to: "cccccccccccc", message: "hi" } }] }, parent_tool_use_id: null } },
+    { seq: 2, message: { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: [{ type: "text", text: '{"success":false,"message":"Not sent: no task cccccccccccc."}' }] }] }, parent_tool_use_id: null } },
+  ]);
+  expect(items[0]).toMatchObject({ kind: "tool", messageTo: "cccccccccccc", failed: true });
+});
+test("a receipt is a status line", () => {
+  const items = buildThread([{ seq: 1, message: { type: "meddle", subtype: "peer_receipt", uuid: "u1", status: "held" } }]);
+  expect(items).toEqual([{ kind: "status", text: "Message held" }]);
+});
+test("Claude Code's echo of a peer message and its hold events add nothing: meddle logs the message itself", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "system", subtype: "peer_message_hold", state: "held", message_uuid: "u1" } },
+    { seq: 2, message: { type: "system", subtype: "peer_message_hold", state: "released", message_uuid: "u1" } },
+    { seq: 3, message: { type: "meddle", subtype: "peer_message", from: peerFrom, text: "hi", uuid: "u1" } },
+    { seq: 4, message: { type: "user", message: { role: "user", content: "Another Claude session sent a message:\n<cross-session-message from=\"bbbbbbbbbbbb\">\nhi\n</cross-session-message>" }, isReplay: true, isSynthetic: true, origin: { kind: "peer", from: "uds:/x.sock" }, parent_tool_use_id: null } },
+  ]);
+  expect(items).toEqual([{ kind: "peer", from: peerFrom, text: "hi" }]);
+});

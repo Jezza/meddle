@@ -8,8 +8,10 @@ import { SqliteSessionStore } from "../src/store/session-store";
 import { Approvals, } from "../src/engine/approvals";
 import { InputQueue } from "../src/engine/input";
 import { promptEvent, runTurn, tokenFaultOf, type TokenFault } from "../src/engine/session";
+import { PeerInbox } from "../src/engine/peer-inbox";
+import { findSocket } from "../src/engine/peer-socket";
 import type { Attachment, Prompt } from "../src/blobs/attachment";
-import { loadConfig, ensureDataDirs } from "../src/config";
+import { loadConfig, ensureDataDirs, paths } from "../src/config";
 import { DEFAULT_CONTEXT } from "../src/projects/context";
 const replay = `${import.meta.dir}/fake-claude/replay.ts`;
 const att: Attachment = { hash: "a".repeat(64), name: "a.png", type: "image/png", size: 3 };
@@ -456,4 +458,97 @@ test("approvals: pending until answered, unknown ids refused, listeners told", a
   expect(await asked).toEqual({ behavior: "allow", updatedInput: { command: "ls" } });
   expect(approvals.pending()).toEqual([]);
   expect(approvals.answer("r1", { behavior: "deny", message: "x" })).toBe(false);
+});
+
+// Messages from other tasks' agents, written into the turn's Claude Code through its own socket (the replayer's peer
+// mode stands in for Claude Code's registry entry and socket).
+const sender = { taskId: "bbbbbbbbbbbb", nodeId: "n2", title: "Quiet fox" };
+const peerMessage = (text: string) => ({ text, attachments: [] as Attachment[], peer: sender });
+async function peerSetup() {
+  const s = await setup();
+  const sessions = `${s.cfg.taskRoot}/abc/.meddle/claude/sessions`;
+  const inputFile = `${s.cfg.taskRoot}/input.jsonl`;
+  const socket = paths(s.cfg).taskSocket("abc");
+  const inbox = (opts: { timeoutMs?: number; startMs?: number } = {}) => new PeerInbox(
+    (signal) => findSocket(sessions, socket, { signal, ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }) }),
+    () => `${s.cfg.taskRoot}/receipts.sock`,
+    opts.startMs === undefined ? {} : { startMs: opts.startMs },
+  );
+  const socketInput = () => {
+    try { return readFileSync(inputFile, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l)).filter(f => f.via === "socket"); } catch { return []; }
+  };
+  return { ...s, input: { ...s.input, messagingSocket: socket }, inbox, inputFile, socketInput };
+}
+test("a turn with no prompt runs the message Claude Code takes from its socket", async () => {
+  const { db, input, fixture, inbox, inputFile, socketInput } = await peerSetup();
+  const box = inbox();
+  box.push(peerMessage("hi"));
+  const { done } = runTurn({ input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_PEER: "1", MEDDLE_FIXTURE_INPUT: inputFile } }, db, approvals: new Approvals(), inbox: box });
+  expect((await done).type).toBe("result");
+  const recorded = listEvents(db, "abc").map(e => e.message as any);
+  expect(recorded[0]).toMatchObject({ type: "meddle", subtype: "turn_started" });
+  const at = recorded.findIndex(m => m.subtype === "peer_message");
+  expect(recorded[at]).toMatchObject({ type: "meddle", subtype: "peer_message", from: sender, text: "hi", uuid: expect.any(String) });
+  expect(at).toBeLessThan(recorded.findIndex(m => m.type === "result"));
+  expect(recorded.filter(m => m.type === "user" && typeof m.message?.content === "string")).toEqual([]);
+  expect(socketInput().map(f => f.message.content)).toEqual(['<cross-session-message from="bbbbbbbbbbbb">\nhi\n</cross-session-message>']);
+  expect(box.untaken()).toEqual([]);
+});
+test("a resumed session's empty result does not end a message-only turn", async () => {
+  const { db, input, fixture, inbox } = await peerSetup();
+  const box = inbox();
+  box.push(peerMessage("hi"));
+  const { done } = runTurn({ input: { ...input, extraEnv: { ...fixture("background-resume"), MEDDLE_FIXTURE_PEER: "1" } }, db, approvals: new Approvals(), inbox: box });
+  const result = await done;
+  const recorded = listEvents(db, "abc").map(e => e.message as any);
+  const results = recorded.filter(m => m.type === "result");
+  expect(results.length).toBeGreaterThan(1);
+  expect(result).toEqual(results.at(-1));
+  expect(recorded.findIndex(m => m.subtype === "peer_message")).toBeLessThan(recorded.indexOf(results.at(-1)));
+  expect(box.untaken()).toEqual([]);
+});
+test("a message folded into a running turn is logged where it was taken", async () => {
+  const { db, input, fixture, inbox } = await peerSetup();
+  const box = inbox();
+  let pushed = false;
+  const { done } = runTurn({
+    input: { ...input, extraEnv: { ...fixture("steer-fold"), MEDDLE_FIXTURE_PEER: "1" } }, prompt: { text: "Run: sleep 2", attachments: [] }, db, approvals: new Approvals(), inbox: box,
+    onMessage: (m) => { if ((m as any).type === "assistant" && !pushed) { pushed = true; box.push(peerMessage("also this")); } },
+  });
+  await done;
+  const recorded = listEvents(db, "abc").map(e => e.message as any);
+  const at = recorded.findIndex(m => m.subtype === "peer_message");
+  expect(at).toBeGreaterThan(-1);
+  expect(at).toBeLessThan(recorded.findIndex(m => m.type === "result"));
+  expect(box.untaken()).toEqual([]);
+});
+test("a message the turn did not take is handed back untaken", async () => {
+  const { db, input, fixture, inbox, inputFile, socketInput } = await peerSetup();
+  const box = inbox();
+  let pushed = false;
+  const { done } = runTurn({
+    input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_PEER: "1", MEDDLE_FIXTURE_RESULTS_MS: "500", MEDDLE_FIXTURE_INPUT: inputFile } }, prompt: { text: "x", attachments: [] }, db, approvals: new Approvals(), inbox: box,
+    onMessage: (m) => { if ((m as any).type === "assistant" && !pushed) { pushed = true; box.push(peerMessage("late")); } },
+  });
+  expect((await done).type).toBe("result");
+  expect(socketInput()).toHaveLength(1); // written, never taken
+  expect(box.untaken().map(u => u.prompt.text)).toEqual(["late"]);
+  expect(listEvents(db, "abc").some(e => (e.message as any).subtype === "peer_message")).toBe(false);
+}, 15_000);
+test("a peer turn whose socket never registers fails and hands its message back", async () => {
+  const { db, input, fixture, inbox } = await peerSetup();
+  const box = inbox({ timeoutMs: 300 });
+  box.push(peerMessage("hi"));
+  const { done } = runTurn({ input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_PEER: "1", MEDDLE_FIXTURE_PEER_SKIP: "1" } }, db, approvals: new Approvals(), inbox: box });
+  await expect(done).rejects.toThrow("messaging socket never registered");
+  expect(listEvents(db, "abc").map(e => e.message as any).at(-1)).toMatchObject({ type: "meddle", subtype: "turn_failed", error: "messaging socket never registered" });
+  expect(box.untaken().map(u => u.prompt.text)).toEqual(["hi"]);
+});
+test("a message Claude Code never starts fails its message-only turn", async () => {
+  const { db, input, fixture, inbox } = await peerSetup();
+  const box = inbox({ startMs: 300 });
+  box.push(peerMessage("hi"));
+  const { done } = runTurn({ input: { ...input, extraEnv: { ...fixture("hello"), MEDDLE_FIXTURE_PEER: "1", MEDDLE_FIXTURE_PEER_IGNORE: "1" } }, db, approvals: new Approvals(), inbox: box });
+  await expect(done).rejects.toThrow("the message was not taken");
+  expect(box.untaken().map(u => u.prompt.text)).toEqual(["hi"]);
 });

@@ -1,5 +1,6 @@
 import type {
   CanUseTool,
+  HookCallbackMatcher,
   McpServerConfig,
   Options,
   PermissionDeniedHookInput,
@@ -10,6 +11,7 @@ import type {
 import { delimiter, resolve } from "node:path";
 import type { NodeConfig } from "../config";
 import { paths } from "../paths";
+import { messagingHooks, type Messaging } from "./messaging-hooks";
 import { composeEnv, composeSettings, type Context } from "../projects/context";
 import type { TaskManifest } from "../tasks/manifest";
 import { cwdFor } from "../tasks/provision";
@@ -46,6 +48,13 @@ export type EngineInput = {
    * `PostToolUse` hook): the task's lines are written from its workspaces soon after. Without it, no such hook.
    */
   onFilesChanged?: () => void;
+  /** Meddle's messaging between tasks (`messagingHooks`): `SendMessage` to a task and `ListAgents` go through it. */
+  messaging?: Messaging;
+  /**
+   * Where the task's Claude Code listens for messages from other tasks (`--messaging-socket-path`, in a private dir):
+   * started so, it keeps each message's uuid, which it reports the message's progress by.
+   */
+  messagingSocket?: string;
 };
 
 /** The tools whose calls may change the task's files: `onFilesChanged` follows each (a `PostToolUse` matcher). */
@@ -101,6 +110,17 @@ export function buildOptions(i: EngineInput): Options {
   const mcpServers: Record<string, unknown> = Object.assign({}, ...i.contexts.map((c) => c.claude.mcpServers), i.extraMcpServers);
   const skills = i.contexts.findLast((c) => c.claude.skills !== null)?.claude.skills;
 
+  const messaging = i.messaging === undefined ? undefined : messagingHooks(i.messaging);
+  const postToolUse: HookCallbackMatcher[] = [
+    ...(i.onFilesChanged === undefined ? [] : [{
+      matcher: FILE_TOOLS_MATCHER,
+      hooks: [async () => {
+        i.onFilesChanged?.();
+        return { continue: true };
+      }],
+    }]),
+    ...(messaging?.PostToolUse ?? []),
+  ];
   const options: Options = {
     cwd,
     // Where a prompt's attached files are written (`materialize`): Claude Code reads them without asking.
@@ -123,15 +143,8 @@ export function buildOptions(i: EngineInput): Options {
           return { continue: true };
         }],
       }],
-      ...(i.onFilesChanged === undefined ? {} : {
-        PostToolUse: [{
-          matcher: FILE_TOOLS_MATCHER,
-          hooks: [async () => {
-            i.onFilesChanged?.();
-            return { continue: true };
-          }],
-        }],
-      }),
+      ...(i.messaging === undefined ? {} : { PreToolUse: messaging!.PreToolUse }),
+      ...(postToolUse.length === 0 ? {} : { PostToolUse: postToolUse }),
     },
     sessionStore: i.sessionStore,
     persistSession: true,
@@ -145,6 +158,7 @@ export function buildOptions(i: EngineInput): Options {
   if (i.tools !== undefined) options.tools = i.tools;
   if (i.allowedTools !== undefined) options.allowedTools = i.allowedTools;
   if (i.effort !== undefined) options.effort = i.effort as Options["effort"];
+  if (i.messagingSocket !== undefined) options.extraArgs = { "messaging-socket-path": i.messagingSocket };
   if (i.claudePath !== undefined) {
     options.pathToClaudeCodeExecutable = i.claudePath;
     options.executable = i.claudeRuntime ?? "bun";

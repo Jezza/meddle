@@ -15,16 +15,25 @@
 // MEDDLE_FIXTURE_TOOL_USE=<tool> (before the first `result`, as Claude Code does once that tool has run, calls each
 // `PostToolUse` hook the host registered at `initialize` whose matcher matches <tool>), and with
 // MEDDLE_FIXTURE_TOOL_USE_EXIT=1 then exits once the host answered them, with no `result` (a turn that fails).
+// MEDDLE_FIXTURE_PEER=1 (stand in for Claude Code's peer messaging: register in <CLAUDE_CONFIG_DIR>/sessions as
+// `<pid>.json`, named CLAUDE_CODE_SESSION_NAME, with a key, and listen on a socket, at --messaging-socket-path if given; a message written there after its
+// auth line is a user message like one on stdin, reported `command_lifecycle` `queued` as it arrives, `started` as the
+// recording uses it and `completed` after the next `result`, and appended to MEDDLE_FIXTURE_INPUT with
+// `"via":"socket"`), with MEDDLE_FIXTURE_PEER_SKIP=1 never registering, or MEDDLE_FIXTURE_PEER_IGNORE=1 never using
+// a message from the socket.
 // Any argv is accepted; only `--session-id` / `--resume` are read (see `transcribe`). Dependency-free so it
 // starts fast. The recording's user messages' uuids become those of the user messages this run is sent, in order,
 // wherever an `out` line names them (`command_lifecycle`, `user_message_uuids`).
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 type Entry = { dir: "in" | "out"; t: number; line: string } | { dir: "close"; t: number } | { dir: "exit"; t: number; code: number | null };
 type HookMatcher = { matcher?: string; hookCallbackIds?: string[] };
 type Frame = {
-  type: string; subtype?: string; uuid?: string; message?: { content?: unknown }; request_id?: string;
+  type: string; subtype?: string; uuid?: string; viaSocket?: boolean; message?: { content?: unknown }; request_id?: string;
   request?: { subtype?: string; hooks?: Record<string, HookMatcher[]>; send_now?: boolean; message_uuid?: string }; response?: { request_id?: string };
 };
 type Need = { kind: "user" } | { kind: "response" } | { kind: "host"; subtype: string } | { kind: "type"; type: string };
@@ -176,6 +185,14 @@ function matches(need: Need, f: Frame): boolean {
   }
 }
 
+/** The value of `flag` on the command line (`--flag <v>` or `--flag=<v>`), if given. */
+function flagArg(flag: string): string | undefined {
+  const argv = process.argv;
+  const i = argv.indexOf(flag);
+  if (i !== -1 && i + 1 < argv.length) return argv[i + 1];
+  return argv.find(a => a.startsWith(`${flag}=`))?.slice(flag.length + 1);
+}
+
 /** The session id the SDK passed (`--session-id <id>` or `--resume <id>`, either also as `--flag=<id>`). */
 function sessionArg(): string | undefined {
   const argv = process.argv;
@@ -242,6 +259,10 @@ async function waitFor(need: Need, recordedUuid?: string) {
     const hit = arrived.find(a => !a.used && matches(need, a.frame));
     if (hit) {
       hit.used = true;
+      if (hit.frame.viaSocket === true && hit.frame.uuid !== undefined) {
+        lifecycle(hit.frame.uuid, "started");
+        toComplete.push(hit.frame.uuid);
+      }
       if (need.kind === "user") transcribe(hit.frame);
       if (recordedUuid !== undefined && hit.frame.uuid !== undefined) liveUuids.set(recordedUuid, hit.frame.uuid);
       return;
@@ -276,6 +297,46 @@ async function hooksAnswered(n: number) {
   }
 }
 
+/** Socket messages the recording used, whose `completed` follows the next `result`. */
+const toComplete: string[] = [];
+/** Reports a socket message's progress as Claude Code does, by the uuid it was sent with. */
+function lifecycle(uuid: string, state: "queued" | "started" | "completed") {
+  write(JSON.stringify({ type: "command_lifecycle", command_uuid: uuid, state, uuid: randomUUID(), session_id: sessionArg() ?? "" }));
+}
+if (process.env.MEDDLE_FIXTURE_PEER === "1" && process.env.MEDDLE_FIXTURE_PEER_SKIP !== "1") {
+  const sessions = join(process.env.CLAUDE_CONFIG_DIR ?? tmpdir(), "sessions");
+  mkdirSync(sessions, { recursive: true });
+  // Where the host said to listen (`--messaging-socket-path`), else a socket of its own.
+  const sock = flagArg("--messaging-socket-path") ?? join(mkdtempSync(join(tmpdir(), "meddle-replay-sock-")), `${process.pid}.sock`);
+  try { rmSync(sock); } catch { /* none left */ }
+  const token = randomBytes(16).toString("hex");
+  const ignore = process.env.MEDDLE_FIXTURE_PEER_IGNORE === "1";
+  createServer((c) => {
+    let pending = "";
+    let authed = false;
+    c.on("data", (chunk: Buffer) => {
+      pending += chunk.toString();
+      let i: number;
+      while ((i = pending.indexOf("\n")) !== -1) {
+        const line = pending.slice(0, i); pending = pending.slice(i + 1);
+        let f: Frame & { token?: string; msg_id?: string };
+        try { f = JSON.parse(line); } catch { continue; }
+        if (f.type === "auth") { authed = f.token === token; continue; }
+        if (f.type !== "user" || !authed) continue;
+        if (input !== undefined) appendFileSync(input, JSON.stringify({ ...f, via: "socket" }) + "\n");
+        if (f.uuid !== undefined) lifecycle(f.uuid, "queued");
+        if (ignore) continue;
+        arrived.push({ frame: { ...f, viaSocket: true }, used: false });
+        wake();
+      }
+    });
+  }).listen(sock).unref();
+  const entry = join(sessions, `${process.pid}.json`);
+  writeFileSync(join(sessions, `${process.pid}.${createHash("sha256").update(sock).digest("hex")}.key`), JSON.stringify({ peerToken: token }));
+  writeFileSync(entry, JSON.stringify({ pid: process.pid, sessionId: sessionArg(), name: process.env.CLAUDE_CODE_SESSION_NAME, messagingSocketPath: sock }));
+  process.on("exit", () => { try { rmSync(entry); } catch { /* gone */ } });
+}
+
 let toolCalled = false;
 for (const step of steps.slice(0, lastEmit + 1)) {
   if ("need" in step) { await waitFor(step.need, step.uuid); continue; }
@@ -299,6 +360,7 @@ for (const step of steps.slice(0, lastEmit + 1)) {
   }
   if (step.frame.type === "control_request") lastEmittedRequestId = step.frame.request_id;
   write(line);
+  if (step.frame.type === "result") for (const uuid of toComplete.splice(0)) lifecycle(uuid, "completed");
 }
 if (!exitedOnItsOwn) await waitForEof();
 await finish();

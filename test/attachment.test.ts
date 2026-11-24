@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import {
   type Attachment, IMAGE_BUDGET_BASE64, INLINE_IMAGE_TYPES, MAX_BLOB_BYTES, MAX_IMAGE_BASE64,
-  attachmentProblem, base64Length, cleanName, inlined, isBlobHash, pastedName, promptOf, queueEntry,
+  attachmentProblem, base64Length, cleanName, inlined, isBlobHash, isPeerPrompt, pastedName, promptOf, queueEntry,
 } from "../src/blobs/attachment";
 
 const att = (over: Partial<Attachment> = {}): Attachment =>
@@ -90,6 +90,21 @@ test("a queued prompt reads back with each attachment as its four fields only", 
   const entry = { text: "x", attachments: [{ ...att(), data: "AAAA", note: { deep: true } }], extra: 1 };
   expect(promptOf(entry)).toEqual({ text: "x", attachments: [att()] });
   expect(Object.keys(promptOf(entry).attachments[0]!)).toEqual(["hash", "name", "type", "size"]);
+});
+const peer = { taskId: "aaaaaaaaaaaa", nodeId: "n1", title: "Quiet fox" };
+test("promptOf keeps a message's sender", () => {
+  const m = { text: "hi", attachments: [], peer };
+  expect(promptOf(m)).toEqual(m);
+  expect(isPeerPrompt(promptOf(m))).toBe(true);
+  expect(isPeerPrompt({ text: "hi", attachments: [] })).toBe(false);
+});
+test("queueEntry of a message is the object, not the text", () => {
+  const m = { text: "hi", attachments: [], peer };
+  expect(typeof queueEntry(m)).toBe("object");
+  expect(promptOf(queueEntry(m))).toEqual(m);
+});
+test("promptOf rejects a malformed sender", () => {
+  expect(() => promptOf({ text: "hi", attachments: [], peer: { taskId: 1 } })).toThrow("bad queued prompt");
 });
 test("a queued prompt that would write somewhere it must not is refused", () => {
   expect(() => promptOf({ text: "x", attachments: [att({ name: "../x" })] })).toThrow("bad queued prompt");

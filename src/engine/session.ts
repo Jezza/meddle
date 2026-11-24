@@ -9,12 +9,13 @@ import {
   type SDKResultMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { Attachment, Prompt } from "../blobs/attachment";
+import type { Attachment, PeerFrom, PeerPrompt, Prompt } from "../blobs/attachment";
 import type { UserContent } from "../blobs/content";
 import { appendEvent } from "../store/events";
 import type { TrainTurnKind } from "../train/tools";
 import type { Approvals } from "./approvals";
 import { InputQueue } from "./input";
+import { PeerInbox } from "./peer-inbox";
 import { buildOptions, type EngineInput } from "./options";
 
 /** meddle's own entries in a task's event log, interleaved with the SDK's messages. */
@@ -37,6 +38,13 @@ export type MeddleEvent =
   | { type: "meddle"; subtype: "train_left"; reason: string }
   /** The task's work landed on `branch` at `commit`, and the task continues there (Accept & continue). */
   | { type: "meddle"; subtype: "landed"; branch: string; commit: string }
+  /**
+   * A message from another task's agent, logged as the turn's Claude Code takes it from its socket (Claude Code does
+   * not echo it): `uuid` is the one it was written with.
+   */
+  | { type: "meddle"; subtype: "peer_message"; from: PeerFrom; text: string; uuid: string }
+  /** What Claude Code said of a message written to its socket (held, dropped, …), by the uuid it was written with. */
+  | { type: "meddle"; subtype: "peer_receipt"; uuid: string; status: string; reason?: string }
   | { type: "meddle"; subtype: "turn_aborted"; at: string }
   | { type: "meddle"; subtype: "turn_failed"; at: string; error: string }
   | { type: "meddle"; subtype: "permission_denied_hook"; input: PermissionDeniedHookInput }
@@ -158,7 +166,13 @@ const EXIT_GRACE_MS = 5_000;
 
 export type RunTurnArgs = {
   input: Omit<EngineInput, "prompt" | "canUseTool" | "onPermissionDenied">;
-  prompt: Prompt;
+  /**
+   * The turn's prompt, sent on stdin. None: a turn of the messages in `inbox` alone, which Claude Code runs as it takes
+   * the first from its socket (it ends with the `result` after that, and fails when the inbox says none can be taken).
+   */
+  prompt?: Prompt;
+  /** The messages written into this turn's Claude Code through its socket; a turn with a prompt may get some too. */
+  inbox?: PeerInbox;
   /** What Claude Code is sent for `prompt`; its text when not given. */
   content?: UserContent;
   /**
@@ -208,17 +222,24 @@ export function runTurn(args: RunTurnArgs): {
   done: Promise<SDKResultMessage>;
   sendNow: () => Promise<SendNowOutcome | undefined>;
   takeBack: () => Promise<Prompt[]>;
+  inbox: PeerInbox;
 } {
   const { input } = args;
   const taskId = input.manifest.id;
   const record = recorder(args);
   const queue = args.queue ?? new InputQueue();
-  const uuid = queue.push(args.prompt, "next", args.content, args.origin);
-  queue.take(uuid);
+  const inbox = args.inbox ?? new PeerInbox(async () => { throw new Error("this turn takes no messages"); }, () => "");
+  let uuid: string | null = null;
+  if (args.prompt !== undefined) {
+    uuid = queue.push(args.prompt, "next", args.content, args.origin);
+    queue.take(uuid);
+  }
   record({ type: "meddle", subtype: "turn_started", at: new Date().toISOString(), resume: input.resume });
-  record(args.train === undefined
-    ? promptEvent(args.prompt, uuid)
-    : { type: "meddle", subtype: "train_turn", kind: args.train.kind, text: args.prompt.text, after: args.train.after });
+  if (args.prompt !== undefined) {
+    record(args.train === undefined
+      ? promptEvent(args.prompt, uuid!)
+      : { type: "meddle", subtype: "train_turn", kind: args.train.kind, text: args.prompt.text, after: args.train.after });
+  }
 
   const canUseTool: CanUseTool = (toolName, toolInput, options) => args.approvals.ask({
     requestId: options.requestId,
@@ -237,6 +258,7 @@ export function runTurn(args: RunTurnArgs): {
     q = query({ prompt: queue, options: buildOptions({ ...input, prompt: queue, canUseTool, onPermissionDenied }) });
   } catch (err) {
     queue.end();
+    inbox.end();
     bestEffort(() => record(turnFailed(String(err))));
     throw err;
   }
@@ -257,7 +279,7 @@ export function runTurn(args: RunTurnArgs): {
     }
   };
   const ending: Ending = { recheck: () => {} };
-  const done = drive(q, queue, uuid, args.signal, record, watch, ending).then(
+  const done = drive(q, queue, uuid, inbox, args.signal, record, watch, ending).then(
     (result) => { tell(); return result; },
     (err: unknown) => {
       if (!(err instanceof DOMException && err.name === "AbortError")) tell();
@@ -290,7 +312,7 @@ export function runTurn(args: RunTurnArgs): {
     if (cancelled) ending.recheck();
     return back;
   };
-  return { query: q, done, sendNow, takeBack };
+  return { query: q, done, sendNow, takeBack, inbox };
 }
 
 /** What Claude Code says a send now did: put what waits into the running turn, cut the turn for it, or found nothing. */
@@ -326,7 +348,8 @@ function recorder(args: RunTurnArgs): (m: SDKMessage | MeddleEvent) => void {
 async function drive(
   q: Query,
   queue: InputQueue,
-  prompt: string,
+  prompt: string | null,
+  inbox: PeerInbox,
   signal: AbortSignal | undefined,
   record: (m: SDKMessage | MeddleEvent) => void,
   watch: (m: SDKMessage) => void,
@@ -348,6 +371,10 @@ async function drive(
   let ended = false; // the iterator finished on its own: the child has gone
   let closed = false;
   let logged = false; // a turn_aborted or turn_failed is in the log
+  /** A turn of messages alone: it is the first message's, and fails when the inbox says none can be taken. */
+  const messageOnly = prompt === null;
+  let tookMessage = false;
+  const failure = messageOnly ? inbox.failed.then((err) => ({ failed: err })) : undefined;
   const close = () => { if (!closed) { closed = true; q.close(); } };
   /** Claude Code went on after the `result`: the turn ends with a later one. */
   const goOn = () => {
@@ -358,7 +385,7 @@ async function drive(
   };
   /** With the `result` in, every steer taken (or taken back) and no background work, the input closes: the child goes. */
   const endIfDone = (): boolean => {
-    if (result === undefined || queue.untaken().length > 0 || background > 0) return false;
+    if (result === undefined || queue.untaken().length > 0 || inbox.untaken().length > 0 || background > 0) return false;
     queue.end();
     return true;
   };
@@ -381,9 +408,11 @@ async function drive(
 
   try {
     for (;;) {
-      let step: IteratorResult<SDKMessage> | "aborted" | "grace";
+      let step: IteratorResult<SDKMessage> | "aborted" | "grace" | { failed: Error };
       try {
-        step = await Promise.race([it.next(), aborted, takenBackAll, ...(graceOver ? [graceOver] : [])]);
+        step = await Promise.race([
+          it.next(), aborted, takenBackAll, ...(graceOver ? [graceOver] : []), ...(failure && !tookMessage ? [failure] : []),
+        ]);
       } catch (err) {
         if (result !== undefined) return result; // shutdown noise after the result
         if (!signal?.aborted) throw err;
@@ -397,15 +426,32 @@ async function drive(
         throw new DOMException("aborted", "AbortError");
       }
       if (step === "grace") return result!;
+      if ("failed" in step) {
+        close();
+        logged = true;
+        bestEffort(() => record(turnFailed(step.failed.message)));
+        throw step.failed;
+      }
       if (step.done) { ended = true; break; }
       const m = step.value;
-      if (queuedBy(m) === prompt) promptQueued = true;
-      // A steer is logged as Claude Code takes it, ahead of the message that says so.
+      const queued = queuedBy(m);
+      if (queued !== undefined) {
+        if (queued === prompt) promptQueued = true;
+        inbox.noteQueued(queued);
+      }
+      // A steer, or a message from another task, is logged as Claude Code takes it, ahead of the frame that says so.
       for (const uuid of takenBy(m)) {
         if (uuid === prompt) promptQueued = false;
         const taken = queue.take(uuid);
-        if (taken === null) continue;
-        record(promptEvent(taken, uuid));
+        if (taken !== null) {
+          record(promptEvent(taken, uuid));
+          goOn();
+          continue;
+        }
+        const message = inbox.take(uuid);
+        if (message === null) continue;
+        tookMessage = true;
+        record(peerMessageEvent(message, uuid));
         goOn();
       }
       record(m);
@@ -416,7 +462,9 @@ async function drive(
       else if (m.type === "system" && m.subtype === "background_tasks_changed") {
         background = m.tasks.filter((t) => t.ambient !== true).length;
         settle();
-      } else if (m.type === "result" && result === undefined && !promptQueued) {
+      } else if (m.type === "result" && result === undefined && !promptQueued && !(messageOnly && !tookMessage)) {
+        // (A message-only turn's is the `result` after Claude Code took its message: one before is a resumed session's,
+        // for the work its last process left.)
         result = m;
         // With every steer taken and no background work the input closes, so the child goes. An untaken steer keeps it
         // open for Claude Code, and so does background work, which Claude Code wakes for when it ends: then the input
@@ -439,7 +487,13 @@ async function drive(
     signal?.removeEventListener("abort", onAbort);
     clearTimeout(graceTimer);
     queue.end();
+    inbox.end();
   }
+}
+
+/** The event meddle logs for a message from another task's agent that Claude Code took, written as `uuid`. */
+function peerMessageEvent(message: PeerPrompt, uuid: string): MeddleEvent {
+  return { type: "meddle", subtype: "peer_message", from: message.peer, text: message.text, uuid };
 }
 
 /**

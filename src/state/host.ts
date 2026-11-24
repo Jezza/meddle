@@ -145,7 +145,7 @@ export type PeerObjectDeps = {
   runner: Pick<
     TaskRunner,
     | "receiveTask" | "activateTask" | "abandonTask" | "create" | "prompt" | "nameFromPrompt" | "setModel" | "setEffort" | "trainTurn"
-    | "trainStatus" | "abandonLeftovers" | "unqueue" | "discardMergeTask"
+    | "trainStatus" | "abandonLeftovers" | "unqueue" | "discardMergeTask" | "listLive" | "message"
   >;
 };
 
@@ -226,6 +226,14 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
       discardTask: ({ taskId }) => {
         if (!deps.isMember(from)) throw forbidden("members only");
         return deps.runner.discardMergeTask(taskId);
+      },
+      tasks: () => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return deps.runner.listLive();
+      },
+      message: ({ to, from: sender, text }) => {
+        if (!deps.isMember(from)) throw forbidden("members only");
+        return deps.runner.message(to, sender, text);
       },
       // Refused like a local create (no task root, no usable token, …) before any prompt is taken.
       createTaskAt: async ({ title, taskId, starts, prompt, attachments = [], nameFromPrompt, model, effort, merge }) => {
@@ -1050,6 +1058,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
       interrupt: () => runner.interrupt(id),
       sendNow: async () => { await runner.sendNow(id); },
       takeBackQueued: async () => ({ prompts: await runner.takeBackQueued(id) }),
+      dropQueued: ({ entry }) => runner.dropQueued(id, entry),
       accept: (input) => runner.accept(id, { continue: input.continue === true }),
       unqueue: () => runner.unqueue(id, UNQUEUED_BY_USER),
       retry: () => runner.retry(id),
