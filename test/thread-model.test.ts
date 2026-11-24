@@ -601,3 +601,12 @@ test("Claude Code's echo of a peer message and its hold events add nothing: medd
   ]);
   expect(items).toEqual([{ kind: "peer", from: peerFrom, text: "hi" }]);
 });
+
+test("Claude Code's echo of your message or a task's notice adds nothing: the log holds each already", () => {
+  const items = buildThread([
+    { seq: 1, message: { type: "user", message: { role: "user", content: "steer" }, uuid: "u1", isReplay: true, origin: { kind: "human" }, parent_tool_use_id: null } },
+    { seq: 2, message: { type: "user", message: { role: "user", content: "steer" }, uuid: "u1", parent_tool_use_id: null } },
+    { seq: 3, message: { type: "user", message: { role: "user", content: "<task-notification>\n<task-id>a1</task-id>\n</task-notification>" }, isReplay: true, origin: { kind: "task-notification" }, parent_tool_use_id: null } },
+  ]);
+  expect(items).toEqual([{ kind: "user", text: "steer", attachments: [] }]);
+});

@@ -92,8 +92,9 @@ export function buildThread(events: Array<{ seq: number; message: unknown; at?: 
         addAssistant(m, listFor(m.parent_tool_use_id));
         break;
       case "user":
-        // Claude Code's echo of a message from another task: meddle logged it as it was taken (`peer_message`).
-        if (m.isReplay === true && (m.origin as { kind?: unknown } | undefined)?.kind === "peer") break;
+        // Claude Code's echo of what it took: the log has each already (your message as meddle sent it, another task's
+        // as its `peer_message`, a task's notice as its `task_notification`).
+        if (m.isReplay === true) break;
         addUser(m, listFor(m.parent_tool_use_id));
         break;
       case "system":
