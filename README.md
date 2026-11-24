@@ -1350,7 +1350,7 @@ Archived, collapsed, every online node's archived tasks; and at its foot Nodes, 
 its load, or since when it has been offline. A task's row shows its state (a dot: running, waiting on you, idle), how
 many approvals and questions wait on you, how many of its subagents are running (a purple count after its title), and
 the node it runs on (`from → to` while it moves); a task queued on its project's train has the train's icon (a
-merge, drawn as jj log draws one) after its title, which opens the train page with the task's row highlighted; its ⋯
+merge, drawn as jj log draws one) before its title, which opens the train page with the task's row highlighted; its ⋯
 menu (or a right click) accepts it (Accept, first; Unqueue for a queued task), renames it, moves it, archives it, or
 for an archived task restores or deletes it. A project's line ends in the train's icon and how many tasks are queued
 on its train, which opens the project's train page (with none queued it shows, as Train, only while you hover the

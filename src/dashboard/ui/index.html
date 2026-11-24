@@ -121,8 +121,8 @@
   .side-row:hover .more { display: inline; }
   .side-row:hover .where { display: none; }
   .side-row .rename { flex: 1; min-width: 0; padding: 1px 6px; }
-  /* The train's mark on a project's line (its queue, or "Train" on hover or focus while it is empty) and on a queued task's row:
-     both open the project's train page. A merge task's title starts with it in the train's purple. */
+  /* The train's mark on a project's line (its queue, or "Train" on hover or focus while it is empty) and before a queued task's
+     title: both open the project's train page. A merge task's title starts with it in the train's purple. */
   .train-mark { display: inline-flex; align-items: center; gap: 4px; flex: none; background: var(--chip); color: var(--chip-fg); border: none;
     border-radius: 8px; padding: 0 6px; font-size: 10.5px; font-weight: 400; line-height: 17px; }
   .train-mark:hover:not(:disabled) { background: var(--chip); color: var(--fg); }
@@ -130,7 +130,7 @@
   .train-mark:not(.busy):not(.sel) { visibility: hidden; }
   .side-project:hover .train-mark:not(.busy), .side-project:focus-within .train-mark:not(.busy) { visibility: visible; }
   .train-mark svg, .side-row .queued-mark svg { width: 11px; height: 11px; }
-  .side-row .queued-mark { display: inline-flex; background: none; border: none; padding: 0 2px; color: var(--muted); flex: none; }
+  .side-row .queued-mark { background: none; border: none; padding: 0; margin-right: 5px; vertical-align: -1px; color: var(--muted); }
   .side-row .queued-mark:hover:not(:disabled) { background: none; color: var(--fg); }
   .merge-mark { width: 11px; height: 11px; margin-right: 5px; vertical-align: -1px; color: var(--tint-purple); }
   .badge { background: var(--warn); color: var(--bg); font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; flex: none; }

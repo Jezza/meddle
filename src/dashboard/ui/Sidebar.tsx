@@ -137,11 +137,13 @@ function TaskRow({ task, nodes, nameOf, indent, selected, onNavigate }: {
         <StateDot state={task.state} waiting={waitsOnYou(task)} />
         {renaming
           ? <RenameInput value={task.title} onDone={() => setRenaming(false)} onSave={(title) => action.run(() => task.ref.rename({ title }))} />
-          : <span class="title">{task.merge && <Glyph name="merge" cls="merge-mark" />}{task.title}</span>}
-        {task.queued && task.projects.length === 1 && (
-          <button class="queued-mark" title="Open train"
-            onClick={(e) => { e.preventDefault(); e.stopPropagation(); location.hash = trainHref; }}><Glyph name="merge" /></button>
-        )}
+          : <span class="title">
+              {task.queued && task.projects.length === 1 && (
+                <button class="queued-mark" title="Open train"
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); location.hash = trainHref; }}><Glyph name="merge" /></button>
+              )}
+              {task.merge && <Glyph name="merge" cls="merge-mark" />}{task.title}
+            </span>}
         {task.pending > 0 && <span class="badge">{task.pending}</span>}
         {task.agents > 0 && (
           <span class="agent-count" title={`${task.agents} ${task.agents === 1 ? "agent" : "agents"} running`}><Glyph name="agent" />{task.agents}</span>
