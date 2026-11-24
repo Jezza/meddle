@@ -23,6 +23,15 @@ test("env overrides and derived paths", () => {
     expect(() => loadConfig({ HOME: "/home/x", MEDDLE_JJ_NETWORK_TIMEOUT_MS: bad })).toThrow("MEDDLE_JJ_NETWORK_TIMEOUT_MS must be a positive integer");
   }
 });
+test("MEDDLE_DASHBOARD_ORIGIN: an origin, or unset", () => {
+  expect(loadConfig({ HOME: "/home/x" }).dashboardOrigin).toBeNull();
+  expect(loadConfig({ HOME: "/home/x", MEDDLE_DASHBOARD_ORIGIN: "" }).dashboardOrigin).toBeNull();
+  expect(loadConfig({ HOME: "/home/x", MEDDLE_DASHBOARD_ORIGIN: "https://Meddle.Example.com/" }).dashboardOrigin).toBe("https://meddle.example.com");
+  expect(loadConfig({ HOME: "/home/x", MEDDLE_DASHBOARD_ORIGIN: "http://100.64.0.1:8080" }).dashboardOrigin).toBe("http://100.64.0.1:8080");
+  for (const bad of ["meddle.example.com", "https://meddle.example.com/app", "https://u@meddle.example.com", "ftp://meddle.example.com", "https://x.example?y"]) {
+    expect(() => loadConfig({ HOME: "/home/x", MEDDLE_DASHBOARD_ORIGIN: bad })).toThrow("MEDDLE_DASHBOARD_ORIGIN must be an origin");
+  }
+});
 test("checkTaskRoot reports a missing root", async () => {
   const cfg = loadConfig({ HOME: "/home/x", MEDDLE_TASK_ROOT: "/nonexistent/meddle" });
   expect((await checkTaskRoot(cfg)).ok).toBe(false);

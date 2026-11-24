@@ -101,7 +101,8 @@ test("taskChanges leaves out what the default branch has", async () => {
     await jj(["--ignore-working-copy", "rebase", "-s", first.commit, "-d", upstream], replica, cfg);
     expect((await taskChanges(cfg, project, TASK)).changes.map((c) => c.description)).toEqual(["", "second", "first", "upstream"]);
     const rebased = await taskChanges(cfg, project, TASK, { defaultBranch: "main" });
-    expect(rebased).toMatchObject({ start: "feature", conflicted: false });
+    // The line is on `main` now, not on the base it started on.
+    expect(rebased).toMatchObject({ start: "main", conflicted: false });
     expect(rebased.changes.map((c) => c.description)).toEqual(["", "second", "first"]);
     expect(rebased.changes.map((c) => c.workingCopy)).toEqual([true, false, false]);
     expect(rebased.changes[0]!.commit).toBe(await lineAt());
@@ -113,12 +114,19 @@ test("taskChanges leaves out what the default branch has", async () => {
     expect(all).not.toContain("up.txt");
     // Without the default branch, from the task's base: `main`'s file is in it.
     const plain = await taskChanges(cfg, project, TASK);
-    expect(plain.from).toBe(base.commit);
+    expect(plain).toMatchObject({ start: "feature", from: base.commit });
     expect(await changeDiff(cfg, project, plain.changes[0]!.commit, plain.from!)).toContain("up.txt");
+
+    // `main` moves on again: the line is on a commit no bookmark is on, named by its short change id.
+    await writeFile(join(replica, "later.txt"), "later\n");
+    await jj(["commit", "-m", "later"], replica, cfg);
+    await bookmarkSet(replica, "main", "@-", cfg);
+    const short = (await jj(["--ignore-working-copy", "log", "-r", upstream, "--no-graph", "-T", "change_id.short(8)"], replica, cfg)).trim();
+    expect(await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).toMatchObject({ start: short, from: upstream });
 
     // The line merged into `main`: none left.
     await bookmarkSet(replica, "main", await lineAt(), cfg, { ignoreWorkingCopy: true });
-    expect(await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).toMatchObject({ from: await lineAt(), changes: [] });
+    expect(await taskChanges(cfg, project, TASK, { defaultBranch: "main" })).toMatchObject({ start: "main", from: await lineAt(), changes: [] });
   } finally {
     await close();
   }

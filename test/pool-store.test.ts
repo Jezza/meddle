@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb } from "../src/store/db";
 import { poolKey } from "../src/pool/secret";
-import { PROVISIONAL_AT, PoolStore, type NodeSummary, type RosterRow, type WireAddr } from "../src/pool/store";
+import { PROVISIONAL_AT, PoolStore, rosterName, type NodeSummary, type RosterRow, type WireAddr } from "../src/pool/store";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -29,6 +29,24 @@ test("ensurePool makes an empty pool (no secret) with this node alone, and is id
   expect(store.ensurePool({ nodeId: A, hostname: "alpha" }, t2)).toEqual(pool);
   expect(store.members().map((r) => r.nodeId)).toEqual([A]);
   expect(store.row(A)).toMatchObject({ hostname: "alpha", status: "member", addedBy: A, updatedAt: t1 });
+});
+
+test("ensurePool brings this node's hostname up to date after a rename, leaving its membership's updatedAt alone", () => {
+  const store = new PoolStore(openDb(":memory:"));
+  store.ensurePool({ nodeId: A, hostname: "alpha" }, t1);
+  store.ensurePool({ nodeId: A, hostname: "renamed" }, t2);
+  expect(store.row(A)).toMatchObject({ hostname: "renamed", status: "member", updatedAt: t1 });
+  // a removal this node has not heard of still wins the merge
+  expect(store.merge([row(A, "removed", t2, { hostname: "alpha" })])).toBe(true);
+  expect(store.row(A)).toMatchObject({ status: "removed", updatedAt: t2 });
+});
+
+test("rosterName: another node by its summary's hostname, else the roster's; this node by the roster's", () => {
+  expect(rosterName(row(B, "member", t1), A)).toBe("host-b");
+  expect(rosterName(row(B, "member", t1, { summary: summary("renamed", 0) }), A)).toBe("renamed");
+  expect(rosterName(row(B, "member", t1, { summary: summary("", 0) }), A)).toBe("host-b");
+  expect(rosterName(row(A, "member", t1, { summary: summary("stale", 0) }), A)).toBe("host-a");
+  expect(rosterName(row(A, "member", t1, { summary: summary("other", 0) }), null)).toBe("other");
 });
 
 test("a pool row of an older meddle (no name) is reset to an empty pool", () => {

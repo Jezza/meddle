@@ -7,6 +7,11 @@ export type NodeConfig = {
   dataDir: string;
   taskRoot: string;
   port: number;
+  /**
+   * The origin a proxy serves the dashboard on besides localhost, `MEDDLE_DASHBOARD_ORIGIN` (`https://meddle.example`);
+   * null (unset or empty) for localhost only.
+   */
+  dashboardOrigin: string | null;
   home: string;
   claudeHome: string;
   envPassthrough: string[];
@@ -54,6 +59,16 @@ function parsePort(raw: string | undefined): number {
   return n;
 }
 
+function parseDashboardOrigin(raw: string | undefined): string | null {
+  if (raw === undefined || raw === "") return null;
+  let url: URL | null = null;
+  try { url = new URL(raw); } catch { /* reported below */ }
+  if (url === null || (url.protocol !== "https:" && url.protocol !== "http:") || url.origin !== raw.replace(/\/$/, "").toLowerCase()) {
+    throw new Error("MEDDLE_DASHBOARD_ORIGIN must be an origin, such as https://meddle.example.com");
+  }
+  return url.origin;
+}
+
 function parseIrohPreset(raw: string | undefined): "n0" | "minimal" {
   if (raw === undefined) return "n0";
   if (raw !== "n0" && raw !== "minimal") throw new Error("MEDDLE_IROH_PRESET must be n0 or minimal");
@@ -94,6 +109,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     dataDir: resolve(env.MEDDLE_DATA_DIR ?? join(home, ".local/share/meddle")),
     taskRoot: resolve(env.MEDDLE_TASK_ROOT ?? "/opt/meddle/tasks"),
     port: parsePort(env.MEDDLE_PORT),
+    dashboardOrigin: parseDashboardOrigin(env.MEDDLE_DASHBOARD_ORIGIN),
     home,
     claudeHome: resolve(env.CLAUDE_CONFIG_DIR ?? join(home, ".claude")),
     envPassthrough: env.MEDDLE_ENV_PASSTHROUGH === undefined

@@ -46,11 +46,15 @@ export function highlight(code: string, lang: string | undefined): string {
   return escapeHtml(code);
 }
 
+function codeBlock(code: string, lang: string | undefined): string {
+  return `<pre class="code"><code class="hljs">${highlight(code, lang)}</code></pre>`;
+}
+
 const marked = new Marked({
   gfm: true,
   renderer: {
     code({ text, lang }: Tokens.Code): string {
-      return `<pre class="code"><code class="hljs">${highlight(text.replace(/\n$/, ""), lang)}</code></pre>\n`;
+      return `${codeBlock(text.replace(/\n$/, ""), lang)}\n`;
     },
     // Raw HTML in the model's text is shown as text, never as markup.
     html({ text }: Tokens.HTML | Tokens.Tag): string {
@@ -62,4 +66,24 @@ const marked = new Marked({
 /** `text` (Markdown) as HTML. Not sanitised: the caller sanitises it before it reaches the page. */
 export function renderMarkdown(text: string): string {
   return marked.parse(text, { async: false });
+}
+
+/** A fenced code block on lines of its own: its fence, its info string, its code. */
+const FENCE = /(?:^|\n)(`{3,}|~{3,})([^\n]*)\n(?:([\s\S]*?)\n)?\1[ \t]*(?=\n|$)/g;
+
+/**
+ * A message you wrote as HTML: inline Markdown (emphasis, code, links) and fenced code blocks, the rest as typed, so
+ * line breaks, `#` and `-` stay what they were. Not sanitised: the caller sanitises it before it reaches the page.
+ */
+export function renderPrompt(text: string): string {
+  let html = "";
+  let at = 0;
+  for (const m of text.matchAll(FENCE)) {
+    html += marked.parseInline(text.slice(at, m.index), { async: false });
+    html += codeBlock(m[3] ?? "", m[2]);
+    at = m.index + m[0].length;
+    // The block breaks the line itself.
+    if (text[at] === "\n") at++;
+  }
+  return html + marked.parseInline(text.slice(at), { async: false });
 }

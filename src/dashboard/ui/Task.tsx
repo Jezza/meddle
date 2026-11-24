@@ -20,7 +20,7 @@ import { composerKey, enters, withTakenBack } from "./composer-model";
 import { type Anchor, copyText, deleteTask, MenuItem, ModelPicker, MoveMenu, PaneHead, Popover, type PoolRef, RemovedProjects, RenameInput, RestoreMenu, StateDot, Unavailable } from "./common";
 import { DiffRows, DiffView } from "./diff";
 import { Chevron, Glyph, Icon, Iconoir } from "./icons";
-import { renderMarkdown } from "./markdown";
+import { renderMarkdown, renderPrompt } from "./markdown";
 import { hashOf } from "./routes";
 import { ago, type ProjectLine, projectLines, restoreBlocked } from "./sidebar-model";
 import { useOptionalValue } from "./sources";
@@ -46,7 +46,7 @@ const ARRIVAL_MARGIN = 8;
 const SMALL_DIFF = 12;
 const MOVE_NOW_WARNING = "Interrupts the running turn. Background shells and subagents on this node stop and do not travel.";
 
-// Links in the model's text open in a new tab, never in place of the dashboard.
+// Links in the thread's text open in a new tab, never in place of the dashboard.
 DOMPurify.addHook("afterSanitizeAttributes", (el) => {
   if (el.tagName === "A") {
     el.setAttribute("target", "_blank");
@@ -119,11 +119,11 @@ function TaskLoaded({ node, pool, task, session, tab }: { node: NodeRef; pool: P
   const showChanges = switchable && tab === "changes";
   /** Shows every event in the thread, the ones it otherwise leaves out included. */
   const [raw, setRaw] = useState(false);
-  // What the composer holds, its text and its files, here so that a failed prompt's Edit can put them back. Its text is
-  // kept by task id, so that it is still there after another task (or a reload), and follows the task when it moves to
+  // What the composer holds, its text and its files, here so that a failed prompt's Edit can put them back. Both are
+  // kept by task id, so that they are still there after another task (or a reload), and follow the task when it moves to
   // another node.
   const [draft, setDraft] = useDraft(`task.${manifest.id}`);
-  const drafts = useDrafts();
+  const drafts = useDrafts(`task.${manifest.id}`);
   const box = useRef<HTMLTextAreaElement>(null);
   /** Prompts the task could not be sent: this page's own, so they go with it. */
   const [failed, setFailed] = useState<Failed[]>([]);
@@ -212,6 +212,7 @@ function TaskHead({ task, nodes, nodeId, title, state, pendingCount, moving, par
             <strong title={title}>{title}</strong>
             {!archived && !moving && state !== "moved" && <button class="icon" title="Rename" onClick={() => setRenaming(true)}>✎</button>}
           </>}
+        <CopyId id={task.manifest.value.id} shown="" />
         <StateDot state={state} waiting={pendingCount > 0} />
         <span class="muted state-text">{stateText}</span>
         {partly && (
@@ -975,9 +976,15 @@ function PromptBody({ text, attachments }: { text: string; attachments: Attachme
   return (
     <>
       <AttachmentList attachments={attachments} />
-      {(text.trim() !== "" || attachments.length === 0) && <div class="user-text">{text}</div>}
+      {(text.trim() !== "" || attachments.length === 0) && <PromptText text={text} />}
     </>
   );
+}
+
+/** Your message's text, with its inline Markdown and fenced code formatted, and its lines as you typed them. */
+function PromptText({ text }: { text: string }) {
+  const html = useMemo(() => DOMPurify.sanitize(renderPrompt(text)), [text]);
+  return <div class="user-text md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 /** A prompt the task was sent and has not started on: it joins the thread where Claude takes it. */
@@ -1206,18 +1213,22 @@ function BottomBar({ task, pool, node, nodeId, archived, archivedOn, moving }: {
 
 /** A project's line: its change id, which copies the whole id when clicked; `conflicted`; or nothing before it has one. */
 function Revision({ line }: { line: ProjectLine }) {
+  if (line.conflicted) return <span class="rev flag" title="Its bookmark points at several changes">conflicted</span>;
+  if (line.changeId === null) return null;
+  return <CopyId id={line.changeId} shown={line.changeId.slice(0, 8)} />;
+}
+
+/** `shown` (else all of `id`; "" for just the icon), which copies the whole id when clicked and ticks for a moment once it has. */
+function CopyId({ id, shown = id }: { id: string; shown?: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
     const t = setTimeout(() => setCopied(false), 1500);
     return () => clearTimeout(t);
   }, [copied]);
-  if (line.conflicted) return <span class="rev flag" title="Its bookmark points at several changes">conflicted</span>;
-  if (line.changeId === null) return null;
-  const id = line.changeId;
   return (
     <button class="rev" title={`Copy ${id}`} onClick={() => void copyText(id).then(setCopied)}>
-      {id.slice(0, 8)}<Iconoir name={copied ? "check" : "copy"} />
+      {shown}<Iconoir name={copied ? "check" : "copy"} />
     </button>
   );
 }

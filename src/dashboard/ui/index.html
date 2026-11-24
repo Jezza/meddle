@@ -10,7 +10,7 @@
     --fg: #1d1d1f; --fg-soft: #3c3d42; --muted: #75767d; --faint: #a3a4ab;
     --accent: #2f5fd0; --accent-soft: #2f5fd022; --on-accent: #fff;
     --warn: #9a6400; --warn-bg: #fff6e3; --warn-line: #e9cf96; --bad: #b3261e; --bad-bg: #fdecea;
-    --code-bg: #f4f5f7; --inline-code: #eef0f3;
+    --code-bg: #f4f5f7; --inline-code: #eef0f3; --inline-code-fg: #4b4fc4;
     --ok: #2e8b57; --ok-soft: #2e8b5722; --add: #22774a; --add-bg: #2e8b571c; --del-bg: #b3261e14;
     --composer: #ffffff;
     --you-bg: #f1f2f5; --you-line: #d9dbe1; --you-fg: #1d1d1f;
@@ -28,7 +28,7 @@
       --fg: #d7d9de; --fg-soft: #b9bdc6; --muted: #7f848e; --faint: #5a5f68;
       --accent: #7d9fe6; --accent-soft: #7d9fe633; --on-accent: #0f1a33;
       --warn: #d4b16c; --warn-bg: #2a251b; --warn-line: #5a4a2a; --bad: #e07a7a; --bad-bg: #3a2222;
-      --code-bg: #121316; --inline-code: #24272d;
+      --code-bg: #121316; --inline-code: #24272d; --inline-code-fg: #a3a7f7;
       --ok: #7fb98a; --ok-soft: #7fb98a2e; --add: #7fb98a; --add-bg: #5fb8651a; --del-bg: #db5c5c1c;
       --composer: #202328;
       --you-bg: #272a31; --you-line: #3d424b; --you-fg: #eceef1;
@@ -368,6 +368,8 @@
   .failed-acts { margin-left: auto; display: flex; gap: 2px; }
   .failed-acts button { background: none; border: none; padding: 1px 6px; color: var(--fg-soft); font-size: 12px; }
   .user-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* The usual inline code shade is the card's own; a code block keeps its own background. */
+  .user-text.md code { background: var(--you-line); }
   /* A prompt's files above its text: images as thumbnails, any other file as a chip with its name and size. */
   .attachments { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; }
   .msg.you .attachments + * { margin-top: 8px; }
@@ -392,9 +394,9 @@
   .md li { margin: 2px 0; }
   .md h1, .md h2, .md h3, .md h4 { margin: 18px 0 8px; font-size: 15px; font-weight: 600; color: var(--fg); }
   .md h1 { font-size: 17px; }
-  .md code { background: var(--inline-code); padding: 1px 4px; border-radius: 3px; font-size: 12.5px; }
+  .md code { background: var(--inline-code); color: var(--inline-code-fg); padding: 1px 4px; border-radius: 3px; font-size: 12.5px; }
   .md pre.code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 8px 0 12px; }
-  .md pre.code code { background: none; padding: 0; font-size: 12.5px; line-height: 1.5; }
+  .md pre.code code { background: none; color: inherit; padding: 0; font-size: 12.5px; line-height: 1.5; }
   .md blockquote { margin: 0 0 10px; padding-left: 12px; border-left: 3px solid var(--line-strong); color: var(--fg-soft); }
   .md table { margin: 0 0 12px; width: auto; }
   .md hr { border: none; border-top: 1px solid var(--line); margin: 14px 0; }

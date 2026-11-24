@@ -395,13 +395,15 @@ print each id's shortest unique prefix in bold magenta: what you need to type. (
 The task commands (`task prompt`, `retry`, `move`, `archive`, `restore`, `delete`) work from any node: they act on
 the node the task lives on (or is archived on), reaching it through this node as the dashboard does. A task named by
 its whole id that lives on this node needs no other node; a prefix is looked up across every online member. Nodes are
-named by short id and hostname in what they print, such as `moving e98d79415f8e to 164ff3e5ed (Gem)`.
+named by short id and hostname in what they print, such as `moving e98d79415f8e to 164ff3e5ed (Gem)`; a machine
+that was renamed goes by its new name once its node has started again.
 
 ### Environment
 
 | Variable | Default | |
 | --- | --- | --- |
 | `MEDDLE_PORT` | `7777` | The localhost port of the dashboard and of the socket the CLI talks to the node on. |
+| `MEDDLE_DASHBOARD_ORIGIN` | unset | The origin a reverse proxy serves the dashboard on besides localhost (see [Dashboard](#dashboard)), such as `https://meddle.example.com`. |
 | `MEDDLE_DATA_DIR` | `~/.local/share/meddle` | The node's data: database, secrets, replicas, memory, archives. |
 | `MEDDLE_TASK_ROOT` | `/opt/meddle/tasks` | Where tasks' folders are made (see [Task root](#task-root)). |
 | `MEDDLE_GIT_SOCKET` | `<data dir>/git.sock` | The unix socket the git remote helper reaches the node at (see [`meddle://` remotes](#meddle-remotes)). |
@@ -1334,6 +1336,13 @@ bun run src/cli.ts serve
 ```
 
 Then open <http://127.0.0.1:7777/> (`MEDDLE_PORT` changes the port). The dashboard binds to localhost only.
+
+To reach it from elsewhere, put a reverse proxy on the same machine in front of it and set `MEDDLE_DASHBOARD_ORIGIN`
+to the origin the proxy serves (`https://meddle.example.com`). The node still binds to localhost; it also accepts the
+proxy's requests, whose `Host` and `Origin` must be passed on as the browser sent them (that check is what stops
+another site's page from driving the node through your browser). The proxy is the only lock: whoever gets past it
+controls every node of the pool, so serve it over HTTPS only and behind authentication. A node that only serves the
+dashboard needs no task root, and then hosts no tasks.
 
 The dashboard of any node shows the whole pool. Its sidebar lists the pool's projects, each with the tasks that work
 in it alone and a New task row; then Tasks, the tasks with no project or several (each marked with how many); then

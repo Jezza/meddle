@@ -6,7 +6,7 @@ import { agentCounts, foldedLine, panelRows, rootOf, toolCount } from "../src/da
 import type { AgentEntry } from "../src/state/contracts";
 import { ago, groupTasks, homeTask, moveChoices, nodeLineText, projectLines, restoreBlocked, uniqueTasks, usageShort, type TaskEntry } from "../src/dashboard/ui/sidebar-model";
 import { mergeStatus, resumeLabel, trainColumns, trainError, trainOffer, type TrainView } from "../src/dashboard/ui/train-model";
-import { highlight, renderMarkdown } from "../src/dashboard/ui/markdown";
+import { highlight, renderMarkdown, renderPrompt } from "../src/dashboard/ui/markdown";
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
@@ -17,7 +17,7 @@ import { composerKey, composing, enters, withTakenBack } from "../src/dashboard/
 import { contextMeter, levelOf, readAgo, windowMeter } from "../src/dashboard/ui/usage-model";
 import type { FilePatch } from "../src/dashboard/ui/git-diff";
 import type { ProjectChanges, TaskChange } from "../src/tasks/changes";
-import { blobUrl, type Draft, draftAttachments, guardDrops, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
+import { blobUrl, ComposerFiles, type Draft, draftAttachments, guardDrops, nameFor, pastedFiles, readyToSend, shownInline, sizeText } from "../src/dashboard/ui/attach-model";
 import type { Attachment } from "../src/blobs/attachment";
 
 test("the dashboard bundle builds", async () => {
@@ -314,6 +314,19 @@ test("renderMarkdown highlights code blocks and shows raw HTML as text", () => {
   expect(highlight("<b>", "nope")).toBe("&lt;b&gt;");
 });
 
+test("renderPrompt formats inline Markdown and fenced code, and keeps the rest as typed", () => {
+  expect(renderPrompt("I sometimes do stuff _like_ this.\nOr `main`, or **this**.")).toBe(
+    "I sometimes do stuff <em>like</em> this.\nOr <code>main</code>, or <strong>this</strong>.");
+  // Lines that would be blocks in Markdown stay as typed, and words with underscores stay whole.
+  expect(renderPrompt("# not a heading\n- not a list\nsnake_case_name")).toBe("# not a heading\n- not a list\nsnake_case_name");
+  expect(renderPrompt("<b>hi</b> & <script>")).toBe("&lt;b&gt;hi&lt;/b&gt; &amp; &lt;script&gt;");
+  const fenced = renderPrompt("Look:\n```rust\nfn init() {}\n```\nThen _this_.");
+  expect(fenced).toStartWith('Look:<pre class="code"><code class="hljs"><span class="hljs-keyword">fn</span>');
+  expect(fenced).toEndWith("</code></pre>Then <em>this</em>.");
+  // An unclosed fence is only text.
+  expect(renderPrompt("```\nhalf")).not.toContain("<pre");
+});
+
 /** A rollout of build `n3w` to a and b, started at 10:00 with 30m to confirm and 2m for each node's health. */
 function rollout(over: Partial<RolloutSummary> = {}, participants: Array<Partial<RolloutSummary["participants"][number]>> = [{}, {}]): RolloutSummary {
   return {
@@ -565,6 +578,41 @@ test("draftAttachments takes the uploaded drafts' attachments; only the four ima
   const log: Attachment = { ...shot, name: "server.log", type: "application/octet-stream" };
   expect(draftAttachments([draft(), draft({ id: 2, state: "uploading", attachment: null }), draft({ id: 3, attachment: log })])).toEqual([shot, log]);
   expect(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml", ""].map(shownInline)).toEqual([true, true, true, true, false, false]);
+});
+
+test("ComposerFiles keeps a composer's uploaded files across views and in storage", () => {
+  const kept = new Map<string, string>();
+  const storage = { getItem: (k: string) => kept.get(k) ?? null, setItem: (k: string, v: string) => void kept.set(k, v), removeItem: (k: string) => void kept.delete(k) };
+  const files = new ComposerFiles(storage);
+  let told = 0;
+  const off = files.subscribe("new.p", () => told++);
+  const pasted = files.draft({ name: shot.name, type: shot.type, size: shot.size, preview: "blob:x", state: "uploading", attachment: null });
+  files.update("new.p", (all) => [...all, pasted]);
+  // uploading: held for the next view, not kept
+  expect(files.get("new.p")).toEqual([pasted]);
+  expect(kept.has("meddle.draft.new.p.files")).toBe(false);
+  // the upload settles with no view open: kept all the same
+  off();
+  files.update("new.p", (all) => all.map((d) => ({ ...d, state: "done" as const, attachment: shot })));
+  expect(told).toBe(1);
+  expect(JSON.parse(kept.get("meddle.draft.new.p.files")!)).toEqual([shot]);
+  expect(files.get("task.t")).toEqual([]);
+
+  // a reload: back from storage, previewed from the node; a bad entry is left out
+  kept.set("meddle.draft.new.p.files", JSON.stringify([{ ...shot, extra: 1 }, { hash: "nope" }]));
+  const back = new ComposerFiles(storage).get("new.p");
+  expect(back.map((d) => [d.attachment, d.preview, d.state])).toEqual([[shot, blobUrl(shot), "done"]]);
+  expect(new ComposerFiles(storage).get("new.p")).toHaveLength(1);
+  kept.set("meddle.draft.task.t.files", "not json");
+  expect(new ComposerFiles(storage).get("task.t")).toEqual([]);
+
+  // sent: no longer kept
+  files.update("new.p", () => []);
+  expect(kept.has("meddle.draft.new.p.files")).toBe(false);
+  // no storage at all: the files last as long as the page
+  const bare = new ComposerFiles(null);
+  bare.update("k", () => [bare.restored(shot)]);
+  expect(draftAttachments(bare.get("k"))).toEqual([shot]);
 });
 
 test("pastedFiles takes a clipboard's files when its text is nothing but their names or paths", () => {

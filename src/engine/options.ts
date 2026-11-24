@@ -83,6 +83,8 @@ export function buildEnv(i: EngineInput): Record<string, string> {
     ...inheritedEnv(i.cfg),
     ...i.cfg.poolEnv,
     CLAUDE_CONFIG_DIR: paths(i.cfg).taskConfig(i.manifest.id),
+    // The name other tasks' agents send messages to (their `sessions` registry is shared).
+    CLAUDE_CODE_SESSION_NAME: i.manifest.id,
     // Without a project, Claude Code names the project dir after the folder it runs in, as it does on its own.
     ...(typeof i.manifest.primaryProjectId === "string" ? { CLAUDE_CODE_PROJECT_DIR_NAME: i.manifest.primaryProjectId } : {}),
     CLAUDE_CODE_OAUTH_TOKEN: i.token,

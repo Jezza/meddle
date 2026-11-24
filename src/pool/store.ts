@@ -54,6 +54,15 @@ export type RosterRow = {
   reachedAt: string | null; reachedAddr: WireAddr | null;
 };
 
+/**
+ * The name `row`'s node goes by. Another node's is the hostname in its latest summary, its own word, which follows a
+ * rename; the roster's hostname is what the node was called when the row was made, kept with its membership. This
+ * node's own (`selfId`) is the roster's, which `ensurePool` refreshes at every start.
+ */
+export function rosterName(row: Pick<RosterRow, "nodeId" | "hostname" | "summary">, selfId: string | null): string {
+  return (row.nodeId === selfId ? "" : row.summary?.hostname) || row.hostname;
+}
+
 /** A roster row as a peer may send it (its summary perhaps an older meddle's, perhaps without link reports). */
 export type WireRosterRow = Omit<RosterRow, "summary" | "reachedAt" | "reachedAddr"> & {
   summary: WireSummary | null; reachedAt?: string | null; reachedAddr?: WireAddr | null;
@@ -136,12 +145,20 @@ export class PoolStore {
     })();
   }
 
+  /**
+   * Gives this node a member row, or brings the hostname of the one it has up to date (the machine was renamed). The
+   * rename leaves `updatedAt` alone: a newer one would win the membership merge over a removal this node has not heard
+   * of yet. The other nodes learn the new name from this node's summary instead (`rosterName`).
+   */
   private ensureSelf(self: { nodeId: string; hostname: string }, now: string): void {
-    if (this.row(self.nodeId) === null) {
+    const row = this.row(self.nodeId);
+    if (row === null) {
       this.upsert({
         nodeId: self.nodeId, hostname: self.hostname, status: "member", updatedAt: now, addedBy: self.nodeId,
         summary: null, lastSeenAt: null, lastAddr: null, reachedAt: null, reachedAddr: null,
       });
+    } else if (row.hostname !== self.hostname) {
+      this.db.query("UPDATE roster SET hostname = ? WHERE node_id = ?").run(self.hostname, self.nodeId);
     }
   }
 
