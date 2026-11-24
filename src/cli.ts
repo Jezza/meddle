@@ -51,7 +51,7 @@ import {
 } from "./token";
 import { ensureClaude } from "./claude-code";
 import { embedded } from "./embedded";
-import { helpRequest, usageFor } from "./help";
+import { commandArgs, helpRequest, usageFor } from "./help";
 import { highlightId, palette, table, wantsColour } from "./ansi";
 import { claudeCodeVersion, VERSION } from "./version";
 import { buildInfo, readBinary, CHECKOUT_BUILD, type BuildInfo } from "./update/build";
@@ -560,15 +560,20 @@ function statusText(t: TokenMeta): string {
 }
 
 /**
- * One line per token in order (id, label, status, expiry), then `active: <id|none>`: the database read read-only, so
- * it works without a node and creates nothing.
+ * One line per token in order (id, its unique prefix highlighted, label, status, expiry), then `active: <id|none>`:
+ * the database read read-only, so it works without a node and creates nothing.
  */
 async function tokenList(): Promise<number> {
   const cfg = loadConfig();
+  const colour = wantsColour(process.stdout);
   const lines = await readDb(cfg, async (db) => {
     if (!hasTokens(db)) return ["active: none"];
-    const rows = listTokens(db).map((t) => `${t.id}  ${t.label}  ${statusText(t)}  expires ${t.expiresAt}`);
-    return [...rows, `active: ${(await activeToken(cfg, db)) ?? "none"}`];
+    const tokens = listTokens(db);
+    const prefixes = uniquePrefixLengths(tokens.map((t) => t.id));
+    const id = (tokenId: string) => highlightId(tokenId, prefixes.get(tokenId) ?? 1, colour);
+    const rows = tokens.map((t) => `${id(t.id)}  ${t.label}  ${statusText(t)}  expires ${t.expiresAt}`);
+    const active = await activeToken(cfg, db);
+    return [...rows, `active: ${active === null ? "none" : id(active)}`];
   });
   for (const line of lines ?? ["active: none"]) console.log(line);
   return 0;
@@ -1936,14 +1941,15 @@ function plainError(message: string): string {
   }
 }
 
-const help = helpRequest(process.argv.slice(2), wantsColour(process.stdout));
+const argv = commandArgs(process.argv.slice(2));
+const help = helpRequest(argv, wantsColour(process.stdout));
 if (help !== null) {
   (help.found ? console.log : console.error)(help.text);
   process.exit(help.found ? 0 : 2);
 }
-const run = dispatch(process.argv.slice(2));
+const run = dispatch(argv);
 if (run === null) {
-  console.error(usageFor(process.argv.slice(2)) ?? USAGE);
+  console.error(usageFor(argv) ?? USAGE);
   process.exit(2);
 }
 try {

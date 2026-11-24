@@ -1,6 +1,6 @@
 // test/help.test.ts — `meddle help`, `--help` and `<command> --help`: what each command does, coloured on a terminal.
 import { test, expect } from "bun:test";
-import { helpRequest, usageFor, wantsColour } from "../src/help";
+import { commandArgs, helpRequest, usageFor, wantsColour } from "../src/help";
 import { closedPort, meddle } from "./helpers";
 
 const ESC = "\x1b[";
@@ -52,7 +52,7 @@ test("a project has no sync branches: help, the usage text and the README name n
   const sync = await meddle(["help", "project", "sync"], await env());
   expect(sync.code).toBe(2);
   expect(sync.stderr).toStartWith("meddle: no such command: project sync\n");
-  const usage = await meddle(["project"], await env());
+  const usage = await meddle(["project", "frob"], await env());
   expect(usage.code).toBe(2);
   expect(usage.stderr).not.toContain("project sync");
   expect(usage.stderr).not.toContain("--sync");
@@ -79,7 +79,7 @@ test("project add, project set-default and checkout document the service repo, t
   const all = await meddle(["help"], await env());
   expect(all.stdout).toContain("  meddle project set-default <id|name> <branch>");
   expect(all.stdout).toContain("  meddle checkout <id|name> [<dir>]");
-  const usage = await meddle(["project"], await env());
+  const usage = await meddle(["project", "frob"], await env());
   expect(usage.stderr).toContain("meddle project set-default <id|name> <branch>");
   const readme = await Bun.file(`${import.meta.dir}/../README.md`).text();
   for (const form of ["project set-default <id|name> <branch>", "checkout <id|name> [<dir>]"]) expect(readme).toContain(form);
@@ -96,7 +96,7 @@ test("help for no such command says so on stderr and exits 2; a usage error poin
 });
 
 test("a usage error under a known command lists only that command's forms; under none, every command", async () => {
-  const group = await meddle(["token"], await env());
+  const group = await meddle(["token", "frob"], await env());
   expect(group.code).toBe(2);
   expect(group.stderr).toStartWith("usage: meddle token add [--file <path>] [--label <l>]\n");
   expect(group.stderr).toContain("       meddle token enable <id|label>\n");
@@ -112,6 +112,20 @@ test("a usage error under a known command lists only that command's forms; under
   expect(usageFor(["service"])).toStartWith("usage: meddle service install [--dry-run]\n\n");
   expect(usageFor(["frob"])).toBeNull();
   expect(usageFor([])).toBeNull();
+});
+
+test("a plural is its command, after help too, and a listing command alone is its list", () => {
+  expect(commandArgs(["tokens", "remove", "x"])).toEqual(["token", "remove", "x"]);
+  expect(commandArgs(["projects"])).toEqual(["project", "list"]);
+  expect(commandArgs(["tasks"])).toEqual(["task", "list"]);
+  expect(commandArgs(["config"])).toEqual(["config", "list"]);
+  expect(commandArgs(["help", "tokens"])).toEqual(["help", "token"]);
+  expect(commandArgs(["--help", "tasks", "move"])).toEqual(["--help", "task", "move"]);
+  // Only the command's own word: a task named `tasks` stays one.
+  expect(commandArgs(["task", "prompt", "tasks", "tokens"])).toEqual(["task", "prompt", "tasks", "tokens"]);
+  expect(commandArgs(["pool"])).toEqual(["pool"]);
+  expect(commandArgs(["help"])).toEqual(["help"]);
+  expect(commandArgs([])).toEqual([]);
 });
 
 test("help is coloured on a terminal or with FORCE_COLOR, plain otherwise or with NO_COLOR", async () => {
@@ -193,7 +207,7 @@ test("help documents checkout, project set-default and project status, and how a
     expect(text).toContain(phrase);
   }
   expect(all.stdout).not.toContain("migrate");
-  const usage = await meddle(["project"], await env());
+  const usage = await meddle(["project", "frob"], await env());
   expect(usage.stderr).toContain("meddle project status <id|name>");
   const readme = (await Bun.file(`${import.meta.dir}/../README.md`).text()).replace(/\s+/g, " ");
   for (const phrase of ["project status <id|name>", "git push meddle :refs/heads/meddle/conflict/<b>/<id>", "jj bookmark track"]) {

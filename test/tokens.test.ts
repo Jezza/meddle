@@ -134,12 +134,12 @@ test("remove deletes the value file and keeps a removed row; add again revives i
   expect(await tokenValue(cfg, a.id)).toBe("tok-a");
   expect(await pickToken(cfg, db)).toMatchObject({ id: b.id });
 
-  // Two tokens named the same are named by id instead; an id prefix names nothing.
+  // Two tokens named the same are named by id instead, or by the start of one.
   const c = await addToken(cfg, db, "tok-c", { label: "home", setBy: A });
   await expect(removeToken(cfg, db, "home")).rejects.toThrow("ambiguous token label: home");
   expect(() => enableToken(db, "home")).toThrow("ambiguous token label: home");
-  await expect(removeToken(cfg, db, c.id.slice(0, 8))).rejects.toThrow(`no such token: ${c.id.slice(0, 8)}`);
-  expect((await removeToken(cfg, db, c.id)).id).toBe(c.id);
+  await expect(removeToken(cfg, db, "0123")).rejects.toThrow("no such token: 0123");
+  expect((await removeToken(cfg, db, c.id.slice(0, 8))).id).toBe(c.id);
   expect(existsSync(tokenFile(cfg, b.id))).toBe(true);
   expect(listTokens(db).map((t) => t.id)).toEqual([b.id, a.id]);
 });

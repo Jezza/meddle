@@ -132,8 +132,8 @@ or on two, is listed once. `token rename` renames a token without its value, as 
 either leaves it where it is in the order. Adding a
 removed token brings it back at the end of the list, keeping when it was first set (and so its expiry).
 Without `--label` a token is named after the first 8 characters of its id; a label is at most 64 characters. `token
-add` prints `token <id> (<label>)`, and `token set` is the same command. `remove`, `enable` and `rename` take a full id or a
-label; a label two tokens share is refused (`ambiguous token label`), so name the token by its id then.
+add` prints `token <id> (<label>)`, and `token set` is the same command. `remove`, `enable` and `rename` take an id, its unique
+prefix or a label; a label two tokens share is refused (`ambiguous token label`), so name the token by its id then.
 
 The order is each token's rank, kept apart from when it was set. A new token goes last: its rank is the time it was
 added, or just past the last token's when this node's clock is behind. `token move a --before b` (or `--after b`)

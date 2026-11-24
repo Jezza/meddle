@@ -10,7 +10,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { ensurePrivateDir, paths } from "./paths";
 import type { NodeConfig } from "./config";
-import { isNodeId } from "./pool/ids";
+import { isNodeId, resolveId } from "./pool/ids";
 
 /** A token id: what names its value file, so nothing else may pass for one. */
 export const TOKEN_ID = /^[0-9a-f]{16}$/;
@@ -127,8 +127,9 @@ function labelOk(label: unknown): label is string {
 }
 
 /**
- * The token a CLI argument names among the tokens not removed: its full id, else its label (one token only). Throws
- * `ambiguous token label: <l>` or `no such token: <x>`.
+ * The token a CLI argument names among the tokens not removed: its full id, else its label (one token only), else the
+ * start of one id (`resolveId`). Throws `ambiguous token label: <l>`, `ambiguous token: <x> (<ids>)` or
+ * `no such token: <x>`.
  */
 export function findToken(db: Database, idOrLabel: string): TokenMeta {
   const live = listTokens(db);
@@ -136,8 +137,9 @@ export function findToken(db: Database, idOrLabel: string): TokenMeta {
   if (byId !== undefined) return byId;
   const byLabel = live.filter((t) => t.label === idOrLabel);
   if (byLabel.length > 1) throw new Error(`ambiguous token label: ${idOrLabel}`);
-  if (byLabel.length === 0) throw new Error(`no such token: ${idOrLabel}`);
-  return byLabel[0]!;
+  if (byLabel.length === 1) return byLabel[0]!;
+  const id = resolveId(live.map((t) => t.id), idOrLabel, "token");
+  return live.find((t) => t.id === id)!;
 }
 
 let tmpSeq = 0;

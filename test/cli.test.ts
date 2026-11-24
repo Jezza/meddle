@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter } from "node:path";
 import { paths } from "../src/config";
 import { startDashboard } from "../src/dashboard/server";
-import { resolveNodeId, shortId } from "../src/pool/ids";
+import { resolveNodeId, shortId, uniquePrefixLengths } from "../src/pool/ids";
 import { listLineRows } from "../src/pool/rows";
 import { PoolObject } from "../src/state/contracts";
 import { openDb } from "../src/store/db";
@@ -15,6 +15,8 @@ import { markToken, tokenId } from "../src/token";
 import { initColocated, jj } from "../src/jj";
 import { childEnv, closedPort, createTask, meddle, replay, repoRoot, startServe } from "./helpers";
 import { linkClient, peerReady, POOL_ENV, poolNodes, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
+
+const ESC = "\x1b[";
 
 /** The env a CLI child runs with: no inherited MEDDLE_* and a port nothing listens on. */
 async function env() {
@@ -173,6 +175,47 @@ test("token add, set, list, enable, remove and status work on the database, with
   expect(await meddle(["token", "remove", "again"], env)).toEqual({ stdout: "", stderr: "meddle: no such token: again\n", code: 1 });
   expect(await meddle(["token", "remove", b.slice(0, 8)], env)).toEqual({ stdout: `removed ${b} (${b.slice(0, 8)})\n`, stderr: "", code: 0 });
   expect(await meddle(["token", "list"], env)).toEqual({ stdout: "active: none\n", stderr: "", code: 0 });
+}, 30_000);
+
+test("token list highlights each id's unique prefix, and the token commands take it", async () => {
+  const dir = await mkdtemp("/tmp/meddle-cli-token-prefix-");
+  const env = { HOME: dir, MEDDLE_DATA_DIR: `${dir}/d`, MEDDLE_TASK_ROOT: `${dir}/t`, MEDDLE_PORT: String(await closedPort()) };
+  // Two values whose ids start alike, so a prefix can be ambiguous.
+  const values = Array.from({ length: 17 }, (_, i) => `tok-${i}`);
+  const x = values.find((v) => values.some((w) => w !== v && tokenId(w)[0] === tokenId(v)[0]))!;
+  const y = values.find((w) => w !== x && tokenId(w)[0] === tokenId(x)[0])!;
+  const [a, b] = [tokenId(x), tokenId(y)];
+  for (const [value, label] of [[x, "x"], [y, "y"]] as const) {
+    await writeFile(`${dir}/${label}`, `${value}\n`);
+    expect((await meddle(["token", "add", "--file", `${dir}/${label}`, "--label", label], env)).code).toBe(0);
+  }
+
+  const prefixes = uniquePrefixLengths([a, b]);
+  const lit = (id: string) => `${ESC}1;35m${id.slice(0, prefixes.get(id)!)}${ESC}22;39m${id.slice(prefixes.get(id)!)}`;
+  const coloured = (await meddle(["token", "list"], { ...env, FORCE_COLOR: "1" })).stdout.trimEnd().split("\n");
+  expect(coloured[0]).toStartWith(`${lit(a)}  x  `);
+  expect(coloured[1]).toStartWith(`${lit(b)}  y  `);
+  expect(coloured[2]).toBe(`active: ${lit(a)}`);
+
+  const pa = a.slice(0, prefixes.get(a)!);
+  expect(await meddle(["token", "rename", pa, "z"], env)).toEqual({ stdout: `renamed ${a} (z)\n`, stderr: "", code: 0 });
+  const ambiguous = await meddle(["token", "remove", a[0]!], env);
+  expect(ambiguous).toEqual({ stdout: "", stderr: `meddle: ambiguous token: ${a[0]} (${[a, b].sort().join(", ")})\n`, code: 1 });
+  expect(await meddle(["token", "remove", pa], env)).toEqual({ stdout: `removed ${a} (z)\n`, stderr: "", code: 0 });
+}, 30_000);
+
+test("token, project, task and config alone list, and tokens, projects and tasks are token, project and task", async () => {
+  const dir = await mkdtemp("/tmp/meddle-cli-token-alias-");
+  const env = { HOME: dir, MEDDLE_DATA_DIR: `${dir}/d`, MEDDLE_TASK_ROOT: `${dir}/t`, MEDDLE_PORT: String(await closedPort()) };
+  await writeFile(`${dir}/a`, "tok-a\n");
+  expect((await meddle(["tokens", "add", "--file", `${dir}/a`], env)).code).toBe(0);
+  const listed = await meddle(["token", "list"], env);
+  expect(listed.stdout).toEndWith(`active: ${tokenId("tok-a")}\n`);
+  for (const args of [["token"], ["tokens"], ["tokens", "list"]]) expect(await meddle(args, env)).toEqual(listed);
+  // Without a node, the other lists say to start one rather than print their usage.
+  for (const args of [["project"], ["projects"], ["task"], ["tasks"], ["config"]]) {
+    expect(await meddle(args, env)).toEqual({ stdout: "", stderr: 'meddle: start "meddle serve" first\n', code: 1 });
+  }
 }, 30_000);
 
 test("token move puts a token before or after another, without a node", async () => {

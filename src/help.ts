@@ -139,20 +139,20 @@ const GROUPS: Group[] = [
         name: "token remove",
         usage: ["token remove <id|label>"],
         summary: "Remove a token, here and across the pool.",
-        details: "Takes a full id or a label; a label two tokens share is refused, so name the token by its id then.",
+        details: "Takes an id, its unique prefix or a label; a label two tokens share is refused, so name the token by its id then.",
       },
       {
         name: "token enable",
         usage: ["token enable <id|label>"],
         summary: "Make an exhausted or disabled token usable again.",
-        details: "Takes a full id or a label. The dashboard's Enable button does the same.",
+        details: "Takes an id, its unique prefix or a label. The dashboard's Enable button does the same.",
       },
       {
         name: "token rename",
         usage: ["token rename <id|label> <label>"],
         summary: "Rename a token, across the pool.",
         details:
-          "Takes a full id or a label. A label is at most 64 characters, with no control characters. Works with or " +
+          "Takes an id, its unique prefix or a label. A label is at most 64 characters, with no control characters. Works with or " +
           "without the node running. Prints `renamed <id> (<label>)`.",
       },
       {
@@ -160,7 +160,7 @@ const GROUPS: Group[] = [
         usage: ["token move <id|label> --before <id|label>", "token move <id|label> --after <id|label>"],
         summary: "Put a token just before or just after another in the order turns try them, across the pool.",
         details:
-          "Takes full ids or labels. A turn uses the first usable token in order, so `token move a --before b` makes a " +
+          "Takes ids, their unique prefixes or labels. A turn uses the first usable token in order, so `token move a --before b` makes a " +
           "turn try a first. Works with or without the node running; the dashboard's Up and Down buttons do the same. " +
           "Prints `moved <id> (<label>) before|after <id> (<label>)`.",
       },
@@ -687,6 +687,22 @@ export function usageFor(args: string[]): string | null {
     }
   }
   return null;
+}
+
+/** Other names for a command's first word: the plural of what it lists. */
+const ALIASES = new Map([["tokens", "token"], ["projects", "project"], ["tasks", "task"]]);
+
+/** The commands whose first word alone lists: `meddle token` is `meddle token list`. */
+const LISTS = new Set(["token", "project", "task", "config"]);
+
+/**
+ * `args` as the commands know them: a command's other name as its own (`tokens` is `token`, after `help` too), and a
+ * listing command's word alone as its `list`.
+ */
+export function commandArgs(args: string[]): string[] {
+  const at = args[0] === "help" || args[0] === "--help" || args[0] === "-h" ? 1 : 0;
+  const out = args.map((a, i) => (i === at ? ALIASES.get(a) ?? a : a));
+  return out.length === 1 && LISTS.has(out[0]!) ? [out[0]!, "list"] : out;
 }
 
 function notFound(words: string[], paint: Paint): { text: string; found: false } {
