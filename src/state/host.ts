@@ -242,7 +242,7 @@ export function servePeer(host: Host, deps: PeerObjectDeps): void {
         if (model !== undefined) await deps.runner.setModel(manifest.id, model);
         if (effort !== undefined) await deps.runner.setEffort(manifest.id, effort);
         const first = firstPrompt(prompt, attachments);
-        if (first !== null && nameFromPrompt === true) void deps.runner.nameFromPrompt(manifest.id, title, first.text);
+        if (first !== null && nameFromPrompt === true) void deps.runner.nameFromPrompt(manifest.id, title, first);
         if (first !== null) await deps.runner.prompt(manifest.id, first.text, first.attachments);
         return { manifest };
       },
@@ -580,7 +580,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
           if (!taskIds.value.includes(manifest.id)) taskIds.replace(ctx, [...taskIds.value, manifest.id]);
           // The pool sees the new task count now, not at the next periodic refresh.
           void pool.refresh();
-          if (first !== null && nameFromPrompt) void runner.nameFromPrompt(manifest.id, title, first.text);
+          if (first !== null && nameFromPrompt) void runner.nameFromPrompt(manifest.id, title, first);
           if (first !== null) await runner.prompt(manifest.id, first.text, first.attachments);
           return { manifest, nodeId: selfId };
         }

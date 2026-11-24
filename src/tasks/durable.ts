@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createServer, type Server } from "node:net";
 import { randomBytes } from "node:crypto";
@@ -9,7 +9,7 @@ import { forbidden, isChordError } from "@earendil-works/chord";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { defineTask, type Harness, type TaskInspection, type TaskRuntime } from "@earendil-works/pi-durable";
 import type { NodeConfig } from "../config";
-import { attachmentProblem, isPeerPrompt, promptOf, queueEntry, type Attachment, type PeerFrom, type PeerPrompt, type Prompt } from "../blobs/attachment";
+import { attachmentProblem, inlined, isPeerPrompt, promptOf, queueEntry, type Attachment, type PeerFrom, type PeerPrompt, type Prompt } from "../blobs/attachment";
 import { materialize, promptContent } from "../blobs/content";
 import { BlobFetcher } from "../blobs/pool";
 import { BlobStore } from "../blobs/store";
@@ -19,7 +19,7 @@ import { PeerInbox } from "../engine/peer-inbox";
 import { findSocket, type PeerSocket } from "../engine/peer-socket";
 import type { EngineInput } from "../engine/options";
 import { resultError, runTurn, type MeddleEvent, type SendNowOutcome, type TokenFault } from "../engine/session";
-import { askTitle } from "../engine/title";
+import { askTitle, type TitleFile } from "../engine/title";
 import { abandon, bookmarkForget, bookmarkSet, changeId, changesIn, jj } from "../jj";
 import { checkTaskRoot, paths } from "../paths";
 import { shortId } from "../pool/ids";
@@ -596,17 +596,36 @@ export class TaskRunner {
   /**
    * Haiku's title for a new task whose first prompt is `prompt` (`askTitle`), run with this node's first usable token
    * and its Claude Code; null when no token is usable or the query failed. It does not mark the token: a turn will.
+   * Haiku is shown each attachment's name, and the images a turn would get inline (`inlined`) as images, each fetched
+   * from the pool when it is not here; one that cannot be had, or is not the size it says, goes by its name alone.
    */
-  async askTitle(prompt: string): Promise<string | null> {
+  async askTitle(prompt: Prompt): Promise<string | null> {
     const picked = await pickToken(this.#cfg, this.#db);
     if (picked === null) return null;
-    return askTitle(prompt, {
+    const inline = inlined(prompt.attachments);
+    const files: TitleFile[] = [];
+    for (const [i, a] of prompt.attachments.entries()) {
+      const bytes = inline[i] ? await this.#blobBytes(a) : null;
+      files.push(bytes === null ? { name: a.name } : { name: a.name, image: { type: a.type, data: bytes.toString("base64") } });
+    }
+    return askTitle(prompt.text, {
       cfg: this.#cfg,
       token: picked.value,
       ...(this.#deps.claudePath === undefined ? {} : { claudePath: this.#deps.claudePath }),
       ...(this.#deps.claudeRuntime === undefined ? {} : { claudeRuntime: this.#deps.claudeRuntime }),
       ...(this.#deps.extraEnv === undefined ? {} : { extraEnv: this.#deps.extraEnv }),
-    });
+    }, files);
+  }
+
+  /** The bytes of `a`'s file, fetched from the pool when it is not here; null when it cannot be had or is not `a.size`. */
+  async #blobBytes(a: Attachment): Promise<Buffer | null> {
+    try {
+      if (attachmentProblem(a) !== null || !(await this.blobs.ensure(a.hash))) return null;
+      const bytes = await readFile(this.blobs.store.path(a.hash));
+      return bytes.length === a.size ? bytes : null;
+    } catch {
+      return null;
+    }
   }
 
   /** How many of this node's tasks are in state `running` or `waiting`. */
@@ -1236,12 +1255,12 @@ export class TaskRunner {
   }
 
   /**
-   * Names task `taskId`, created with the made-up title `placeholder` (`initialTitle`), from its first prompt
-   * (`promptTitle`: Haiku's title, else the prompt's first line) once that answers, unless the task was renamed
-   * meanwhile (its title is no longer `placeholder`). Never rejects: a task that moved or was archived meanwhile keeps
+   * Names task `taskId`, created with the made-up title `placeholder` (`initialTitle`), from its first prompt and its
+   * attachments (`promptTitle`: Haiku's title, else the text's first line) once that answers, unless the task was
+   * renamed meanwhile (its title is no longer `placeholder`). Never rejects: a task that moved or was archived meanwhile keeps
    * the title it has.
    */
-  async nameFromPrompt(taskId: string, placeholder: string, prompt: string): Promise<void> {
+  async nameFromPrompt(taskId: string, placeholder: string, prompt: Prompt): Promise<void> {
     try {
       const title = await promptTitle(prompt, (p) => this.askTitle(p));
       if (title !== null) await this.#rename(taskId, title, placeholder);

@@ -207,8 +207,8 @@ const nodeMethods = {
    * turn there when the text is not blank or there are attachments. With attachments, placement picks only a node that
    * takes them, and a named node that does not is refused `<host> runs a meddle that takes no attachments` before
    * anything is written. `title` absent or blank: the task is created as two adjectives and a noun (`initialTitle`),
-   * and with a prompt the node it is on renames it to Haiku's title for the prompt, else its first line, once that
-   * answers, unless it was renamed meanwhile (`nameFromPrompt`; a blank text names nothing). Answers the manifest and
+   * and with a prompt the node it is on renames it to Haiku's title for the prompt and its attachments, else the text's
+   * first line, once that answers, unless it was renamed meanwhile (`nameFromPrompt`). Answers the manifest and
    * the node the task is on, without waiting for that title.
    */
   createTask: method(

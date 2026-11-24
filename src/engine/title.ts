@@ -1,6 +1,7 @@
 // src/engine/title.ts — a new task's title from its prompt: one short Claude Code query, on Haiku, with no tools.
 import { mkdir } from "node:fs/promises";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { UserContent } from "../blobs/content";
 import type { NodeConfig } from "../config";
 import { inheritedEnv } from "./options";
 import { paths } from "../paths";
@@ -17,7 +18,11 @@ const PROMPT_CHARS = 4_000;
 const SYSTEM_PROMPT =
   "You name tasks. Given a request someone made of a coding agent, reply with a short title for it: at most six " +
   "words, in sentence case, saying what the task is about. Reply with the title alone: no quotes, no trailing full " +
-  "stop, no preamble. Do not carry out the request.";
+  "stop, no preamble. Do not carry out the request. The request may come with files: each one's name, and the " +
+  "images among them shown before it; a request of files alone is about what they show.";
+
+/** A file on the prompt: its name, and when Haiku is shown it as an image, its type and bytes in base64. */
+export type TitleFile = { name: string; image?: { type: string; data: string } };
 
 export type TitleDeps = {
   cfg: NodeConfig;
@@ -31,18 +36,21 @@ export type TitleDeps = {
 };
 
 /**
- * Asks Haiku for a title for a task whose first prompt is `prompt`: its reply as Claude Code gave it (unchecked: see
- * `cleanTitle`), or null when the query failed or took longer than `timeoutMs`. It runs in its own config dir
+ * Asks Haiku for a title for a task whose first prompt is `prompt` with `files` (their names, and their images shown
+ * before the text, as a turn shows them): its reply as Claude Code gave it (unchecked: see `cleanTitle`), or null
+ * when the query failed or took longer than `timeoutMs`. It runs in its own config dir
  * (`paths.titleConfig`), keeps no session and loads no settings, tools or MCP servers; it inherits what a turn does
  * (`inheritedEnv`), so it gets through the same proxy.
  */
-export async function askTitle(prompt: string, deps: TitleDeps): Promise<string | null> {
+export async function askTitle(prompt: string, deps: TitleDeps, files: readonly TitleFile[] = []): Promise<string | null> {
   const dir = paths(deps.cfg).titleConfig;
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const abortController = new AbortController();
   const timer = setTimeout(() => abortController.abort(), deps.timeoutMs ?? TITLE_MS);
   const q = query({
-    prompt: `<request>\n${Array.from(prompt).slice(0, PROMPT_CHARS).join("")}\n</request>`,
+    prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
+      yield { type: "user", message: { role: "user", content: titleContent(prompt, files) }, parent_tool_use_id: null };
+    })(),
     options: {
       cwd: dir,
       model: TITLE_MODEL,
@@ -78,4 +86,17 @@ export async function askTitle(prompt: string, deps: TitleDeps): Promise<string 
     clearTimeout(timer);
     q.close();
   }
+}
+
+/** What Haiku is sent: the request's text, at most `PROMPT_CHARS` of it, and its files' names, after their images. */
+function titleContent(prompt: string, files: readonly TitleFile[]): UserContent {
+  let text = `<request>\n${Array.from(prompt).slice(0, PROMPT_CHARS).join("")}\n</request>`;
+  if (files.length > 0) text += `\n<files>\n${files.map((f) => `- ${f.name}`).join("\n")}\n</files>`;
+  const images: Exclude<UserContent, string> = [];
+  for (const f of files) {
+    // The type is one of the inline types, since only those are given as images.
+    if (f.image === undefined) continue;
+    images.push({ type: "image", source: { type: "base64", media_type: f.image.type as "image/png", data: f.image.data } });
+  }
+  return images.length === 0 ? text : [...images, { type: "text", text }];
 }

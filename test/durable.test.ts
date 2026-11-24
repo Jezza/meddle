@@ -627,24 +627,46 @@ test("a task created with a made-up title is named from its prompt, unless it wa
   const manifests: string[] = [];
   runner.onManifest((tid, manifest) => { if (tid === m.id) manifests.push(manifest.title); });
   // The stand-in Claude Code replays a recording whose reply is `ok`: that is Haiku's title.
-  await runner.nameFromPrompt(m.id, "t", "Say hello");
+  await runner.nameFromPrompt(m.id, "t", { text: "Say hello", attachments: [] });
   expect(getTask(db, m.id)?.title).toBe("ok");
   expect(JSON.parse(getTask(db, m.id)!.manifest).title).toBe("ok");
   expect((await readManifest(cfg, m.id)).title).toBe("ok");
   expect(manifests).toEqual(["ok"]);
   // Renamed while Haiku is asked: the rename stands.
   await runner.rename(m.id, "first");
-  const naming = runner.nameFromPrompt(m.id, "first", "Say hello");
+  const naming = runner.nameFromPrompt(m.id, "first", { text: "Say hello", attachments: [] });
   await runner.rename(m.id, "Mine");
   await naming;
   expect(getTask(db, m.id)?.title).toBe("Mine");
   expect((await readManifest(cfg, m.id)).title).toBe("Mine");
   // A task that cannot be renamed keeps its title, and naming it does not reject.
-  await runner.nameFromPrompt("nonexistent", "t", "Say hello");
+  await runner.nameFromPrompt("nonexistent", "t", { text: "Say hello", attachments: [] });
   await h.close();
 });
 
 // ─── prompts with attachments ───
+
+test("a task whose first prompt is files alone is named from them: Haiku sees its images and every file's name", async () => {
+  const { db, h, m, open } = await setup();
+  const input = `${await mkdtemp("/tmp/meddle-title-input-")}/input.jsonl`;
+  const { h: h2, runner } = await open({ MEDDLE_FIXTURE_INPUT: input });
+  try {
+    const shot = await storedShot({ runner });
+    // A file of a type Haiku is not shown, and an image this node lacks and no pool has: each goes by its name alone.
+    const notes = { ...(await storedShot({ runner })), name: "notes.txt", type: "text/plain" };
+    const lost = { hash: "0".repeat(64), name: "lost.png", type: "image/png", size: 3 };
+    await runner.nameFromPrompt(m.id, "t", { text: "  ", attachments: [shot, notes, lost] });
+    expect(getTask(db, m.id)?.title).toBe("ok");
+    const [sent] = (await readFile(input, "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const content = sent.message.content;
+    expect(content).toHaveLength(2);
+    expect(content[0]).toMatchObject({ type: "image", source: { type: "base64", media_type: "image/png", data: Buffer.from(PNG_BYTES).toString("base64") } });
+    expect(content[1]).toEqual({ type: "text", text: "<request>\n\n</request>\n<files>\n- shot.png\n- notes.txt\n- lost.png\n</files>" });
+  } finally {
+    await h2.close();
+    await h.close();
+  }
+});
 
 async function* chunks(...parts: Uint8Array[]) { for (const p of parts) yield p; }
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]); // a few bytes are enough; nothing decodes them
