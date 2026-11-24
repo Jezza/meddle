@@ -6,7 +6,7 @@ import { ensureMemoryReplica } from "../src/memory";
 import { shortId } from "../src/pool/identity";
 import { markRemoved } from "../src/pool/removed";
 import { forgetProject, getProject, listProjects, type Project } from "../src/projects/project";
-import { ensureRemote, ensureServiceRepo, pushBookmark, rosterProjectIds, settled, type ReplicaDeps } from "../src/projects/replicas";
+import { ensureRemote, ensureServiceRepo, rosterProjectIds, settled, type ReplicaDeps } from "../src/projects/replicas";
 import { NodeObject } from "../src/state/contracts";
 import { linkClient, linkNodes, peerReady, twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -34,7 +34,7 @@ async function commitOn(node: GitPoolNode, repo: string, parent: string, file: s
   return changeOf(node, repo, "@-");
 }
 
-test("ensureServiceRepo makes an empty service repo with the home's remote, and clones the memory from home", async () => {
+test("ensureServiceRepo makes an empty service repo with the home's remote, and an empty memory repo of its own", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
     const main = await makeMain(A);
@@ -56,8 +56,9 @@ test("ensureServiceRepo makes an empty service repo with the home's remote, and 
     expect(await remoteList(project.replica, B.cfg)).toEqual([{ name: shortA, url }]);
     const memoryB = paths(B.cfg).memory(id);
     expect(await isJjRepo(memoryB)).toBe(true);
-    expect(await remoteList(memoryB, B.cfg)).toEqual([{ name: shortA, url: `meddle://${A.id}/memory/${id}` }]);
-    expect(await bookmarkList(memoryB, B.cfg)).toContainEqual({ name: "memory", remote: shortA, changeId: memoryChange, conflicted: false });
+    // The scope sync fills it from the pool's heads: nothing is cloned, no remote.
+    expect(await remoteList(memoryB, B.cfg)).toEqual([]);
+    expect(await bookmarkList(memoryB, B.cfg)).not.toContainEqual(expect.objectContaining({ changeId: memoryChange }));
 
     // Not a clone: no bookmark of the home's yet, `@` on the root commit, git's `HEAD` on no branch.
     expect(await bookmarkList(project.replica, B.cfg)).toEqual([]);
@@ -78,26 +79,14 @@ test("ensureServiceRepo makes an empty service repo with the home's remote, and 
     expect(await ensureRemote(B.cfg, memoryB, A.id, { kind: "memory", id })).toBe(shortA);
     expect(await remoteList(memoryB, B.cfg)).toEqual([{ name: shortA, url: memoryUrl }]);
 
-    // With the home offline, a service repo that is gone is made again all the same; its memory waits for the home.
+    // With the home offline, a service repo that is gone is made again all the same, and its memory repo with it.
     await rm(project.replica, { recursive: true, force: true });
     await rm(memoryB, { recursive: true, force: true });
     A.net.unwatch(B.id, "bye");
     B.net.unwatch(A.id, "bye");
     expect(await ensureServiceRepo(depsOf(B), id)).toEqual(project);
     expect(await isJjRepo(project.replica)).toBe(true);
-    expect(await isJjRepo(memoryB)).toBe(false);
-    // Once the home is back, the next call clones the memory.
-    A.net.watch(B.id);
-    B.net.watch(A.id);
-    await linkNodes(A, B);
-    const back = Date.now() + 10_000;
-    while (!B.net.isOnline(A.id)) {
-      if (Date.now() > back) throw new Error("the home never came back");
-      await Bun.sleep(10);
-    }
-    await peerReady(B, A);
-    await ensureServiceRepo(depsOf(B), id);
-    expect(await bookmarkList(memoryB, B.cfg)).toContainEqual({ name: "memory", remote: shortA, changeId: memoryChange, conflicted: false });
+    expect(await isJjRepo(memoryB)).toBe(true);
   } finally {
     await close();
   }
@@ -131,36 +120,15 @@ test("a default branch set on a node other than the home is set on the home, so 
   }
 }, 15_000);
 
-test("pushBookmark reaches the home fresh, over an untracked remote bookmark, and after the home's copy moved", async () => {
+test("a replica gets an empty memory repo of its own, for the scope sync to fill", async () => {
   const { A, B, close } = await twoPoolNodes();
   try {
-    const shortA = shortId(A.id);
-    // `memory` in the project's memory repo: the one bookmark a peer pushes into a home's own bookmarks.
-    const home = await ensureMemoryReplica(A.cfg, A.project.id);
     await peerReady(B, A);
     await ensureServiceRepo(depsOf(B), A.project.id);
     const repo = paths(B.cfg).memory(A.project.id);
-    const onA = async () => (await bookmarkList(home, A.cfg)).find((b) => b.name === "memory" && b.remote === null)?.changeId;
-
-    // 1. Fresh.
-    const first = await commitOn(B, repo, "root()", "one");
-    await pushBookmark(B.cfg, repo, A.id, "memory", first);
-    expect(await onA()).toBe(first);
-
-    // 2. `memory@<shortA>` is there but untracked.
-    await jj(["bookmark", "untrack", "exact:memory", "--remote", `exact:${shortA}`], repo, B.cfg);
-    expect((await bookmarkRefs(repo, "exact:memory", B.cfg)).find((r) => r.remote === shortA)?.tracked).toBe(false);
-    const second = await commitOn(B, repo, first, "two");
-    await pushBookmark(B.cfg, repo, A.id, "memory", second);
-    expect(await onA()).toBe(second);
-
-    // 3. A's copy moved ahead of what B last saw; B's push moves it sideways.
-    const ahead = await commitOn(A, home, second, "ahead");
-    await jj(["bookmark", "set", "memory", "-r", ahead], home, A.cfg);
-    const third = await commitOn(B, repo, second, "three");
-    await pushBookmark(B.cfg, repo, A.id, "memory", third);
-    expect(await onA()).toBe(third);
-    expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+    expect(await isJjRepo(repo)).toBe(true);
+    // Not a clone of the home's: no remote, nothing fetched.
+    expect((await jj(["git", "remote", "list"], repo, B.cfg)).trim()).toBe("");
   } finally {
     await close();
   }

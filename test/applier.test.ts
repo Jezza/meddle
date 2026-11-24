@@ -290,8 +290,8 @@ test("with the home stopped, a node that never had the project gets its service 
     expect(project.defaultBranch).toBe("main");
     expect(await visible(n3, project.replica, y)).toBe(true);
     expect((await viewOf(n3, project.replica)).get("refs/heads/main")).toBe(y);
-    // The memory stays home-based: not cloned while the home is away.
-    expect(await isJjRepo(paths(n3.cfg).memory(P))).toBe(false);
+    // Its memory repo is made here all the same, empty: the scope sync fills it from any peer's head.
+    expect(await isJjRepo(paths(n3.cfg).memory(P))).toBe(true);
   } finally {
     for (const stop of stops) stop();
     await close();
@@ -424,8 +424,8 @@ test("the applier applies a new project's rows without waiting for its home's me
       const replica = getProject(n1.db, Q)?.replica;
       return replica !== undefined && (await bookmarksOf(n1, replica).catch(() => new Map())).get("main")?.commitId === m;
     }, 15_000);
-    // The memory clone is still waiting on n3.
-    expect(memoryStall.held.length).toBeGreaterThan(0);
+    // Nothing asks n3 for the memory: it is no longer cloned from the home.
+    expect(memoryStall.held).toHaveLength(0);
     expect((await viewOf(n1, getProject(n1.db, Q)!.replica)).get("refs/heads/main")).toBe(m);
   } finally {
     for (const stop of stops) stop();

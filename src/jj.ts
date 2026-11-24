@@ -44,6 +44,10 @@ export type JjOptions = {
    * repo's lock for good.
    */
   timeoutMs?: number;
+  /** Added to the environment the command runs in. */
+  env?: Record<string, string>;
+  /** Written to the command's stdin (else it reads none). */
+  input?: string;
 };
 
 /** Runs jj in `cwd`; with `cfg`, in `jjEnv(cfg)` so that `meddle://` remotes work. Rejects a `JjError` on failure. */
@@ -74,10 +78,11 @@ async function run(
   args: string[], cwd: string, cfg: NodeConfig | undefined, options: JjOptions,
 ): Promise<string> {
   const { timeoutMs } = options;
+  const base = cfg === undefined ? process.env : jjEnv(cfg);
   const proc = Bun.spawn([...command, ...args], {
     cwd,
-    env: cfg === undefined ? process.env : jjEnv(cfg),
-    stdin: "ignore",
+    env: options.env === undefined ? base : { ...base, ...options.env },
+    stdin: options.input === undefined ? "ignore" : new TextEncoder().encode(options.input),
     stdout: "pipe",
     stderr: "pipe",
     // Its own process group, so a timeout kills git and the remote helper with it.

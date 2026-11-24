@@ -1,18 +1,18 @@
-// Names on the git transport: repos (`project/<id>`, `memory/<id>`), `meddle://<nodeId>/<repo>` remote URLs and the
+// Names on the git transport: repos (`project/<id>`, `memory/<id>`, `profile/pool`), `meddle://<nodeId>/<repo>` remote URLs and the
 // header of a `git` stream.
 import type { StreamHeader } from "../pool/frames";
 
-export type Repo = { kind: "project" | "memory"; id: string };
+export type Repo = { kind: "project" | "memory" | "profile"; id: string };
 
 export type GitService = "upload-pack" | "receive-pack";
 
 /** The header a `git` stream opens with: the repo to serve and the git service to run on it. */
 export type GitHeader = { stream: "git"; repo: string; service: GitService };
 
-const REPO = /^(project|memory)\/([A-Za-z0-9_-]+)$/;
+const REPO = /^(project|memory|profile)\/([A-Za-z0-9_-]+)$/;
 const URL = /^meddle:\/\/([0-9a-f]{64})\/(.*)$/;
 
-/** `project/<id>` or `memory/<id>` (an id of letters, digits, `_` and `-`); throws "bad repo name". */
+/** `project/<id>`, `memory/<id>` or `profile/<id>` (an id of letters, digits, `_` and `-`); throws "bad repo name". */
 export function parseRepo(text: string): Repo {
   const match = REPO.exec(text);
   if (!match) throw new Error("bad repo name");

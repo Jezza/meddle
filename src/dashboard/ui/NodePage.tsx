@@ -1,7 +1,7 @@
 // One node of the pool: its versions, token, task root and resources while it is reachable, what the roster knows of
-// it otherwise, and the tasks it holds.
+// it otherwise, its profile and memory when they are not in step with the pool, and the tasks it holds.
 import type { Host, Ref } from "@earendil-works/chord";
-import { NodeObject } from "../../state/contracts";
+import { NodeObject, ScopeHeadsObject } from "../../state/contracts";
 import { shortId } from "../../pool/ids";
 import { type Hosts, useObject, useValue } from "./hooks";
 import { mb, nodeDot, PaneHead, type PoolNode, type PoolRef, StateDot, tokenText, Unavailable } from "./common";
@@ -10,6 +10,7 @@ import { hashOf } from "./routes";
 import { nodeLineText, waitsOnYou } from "./sidebar-model";
 import type { PoolIndex } from "./sources";
 import { buildAlert, type UpdateView } from "./update-model";
+import { syncRows } from "./sync-model";
 
 type NodeRef = Ref<typeof NodeObject>;
 
@@ -44,6 +45,7 @@ export function NodePage({ hosts, pool, index, nodeId, update }: {
         )}
         {row.status === "member" && row.online && host === undefined && <Unavailable status={hosts.status(nodeId)} />}
         {host === undefined ? <Summary row={row} selfRow={selfRow} /> : <Live host={host} row={row} selfRow={selfRow} />}
+        {host !== undefined && <Sync host={host} nodes={nodes} />}
         <h3>Tasks</h3>
         {tasks.length === 0 ? <p class="muted">{row.online ? "No tasks." : `${row.taskCount} tasks, not reachable while it is offline.`}</p> : (
           <ul class="plain">
@@ -59,6 +61,21 @@ export function NodePage({ hosts, pool, index, nodeId, update }: {
       </div>
     </>
   );
+}
+
+/** The node's synced scopes that are not in step with the pool (nothing when all are). */
+function Sync({ host, nodes }: { host: Host; nodes: readonly PoolNode[] }) {
+  const heads = useObject(host, ScopeHeadsObject, {});
+  if (heads.ref === undefined || heads.ref.variant !== "default") return null;
+  return <SyncLoaded scopes={heads.ref.scopes} nodes={nodes} />;
+}
+
+function SyncLoaded({ scopes, nodes }: { scopes: Extract<Ref<typeof ScopeHeadsObject>, { variant: "default" }>["scopes"]; nodes: readonly PoolNode[] }) {
+  const list = useValue(scopes);
+  const projects = nodes.flatMap((n) => n.projects);
+  const rows = syncRows(list, (id) => nodes.find((n) => n.nodeId === id)?.hostname ?? shortId(id), (id) => projects.find((p) => p.id === id)?.name ?? null);
+  if (rows.length === 0) return null;
+  return <dl>{rows.flatMap((r) => [<dt key={`t:${r.label}`}>{r.label}</dt>, <dd key={`d:${r.label}`}>{r.text}</dd>])}</dl>;
 }
 
 /** What the roster knows about a node that is offline (or whose objects are still loading). */

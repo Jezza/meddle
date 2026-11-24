@@ -10,6 +10,7 @@ import { highlight, renderMarkdown, renderPrompt } from "../src/dashboard/ui/mar
 import { blinded, buildAlert, buildAlerts, draining, failureText, participantLines, timeLeft, waits } from "../src/dashboard/ui/update-model";
 import { nodeDot } from "../src/dashboard/ui/common";
 import { canSaveNew, changeWho, memorySource, mergeFirstPage, stripFrontmatter, writeError } from "../src/dashboard/ui/memory-model";
+import { syncRows } from "../src/dashboard/ui/sync-model";
 import type { MemoryChange } from "../src/projects/memory-view";
 import type { NodeBuildView, RolloutSummary } from "../src/update/updater";
 import { changeCount, changeLabel, type FileNode, fileTree, patchHash, summary, totals, treeFiles } from "../src/dashboard/ui/changes-model";
@@ -393,11 +394,11 @@ test("the last failure names its build, node and reason; a node behind the pool'
   expect(nodeDot({ online: true, running: 2 })).toBe("dot busy");
 });
 
-test("memorySource picks the home, else a holder, read-only", () => {
-  expect(memorySource("h", ["h", "a", "b"], ["a", "h", "b"])).toEqual({ nodeId: "h", editable: true });
-  expect(memorySource("h", ["h", "a", "b"], ["b", "a"])).toEqual({ nodeId: "a", editable: false });
-  expect(memorySource("h", ["h", "a"], ["c"])).toBeNull();
-  expect(memorySource("h", [], [])).toBeNull();
+test("memorySource picks this node when it holds the project, else an online holder, and both can write", () => {
+  expect(memorySource("s", ["h", "s", "b"], ["b", "h", "s"])).toEqual({ nodeId: "s", editable: true });
+  expect(memorySource("s", ["h", "a", "b"], ["b", "a"])).toEqual({ nodeId: "a", editable: true });
+  expect(memorySource("s", ["h", "a"], ["c"])).toBeNull();
+  expect(memorySource("s", [], [])).toBeNull();
 });
 
 test("changeWho names the task, the dashboard or the import", () => {
@@ -412,10 +413,10 @@ test("changeWho names the task, the dashboard or the import", () => {
   expect(changeWho(change("other"), title)).toEqual({ label: "", taskId: null });
 });
 
-test("writeError reads changed and busy", () => {
+test("writeError reads changed", () => {
   const refused = (message: string) => Object.assign(new Error(message), { code: "unavailable" });
   expect(writeError(refused("unavailable: changed: x"))).toBe("Changed");
-  expect(writeError(refused("unavailable: busy: y"))).toBe("Busy");
+  expect(writeError(refused("unavailable: busy: y"))).toBeNull();
   expect(writeError(refused("unavailable: path: z"))).toBeNull();
   expect(writeError(refused("unavailable: other"))).toBeNull();
   expect(writeError(new Error("network down"))).toBeNull();
@@ -866,4 +867,19 @@ test("trainError: a home older than the train is said to run an older meddle, an
   expect(trainError(older, "gem")).toBe("gem runs an older meddle");
   expect(trainError("not_in_variant: train", "gem")).toBe("gem runs an older meddle");
   expect(trainError("connection reset", "gem")).toBe("connection reset");
+});
+
+test("syncRows lists only the scopes not in step, by what they wait on", () => {
+  const name = (id: string) => (id === "n2" ? "gem" : id);
+  const project = (id: string) => (id === "p1" ? "meddle" : null);
+  expect(syncRows([{ scope: "profile", head: "a", behind: 0, waiting: [] }], name, project)).toEqual([]);
+  expect(syncRows([
+    { scope: "profile", head: "a", behind: 2, waiting: [] },
+    { scope: "memory/p1", head: "b", behind: 0, waiting: [{ node: "n2", why: "fetch" }] },
+    { scope: "memory/p9", head: "c", behind: 0, waiting: [{ node: "n2", why: "rule" }, { node: "n3", why: "seed" }] },
+  ], name, project)).toEqual([
+    { label: "Profile", text: "2 behind" },
+    { label: "Memory of meddle", text: "waiting for gem" },
+    { label: "Memory of p9", text: "other merge rules: gem" },
+  ]);
 });

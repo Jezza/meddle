@@ -10,8 +10,12 @@ import type { NodeConfig } from "../config";
 import type { PendingApproval } from "../engine/approvals";
 import { resultError, tokenFaultNotice, tokenFaultOf, type MeddleEvent, type TokenFault } from "../engine/session";
 import type { MetricsSampler, NodeMetrics } from "../metrics";
-import { peerOf, remoteReason, servePool } from "../pool/object";
+import { PEER_PRINCIPAL_PREFIX, peerOf, remoteReason, servePool } from "../pool/object";
 import { serveRemovedProjects } from "../pool/removed-object";
+import { serveScopeHeads } from "../pool/heads-object";
+import { headChanges } from "../pool/heads";
+import { importProfile, profileWord } from "../profile";
+import type { ScopeSync } from "../scopes/sync";
 import type { PoolRuntime } from "../pool/runtime";
 import { EFFORT_LEVELS } from "../pool/settings";
 import { acceptPeerLinks } from "../pool/sync";
@@ -21,7 +25,7 @@ import { paths } from "../paths";
 import { projectBranches } from "../projects/applier";
 import { loadBranchContext } from "../projects/context";
 import { graphCommit, graphProbe, olderGraph, projectGraph, type GraphCommit, type GraphProbe } from "../projects/graph";
-import { memoryChanges, memoryPlacing, MemoryWriteError, syncMemoryBefore, writeMemory } from "../projects/memory-sync";
+import { memoryChanges, memoryPlacing, MemoryWriteError, writeMemory } from "../projects/memory-sync";
 import { isMemoryPath, memoryDiff, memoryEntries, memoryFile, memoryHistory } from "../projects/memory-view";
 import { releaseLineRows } from "../projects/lines";
 import { removeProject } from "../projects/removal";
@@ -56,6 +60,7 @@ import {
   NodeStore,
   PeerObject,
   PROGRESS_KINDS,
+  ProfileObject,
   ProjectObject,
   ProjectViewSchema,
   SessionObject,
@@ -85,6 +90,8 @@ export type NodeHostDeps = {
    * they are refused all the same, so a node awaiting confirmation takes no input at all.
    */
   inputHold?(): string | null;
+  /** The node's scope sync (the profile, each project's memory): a dashboard write asks it for a pass; its state is served. */
+  scopeSync?: ScopeSync;
 };
 
 type TaskEvent = { taskId: string; seq: number; message: SDKMessage | MeddleEvent };
@@ -336,10 +343,15 @@ export function createNodeHost(deps: NodeHostDeps): Host {
 
   const host = createHost({ name: "node", self: "node" });
   servePool(host, { ...pool.objectDeps, inputHold: deps.inputHold });
+  serveProfile(host, deps);
+  serveScopeHeads(host, {
+    db,
+    ...(deps.scopeSync === undefined ? {} : { scopes: () => deps.scopeSync!.state(), scopeChanges: deps.scopeSync.changes }),
+  });
   serveRemovedProjects(host, {
     db,
     inputHold: deps.inputHold,
-    remove: (id) => removeProject({ cfg, db, pool, runner }, id),
+    remove: (id) => removeProject({ cfg, db, pool, runner, scopeSync: deps.scopeSync ?? null }, id),
   });
   servePeer(host, {
     cfg,
@@ -774,24 +786,8 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     };
     const memoryHead = self.state("memoryHead", ProjectObject.def.variants.default.state.memoryHead, { init: memoryHeadNow });
     const refreshMemoryHead = latest(memoryHeadNow, memoryHead);
-    /**
-     * On the project's home, with no task of it live here, brings the memory working copy onto `memory`: a peer's push
-     * moves only the bookmark, and the entries are read from disk. With one live its turn end does it. What this moves
-     * tells `memoryChanges` again, and that second run finds nothing to move.
-     */
-    const followHome = async () => {
-      if (getProject(db, id)?.home !== pool.identity.id || !(await isJjRepo(memoryRepo))) return;
-      // Asked just before the sync queues for its lock: a turn starting later queues its own sync behind this one.
-      if (!runner.projectLive(id)) await syncMemoryBefore({ cfg, db, pool }, id, false);
-    };
     self.on("memory", memoryChanges, async (projectId, ctx) => {
       if (projectId !== id) return;
-      await followHome();
-      await refreshMemoryHead(ctx);
-    });
-    // A push that landed while no one here listened left the working copy behind: caught up once the object is live.
-    self.task(async (ctx) => {
-      await followHome();
       await refreshMemoryHead(ctx);
     });
     self.on("memoryTicks", slowTicks, (_event, ctx) => refreshMemoryHead(ctx));
@@ -807,7 +803,7 @@ export function createNodeHost(deps: NodeHostDeps): Host {
     /** A write of memory, its refusals (`MemoryWriteError`) with their code first; any other failure as it is. */
     const write = async (path: string, text: string | null, base: string | null) => {
       try {
-        return await writeMemory({ cfg, db, pool }, id, path, text, base, () => runner.projectLive(id));
+        return await writeMemory({ cfg, db, pool, sync: deps.scopeSync ?? null }, id, path, text, base);
       } catch (err) {
         if (err instanceof MemoryWriteError) throw memoryRefusal(err.code, err.message);
         throw err;
@@ -1408,4 +1404,28 @@ class CreationSent extends Error {
     super(message);
     this.name = "CreationSent";
   }
+}
+
+/** Serves `ProfileObject`: this node's standing in the pool's profile, and the import that makes a directory the pool's. */
+function serveProfile(host: Host, deps: NodeHostDeps): void {
+  const { cfg } = deps;
+  host.serve(ProfileObject, (_input, principal, self) => {
+    if (peerOf(principal) !== null || (typeof principal === "string" && principal.startsWith(PEER_PRINCIPAL_PREFIX))) {
+      throw forbidden("the profile has no peer view");
+    }
+    const standing = self.state("standing", ProfileObject.def.variants.default.state.standing, { init: () => profileWord(cfg) });
+    const refresh = latest(() => profileWord(cfg), standing);
+    self.on("heads", headChanges, async (scope, ctx) => {
+      if (scope === "profile") await refresh(ctx);
+    });
+    return gated({
+      variant: "default",
+      standing,
+      import: async ({ dir }: { dir?: string }, ctx: Ctx) => {
+        const commit = await importProfile(cfg, dir ?? paths(cfg).profile, deps.scopeSync ?? null);
+        await refresh(ctx);
+        return { commit };
+      },
+    }, deps.inputHold);
+  });
 }

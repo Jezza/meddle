@@ -4,13 +4,13 @@ import { isMemoryPath, remoteReason } from "../../projects/memory-names";
 import type { MemoryChange } from "../../projects/memory-view";
 
 /**
- * Where memory is read from: the project's home while it is online (writes go there), else the first online holder,
- * read-only; null when no node holding the project is online.
+ * Where memory is read from and written to: this node when it holds the project, else the first online holder (every
+ * holder's memory is the pool's, kept in step); null when no node holding the project is online.
  */
-export function memorySource(home: string, holders: readonly string[], online: readonly string[]): { nodeId: string; editable: boolean } | null {
-  if (online.includes(home)) return { nodeId: home, editable: true };
-  const holder = holders.find((h) => h !== home && online.includes(h));
-  return holder === undefined ? null : { nodeId: holder, editable: false };
+export function memorySource(self: string, holders: readonly string[], online: readonly string[]): { nodeId: string; editable: boolean } | null {
+  if (holders.includes(self)) return { nodeId: self, editable: true };
+  const holder = holders.find((h) => online.includes(h));
+  return holder === undefined ? null : { nodeId: holder, editable: true };
 }
 
 /** Who made a change: a task (its title, or its id when unknown here), the dashboard, an import; "" for anything else. */
@@ -21,12 +21,9 @@ export function changeWho(c: MemoryChange, taskTitle: (id: string) => string | n
   return { label: "", taskId: null };
 }
 
-/** The word a refused write shows beside `Save`: the file changed since it was opened, or a live turn is behind memory. */
-export function writeError(err: unknown): "Changed" | "Busy" | null {
-  const reason = remoteReason(err);
-  if (reason.startsWith("changed:")) return "Changed";
-  if (reason.startsWith("busy:")) return "Busy";
-  return null;
+/** The word a refused write shows beside `Save`: the file changed since it was opened. */
+export function writeError(err: unknown): "Changed" | null {
+  return remoteReason(err).startsWith("changed:") ? "Changed" : null;
 }
 
 /** Whether a read failed because the node holds no memory repo of the project (nothing to show). */

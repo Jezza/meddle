@@ -35,6 +35,8 @@ export function paths(cfg: NodeConfig) {
     /** Prepended to `PATH` for every jj meddle runs (never an agent's): it holds the git remote helper. */
     bin,
     binHelper: join(bin, "git-remote-meddle"),
+    /** git's merge driver for the repos of synced scopes (the profile, each project's memory). */
+    binMergeDriver: join(bin, "meddle-merge-driver"),
     /** `core.hooksPath` of every `receive-pack` this node serves (a checkout's push here, a peer's to a memory repo). */
     checkoutHooks: join(data, "checkout-hooks"),
     hookPreReceive: join(data, "checkout-hooks", "pre-receive"),

@@ -11,7 +11,10 @@ import { startDashboard, type Dashboard } from "./dashboard/server";
 import { acceptDashboardStreams } from "./dashboard/tunnel";
 import { gitRemote } from "./git/remote-main";
 import { gitPreReceive } from "./git/pre-receive";
-import { writeHelperWrapper, writePreReceiveHook } from "./git/scripts";
+import { writeHelperWrapper, writeMergeDriver, writePreReceiveHook } from "./git/scripts";
+import { mergeDriver } from "./scopes/merge-driver-main";
+import { checkGit } from "./scopes/repo";
+import { startScopeSync, type ScopeSync } from "./scopes/sync";
 import { acceptGitStreams } from "./git/serve";
 import { startApplier } from "./projects/applier";
 import { branchText, conflictFix } from "./projects/branches";
@@ -26,9 +29,12 @@ import { poolProjects, projectLine, resolveProject, resolveRemovable } from "./p
 import { dedupe } from "./pool/report";
 import { startPool, type PoolRuntime } from "./pool/runtime";
 import { PoolStore, rosterName } from "./pool/store";
-import { ensurePlugins, seedProfile } from "./profile";
+import { ensurePlugins, profileHooks, profileWord, seedProfile } from "./profile";
+import { allWaitingHeadRows, listHeadRows } from "./pool/heads";
+import { scopeLines } from "./scopes/lines";
+import { pluginRunner } from "./plugins";
 import { isTrainEvent, resultError, tokenFaultNotice, tokenFaultOf } from "./engine/session";
-import { PoolObject, ProjectObject, RemovedProjectsObject } from "./state/contracts";
+import { PoolObject, ProfileObject, ProjectObject, RemovedProjectsObject } from "./state/contracts";
 import { createNodeHost, NodeObject, SessionObject, TaskObject } from "./state/host";
 import { openDb } from "./store/db";
 import { attachCheckout, checkHelperOnPath, checkoutAt, colocate, fetchCheckout, makeCheckout, pushStart } from "./projects/checkouts";
@@ -116,6 +122,8 @@ type OpenNode = {
   stopRemovedWatch?: () => void;
   /** Stops applying rows to the service repos and their views. */
   stopApplier?: () => void;
+  /** Keeps the profile and each project's memory in step with the pool. */
+  scopeSync?: ScopeSync;
   /** Stops checking whether tasks' work is accepted (`TaskRunner.close`). */
   stopAccepting?: () => void;
   /** This node's part in pool updates, and the rollout channel's streams. */
@@ -134,6 +142,7 @@ async function shutdown(node: OpenNode): Promise<void> {
   clearInterval(node.janitor);
   node.stopRemovedWatch?.();
   node.stopApplier?.();
+  node.scopeSync?.stop();
   node.stopAccepting?.();
   node.stopTunnels?.();
   node.stopBlobs?.();
@@ -178,8 +187,12 @@ async function serve(): Promise<number> {
   // Before anything runs jj: git finds the helper for meddle:// remotes, and a push meets its hook.
   await writeHelperWrapper(cfg);
   await writePreReceiveHook(cfg);
-  await seedProfile(cfg);
+  await writeMergeDriver(cfg);
+  // Synced scopes merge with `merge-tree -X`: an older git would merge differently, or not at all.
+  await checkGit();
+  // Plugins first: a seed's plugin list starts from what this node has.
   await ensurePlugins(cfg);
+  await seedProfile(cfg);
   const root = await checkTaskRoot(cfg);
   if (!root.ok) console.error(`meddle: ${root.reason}; this node will not host tasks`);
 
@@ -220,6 +233,11 @@ async function serve(): Promise<number> {
     // On a held build nothing the Harness holds reruns until the updater lets it.
     const harness = (node.harness = await openHarness(cfg, createRegistry(), { hold: heldAtBoot }));
     const runner = new TaskRunner(cfg, db, harness.harness, { ...claude, pool });
+    // The profile and every project's memory kept in step with the pool; a turn end asks it to publish what it wrote.
+    const scopeSync = (node.scopeSync = startScopeSync({ cfg, db, pool, liveTasks: (projectId) => runner.liveTasks(projectId),
+      profile: profileHooks(cfg, pluginRunner(cfg, claude.claudePath ?? "claude")),
+    }));
+    runner.setScopeSync(scopeSync);
     if (heldAtBoot) runner.setHolds({ turns: "update in progress", work: "update in progress", hosting: "update in progress" });
     const updater = (node.updater = startUpdater(files, build, boot, pool, runner, {
       swap: (plan) => { after = { swap: plan }; signalled.resolve(); },
@@ -246,7 +264,7 @@ async function serve(): Promise<number> {
       dataDir: cfg.dataDir,
     }));
     metrics.start();
-    const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool, inputHold }));
+    const host = (node.host = createNodeHost({ cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool, inputHold, scopeSync }));
     serveUpdate(host, {
       snapshot: () => updater.snapshot(),
       startRollout: (req) => updater.startRollout(req),
@@ -258,7 +276,7 @@ async function serve(): Promise<number> {
     // Each project removed from the pool cleaned up here: the watch first, so that an entry merged from now on is not
     // missed, then whatever is left of those on the list. Not awaited: on a held build it waits for the updater's hold
     // to lift, after startup.
-    const removal = { cfg, db, pool, runner };
+    const removal = { cfg, db, pool, runner, scopeSync };
     node.stopRemovedWatch = watchRemoved(removal);
     sweepRemoved(removal).catch((err: unknown) => console.error("meddle: removal sweep:", err));
     // Every project of the pool kept here, its rows applied to its service repo and view as they change.
@@ -384,6 +402,20 @@ async function status(): Promise<number> {
   console.log(`tasks ${(await readDb(cfg, (db) => listLiveTasks(db).length)) ?? 0}`);
   console.log(`node ${existsSync(paths(cfg).irohKey) ? (await loadOrCreateIdentity(cfg)).id : "(none yet)"}`);
   console.log((await readDb(cfg, poolLine)) ?? "pool (none yet)");
+  // The profile and each project's memory: in step with the pool, or behind whom.
+  if (existsSync(paths(cfg).irohKey)) {
+    const selfId = (await loadOrCreateIdentity(cfg)).id;
+    const standing = await profileWord(cfg);
+    const lines = await readDb(cfg, (db) => {
+      const roster = hasPool(db) ? new PoolStore(db).roster() : [];
+      const projects = new Map(listProjects(db).map((p) => [p.id, p.name]));
+      return scopeLines(listHeadRows(db), allWaitingHeadRows(db), selfId, standing, {
+        node: (id) => nodeLabel(roster.map((r) => ({ nodeId: r.nodeId, hostname: rosterName(r, selfId) })), id),
+        project: (id) => projects.get(id) ?? null,
+      });
+    });
+    for (const line of lines ?? []) console.log(line);
+  }
   // Pool updates, from the update's files: also while the node is down for its swap.
   const files = updateFiles(cfg.dataDir, process.execPath);
   const { self, view } = await readState(files);
@@ -883,6 +915,20 @@ function projectRemove(project: string): Promise<number> {
       }
     } finally {
       pool.release();
+    }
+  });
+}
+
+/** `profile import [<dir>]`: makes `dir` (this node's own profile when none) the pool's profile; prints the commit. */
+function profileImport(dir: string | undefined): Promise<number> {
+  return withNode(async (client) => {
+    const profile = await client.get(ProfileObject, {});
+    try {
+      const { commit } = await profile.import(dir === undefined ? {} : { dir: resolve(dir) });
+      console.log(`imported ${commit.slice(0, 12)}`);
+      return 0;
+    } finally {
+      profile.release();
     }
   });
 }
@@ -1753,7 +1799,7 @@ function readOnly(args: string[]): boolean {
     // Watching a train changes nothing; pausing or resuming one does.
     case "train": return sub !== "pause" && sub !== "resume";
     case "update": return args.length === 1;
-    default: return ["--version", "serve", "status", "checkout", "git-remote", "git-pre-receive", "update-guard", "update-preflight", "service"].includes(command ?? "");
+    default: return ["--version", "serve", "status", "checkout", "git-remote", "git-pre-receive", "merge-driver", "update-guard", "update-preflight", "service"].includes(command ?? "");
   }
 }
 
@@ -1811,6 +1857,7 @@ function route(args: string[]): (() => Promise<number>) | null {
   }
   if (command === "project" && sub === "set-default" && rest.length === 2) return () => projectSetDefault(rest[0]!, rest[1]!);
   if (command === "project" && sub === "remove" && rest.length === 1) return () => projectRemove(rest[0]!);
+  if (command === "profile" && sub === "import" && rest.length <= 1) return () => profileImport(rest[0]);
   if (command === "checkout" && sub !== undefined && rest.length <= 1 && !sub.startsWith("--")) return () => checkout(sub, rest[0]);
   if (command === "project" && sub === "list" && rest.length === 0) return projectList;
   if (command === "project" && sub === "status" && rest.length === 1) return () => projectStatus(rest[0]!);
@@ -1861,6 +1908,8 @@ function route(args: string[]): (() => Promise<number>) | null {
   if (command === "git-remote" && sub !== undefined && rest.length <= 1) return () => gitRemote(rest[0] ?? sub);
   // git's pre-receive hook, as `writePreReceiveHook` writes it for the compiled binary.
   if (args.length === 1 && command === "git-pre-receive") return () => gitPreReceive();
+  // git's merge driver for synced scopes, as `writeMergeDriver` writes it for the compiled binary.
+  if (command === "merge-driver" && args.length === 5) return () => mergeDriver(args.slice(1));
   if (command === "update") {
     const parsed = updateArgs(args.slice(1));
     if (parsed !== null && "problem" in parsed) return async () => (console.error(`meddle: ${parsed.problem}`), 2);

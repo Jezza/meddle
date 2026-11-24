@@ -6,7 +6,8 @@
 import type { Database } from "bun:sqlite";
 import { createHost, isChordError, type Host } from "@earendil-works/chord";
 import type { NodeConfig } from "../config";
-import { PoolObject, RemovedProjectsObject } from "../state/contracts";
+import { PoolObject, RemovedProjectsObject, ScopeHeadsObject } from "../state/contracts";
+import { mergeHeadRows } from "./heads";
 import { deleteTokenValue, hasTokenValue, listTokens, mergeTokens, tokenId, tokenRow, tokenValue, writeTokenValue } from "../token";
 import { shortId } from "./identity";
 import { IrohLink, type LinkTap } from "./link";
@@ -55,6 +56,10 @@ type PeerView = {
   removed: RemovedSupport;
   /** The next wait before holding the peer's RemovedProjectsObject again after a failure, and the timer of the try pending. */
   removedRetry: { waitMs: number; timer: ReturnType<typeof setTimeout> | null };
+  /** Whether the peer's ScopeHeadsObject is held, or the peer serves none (an older meddle); `pending` until either. */
+  heads: RemovedSupport;
+  /** The next wait before holding the peer's ScopeHeadsObject again after a failure, and the timer of the try pending. */
+  headsRetry: { waitMs: number; timer: ReturnType<typeof setTimeout> | null };
 };
 
 /** How a peer stands for the removed list (`PoolSync.removedSupport`). */
@@ -179,6 +184,11 @@ export class PoolSync {
     return this.views.get(peerId)?.removed ?? "pending";
   }
 
+  /** As `removedSupport`, for the peer's ScopeHeadsObject: the heads of the synced scopes. */
+  headsSupport(peerId: string): RemovedSupport {
+    return this.views.get(peerId)?.heads ?? "pending";
+  }
+
   /**
    * Records this node's current summary and address in its own row, and a report of each connection it holds (now,
    * at the address it sees the peer at) in that peer's row, then tells the node.
@@ -248,6 +258,7 @@ export class PoolSync {
     const view: PeerView = {
       host: null, abort: new AbortController(), tokenIds: new Set(), fetchToken: null,
       removed: "pending", removedRetry: { waitMs: this.deps.holdRetryMs ?? 1000, timer: null },
+      heads: "pending", headsRetry: { waitMs: this.deps.holdRetryMs ?? 1000, timer: null },
     };
     this.views.set(id, view);
     void this.attach(id, view);
@@ -311,6 +322,7 @@ export class PoolSync {
         if (current() && mergeBranchRows(this.deps.db, rows).changed.length > 0) this.deps.onChange();
       });
       void this.holdRemoved(id, view);
+      void this.holdHeads(id, view);
     } catch (err) {
       if (!current()) return;
       // The connection the stream rode on closed (the peer went, or a connection that wins replaced it): the net says
@@ -362,6 +374,41 @@ export class PoolSync {
       retry.timer = setTimeout(() => {
         retry.timer = null;
         void this.holdRemoved(id, view);
+      }, wait);
+      retry.timer.unref?.();
+    }
+  }
+
+  /**
+   * Holds the peer's ScopeHeadsObject over the view's client host, once its PoolObject is held, and merges its head rows
+   * into this node's on every change (a merge that set a row waiting tells the node). A peer of an older meddle serves
+   * none: noted as `older`. Any other failure is reported and tried again after a backoff.
+   */
+  private async holdHeads(id: string, view: PeerView): Promise<void> {
+    const current = () => !this.stopped && this.views.get(id) === view;
+    if (!current() || view.host === null) return;
+    try {
+      const ref = await view.host.get(ScopeHeadsObject, {}, { signal: view.abort.signal });
+      if (!current()) return;
+      if (ref.variant !== "peer") throw new Error(`${shortId(id)} did not serve the peer variant of ScopeHeadsObject`);
+      view.heads = "held";
+      ref.heads.subscribe((rows) => {
+        if (current() && mergeHeadRows(this.deps.db, rows).changed.length > 0) this.deps.onChange();
+      });
+    } catch (err) {
+      if (!current() || view.abort.signal.aborted) return;
+      if (isChordError(err, "unavailable") && err.reason === "unknown_type") {
+        view.heads = "older";
+        return;
+      }
+      this.report(new HoldFailed(id, `holding the scope heads of ${shortId(id)}: ${messageOf(err)}`));
+      const retry = view.headsRetry;
+      if (retry.timer !== null) return;
+      const wait = retry.waitMs;
+      retry.waitMs = Math.min(wait * 2, HOLD_RETRY_MAX_MS);
+      retry.timer = setTimeout(() => {
+        retry.timer = null;
+        void this.holdHeads(id, view);
       }, wait);
       retry.timer.unref?.();
     }
@@ -437,8 +484,10 @@ export class PoolSync {
     const view = this.views.get(id);
     if (!view) return;
     this.views.delete(id);
-    if (view.removedRetry.timer !== null) clearTimeout(view.removedRetry.timer);
-    view.removedRetry.timer = null;
+    for (const retry of [view.removedRetry, view.headsRetry]) {
+      if (retry.timer !== null) clearTimeout(retry.timer);
+      retry.timer = null;
+    }
     view.abort.abort(new Error(`stopped holding the pool of ${shortId(id)}`));
     if (view.host === null) return;
     const closed = view.host.close().catch((err: unknown) => this.report(err));

@@ -135,8 +135,8 @@ meddle config set jj.email you@example.com
 ```
 
 This needs the node running. It is a pool setting: every node, and every task's Claude Code, commits with it. Without
-it jj refuses to push the commits it makes, so the node's memory syncs to a project's home fail (each turn end logs
-`meddle: git: …`). `config list` shows what is set ([Pool settings](../README.md#pool-settings)).
+it jj refuses to commit, so the node's memory and profile do not sync (it logs `meddle: memory of …` or
+`meddle: profile: …`). `config list` shows what is set ([Pool settings](../README.md#pool-settings)).
 
 ### 6. Run the first task
 
@@ -248,7 +248,7 @@ What follows on its own:
 - the pool settings and the token list, within seconds; the new node pulls each token's value from a member that has
   it;
 - every project: the new node makes a service repo of each, and fetches the commits the pool's rows name from any
-  member, and each project's memory from its home. `meddle project list` on either node lists every project of the
+  member, and each project's memory and the profile from the pool. `meddle project list` on either node lists every project of the
   pool with its home and the nodes holding a copy, and `meddle checkout <project>` there gives you a checkout to work
   in;
 - placement: `task new` without `--node` now picks between the two, preferring the project's home, then
@@ -304,17 +304,20 @@ page in the dashboard) shows each branch and how to resolve one: push a merge of
 
 ### Profile: the user layer
 
-On its first start a node copies `CLAUDE.md`, `settings.json`, `skills`, `agents`, `commands` and `hooks` from that
-machine's `~/.claude` (or `CLAUDE_CONFIG_DIR`) into `<data dir>/profile`, a jj repo, and symlinks every task's Claude
-Code config directory at it. `plugins` is a live symlink to `~/.claude/plugins` when that directory exists at the first start, else an empty
-directory.
+The profile is the user layer of every task's Claude Code: `CLAUDE.md`, `settings.json`, `skills`, `agents`,
+`commands`, `hooks`, and `plugins.json`, the list of plugins. It is the pool's, the same on every node: a Claude that
+edits it in one task (through its config directory) changes it everywhere within seconds. `~/.claude` only seeds it.
 
-Two things to know. It is a snapshot: later changes to `~/.claude` do not reach it. Edit the files under
-`<data dir>/profile` instead (new sessions see them), or stop the node, delete `<data dir>/profile` and start it again
-to seed it afresh. And it is per node, not per pool: the design means for the profile to sync like memory does, but
-that is not built, so a second machine seeds from its own `~/.claude`, or from empty defaults (an empty `CLAUDE.md`, `{}` settings,
-empty directories) if there is none. Copy the entries
-you want there before its first start, or copy the profile repo over.
+- A new pool: the first node seeds the profile from that machine's `~/.claude` (or `CLAUDE_CONFIG_DIR`), leaving out
+  `skills/synced` (Claude Code's own copy of your claude.ai account's skills). A node that joins takes the pool's.
+- A node an older meddle ran keeps its own profile, as it was, until you run `meddle profile import` on the node
+  whose profile should be the pool's; every node then takes that one. `meddle profile import <dir>` makes any
+  directory laid out like `~/.claude` the pool's profile, whole.
+- `<data dir>/plugins` is meddle's own copy of `~/.claude/plugins`. Install a plugin inside a task and every node
+  installs it; one installed in a terminal Claude stays out of meddle.
+
+`meddle status` says whether this node's profile is in step with the pool (`profile in step`), behind whom, or still
+its own (`profile legacy`).
 
 ### Per-project context
 
@@ -370,7 +373,7 @@ remove and what to keep.
 | `… refused the connection: closed by peer: bad proof` or `… did not prove the pool secret` in the log | The two nodes have different secrets (or pool names). | Set the same secret with the same name on both. |
 | `no usable token` | No token is `ok` (or its value is not on this node yet). | `meddle token list`; add one, or `token enable` a disabled one. |
 | `this node has no task root` / `no online node hosts tasks` | The task root is missing or not writable on every candidate. | Create it (step 2) and restart the node. |
-| `meddle: git: memory of <short id> …` in the log | A turn end could not sync the project's memory with its home: no jj identity, or the home offline. | `meddle config set jj.user …` and `jj.email`; check `meddle pool`. The next turn end tries again. |
+| `meddle: memory of <short id> …` or `meddle: profile: …` in the log | A pass could not sync the project's memory or the profile: no jj identity, or no node holding the change is online. | `meddle config set jj.user …` and `jj.email`; check `meddle pool` and `meddle status`. The next pass tries again. |
 | `git-remote-meddle is not on your PATH; add <data>/bin to it` | `project add` or `checkout` needs git's remote helper for meddle, which git finds by name. | Put `<data dir>/bin` on your shell's `PATH` (step 6). |
 | `<b> is conflicted; push a merge of its siblings…` | Two machines pushed `<b>` without seeing each other; both commits are kept. | `meddle project status <project>` shows the sides and the fix. |
 | A node shows offline though it runs | In the network lab (`lab/REPORT-2026-11-02.md`) a node that went away was noticed only after about 30 s. A node that restarted dials every member it remembers at once, and the first one it reaches tells the rest where it is now. | Wait half a minute; check the lighthouse URL in Settings; `meddle pool` on both sides. |

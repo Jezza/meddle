@@ -138,6 +138,31 @@ const MIGRATIONS = [
     held TEXT NOT NULL DEFAULT '{}',
     round TEXT
   )`,
+  // Where each node's copy of each synced scope is (src/pool/heads.ts): written by that node, the greater seq wins.
+  // scope is `profile` or `memory/<project id>`; commit_id NULL is none; rule is the merge rules' version; seed the
+  // seed commit a profile line starts from (NULL for none); edited whether the line holds more than its seed.
+  `CREATE TABLE IF NOT EXISTS scope_heads (
+    scope TEXT NOT NULL,
+    node TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    commit_id TEXT NULL,
+    rule INTEGER NOT NULL,
+    seed TEXT NULL,
+    edited INTEGER NOT NULL,
+    PRIMARY KEY (scope, node)
+  )`,
+  // A peer's head rows still waiting for their commits, as scope_heads has them: neither used nor relayed until the
+  // scope's sync admits them.
+  `CREATE TABLE IF NOT EXISTS scope_heads_waiting (
+    scope TEXT NOT NULL,
+    node TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    commit_id TEXT NULL,
+    rule INTEGER NOT NULL,
+    seed TEXT NULL,
+    edited INTEGER NOT NULL,
+    PRIMARY KEY (scope, node)
+  )`,
   // The projects removed from the pool (src/pool/removed.ts): add-only, the earliest entry for an id kept; a removed project's id is never used again.
   `CREATE TABLE IF NOT EXISTS removed_projects (
     id TEXT PRIMARY KEY,

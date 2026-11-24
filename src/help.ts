@@ -33,10 +33,12 @@ const GROUPS: Group[] = [
       {
         name: "status",
         usage: ["status"],
-        summary: "Print this node's versions, data directory, task root, token, task count, id and pool, and pool updates.",
+        summary: "Print this node's versions, data directory, task root, token, task count, id and pool, profile and memory, and pool updates.",
         details:
           "Works with or without the node running, and creates nothing: before the node's first start it prints " +
-          "`node (none yet)` and `pool (none yet)`; before `pool secret` ran, `pool (no secret set)`. Then pool updates: " +
+          "`node (none yet)` and `pool (none yet)`; before `pool secret` ran, `pool (no secret set)`. Then the profile: " +
+          "`profile in step`, `profile behind <nodes>`, or `profile legacy` until `profile import`; and a `memory <project> " +
+          "behind <nodes>` line for each project whose memory is not in step yet. Then pool updates: " +
           "`build <id> (<platform>)` (with a swap in progress here, such as `awaiting confirmation of build <id>`), " +
           "`pool build <id>` once a rollout was confirmed, a `node <name> build <id> <state>` line for every node this one " +
           "has heard of, and the current rollout: what it waits on, or when it was confirmed or failed and why.",
@@ -254,6 +256,17 @@ const GROUPS: Group[] = [
           "ref with `jj bookmark track` makes that sibling mutable in your checkout until you push its deletion. " +
           "Dropping a sibling, like rewinding or deleting a branch, can make jj abandon commits only the old position " +
           "held; jj says so, and `jj op log` gets them back. Needs the node running.",
+      },
+      {
+        name: "profile import",
+        usage: ["profile import [<dir>]"],
+        summary: "Make a directory the pool's profile: CLAUDE.md, settings, skills, agents, commands, hooks.",
+        details:
+          "The profile is what every task's Claude Code reads as its user layer, the same on every node: Claudes edit it " +
+          "through their tasks and the pool keeps it in step. `<dir>` is laid out like `~/.claude` (this node's own " +
+          "profile when none is given); `skills/synced`, Claude Code's copy of the account's skills, is left out. It " +
+          "replaces the pool's profile whole, and a node whose profile an older meddle seeded keeps that one until the " +
+          "first import. Prints `imported <commit>`. Needs the node running.",
       },
       {
         name: "project remove",

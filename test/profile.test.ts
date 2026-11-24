@@ -29,13 +29,15 @@ test("seed copies ~/.claude entries into a jj repo and links them", async () => 
   expect(await readlink(`${configDir}/sessions`)).toBe(paths(cfg).sessions);
 });
 
-test("ensurePlugins replaces the empty plugins dir from ensureDataDirs with a link to ~/.claude/plugins", async () => {
+test("ensurePlugins replaces the empty plugins dir from ensureDataDirs with a copy of ~/.claude/plugins", async () => {
   const home = await mkdtemp("/tmp/meddle-prof-");
   await mkdir(`${home}/.claude/plugins`, { recursive: true });
+  await writeFile(`${home}/.claude/plugins/installed_plugins.json`, "{}");
   const cfg = loadConfig({ HOME: home, MEDDLE_DATA_DIR: `${home}/data`, MEDDLE_TASK_ROOT: home });
   await ensureDataDirs(cfg);
   await ensurePlugins(cfg);
-  expect(await readlink(paths(cfg).plugins)).toBe(`${home}/.claude/plugins`);
+  expect(await readlink(paths(cfg).plugins).catch(() => "not a link")).toBe("not a link");
+  expect(await readFile(`${paths(cfg).plugins}/installed_plugins.json`, "utf8")).toBe("{}\n");
 });
 
 test("a failed seed leaves no repo behind and is retried on the next call", async () => {

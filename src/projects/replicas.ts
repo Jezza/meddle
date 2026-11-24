@@ -1,12 +1,12 @@
 // Service repos of projects homed on other nodes, with the home's remote named after its shortId, and their memory
-// replicas. A task's lines and a project's branches travel as rows (`lines.ts`, `applier.ts`), never pushed; only a
-// memory repo's `memory` bookmark is pushed, to the project's home (`pushBookmark`).
+// replicas. A task's lines and a project's branches travel as rows (`lines.ts`, `applier.ts`), a memory repo's heads as
+// head rows (`src/scopes/`); nothing is pushed.
 import { rm } from "node:fs/promises";
 import type { Database } from "bun:sqlite";
 import { paths, type NodeConfig } from "../config";
 import { repoName, type Repo } from "../git/wire";
-import { bookmarkSet, fetch, isJjRepo, jj, push, remoteEnsure, track } from "../jj";
-import { cloneMemoryReplica } from "../memory";
+import { isJjRepo, remoteEnsure } from "../jj";
+import { ensureMemoryReplica } from "../memory";
 import { shortId } from "../pool/ids";
 import { isRemoved, removedIds } from "../pool/removed";
 import { repoKey, serialised } from "../serial";
@@ -59,9 +59,8 @@ const making = new Map<string, Promise<Project>>();
  * (`initServiceRepo`: never a clone of a peer's) with the home's remote `shortId(home)`, and registers it, from the
  * project row, else what the roster's summaries list, else what an online member says of the project; the home need
  * not be online, since rows and their commits come from any member. A project already here takes the default branch
- * its home (when online) gives now. Then, unless `memory` is false, the project's
- * memory, which stays home-based, is cloned from the home best effort (`cloneMemory`), so a later call (the applier's
- * sweep, when a peer comes online) retries it. Rejects `no online node holds project <shortId>` when nobody knows the
+ * its home (when online) gives now. Then, unless `memory` is false, the project's memory repo is made here when there
+ * is none (`ensureMemory`); the scope sync fills it. Rejects `no online node holds project <shortId>` when nobody knows the
  * project, and `project <shortId> was removed` for one on the removed list, whatever this node holds of it.
  */
 export async function ensureServiceRepo(deps: ReplicaDeps, projectId: string, opts: { memory?: boolean } = {}): Promise<Project> {
@@ -74,7 +73,7 @@ export async function ensureServiceRepo(deps: ReplicaDeps, projectId: string, op
     work = made;
   }
   const project = await work;
-  if (opts.memory !== false) await cloneMemory(deps, project);
+  if (opts.memory !== false) await ensureMemory(deps, project);
   return project;
 }
 
@@ -88,40 +87,21 @@ export function rosterProject(pool: PoolRuntime, db: Database, projectId: string
   return null;
 }
 
-/** The memory clones in flight, by data dir and project. */
-const cloning = new Map<string, Promise<void>>();
-
 /**
- * Resolves once the `ensureServiceRepo` making project `projectId`'s service repo and the clone of its memory, if any
- * is in flight on this data dir, have settled, fulfilled or not: what a removal waits for before it deletes the
- * project's repos.
+ * Resolves once the `ensureServiceRepo` making project `projectId`'s service repo, if any is in flight on this data dir,
+ * has settled, fulfilled or not: what a removal waits for before it deletes the project's repos.
  */
 export async function settled(cfg: NodeConfig, projectId: string): Promise<void> {
-  const key = `${cfg.dataDir}\0${projectId}`;
-  await Promise.allSettled([making.get(key), cloning.get(key)]);
+  await Promise.allSettled([making.get(`${cfg.dataDir}\0${projectId}`)]);
 }
 
 /**
- * Clones the memory of `project` from its home (`cloneMemoryReplica`, which keeps a replica already here and gives it
- * the home's remote) when the home is another node and online, and the project is not removed; a failure is logged,
- * and the next call tries again.
+ * Makes the memory repo of `project` here when there is none (an empty one: the scope sync fills it from the pool's
+ * heads), unless the project is removed.
  */
-async function cloneMemory(deps: ReplicaDeps, project: Project): Promise<void> {
-  const { cfg, db, pool } = deps;
-  if (isRemoved(db, project.id) || project.home === pool.identity.id || !pool.net.isOnline(project.home)) return;
-  // One clone at a time per memory replica: a second caller waits for the first.
-  const key = `${cfg.dataDir}\0${project.id}`;
-  let work = cloning.get(key);
-  if (work === undefined) {
-    const made = cloneMemoryReplica(cfg, project.id, project.home).then(() => {}, (err: unknown) => {
-      (deps.log ?? ((line) => console.error(line)))(
-        `meddle: project ${project.name}: memory not cloned from ${shortId(project.home)}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }).finally(() => cloning.delete(key));
-    cloning.set(key, made);
-    work = made;
-  }
-  await work;
+async function ensureMemory(deps: ReplicaDeps, project: Project): Promise<void> {
+  if (isRemoved(deps.db, project.id)) return;
+  await serialised(repoKey(paths(deps.cfg).memory(project.id)), () => ensureMemoryReplica(deps.cfg, project.id));
 }
 
 async function makeServiceRepo(deps: ReplicaDeps, projectId: string): Promise<Project> {
@@ -196,20 +176,4 @@ export async function ensureRemote(cfg: NodeConfig, replica: string, nodeId: str
   const name = shortId(nodeId);
   await remoteEnsure(replica, name, meddleUrl(nodeId, repo), cfg);
   return name;
-}
-
-/**
- * Points `bookmark` of `replica` at `changeId` and pushes it to node `home` (what a memory replica does with `memory`:
- * the project's home holds the memory repo): fetch it from there (nothing when it has none), track
- * `<bookmark>@<shortId(home)>`, set the bookmark (backwards or sideways too), push. jj refuses a push over an untracked
- * or stale remote bookmark, or a new one while the bookmark tracks another remote; this order survives all three. One push at a time per repo (`repoKey`): overlapping ones would clash on git's ref locks.
- */
-export async function pushBookmark(cfg: NodeConfig, replica: string, home: string, bookmark: string, changeId: string): Promise<void> {
-  const remote = shortId(home);
-  await serialised(repoKey(replica), async () => {
-    await fetch(replica, remote, [`exact:${bookmark}`], cfg);
-    await track(replica, `exact:${bookmark}`, remote, cfg);
-    await bookmarkSet(replica, bookmark, changeId, cfg);
-    await push(replica, remote, `exact:${bookmark}`, cfg);
-  });
 }

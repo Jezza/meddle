@@ -8,7 +8,6 @@ import { parseGitHeader, parseMeddleUrl, parseRepo, repoName } from "../src/git/
 import { bookmarkList, CLONE_TIMEOUT_FACTOR, cloneColocated, fetch, git, GitError, initColocated, jj, JjError, push, remoteAdd, remoteList, track } from "../src/jj";
 import { shortId } from "../src/pool/identity";
 import type { PeerStream, PoolNet } from "../src/pool/net";
-import { pushBookmark } from "../src/projects/replicas";
 import { repoKey, serialised } from "../src/serial";
 import { twoPoolNodes, type GitPoolNode } from "./pool-helpers";
 
@@ -351,10 +350,10 @@ test("a fetch or push whose peer never answers times out, takes its git processe
     const bookmark = "meddle/task/t1/p";
 
     let started = Date.now();
-    await expect(pushBookmark(cfg, repo, A.id, bookmark, "@"))
+    await expect(serialised(repoKey(repo), () => fetch(repo, shortA, [`exact:${bookmark}`], cfg)))
       .rejects.toThrow(`jj git fetch --remote ${shortA} --branch exact:${bookmark} timed out after 1000 ms`);
     expect(Date.now() - started).toBeLessThan(5_000);
-    // The lock pushBookmark held is free again.
+    // The lock the fetch ran under is free again.
     expect(await serialised(repoKey(repo), async () => "free")).toBe("free");
     // The remote helper went with jj: its stream to A ends.
     const ended = await Promise.race([

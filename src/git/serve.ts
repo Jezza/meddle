@@ -60,11 +60,12 @@ function gitDirOf(repo: string): string | null {
 }
 
 /**
- * The working copy of a repo this node holds: a project's replica (a project row) or a memory replica
- * (`<data>/memory/<id>`), when it is a git-backed repo; otherwise null.
+ * The working copy of a repo this node holds: a project's replica (a project row), a memory replica
+ * (`<data>/memory/<id>`) or the profile (`<data>/profile`), when it is a git-backed repo; otherwise null.
  */
 export function repoPath(db: Database, cfg: NodeConfig, repo: Repo): string | null {
-  const path = repo.kind === "project" ? getProject(db, repo.id)?.replica ?? null : paths(cfg).memory(repo.id);
+  const path = repo.kind === "project" ? getProject(db, repo.id)?.replica ?? null
+    : repo.kind === "profile" ? paths(cfg).profile : paths(cfg).memory(repo.id);
   return path !== null && gitDirOf(path) !== null ? path : null;
 }
 
@@ -253,8 +254,9 @@ async function serve(s: PeerStream, deps: GitServeDeps): Promise<void> {
   }
   // A checkout here is served a project as its view; anything else (a peer's stream) the repo itself.
   const project = local && request.repo.kind === "project" ? request.repo.id : null;
-  // A peer writes nothing to a project repo: its lines and branches travel as rows, their commits fetched by id.
-  if (!local && request.repo.kind === "project" && request.service === "receive-pack") {
+  // A peer writes nothing to a project repo or the profile: lines, branches and heads travel as rows, their commits
+  // fetched by id.
+  if (!local && request.repo.kind !== "memory" && request.service === "receive-pack") {
     deps.log?.(`meddle: git: ${shortId(s.peerId)} may not push to ${repoName(request.repo)}`);
     return refuse(s);
   }

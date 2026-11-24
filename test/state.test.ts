@@ -16,7 +16,6 @@ import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { paths, type NodeConfig } from "../src/config";
 import { commitOf, jj } from "../src/jj";
-import { syncMemoryAfter, syncMemoryBefore } from "../src/projects/memory-sync";
 import { ensureServiceRepo } from "../src/projects/replicas";
 import { listTokens } from "../src/token";
 import { defaultBranchCommit } from "../src/projects/starts";
@@ -889,8 +888,8 @@ test("a changed base reaches the caller as changed:, and a delete takes the file
   }
 }, 15_000);
 
-test("the home follows a peer's push of memory onto disk while no task of the project is live there", async () => {
-  const { A, B, close } = await twoPoolNodes();
+test("a peer's memory reaches this node's disk, and memoryHead says where it is", async () => {
+  const { A, B, close } = await twoPoolNodes({ nodes: [{ scopeSync: true }, { scopeSync: true }] });
   const { client, close: closeClient } = linkClient(A.host);
   try {
     await peerReady(B, A);
@@ -900,15 +899,17 @@ test("the home follows a peer's push of memory onto disk while no task of the pr
     const memB = paths(B.cfg).memory(id);
     const view = await client.get(ProjectObject, { id });
     await view.writeMemory({ path: "MEMORY.md", text: "- base\n", base: null });
-    await syncMemoryBefore({ cfg: B.cfg, db: B.db, pool: B.pool }, id, false);
     const before = view.memoryHead.value;
 
     await writeFile(`${memB}/NOTES.md`, "- from b\n");
-    await syncMemoryAfter({ cfg: B.cfg, db: B.db, pool: B.pool }, id, false);
-    const fromB = (await jj(["--ignore-working-copy", "log", "-r", "@-", "--no-graph", "-T", "change_id"], memB, B.cfg)).trim();
-    // The push moved A's `memory`; A's working copy follows it, and `memoryHead` says where both are.
-    const at = await headAt(A.cfg, id, fromB);
-    expect(await until(view.memoryHead, (head) => head === at)).toBe(at);
+    // A's working copy takes B's head, and `memoryHead` says where it is.
+    for (const end = Date.now() + 20_000; !(await Bun.file(`${memA}/NOTES.md`).exists());) {
+      if (Date.now() > end) throw new Error("NOTES.md never reached A");
+      await Bun.sleep(50);
+    }
+    const head = (await jj(["--ignore-working-copy", "log", "-r", "memory", "--no-graph", "-T", "change_id"], memA, A.cfg)).trim();
+    const at = await headAt(A.cfg, id, head);
+    expect(await until(view.memoryHead, (h) => h === at)).toBe(at);
     expect(at).not.toBe(before);
     expect(await Bun.file(`${memA}/NOTES.md`).text()).toBe("- from b\n");
     expect((await view.memoryEntries({})).map((e) => e.path)).toEqual(["MEMORY.md", "NOTES.md"]);
@@ -917,7 +918,7 @@ test("the home follows a peer's push of memory onto disk while no task of the pr
     await closeClient();
     await close();
   }
-}, 20_000);
+}, 30_000);
 
 test("while an update awaits confirmation, a project's memory is not written, and still reads", async () => {
   let held: string | null = null;

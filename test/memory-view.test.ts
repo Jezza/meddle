@@ -92,6 +92,18 @@ test("memoryHistory names who changed memory", async () => {
   }
 });
 
+test("a change naming several tasks is the first task's", async () => {
+  const { cfg, repo, commit, close } = await memoryRepo();
+  try {
+    await writeFile(`${repo}/MEMORY.md`, "- one\n");
+    await commit("memory from abc123: task t1, t2");
+    const [c] = await memoryHistory(cfg, repo, { limit: 1 });
+    expect(c).toMatchObject({ kind: "task", node: "abc123", task: "t1" });
+  } finally {
+    await close();
+  }
+});
+
 test("memoryFile and memoryDiff read a change", async () => {
   const { cfg, repo, commit, close } = await memoryRepo();
   try {

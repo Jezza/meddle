@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter } from "node:path";
 import { paths } from "../src/config";
 import { startDashboard } from "../src/dashboard/server";
@@ -1098,3 +1098,28 @@ test("project remove removes and prints the project", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 }, 120_000);
+
+test("profile import makes a directory the pool's profile and prints the commit", async () => {
+  const dir = await mkdtemp("/tmp/meddle-cli-");
+  await mkdir(`${dir}/t`, { recursive: true });
+  await mkdir(`${dir}/src/skills/babysit`, { recursive: true });
+  await writeFile(`${dir}/src/CLAUDE.md`, "imported rules\n");
+  await writeFile(`${dir}/src/skills/babysit/SKILL.md`, "babysit\n");
+  const base = {
+    HOME: dir, MEDDLE_DATA_DIR: `${dir}/d`, MEDDLE_TASK_ROOT: `${dir}/t`, MEDDLE_CLAUDE_PATH: replay, MEDDLE_CLAUDE_RUNTIME: "bun",
+    MEDDLE_FIXTURE: `${import.meta.dir}/fixtures/hello.jsonl`, ...POOL_ENV,
+  };
+  const node = await startServe({ ...base, MEDDLE_PORT: "0" });
+  const client = { ...base, MEDDLE_PORT: String(node.port) };
+  try {
+    const out = await meddle(["profile", "import", `${dir}/src`], client);
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    expect(out.stdout).toMatch(/^imported [0-9a-f]{12}\n$/);
+    expect(await readFile(`${dir}/d/profile/CLAUDE.md`, "utf8")).toBe("imported rules\n");
+    expect(await readFile(`${dir}/d/profile/skills/babysit/SKILL.md`, "utf8")).toBe("babysit\n");
+  } finally {
+    await node.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 60_000);

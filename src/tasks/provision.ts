@@ -10,6 +10,7 @@ import {
 } from "../jj";
 import { ensurePlugins, linkProfile, seedProfile } from "../profile";
 import { ensureMemoryReplica, linkMemory } from "../memory";
+import { prepareScopeRepo } from "../scopes/repo";
 import { contextTextAt } from "../projects/context";
 import { getProject, type Project } from "../projects/project";
 import { getTask, insertTask } from "../store/records";
@@ -230,8 +231,8 @@ export async function provisionTask(
     if (start.parents?.length === 0) throw new Error("a start has no parents");
     if (start.parents !== undefined && start.mode === "edit") throw new Error("a start on several parents is a child start");
   }
-  await seedProfile(cfg);
   await ensurePlugins(cfg);
+  await seedProfile(cfg);
 
   const p = paths(cfg);
   const task = p.task(id);
@@ -268,6 +269,7 @@ export async function provisionTask(
     const primary = projects[0];
     if (primary !== undefined) {
       await ensureMemoryReplica(cfg, primary.id);
+      await prepareScopeRepo(cfg, paths(cfg).memory(primary.id), { kind: "memory", projectId: primary.id });
       await linkMemory(configDir, cfg, primary.id);
     }
     const manifest: TaskManifest = {
@@ -381,8 +383,8 @@ export async function provisionFromManifest(
     if (parents[entry.id] === undefined) throw new Error(`no parent for project ${entry.id}`);
     projects.push({ ...project, name: entry.name });
   }
-  await seedProfile(cfg);
   await ensurePlugins(cfg);
+  await seedProfile(cfg);
 
   const p = paths(cfg);
   const task = p.task(id);
@@ -416,6 +418,7 @@ export async function provisionFromManifest(
     await linkProfile(configDir, cfg);
     if (manifest.primaryProjectId !== null) {
       await ensureMemoryReplica(cfg, manifest.primaryProjectId);
+      await prepareScopeRepo(cfg, paths(cfg).memory(manifest.primaryProjectId), { kind: "memory", projectId: manifest.primaryProjectId });
       await linkMemory(configDir, cfg, manifest.primaryProjectId);
     }
     const received: TaskManifest = { ...manifest, projects: entries };

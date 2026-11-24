@@ -29,7 +29,7 @@ import type { PoolRuntime } from "../pool/runtime";
 import { Messenger } from "./messenger";
 import { applyProject } from "../projects/applier";
 import { loadProjectSettings, parseContext, withTaskRules } from "../projects/context";
-import { syncMemoryAfter, syncMemoryBefore } from "../projects/memory-sync";
+import type { ScopeSync } from "../scopes/sync";
 import type { StreamReader } from "../pool/frames";
 import { getProject, listProjects, type Project } from "../projects/project";
 import { defaultBranchCommit } from "../projects/starts";
@@ -330,10 +330,13 @@ export class TaskRunner {
   #sessionStore: SqliteSessionStore;
   #live = new Map<string, LiveTurn>();
   /**
-   * The primary project of each task whose turn is live, from its start (memory sync included) to the end of its
-   * `finish` (memory sync included), so whether a project is live here needs no manifest.
+   * The primary project of each task whose turn is live, from its start to the end of its `finish`, so whether a project
+   * is live here needs no manifest.
    */
   #primaries = new Map<string, string>();
+  #scopeSync: ScopeSync | null = null;
+  /** The tasks whose memory was brought in step before a first turn here (in this process). */
+  #memorySynced = new Set<string>();
   #pool: PoolRuntime | undefined;
   #log: (line: string) => void;
   /** Tasks whose new `meddle.turn` is being created or has not started running yet. */
@@ -1403,12 +1406,15 @@ export class TaskRunner {
         this.#log(`meddle: task ${taskId}: CLAUDE.md was not refreshed: ${messageOf(err)}`);
       });
       const primary = manifest.primaryProjectId;
-      const deps = this.#replicaDeps();
       // A task without a project has no memory to sync.
-      if (deps !== null && primary !== null) {
-        const live = this.#projectLiveElsewhere(taskId, primary);
+      if (primary !== null) {
         this.#primaries.set(taskId, primary);
-        await syncMemoryBefore(deps, primary, live, this.#log);
+        // The memory in step with the pool before the task's first turn here (a new task, one moved in): later turns
+        // find it kept in step by the scope sync. Not under any lock; a failure is logged by the sync.
+        if (this.#scopeSync !== null && !this.#memorySynced.has(taskId)) {
+          this.#memorySynced.add(taskId);
+          await this.#scopeSync.syncNow({ kind: "memory", projectId: primary });
+        }
       }
       // Resume only a session whose transcript Claude Code wrote, not one a turn merely set out to create.
       const resume = started && existsSync(transcriptPath(this.#cfg, manifest));
@@ -1546,24 +1552,26 @@ export class TaskRunner {
       }
       const primary = manifest.primaryProjectId;
       if (primary === null) return; // no project: no bookmarks moved, no memory
-      const live = this.#projectLiveElsewhere(taskId, primary);
-      // Decided and dropped in one go: of two tasks ending together, the second then sees the first gone and syncs.
-      // A task that syncs stays live for others until its sync is done, so a turn starting meanwhile defers its own.
-      if (live) this.#primaries.delete(taskId);
-      await syncMemoryAfter(deps, primary, live, this.#log, taskId);
+      // What the turn wrote, committed under its task's name and published.
+      this.#scopeSync?.touched({ kind: "memory", projectId: primary }, taskId);
     } finally {
       this.#primaries.delete(taskId);
     }
   }
 
-  /** Whether any task whose primary project is `projectId` has a turn live (or syncing) here. */
+  /** Whether any task whose primary project is `projectId` has a turn live here. */
   projectLive(projectId: string): boolean {
     return [...this.#primaries.values()].includes(projectId);
   }
 
-  /** Whether a task other than `taskId` whose primary project is `projectId` has a turn live (or syncing) here. */
-  #projectLiveElsewhere(taskId: string, projectId: string): boolean {
-    return [...this.#primaries].some(([id, p]) => id !== taskId && p === projectId);
+  /** The tasks whose primary project is `projectId` with a turn live here: what a memory commit names. */
+  liveTasks(projectId: string): string[] {
+    return [...this.#primaries].filter(([, p]) => p === projectId).map(([id]) => id);
+  }
+
+  /** The node's scope sync: turn ends ask it to commit and publish the memory they wrote. */
+  setScopeSync(sync: ScopeSync | null): void {
+    this.#scopeSync = sync;
   }
 
   /** Points each of the task's project bookmarks at its workspace's working-copy change. */

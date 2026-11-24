@@ -48,3 +48,12 @@ export async function writeHelperWrapper(cfg: NodeConfig): Promise<string> {
 export async function writePreReceiveHook(cfg: NodeConfig): Promise<string> {
   return writeScript(paths(cfg).hookPreReceive, `#!/bin/sh\n# Written by meddle: the gate of a push to this node.\nexec ${meddleCommand("pre-receive.ts")} git-pre-receive\n`);
 }
+
+/**
+ * Writes `<data>/bin/meddle-merge-driver`: a `#!/bin/sh` script that execs this meddle (this bun and the checkout's
+ * `src/scopes/merge-driver-main.ts`, or the compiled binary itself) with `merge-driver "$@"`, git's merge driver for the
+ * repos of synced scopes (`%O %A %B %P`). Rewritten only when its content changed.
+ */
+export async function writeMergeDriver(cfg: NodeConfig): Promise<string> {
+  return writeScript(paths(cfg).binMergeDriver, `#!/bin/sh\n# Written by meddle: the merge driver of synced files.\nexec ${meddleCommand("../scopes/merge-driver-main.ts")} merge-driver "$@"\n`);
+}

@@ -200,7 +200,8 @@ function parseChange(line: string): MemoryChange {
 
 /** Who a change's description says made it. */
 function author(description: string): Pick<MemoryChange, "kind" | "node" | "task"> {
-  let m = /^memory from (\S+): task (\S+)$/.exec(description);
+  // A commit made while several tasks of the project were live names them all: it is the first's (the turn that ended).
+  let m = /^memory from (\S+): task ([^\s,]+)(?:, [^\s,]+)*$/.exec(description);
   if (m) return { kind: "task", node: m[1]!, task: m[2]! };
   m = /^memory from (\S+)$/.exec(description);
   if (m) return { kind: "node", node: m[1]!, task: null };

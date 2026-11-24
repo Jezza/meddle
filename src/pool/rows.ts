@@ -450,10 +450,11 @@ export function writeBranchRow(db: Database, selfId: string, row: Omit<BranchRow
   return written;
 }
 
-/** Deletes every row of `projectId` (its line rows, branch rows and waiting branch rows) in one transaction, and tells `rowChanges`. */
+/** Deletes every row of `projectId` (its line rows, branch rows, waiting branch rows and its memory's head rows) in one transaction, and tells `rowChanges`. */
 export function deleteProjectRows(db: Database, projectId: string): void {
   db.transaction(() => {
     for (const table of ["line_rows", "branch_rows", "branch_rows_waiting"]) db.query(`DELETE FROM ${table} WHERE project = ?`).run(projectId);
+    for (const table of ["scope_heads", "scope_heads_waiting"]) db.query(`DELETE FROM ${table} WHERE scope = ?`).run(`memory/${projectId}`);
   }).immediate();
   changed([projectId]);
 }

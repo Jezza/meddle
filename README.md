@@ -44,8 +44,8 @@ bun run src/cli.ts config set jj.email you@example.com
 ```
 
 Every node of the pool then runs jj and every task with that identity. Without one (neither the pool setting nor a
-jj user config on the node) jj refuses to push the commits it makes, so the node's memory syncs to a project's home
-fail and each turn end logs a `meddle: git: …` line saying so (see [Memory](#memory)).
+jj user config on the node) jj refuses to commit, so the node's memory and profile do not sync and each pass logs a
+`meddle: memory of …` or `meddle: profile: …` line saying so (see [Memory and the profile](#memory-and-the-profile)).
 
 The commands below run from the checkout as `bun run src/cli.ts <command>`; `bin/meddle` runs the same CLI from
 anywhere once linked onto your `PATH` (`ln -s $PWD/bin/meddle ~/.local/bin/meddle`). `meddle help` lists every command with
@@ -568,8 +568,8 @@ colocated with git), and applies all of the project's rows to it; the node a pro
 task's work outlives the machine it ran on. The project's home is only where it was added and its id was made; adding
 the same folder or URL on two nodes makes two projects. A node that hears of a project it has no service repo of
 (from the roster, a row, or `task new --project <id>`) makes an empty one and fetches what the rows name from any
-member that has it, so no particular node needs to be online. It clones the project's memory from its home into
-`<data dir>/memory/<id>` (see [Memory](#memory)).
+member that has it, so no particular node needs to be online. It makes the project's memory repo,
+`<data dir>/memory/<id>`, and fills it from the pool (see [Memory and the profile](#memory-and-the-profile)).
 
 How rows become refs in a service repo:
 
@@ -1062,31 +1062,45 @@ the pool together:
    before. Until a member has started on the new meddle, the pool still lists its old projects, and adding a project
    of the same name is refused as ambiguous; `meddle pool remove` any member you won't bring back.
 
-### Memory
+### Memory and the profile
 
-Each project has a memory repo on every node that holds it, `<data dir>/memory/<project id>`, shared under the
-`memory` bookmark. It is the memory directory of every task whose primary project it is (linked into the task's
-Claude Code config). A folder project's starts from the memory Claude Code already keeps for that folder, if any.
+Each project's memory and the pool's profile are kept the same on every node, continuously, with no home: a change
+leaves its node seconds after it is written, and an offline node catches up when it is back.
 
-The memory of a task's primary project is synced around each of its turns, on every node, except while another task
-whose primary project is the same has a turn running on this node (a task that only uses the project as a second
-project does not count): its session is reading and writing the same files, so the sync waits for the last of them
-to end.
+- **Memory.** Each project has a memory repo on every node that holds it, `<data dir>/memory/<project id>`. It is the
+  memory directory of every task whose primary project it is (linked into the task's Claude Code config). A folder
+  project's starts from the memory Claude Code already keeps for that folder, if any.
+- **The profile.** `<data dir>/profile` holds `CLAUDE.md`, `settings.json`, `skills`, `agents`, `commands`, `hooks`
+  and `plugins.json`, linked into every task's Claude Code config as its user layer. `skills/synced`, Claude Code's
+  own copy of the claude.ai account's skills, is never part of it. A new node seeds it from its `~/.claude` and takes
+  the pool's as soon as it hears of one; a profile an older meddle seeded stays this node's alone until
+  `meddle profile import [<dir>]`, run on one node, makes a directory laid out like `~/.claude` (that node's own
+  profile when none is given) the pool's.
 
-- Before a turn: a node that is not the home fetches `memory` from the home, and the memory repo's working copy is
-  rebased onto `memory` when it is not already on it.
-- After every completed turn: what the turn wrote is committed as `memory from <short id>`, `memory` moves onto it
-  (rebased first when `memory` has moved meanwhile), and a node that is not the home pushes it to the home. A turn
-  that ends while another such task is still running leaves this to that task's turn end, which commits what both
-  wrote.
+How it works: each node commits what is written into its copy (`memory from <short id>: task <id>`, `profile from
+<short id>`, `memory: dashboard`), publishes the commit it is at as a head row in pool sync, fetches every other
+node's from whichever member has it, and merges them. Merges are meddle's own and the same on every node, so every
+node settles on the same commit:
 
-A conflict between two nodes' edits stays in the files as jj's conflict markers, for a later session to tidy. jj
-will not push a commit with conflicts, so until then this node's memory does not reach the home (each turn end logs
-why); the turn end after the tidy-up folds it into the conflicted commit, which then pushes as usual. A
-`memory` bookmark that is itself conflicted takes the home's when the home's is clean, and otherwise one of its own
-targets, logged as `meddle: git: memory of <short id> had a conflicted bookmark; resolved to <change>`. A sync that
-fails is logged as `meddle: git: memory of <short id> was not synced before the turn: …` (or `after`) and the turn
-goes ahead; the next turn tries again.
+- markdown and text merge by line: both sides' lines are kept where both changed the same place, and no line is
+  kept more often than the side that has it most;
+- `settings.json` (any JSON) merges key by key and is always valid JSON;
+- any other file is taken whole, the higher node id's when both changed it (the other stays in history);
+- an edit beats a delete.
+
+Nothing writes conflict markers into a file, and no sync waits for a task to finish. A Claude that read a file before
+a change landed and writes after it gets Claude Code's own "modified since read" refusal and reads again; a write
+through Bash skips that check and can undo a change that landed meanwhile (the undone version stays in history).
+History can drop a node's intermediate versions when two nodes reached the same files by different routes (the
+lower commit is kept; the other stays in git). A failure is logged as `meddle: memory of <short id>: …` or
+`meddle: profile: …` and the next pass tries again; `meddle status` and the node's page say what is not in step.
+
+**Plugins.** `<data dir>/plugins` is meddle's own copy of `~/.claude/plugins` (made on the first start; a link an
+older meddle made is replaced by a copy). The plugin files are not synced, the list is: `plugins.json` names the
+plugins the pool wants and their marketplaces; each node writes into it only what was installed, removed or upgraded
+on it, and brings its own directory to the list with Claude Code's `plugin` commands (a newer listed version
+upgrades, nothing downgrades). A plugin installed in a terminal Claude no longer reaches meddle's tasks; one
+installed in a task reaches every node.
 
 ### `meddle://` remotes
 
@@ -1130,10 +1144,12 @@ repo <repo>`.
   peer it can reach (5 s at most). Its push meets the `pre-receive` hook, which admits or refuses the whole push as
   [Checkouts](#checkouts) and [Branches](#branches) say, before anything lands; what it changed is recorded as this
   node's branch rows.
-- **A peer** is served the repo itself: it fetches a project's commits by id. It never pushes to a project repo
-  (refused, logged `meddle: git: <short id> may not push to project/<id>`): lines and branches travel as rows. It
-  pushes only the `memory` bookmark to a memory repo, under the same `pre-receive` hook, which refuses its deletion
-  (`deleting <ref> is not accepted here`) and every other ref (`ref <ref> is not accepted here`).
+- **A peer** is served the repo itself: it fetches a project's, a memory repo's or the profile's
+  (`meddle://<node id>/profile/pool`) commits by id. It never pushes to a project repo or the profile (refused, logged
+  `meddle: git: <short id> may not push to project/<id>`): lines, branches and heads travel as rows. Only a node of an
+  older meddle still pushes, the `memory` bookmark to a memory repo, under the same `pre-receive` hook, which refuses
+  its deletion (`deleting <ref> is not accepted here`) and every other ref (`ref <ref> is not accepted here`); the next
+  sync folds what it pushed in.
 
 While the hook is missing or cannot run, the node refuses every push, logging `meddle: git: pre-receive hook missing;
 refusing receive-pack`; `serve` writes it again at start.
@@ -1173,8 +1189,8 @@ too, as is one whose turn is parked (retry it first). The dashboard offers only 
 
 The transfer is checked: the target answers with its counts and a SHA-256 over everything it received, and a
 mismatch fails the move. What does not travel: background shells and subagents (see "Move now" below); the rest of
-the task's Claude Code config dir, which the target sets up as for a new task; and memory, which the target syncs
-with the project's home around the task's turns there, as for any task. The target takes the task's lines over (one
+the task's Claude Code config dir, which the target sets up as for a new task; and memory, which the target brings in
+step with the pool before the task's first turn there. The target takes the task's lines over (one
 epoch up) when it activates the task, not before: until then the move can still roll back, and this node then writes
 the lines again above any epoch the target could have written.
 
@@ -1320,11 +1336,10 @@ other node is asked anything.
 - The lighthouse cannot admit anyone, but it chooses whom a node dials and with what address: one that lies can keep
   a node from reaching members it is not already connected to, and learns which nodes hold the secret, since the
   dialer's proof goes first.
-- A project's memory stays with its home, which cannot be moved to another node yet. While the home is offline, other
-  nodes' memory syncs are logged and retried at the next turn end; their tasks' turns still run.
-- When a node's last push of a project's memory to the home failed, the memory commits it has not pushed do not
-  travel with a task that moves away: the target syncs memory from the home. They stay in this node's memory repo
-  and reach the home only with a later turn of that project here.
+- A memory or profile change made on a node that then goes offline before any other node fetched it reaches the
+  pool only when that node is back.
+- Nodes merge memory and the profile only with peers on the same merge rules: during a pool update that changes them,
+  a node of the other build's changes wait (`meddle status`: `other merge rules`) until the rollout is done.
 - A node whose Claude Code version is `unknown` (an older meddle served from its compiled binary) cannot move tasks,
   either away or to it.
 - The single binary runs on one platform; each platform needs its own build. It downloads Claude Code (about 140 MB)
@@ -1343,7 +1358,7 @@ other node is asked anything.
   `meddle service install` on each node.
 - The commits meddle makes no longer need a jj user config on each node: the pool's `jj.user` and `jj.email` settings
   give every node one identity (see [Install](#install)). Without them, and without a node's own config, jj refuses to
-  push the commits that node makes, so its memory syncs to a project's home fail.
+  commit, so that node's memory and profile do not sync.
 - A side bookmark whose name git can't hold as one ref component (a slash after the project name, say) is neither
   applied on other nodes nor shown to checkouts.
 - Nothing prevents conflicts on a shared branch: without a machine that is always on, it can't be done. Pushes that

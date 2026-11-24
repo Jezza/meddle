@@ -11,6 +11,7 @@
 //   once its commit is here, and `HEAD` on the default branch.
 import type { NodeConfig } from "../config";
 import { bookmarkRefs, git, GitError, gitImport, isJjRepo, jj, jjEnv, networkMs } from "../jj";
+import type { Repo } from "../git/wire";
 import { shortId } from "../pool/ids";
 import { isRemoved, removedIds } from "../pool/removed";
 import { dedupe } from "../pool/report";
@@ -143,11 +144,11 @@ function within<T>(work: Promise<T>, deadline: number, fallback: () => T): Promi
 }
 
 /**
- * Fetches `commit` into `repo` as `refs/meddle/fetched/<commit>`, from the first of `sources` that has it, each fetch
+ * Fetches `commit` into `repo` as `refs/meddle/fetched/<commit>`, from repo `remote` of the first of `sources` that has it, each fetch
  * limited to the time left before `deadline`. False when none gave it (or the time ran out). A caller that joins a
  * fetch already in flight waits for it only until its own `deadline`.
  */
-function fetchCommit(deps: ReplicaDeps, repo: string, projectId: string, commit: string, sources: string[], deadline: number): Promise<boolean> {
+export function fetchCommit(deps: ReplicaDeps, repo: string, remote: Repo, commit: string, sources: string[], deadline: number): Promise<boolean> {
   const key = `${repo}\0${commit}`;
   const running = inflight.get(key);
   if (running !== undefined) return within(running, deadline, () => false);
@@ -157,7 +158,7 @@ function fetchCommit(deps: ReplicaDeps, repo: string, projectId: string, commit:
       if (left <= 0) return false;
       try {
         await git(
-          ["fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance", meddleUrl(peer, { kind: "project", id: projectId }), `${commit}:${FETCHED}${commit}`],
+          ["fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance", meddleUrl(peer, remote), `${commit}:${FETCHED}${commit}`],
           repo, deps.cfg, { timeoutMs: Math.min(networkMs(deps.cfg), left) },
         );
         return true;
@@ -172,7 +173,7 @@ function fetchCommit(deps: ReplicaDeps, repo: string, projectId: string, commit:
 }
 
 /** The online members other than this node: the row's writers first, then the rest. */
-function sourcesFor(deps: ReplicaDeps, writers: Set<string>): string[] {
+export function sourcesFor(deps: ReplicaDeps, writers: Set<string>): string[] {
   const { pool } = deps;
   const usable = (id: string) => id !== pool.identity.id && pool.net.isOnline(id);
   const rest = pool.store.members().map((m) => m.nodeId).filter((id) => !writers.has(id));
@@ -190,7 +191,7 @@ async function fetchMissing(deps: ReplicaDeps, project: Project, deadline: numbe
     // An earlier fetch may have brought it along (a base below its line).
     if ((await present(deps.cfg, repo, [commit])).has(commit)) continue;
     if (Date.now() >= deadline) break;
-    if (await fetchCommit(deps, repo, project.id, commit, sourcesFor(deps, writers), deadline)) fetched.push(commit);
+    if (await fetchCommit(deps, repo, { kind: "project", id: project.id }, commit, sourcesFor(deps, writers), deadline)) fetched.push(commit);
   }
   return fetched;
 }

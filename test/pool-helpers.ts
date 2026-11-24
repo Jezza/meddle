@@ -16,6 +16,7 @@ import type { LinkTap } from "../src/pool/link";
 import { PoolNet, fromEndpoint, openEndpoint, toEndpointAddr, type NetDeps } from "../src/pool/net";
 import { servePool, type PoolObjectDeps } from "../src/pool/object";
 import { serveRemovedProjects } from "../src/pool/removed-object";
+import { serveScopeHeads } from "../src/pool/heads-object";
 import { DEFAULT_POOL_NAME, poolKey, proofFor, verifyProof, type PoolKey } from "../src/pool/secret";
 import { PoolStore, type NodeSummary } from "../src/pool/store";
 import { startPool, type PoolSummaryDeps } from "../src/pool/runtime";
@@ -24,6 +25,8 @@ import { PoolSettings } from "../src/pool/settings";
 import { PoolSync, acceptPeerLinks } from "../src/pool/sync";
 import { PeerObject } from "../src/state/contracts";
 import { createNodeHost } from "../src/state/host";
+import { startScopeSync } from "../src/scopes/sync";
+import { profileHooks } from "../src/profile";
 import { openDb } from "../src/store/db";
 import { listProjects } from "../src/projects/project";
 import { countRunningTasks, listLiveTasks } from "../src/store/records";
@@ -182,6 +185,7 @@ async function poolNode(
   const host = createHost({ name: "node", self: "node", onError });
   servePool(host, deps);
   if (serveRemoved) serveRemovedProjects(host, { db, remove: async () => notInThisTest() });
+  if (serveRemoved) serveScopeHeads(host, { db });
   let stopAccepting = () => {};
   const serve = () => {
     stopAccepting();
@@ -332,7 +336,7 @@ export function poolSummaryOf(cfg: NodeConfig, db: Database): PoolSummaryDeps {
  */
 export async function startPoolNode(
   fixture?: string, extraEnv: Record<string, string> = {},
-  options: { token?: string | null; secret?: string | null; inputHold?: () => string | null } = {},
+  options: { token?: string | null; secret?: string | null; inputHold?: () => string | null; scopeSync?: boolean } = {},
 ) {
   /** The lines the runtime and the runner logged (instead of printing them). */
   const logs: string[] = [];
@@ -350,13 +354,20 @@ export async function startPoolNode(
   /** Everything the runtime's net and sync reported. */
   const errors: unknown[] = [];
   const pool = await startPool(cfg, db, poolSummaryOf(cfg, db), { onError: (err) => errors.push(err), log: (line) => logs.push(line) });
+  // As `serve` wires it, when asked: the profile and every project's memory kept in step with the pool.
+  const scopeSync = options.scopeSync === true
+    ? startScopeSync({ cfg, db, pool, liveTasks: (projectId) => runner.liveTasks(projectId), log: (line) => logs.push(line), quietMs: 200, profile: profileHooks(cfg) })
+    : null;
+  runner.setScopeSync(scopeSync);
   const host = createNodeHost({
     cfg, db, runner, metrics, claudeCodeVersion: claudeCodeVersion(), pool, ...(options.inputHold === undefined ? {} : { inputHold: options.inputHold }),
+    ...(scopeSync === null ? {} : { scopeSync }),
   });
   return {
-    ...node, metrics, pool, host, errors, logs, hooks,
+    ...node, metrics, pool, host, errors, logs, hooks, scopeSync,
     id: pool.identity.id, identity: pool.identity, store: pool.store, net: pool.net,
     async close() {
+      scopeSync?.stop();
       metrics.stop();
       runner.close();
       await pool.stop();
@@ -381,7 +392,7 @@ export type GitPoolNode = Awaited<ReturnType<typeof startPoolNode>>;
  * What one node of `poolNodes` runs its turns with, on top of the options for all; `serveGit: false` leaves its `git`
  * streams to the test (no `acceptGitStreams`); `token` is `startPoolNode`'s (default `"tok"`, `null` for none).
  */
-export type NodeOptions = { fixture?: string; extraEnv?: Record<string, string>; serveGit?: boolean; token?: string | null };
+export type NodeOptions = { fixture?: string; extraEnv?: Record<string, string>; serveGit?: boolean; token?: string | null; scopeSync?: boolean };
 
 /** Gives each of the two nodes the other as a member with its address, so that they connect (no lighthouse needed). */
 export async function linkNodes(a: GitPoolNode, b: GitPoolNode): Promise<void> {
@@ -412,7 +423,9 @@ export async function poolNodes(
   try {
     for (let i = 0; i < count; i++) {
       const own = options.nodes?.[i] ?? {};
-      const node = await startPoolNode(own.fixture, { ...options.extraEnv, ...own.extraEnv }, own.token === undefined ? {} : { token: own.token });
+      const node = await startPoolNode(own.fixture, { ...options.extraEnv, ...own.extraEnv }, {
+        ...(own.token === undefined ? {} : { token: own.token }), ...(own.scopeSync === undefined ? {} : { scopeSync: own.scopeSync }),
+      });
       nodes.push(node);
       await writeHelperWrapper(node.cfg);
       await writePreReceiveHook(node.cfg);

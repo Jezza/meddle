@@ -22,7 +22,6 @@ import { readFile, writeFile } from "node:fs/promises";
 import { paths } from "../src/config";
 import { bookmarkList, jj } from "../src/jj";
 import { getProject } from "../src/projects/project";
-import { syncMemoryBefore } from "../src/projects/memory-sync";
 import { applyProject } from "../src/projects/applier";
 
 type Node = Awaited<ReturnType<typeof startPoolNode>>;
@@ -600,7 +599,7 @@ test("peerRef rejects for a node this node is not connected to", async () => {
 }, 15_000);
 
 test("a task created for a project a node has never seen gets a service repo, starts on the default branch as its rows have it, and its turn reaches the home", async () => {
-  const { A, B, close } = await twoPoolNodes({ extraEnv: { MEDDLE_FIXTURE_MEMORY: "1" } });
+  const { A, B, close } = await twoPoolNodes({ extraEnv: { MEDDLE_FIXTURE_MEMORY: "1" }, nodes: [{ scopeSync: true }, { scopeSync: true }] });
   const linked = linkClient(B.host);
   try {
     const id = A.project.id;
@@ -641,10 +640,13 @@ test("a task created for a project a node has never seen gets a service repo, st
     expect(onA?.changeId).toBe(change);
     expect(B.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
 
-    // A's next sync before a turn brings B's memory line into A's working copy.
-    await syncMemoryBefore({ cfg: A.cfg, db: A.db, pool: A.pool }, id, false, (line) => A.logs.push(line));
-    expect(await readFile(`${paths(A.cfg).memory(id)}/MEMORY.md`, "utf8")).toContain("remember this from b");
-    expect(A.logs.filter((l) => l.startsWith("meddle: git:"))).toEqual([]);
+    // B's turn end published its memory line; A's scope sync brings it into A's working copy.
+    const memoryA = () => readFile(`${paths(A.cfg).memory(id)}/MEMORY.md`, "utf8").catch(() => "");
+    for (const end = Date.now() + 20_000; !(await memoryA()).includes("remember this from b");) {
+      if (Date.now() > end) throw new Error(`A's memory never got B's line: ${JSON.stringify(await memoryA())}`);
+      await Bun.sleep(50);
+    }
+    expect(A.logs.filter((l) => l.startsWith("meddle: git:") || l.startsWith("meddle: memory"))).toEqual([]);
   } finally {
     await linked.close();
     await close();

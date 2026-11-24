@@ -415,11 +415,10 @@ export const ProjectObject = remote("meddle.project", {
          */
         resolve: method(Type.Object({ rev: Type.String() }), GraphCommitSchema),
         /**
-         * Writes (`deleteMemory`: deletes) a memory file on the project's home and commits just it to `memory`; `base`
-         * is the `hash` it was read with (null: it was absent). Answers the change `memory` is on after it (where it
-         * was when that left the file as it was). Refused with a reason (as `remoteReason` reads it) starting with why:
-         * `changed:` (the file is not `base` any more), `busy:` (a turn of the project is live and its memory is
-         * behind), `path:`, `not-home:` or `no-repo:`; any other failure as it is.
+         * Writes (`deleteMemory`: deletes) a memory file here (any node holding the project) and commits just it to
+         * `memory`, which the scope sync then publishes; `base` is the `hash` it was read with (null: it was absent).
+         * Answers the change `memory` is on after it. Refused with a reason (as `remoteReason` reads it) starting with
+         * why: `changed:` (the file is not `base` any more), `path:` or `no-repo:`; any other failure as it is.
          */
         writeMemory: method(Type.Object({ path: Type.String(), text: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
         deleteMemory: method(Type.Object({ path: Type.String(), base: Nullable(Type.String()) }), Type.Object({ change: Type.String() })),
@@ -1231,6 +1230,75 @@ export const UpdateObject = remote("meddle.update", {
           }),
           Type.Object({ rollout: Type.String(), build: Type.String(), escalated: Type.Boolean(), participants: Type.Array(Type.String()) }),
         ),
+      },
+    },
+  },
+});
+
+/** Where a node's copy of a synced scope is (`HeadRow`, src/pool/heads.ts). */
+export const HeadRowSchema = Type.Object({
+  scope: Type.String(), node: Type.String(), seq: Type.Number(), commit: Nullable(Type.String()), rule: Type.Number(),
+  seed: Nullable(Type.String()), edited: Type.Boolean(),
+});
+
+/** How one synced scope stands on a node (`ScopeState`, src/scopes/sync.ts). */
+export const ScopeStateSchema = Type.Object({
+  scope: Type.String(),
+  head: Nullable(Type.String()),
+  /** Peer heads not merged yet. */
+  behind: Type.Number(),
+  waiting: Type.Array(Type.Object({ node: Type.String(), why: Type.Union([Type.Literal("fetch"), Type.Literal("rule"), Type.Literal("seed")]) })),
+});
+
+/**
+ * The heads of the synced scopes (the profile, each project's memory): a type of its own rather than members of
+ * `PoolObject`, so that a node binds an older peer's `PoolObject` all the same. A node of a meddle older than it does not
+ * serve it.
+ */
+export const ScopeHeadsObject = remote("meddle.scope-heads", {
+  version: 1,
+  input: Type.Object({}),
+  host: hostNamed("node"),
+  variants: {
+    /** Dashboards and the CLI (principal `local`, `cli`, …): how each scope stands here. */
+    default: {
+      state: {
+        scopes: Type.Array(ScopeStateSchema),
+      },
+    },
+    /** Other nodes (principal `peer:<nodeId>`), which merge the rows into theirs. */
+    peer: {
+      state: {
+        /** Every admitted head row this node holds, by scope and node. */
+        heads: Type.Array(HeadRowSchema),
+      },
+    },
+  },
+});
+
+/** This node's standing in the pool's profile (src/profile.ts): `none` before it has a profile repo. */
+export const ProfileStandingSchema = Type.Union([Type.Literal("legacy"), Type.Literal("seed"), Type.Literal("pool"), Type.Literal("none")]);
+
+/** The pool's profile on this node, for the CLI and dashboards (principal `local`, `cli`, …); no peer view. */
+export const ProfileObject = remote("meddle.profile", {
+  version: 1,
+  input: Type.Object({}),
+  host: hostNamed("node"),
+  variants: {
+    default: {
+      state: {
+        /**
+         * `legacy`: an older meddle's profile, this node's alone until an import; `seed`: seeded from this machine's
+         * `~/.claude`, yielding to the pool's; `pool`: the pool's.
+         */
+        standing: ProfileStandingSchema,
+      },
+      methods: {
+        /**
+         * Makes the profile laid out in `dir` (like `~/.claude`; this node's own profile when absent) the pool's, and
+         * answers the commit (`importProfile`).
+         */
+        import: method(Type.Object({ dir: Type.Optional(Type.String()) }), Type.Object({ commit: Type.String() })),
       },
     },
   },

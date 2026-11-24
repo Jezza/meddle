@@ -10,7 +10,8 @@ import { shortId } from "../pool/ids";
 import { isRemoved, listRemoved, markRemoved, removedChanges, type RemovedProject } from "../pool/removed";
 import { deleteProjectRows, listLineRows, topic } from "../pool/rows";
 import { rosterName, type RosterRow } from "../pool/store";
-import { serialised } from "../serial";
+import type { ScopeSync } from "../scopes/sync";
+import { repoKey, serialised } from "../serial";
 import { listTasks } from "../store/records";
 import { manifestNames, MeddleTurn, type TaskRunner, type TurnInput } from "../tasks/durable";
 import { forgetTrain, MeddleTrain, type TrainInput } from "../train/train";
@@ -18,7 +19,7 @@ import { withProjectLocks } from "./locks";
 import { forgetProject, getProject } from "./project";
 import { rosterProject, settled, type ReplicaDeps } from "./replicas";
 
-export type RemovalDeps = ReplicaDeps & { runner: TaskRunner };
+export type RemovalDeps = ReplicaDeps & { runner: TaskRunner; scopeSync?: ScopeSync | null };
 
 /** How long after a cleanup that left tasks it could not stop yet (`deferred`) `watchRemoved` runs it again. */
 const RETRY_MS = 60_000;
@@ -61,11 +62,14 @@ export async function cleanupRemoved(deps: RemovalDeps, projectId: string): Prom
         cleanups.tell({ db, projectId, deferred: true });
         return;
       }
+      // Its memory no longer synced here: the watcher stopped and a pass in flight finished.
+      await deps.scopeSync?.forget({ kind: "memory", projectId });
       // Deletes only: a stop under the lock would wait for a task key that a `receiveTask` holds while it waits for the lock.
       await withProjectLocks([projectId], async () => {
         if (getProject(db, projectId) !== null) forgetProject(db, projectId);
         await rm(paths(cfg).replica(projectId), { recursive: true, force: true });
-        await rm(paths(cfg).memory(projectId), { recursive: true, force: true });
+        const memory = paths(cfg).memory(projectId);
+        await serialised(repoKey(memory), () => rm(memory, { recursive: true, force: true }));
         deleteProjectRows(db, projectId);
       });
       cleanups.tell({ db, projectId, deferred: false });

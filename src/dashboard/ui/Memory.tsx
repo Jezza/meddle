@@ -132,7 +132,10 @@ function MemoryLoaded({ project, id, editable, context }: { project: ProjectRef;
             </>
           )}
         </div>
-        {historyOpen && <History project={project} head={head} path={filter} context={context} />}
+        {historyOpen && (
+          <History project={project} head={head} path={filter} context={context}
+            restore={editable && filter !== null ? { hash: entries?.find((e) => e.path === filter)?.hash ?? null, reload: load } : null} />
+        )}
       </div>
     </>
   );
@@ -231,7 +234,7 @@ function Entry({ project, projectId, entry, editable, open, onToggle, onHistory,
 
 /**
  * The raw file in a box, `Save` and `Cancel`; with `path` null, a name for a new file first (one not `listed`). A
- * refused save keeps the text and says `Changed` or `Busy`. `Changed` reloads the entries, but the editor keeps the
+ * refused save keeps the text and says `Changed`. `Changed` reloads the entries, but the editor keeps the
  * `base` it opened with: Save answers `Changed` until the user cancels and edits the reloaded entry, so it never saves
  * over text the user has not seen.
  */
@@ -242,7 +245,7 @@ function Editor({ project, path, initial, base, listed, reload, onText, onSaved,
   const [name, setName] = useState("");
   const [text, setText] = useState(initial);
   const [busy, setBusy] = useState(false);
-  const [refused, setRefused] = useState<"Changed" | "Busy" | null>(null);
+  const [refused, setRefused] = useState<"Changed" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const nameBox = useRef<HTMLInputElement>(null);
   useEffect(() => { nameBox.current?.focus(); }, []);
@@ -299,8 +302,16 @@ function Who({ change, context, sep = false }: { change: MemoryChange; context: 
   );
 }
 
-/** The history under `memory`, newest first, 50 at a time; only changes touching `path` when it is set. */
-function History({ project, head, path, context }: { project: ProjectRef; head: string | null; path: string | null; context: Context }) {
+/** What restoring a version of the history's file needs: the file's hash as listed now (null: absent), and a reload. */
+type Restore = { hash: string | null; reload(): Promise<MemoryEntry[] | null> };
+
+/**
+ * The history under `memory`, newest first, 50 at a time; only changes touching `path` when it is set, each then with
+ * `Restore` when `restore` is given.
+ */
+function History({ project, head, path, context, restore }: {
+  project: ProjectRef; head: string | null; path: string | null; context: Context; restore: Restore | null;
+}) {
   const [rows, setRows] = useState<HistoryRows | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -333,7 +344,9 @@ function History({ project, head, path, context }: { project: ProjectRef; head: 
   return (
     <div class="mem-list">
       {error !== null && <p class="error">{error}</p>}
-      {rows?.list.map((c) => <Change key={c.change} project={project} change={c} context={context} />)}
+      {rows?.list.map((c) => (
+        <Change key={c.change} project={project} change={c} context={context} restore={path !== null && restore !== null ? { path, ...restore } : null} />
+      ))}
       {rows?.more === true && (
         <div class="mem-older"><button type="button" class="quiet" disabled={loading} onClick={() => void page(rows.list.at(-1)!.change)}>Older</button></div>
       )}
@@ -341,9 +354,34 @@ function History({ project, head, path, context }: { project: ProjectRef; head: 
   );
 }
 
-/** One change of the history; opened, each file it touched as a diff against its parent's version. */
-function Change({ project, change: c, context }: { project: ProjectRef; change: MemoryChange; context: Context }) {
+/**
+ * One change of the history; opened, each file it touched as a diff against its parent's version, and with `restore`,
+ * `Restore`: the file as this change left it written back (deleted when it left none), refused `Changed` when the file
+ * moved on since it was listed.
+ */
+function Change({ project, change: c, context, restore }: {
+  project: ProjectRef; change: MemoryChange; context: Context; restore: (Restore & { path: string }) | null;
+}) {
   const [open, setOpen] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [refused, setRefused] = useState<string | null>(null);
+  const putBack = async () => {
+    if (restore === null) return;
+    setRestoring(true);
+    setRefused(null);
+    try {
+      const text = await project.memoryFile({ path: restore.path, change: c.change });
+      if (text === null) await project.deleteMemory({ path: restore.path, base: restore.hash });
+      else await project.writeMemory({ path: restore.path, text, base: restore.hash });
+      await restore.reload();
+    } catch (err) {
+      const word = writeError(err);
+      setRefused(word ?? errorText(err));
+      if (word === "Changed") await restore.reload();
+    } finally {
+      setRestoring(false);
+    }
+  };
   const [files, setFiles] = useState<{ patch: FilePatch; file: string[] | null }[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -382,6 +420,13 @@ function Change({ project, change: c, context }: { project: ProjectRef; change: 
       {open && (
         <div class="mem-body">
           {error !== null && <p class="error">{error}</p>}
+          {restore !== null && (
+            <div class="mem-foot">
+              {refused !== null && <span class="error">{refused}</span>}
+              <span class="bar-gap" />
+              <button type="button" disabled={restoring} onClick={() => void putBack()}>Restore</button>
+            </div>
+          )}
           {files?.map(({ patch, file }) => (
             <DiffView key={patch.path} hunks={patch.hunks} file={file}
               head={{ path: patch.path, status: patch.status, added: patch.added, removed: patch.removed }} />

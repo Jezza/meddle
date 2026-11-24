@@ -97,10 +97,12 @@ test("serve, add a project, run a task's turn, and report status", async () => {
     expect(lines[5]).toBe("tasks 1");
     expect(lines[6]).toBe(`node ${node.id}`);
     expect(lines[7]).toBe("pool (no secret set)");
+    // Its profile, seeded here with no peer to be behind.
+    expect(lines[8]).toBe("profile in step");
     // Run from a checkout: never updated; no rollout has been heard of, and its own record is the only one.
-    expect(lines[8]).toMatch(/^build checkout \([a-z0-9]+-[a-z0-9]+\)$/);
-    expect(lines[9]).toMatch(/^node [0-9a-f]+ \(.+\) build checkout idle$/);
-    expect(lines).toHaveLength(10);
+    expect(lines[9]).toMatch(/^build checkout \([a-z0-9]+-[a-z0-9]+\)$/);
+    expect(lines[10]).toMatch(/^node [0-9a-f]+ \(.+\) build checkout idle$/);
+    expect(lines).toHaveLength(11);
   } finally {
     if (!stopped) await node.stop();
   }

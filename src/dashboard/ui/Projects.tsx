@@ -48,7 +48,7 @@ export function ProjectPage({ hosts, pool, index, id, tab }: {
   const nameOf = (nodeId: string) => nodes.find((n) => n.nodeId === nodeId)?.hostname ?? shortId(nodeId);
   const tasks = uniqueTasks(index.tasks).filter((t) => !t.archived && t.projects.some((p) => p.id === id));
   const listed = nodes.flatMap((n) => n.projects).find((p) => p.id === id);
-  const memory = project === undefined ? null : memorySource(project.home, project.holders.map((h) => h.nodeId), onlineIds);
+  const memory = project === undefined ? null : memorySource(hosts.selfId, project.holders.map((h) => h.nodeId), onlineIds);
   const nodeName = (short: string) => nodes.find((n) => shortId(n.nodeId) === short)?.hostname ?? short;
   // Every online holder's graph; the home's carries on with what Older read.
   const holders = project?.holders ?? [];

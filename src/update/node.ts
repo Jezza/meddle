@@ -1,5 +1,6 @@
 // src/update/node.ts — what an update needs of the machine: whether this node can be updated at all, the preflight
 // that proves a staged binary runs here (and fetches the Claude Code it pins), and the restart under systemd.
+import { checkGit } from "../scopes/repo";
 import { access, readFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
@@ -78,10 +79,14 @@ export async function runPreflight(path: string, build: string): Promise<void> {
 }
 
 /**
- * `meddle update-preflight`, run by a node on a staged binary before it swaps: proves this binary runs here, installs
+ * `meddle update-preflight`, run by a node on a staged binary before it swaps: proves this binary runs here (with a git
+ * new enough, `checkGit`), installs
  * the Claude Code it pins (downloaded, or from the binary) into the data directory, and prints its build as JSON.
  */
 export async function preflightCommand(cfg: NodeConfig): Promise<number> {
+  // This build's synced scopes merge with `merge-tree -X`: a node whose git is older refuses the update here, before
+  // the swap, rather than refusing to start after it.
+  await checkGit();
   const packed = embedded();
   if (packed === null) throw new Error("update-preflight runs only in a binary `bun run build` made");
   await ensureClaude(packed.claudeCode, cfg.dataDir, {

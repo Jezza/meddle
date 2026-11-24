@@ -2,8 +2,7 @@ import { cp, mkdir, readdir, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { NodeConfig } from "./config";
 import { paths } from "./paths";
-import { bookmarkSet, cloneColocated, initColocated, isJjRepo, jj, remoteEnsure } from "./jj";
-import { shortId } from "./pool/ids";
+import { bookmarkSet, initColocated, isJjRepo, jj } from "./jj";
 import { exists } from "./profile";
 
 /** The bookmark a memory repo's history is shared under. */
@@ -17,30 +16,6 @@ export async function ensureMemoryReplica(cfg: NodeConfig, projectId: string): P
   const replica = paths(cfg).memory(projectId);
   await mkdir(replica, { recursive: true });
   if (!(await isJjRepo(replica))) await initColocated(replica, cfg);
-  return replica;
-}
-
-/**
- * The memory replica of a project homed on node `home`: cloned from `meddle://<home>/memory/<projectId>` with the
- * remote named `shortId(home)` when this node has none. When the clone fails (the home has no memory repo), an empty
- * local repo with that remote instead; a later sync fetches the home's `memory`. An existing replica is kept (it may
- * hold commits the home has not seen) and gets the remote when it lacks it, or its url corrected (`remoteEnsure`).
- */
-export async function cloneMemoryReplica(cfg: NodeConfig, projectId: string, home: string): Promise<string> {
-  const replica = paths(cfg).memory(projectId);
-  const remote = shortId(home);
-  const url = `meddle://${home}/memory/${projectId}`;
-  if (!(await isJjRepo(replica))) {
-    await rm(replica, { recursive: true, force: true });
-    try {
-      await cloneColocated(url, replica, cfg, remote);
-      return replica;
-    } catch {
-      await rm(replica, { recursive: true, force: true });
-      await ensureMemoryReplica(cfg, projectId);
-    }
-  }
-  await remoteEnsure(replica, remote, url, cfg);
   return replica;
 }
 
