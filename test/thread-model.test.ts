@@ -319,7 +319,7 @@ test("activity says what a running turn is doing from the block streaming, else 
     { seq: 3, message: { type: "assistant", message: { id: "m2", content: [{ type: "tool_use", id: "t2", name: "Agent", input: {} }] } } },
     { seq: 4, message: { type: "assistant", message: { id: "m3", content: [{ type: "tool_use", id: "t3", name: "Bash", input: {} }] }, parent_tool_use_id: "t2" } },
   ]);
-  expect(activity(null, items)).toBe("Running Agent › Bash");
+  expect(activity(null, items)).toBe("Agent › Bash");
   expect(activity(null, items.slice(0, 1))).toBe("Working");
   expect(activity(null, [])).toBe("Working");
 });
@@ -328,7 +328,7 @@ test("activityLine: thinking says so longer the longer it runs; only a turn that
   expect(activityLine("Thinking", 3, 3)).toEqual({ text: "Thinking", stall: 0 });
   expect(activityLine("Thinking", 12, 12).text).toBe("Still thinking");
   expect(activityLine("Thinking", 50, 50)).toEqual({ text: "Deep in thought", stall: 0 });
-  expect(activityLine("Running Bash", 300, 300).stall).toBe(0);
+  expect(activityLine("Bash", 300, 300).stall).toBe(0);
   expect(activityLine("Writing", 40, 9).stall).toBe(0);
   expect(activityLine("Writing", 40, 15).stall).toBe(0.5);
   expect(activityLine("Working", 40, 40)).toEqual({ text: "Working", stall: 1 });
@@ -410,8 +410,21 @@ test("the line under the thread waits on agents while the main session has nothi
   // An older node serves no count: the thread's own running background agents stand in.
   expect(activity(null, items)).toBe("Waiting on 1 agent");
   const busy = buildThread([call(1, "tA", "Agent", { description: "x" }), agentStart(2), answer(3, "tA", "Async agent launched successfully."), call(4, "tB", "Bash", { command: "ls" })]);
-  expect(activity(null, busy, 2)).toBe("Running Bash");
+  expect(activity(null, busy, 2)).toBe("Bash");
   expect(activityLine("Waiting on 2 agents", 300, 300).stall).toBe(0);
+});
+
+test("the line under the thread names the calls running, then the description the agent gave the last", () => {
+  const items = buildThread([
+    call(1, "tA", "Agent", { description: "Implement Task 3" }),
+    call(2, "tB", "Agent", { description: "Check the types" }, "tA"),
+    call(3, "tC", "Bash", { command: "bun test", description: "Run affected tests" }, "tB"),
+  ]);
+  expect(activity(null, items)).toBe("Agent › Agent › Bash: Run affected tests");
+  expect(activity(null, buildThread([call(1, "tC", "Bash", { command: "bun test", description: "Run affected tests" })]))).toBe("Bash: Run affected tests");
+  expect(activity(null, buildThread([call(1, "tA", "Agent", { description: "Implement Task 3" })]))).toBe("Agent: Implement Task 3");
+  expect(activity(null, buildThread([call(1, "tA", "Agent", { description: "x" }), call(2, "tR", "Read", { file_path: "/a" }, "tA")]))).toBe("Agent › Read");
+  expect(activityLine("Agent › Bash: Writing the fixtures", 300, 300).stall).toBe(0);
 });
 
 test("a command's notice ends its row and keeps today's line at the top; a start or notice with no row stays as it was; a stopped agent says so", () => {
@@ -447,7 +460,7 @@ test("a command's notice ends its row and keeps today's line at the top; a start
 
 test("a call of the session's own running before a background agent is what the line says", () => {
   const items = buildThread([call(1, "tB", "Bash", { command: "ls" }), call(2, "tA", "Agent", { description: "x" }), agentStart(3), answer(4, "tA", "Async agent launched successfully.")]);
-  expect(activity(null, items, 1)).toBe("Running Bash");
+  expect(activity(null, items, 1)).toBe("Bash");
   expect(activity(null, [])).toBe("Working");
 });
 

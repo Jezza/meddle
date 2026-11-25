@@ -483,13 +483,13 @@ test("a task's agent runs while its turn is live and its notice is held back, th
     expect(task.agentsRunning.value).toBe(0);
     await task.prompt({ text: "Review the suite in the background." });
     await until(session.window, (w) => w.some((e) => kindOf(e) === "result/success"));
-    await until(task.agents, (a) => a[0]?.doing === "Running bun test");
+    await until(task.agents, (a) => a[0]?.doing === "bun test");
     await until(task.agentsRunning, (n) => n === 1);
     expect(session.window.value.map(kindOf)).not.toContain("system/task_notification");
     expect(task.state.value).toBe("running");
     expect(task.agents.value).toEqual([expect.objectContaining({
       id: "agent01", toolUseId: "toolu_agent", description: "Review the suite", background: true, state: "running", orphaned: false,
-      doing: "Running bun test", tools: 3, tokens: 12000, ms: 4000, endedAt: null,
+      doing: "bun test", tools: 3, tokens: 12000, ms: 4000, endedAt: null,
     })]);
 
     const [done] = await until(task.agents, (a) => a[0]?.state === "completed");
@@ -510,7 +510,7 @@ test("a task's agent left running when its turn's process goes is stopped and or
   const { task, session, close } = await agentNode({ MEDDLE_FIXTURE_STALL: "1" });
   try {
     await task.prompt({ text: "Review the suite in the background." });
-    await until(task.agents, (a) => a[0]?.doing === "Running bun test");
+    await until(task.agents, (a) => a[0]?.doing === "bun test");
     await until(task.agentsRunning, (n) => n === 1);
     expect(task.agents.value[0]).toMatchObject({ state: "running", orphaned: false });
 

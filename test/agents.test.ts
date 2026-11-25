@@ -46,7 +46,7 @@ test("an agent 'completed' while its own commands run is still running, waiting 
     live(3, 2, [command("c1"), command("c2"), command("w1", { ambient: true })]),
     notice(4, 3, "completed", { summary: "This agent has not reported yet: it is waiting on its own background work…" }),
   ]);
-  expect(servedAgents(log, true)[0]).toMatchObject({ state: "running", commands: 2, doing: "Waiting on 2 commands", endedAt: null });
+  expect(servedAgents(log, true)[0]).toMatchObject({ state: "running", commands: 2, doing: "c1, c2", endedAt: null });
   log = foldAgentLog(log, [live(5, 4, [command("c2")]), started(6, 4, { prompt: "<task-notification>\n<task-id>c1</task-id>" })]);
   expect(servedAgents(log, true)[0]).toMatchObject({ state: "running", startedAt: at(1), commands: 1 });
   log = foldAgentLog(log, [live(7, 6, []), notice(8, 6, "completed")]);
@@ -116,4 +116,21 @@ test("a foreground agent moved to the background says so; one started without a 
   const bare: Record<string, unknown> = { ...started(1, 1).message };
   delete bare.tool_use_id;
   expect(servedAgents(foldAgentLog(EMPTY_AGENT_LOG, [e(1, 1, bare)]), true)[0]).toMatchObject({ id: "a1", toolUseId: "" });
+});
+
+test("an agent's Bash step is the description the agent gave it; its other steps stay as Claude Code says them", () => {
+  const step = (description: string, tool: string) => e(3, 2, {
+    type: "system", subtype: "task_progress", task_id: "a1", tool_use_id: "tu1", description, last_tool_name: tool,
+    usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1 },
+  });
+  const log = foldAgentLog(EMPTY_AGENT_LOG, [turn(1, 0), started(2, 1)]);
+  expect(servedAgents(foldAgentLog(log, [step("Running Run affected tests", "Bash")]), true)[0]!.doing).toBe("Run affected tests");
+  expect(servedAgents(foldAgentLog(log, [step("Reading src/state/agents.ts", "Read")]), true)[0]!.doing).toBe("Reading src/state/agents.ts");
+});
+
+test("an agent waiting on commands none of which has a description says how many", () => {
+  const log = foldAgentLog(EMPTY_AGENT_LOG, [
+    turn(1, 0), started(2, 1), live(3, 2, [command("c1", { description: undefined })]), notice(4, 3, "completed"),
+  ]);
+  expect(servedAgents(log, true)[0]).toMatchObject({ state: "running", commands: 1, doing: "Waiting on 1 command" });
 });

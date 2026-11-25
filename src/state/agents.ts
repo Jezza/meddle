@@ -34,9 +34,12 @@ function usageOf(value: unknown): Partial<Pick<AgentRecord, "tools" | "tokens" |
   return out;
 }
 
-const sameCounts = (a: Record<string, number>, b: Record<string, number>): boolean => {
+const sameCommands = (a: Record<string, string[]>, b: Record<string, string[]>): boolean => {
   const keys = Object.keys(a);
-  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
+  return keys.length === Object.keys(b).length && keys.every((key) => {
+    const [x, y] = [a[key]!, b[key]];
+    return y !== undefined && x.length === y.length && x.every((description, i) => description === y[i]);
+  });
 };
 
 /**
@@ -60,7 +63,7 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
       // A new Claude Code process: none of the last one's agents or their commands run on in it.
       turnSeq = seq;
       for (const agent of agents) {
-        if (agent.state === "running" || (agent.state === "completed" && (commands[agent.id] ?? 0) > 0)) {
+        if (agent.state === "running" || (agent.state === "completed" && (commands[agent.id]?.length ?? 0) > 0)) {
           update(agent.id, { state: "stopped", orphaned: true, doing: null });
         }
       }
@@ -95,7 +98,9 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
       }
       case "task_progress": {
         if (id === null) break;
-        const doing = str(m.description);
+        // Claude Code says a Bash step as "Running " and the description the agent gave it: the description alone.
+        const said = str(m.description);
+        const doing = said !== null && m.last_tool_name === "Bash" && said.startsWith("Running ") ? said.slice(8) : said;
         update(id, { ...(doing === null ? {} : { doing }), ...usageOf(m.usage) });
         break;
       }
@@ -113,15 +118,15 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
         break;
       }
       case "background_tasks_changed": {
-        // Every live background task, replacing the last list: count the ones an agent launched that are activity.
-        const next: Record<string, number> = {};
+        // Every live background task, replacing the last list: keep the ones an agent launched that are activity.
+        const next: Record<string, string[]> = {};
         for (const task of Array.isArray(m.tasks) ? m.tasks : []) {
           const t = obj(task);
           const parent = str(t?.parent_task_id);
           if (t === null || parent === null || t.task_type === "local_agent" || t.ambient === true) continue;
-          next[parent] = (next[parent] ?? 0) + 1;
+          (next[parent] ??= []).push(str(t.description) ?? "");
         }
-        if (!sameCounts(commands, next)) commands = next;
+        if (!sameCommands(commands, next)) commands = next;
         break;
       }
     }
@@ -137,12 +142,14 @@ export function foldAgentLog(log: AgentLog, events: readonly EventRecord[]): Age
  */
 export function servedAgents(log: AgentLog, liveTurn: boolean): AgentEntry[] {
   const served = log.agents.map(({ runSeq, ...agent }): AgentEntry => {
-    const commands = log.commands[agent.id] ?? 0;
+    const live = log.commands[agent.id] ?? [];
+    const commands = live.length;
     let { state, endedAt, doing, orphaned } = agent;
     if (state === "completed" && commands > 0) {
       state = "running";
       endedAt = null;
-      doing = `Waiting on ${commands} command${commands === 1 ? "" : "s"}`;
+      const said = live.filter((description) => description !== "");
+      doing = said.length > 0 ? said.join(", ") : `Waiting on ${commands} command${commands === 1 ? "" : "s"}`;
     }
     if (state === "running" && (!liveTurn || runSeq < log.turnSeq)) {
       state = "stopped";

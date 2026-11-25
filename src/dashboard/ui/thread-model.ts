@@ -687,9 +687,10 @@ export function backgroundMeta(tool: ToolItem, agentRuns = true): string | null 
 
 /**
  * What a running turn is doing, for the line under it: the content block streaming (a thinking block says so even
- * when the API leaves its text out), else the call still running (into a subagent's own calls). With no call of the
- * session's own running, it is waiting on its background agents: `agentsRunning` of them, or (an older node serves no
- * count) the thread's own running background Agent calls.
+ * when the API leaves its text out), else the calls still running (into a subagent's own calls) by name, then the
+ * description the agent gave the last one: `Agent › Bash: Run the tests`. With no call of the session's own running,
+ * it is waiting on its background agents: `agentsRunning` of them, or (an older node serves no count) the thread's own
+ * running background Agent calls.
  */
 export function activity(live: Live, items: readonly ThreadItem[], agentsRunning = 0): string {
   if (live !== null) {
@@ -701,14 +702,20 @@ export function activity(live: Live, items: readonly ThreadItem[], agentsRunning
     return "Thinking";
   }
   const names: string[] = [];
+  let last: ToolItem | undefined;
   // At the top, a background agent working is not a call of the session's own running.
   for (let list = items, depth = 0; ; depth++) {
     const tool = list.findLast((i): i is ToolItem => i.kind === "tool" && isRunning(i) && (depth > 0 || !isBackgroundAgent(i)));
     if (tool === undefined) break;
     names.push(tool.name);
+    last = tool;
     list = tool.children;
   }
-  if (names.length > 0) return `Running ${names.join(" › ")}`;
+  if (last !== undefined) {
+    const description = (last.input as { description?: unknown } | null)?.description;
+    const said = typeof description === "string" ? description.split("\n")[0]!.trim() : "";
+    return said === "" ? names.join(" › ") : `${names.join(" › ")}: ${said}`;
+  }
   const agents = agentsRunning > 0 ? agentsRunning : items.filter((i) => isBackgroundAgent(i) && isRunning(i)).length;
   return agents > 0 ? `Waiting on ${agents} ${agents === 1 ? "agent" : "agents"}` : "Working";
 }
@@ -720,15 +727,15 @@ export function duration(seconds: number): string {
 
 /**
  * The activity line for what a turn is doing (`activity`), `phase` seconds into it and `quiet` seconds since
- * anything last streamed or landed. Thinking says so longer as it runs on, and is never stalled (its text may not
- * stream at all), nor is a running call or a wait on agents; anything else stalls from 10 s of quiet, fully at 20 s
- * (`stall` 0 to 1).
+ * anything last streamed or landed. Thinking says so longer as it runs on. Only writing, or working with nothing
+ * running, stalls (thinking's text may not stream at all; a call or agents run as long as they do), from 10 s of
+ * quiet, fully at 20 s (`stall` 0 to 1).
  */
 export function activityLine(doing: string, phase: number, quiet: number): { text: string; stall: number } {
   if (doing === "Thinking") {
     const text = phase < 10 ? "Thinking" : phase < 20 ? "Still thinking" : phase < 30 ? "Thinking more" : phase < 45 ? "Thinking some more" : "Deep in thought";
     return { text, stall: 0 };
   }
-  if (doing.startsWith("Running ") || doing.startsWith("Waiting on ")) return { text: doing, stall: 0 };
-  return { text: doing, stall: Math.min(1, Math.max(0, (quiet - 10) / 10)) };
+  const streams = doing === "Working" || doing.startsWith("Writing");
+  return { text: doing, stall: streams ? Math.min(1, Math.max(0, (quiet - 10) / 10)) : 0 };
 }

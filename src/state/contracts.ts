@@ -487,7 +487,10 @@ export const AgentEntrySchema = Type.Object({
   parent: Nullable(Type.String()),
   state: Type.Union([Type.Literal("running"), Type.Literal("completed"), Type.Literal("failed"), Type.Literal("stopped")]),
   orphaned: Type.Boolean(),
-  /** While running: the latest step, or "Waiting on N commands". */
+  /**
+   * While running: the latest step, or the descriptions of the commands it waits on ("Waiting on N commands" if none
+   * has one).
+   */
   doing: Nullable(Type.String()),
   commands: Type.Number(),
   tools: Type.Number(),
@@ -743,12 +746,13 @@ export type AgentRecord = Type.Static<typeof AgentRecordSchema>;
 
 /**
  * What a `TaskObject` keeps of its task's agents from its event log: the seq of the latest `turn_started`, every
- * agent, and the live background commands of each agent by its id (since that turn started: its process's).
+ * agent, and the descriptions of each agent's live background commands by its id (since that turn started: its
+ * process's; "" for one with none).
  */
 export const AgentLogSchema = Type.Object({
   turnSeq: Type.Number(),
   agents: Type.Array(AgentRecordSchema),
-  commands: Type.Record(Type.String(), Type.Number()),
+  commands: Type.Record(Type.String(), Type.Array(Type.String())),
 });
 export type AgentLog = Type.Static<typeof AgentLogSchema>;
 
